@@ -40,7 +40,9 @@ import (
 	_ "github.com/luxfi/precompile/frost"   // 0x0800..02 FROST EdDSA threshold
 
 	// ── AI ────────────────────────────────────────────────
-	_ "github.com/luxfi/precompile/ai" // 0x0300 AI mining / inference
+	_ "github.com/luxfi/precompile/ai"          // 0x0300 AI mining / inference
+	_ "github.com/luxfi/precompile/attestation" // 0x0300..01 TEE attestation (NVTrust/SGX/SEV-SNP/TDX)
+	_ "github.com/luxfi/precompile/compute"     // 0x0300..10 AI compute marketplace
 
 	// ── Consensus (Quasar) ───────────────────────────────
 	_ "github.com/luxfi/precompile/quasar" // 0x0300..20-24 BLS + Verkle + Ringtail + Hybrid verify
@@ -55,15 +57,14 @@ import (
 	_ "github.com/luxfi/precompile/zk" // 0x0900 Groth16 + PLONK + fflonk + Halo2
 
 	// ── Encryption / Privacy ─────────────────────────────
-	// REMOVED: aes (0x9210), chacha20 (0x9211), ecies (0x9201)
-	// Secret keys in calldata are public on-chain. Use FHE for encrypted compute.
 	_ "github.com/luxfi/precompile/curve25519" // 0x9204 Edwards25519 point ops
-	_ "github.com/luxfi/precompile/hpke"      // 0x9200 HPKE seal (public-key encrypt only)
-	_ "github.com/luxfi/precompile/ring"      // 0x9202 Ring signature verify only
-	_ "github.com/luxfi/precompile/x25519"    // 0x9203 X25519 Diffie-Hellman
+	_ "github.com/luxfi/precompile/hpke"       // 0x9200 HPKE seal (public-key encrypt only)
+	_ "github.com/luxfi/precompile/ring"       // 0x9202 Ring signature verify only
+	_ "github.com/luxfi/precompile/x25519"     // 0x9203 X25519 Diffie-Hellman
 
 	// ── DEX (LX Suite 0x9010-0x9080) ─────────────────────
-	_ "github.com/luxfi/precompile/dex" // Pool + Oracle + Router + Hooks + Flash + Book + Vault + Price + Lend + Repayer + Liquidator + Transmuter
+	_ "github.com/luxfi/precompile/dex"        // Pool + Oracle + Router + Hooks + Flash + Book + Vault + Price + Lend + Repayer + Liquidator + Transmuter
+	_ "github.com/luxfi/precompile/stableswap" // 0x0400..60 Curve StableSwap AMM invariant
 
 	// ── Graph ────────────────────────────────────────────
 	_ "github.com/luxfi/precompile/graph" // 0x0500 On-chain GraphQL
@@ -74,11 +75,10 @@ import (
 	// ── Registry ─────────────────────────────────────────
 	_ "github.com/luxfi/precompile/registry" // Precompile registry + BLS12-381 curves
 
-	// ── REMOVED (no init/module registration — dead imports) ──
-	// _ "github.com/luxfi/precompile/attestation" — library only, no module registration
-	// _ "github.com/luxfi/precompile/pqcrypto"    — umbrella, use mldsa + mlkem + slhdsa
-	// _ "github.com/luxfi/precompile/quantum"      — umbrella, use mldsa + mlkem + slhdsa + ringtail
-	// _ "github.com/luxfi/precompile/threshold"    — umbrella, use cggmp21 + frost + ringtail
+	// ── Deprecated Umbrellas (do NOT import — use explicit packages above) ──
+	// _ "github.com/luxfi/precompile/pqcrypto"  — use mldsa + mlkem + slhdsa
+	// _ "github.com/luxfi/precompile/quantum"   — use mldsa + mlkem + slhdsa + ringtail
+	// _ "github.com/luxfi/precompile/threshold" — use cggmp21 + frost + ringtail
 )
 
 func main() {
