@@ -505,7 +505,7 @@ func (vm *VM) initializeHTTPHandlers() error {
 	service := &Service{vm: vm}
 	vm.rpcServer.RegisterCodec(json.NewCodec(), "application/json")
 	vm.rpcServer.RegisterCodec(json.NewCodec(), "application/json;charset=UTF-8")
-	return vm.rpcServer.RegisterService(service, "qvm")
+	return vm.rpcServer.RegisterService(service, "quantumvm")
 }
 
 // isShuttingDown returns true if VM is shutting down

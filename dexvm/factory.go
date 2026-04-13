@@ -19,14 +19,15 @@
 package dexvm
 
 import (
+	"github.com/luxfi/chains/dexvm/config"
+	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/vms"
-	"github.com/luxfi/chains/dexvm/config"
 )
 
 var (
 	// VMID is the unique identifier for the DEX VM
-	VMID = [32]byte{'d', 'e', 'x', 'v', 'm'}
+	VMID = ids.ID{'d', 'e', 'x', 'v', 'm'}
 
 	_ vms.Factory = (*Factory)(nil)
 )
