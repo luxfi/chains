@@ -1,6 +1,8 @@
-// Copyright (C) 2019-2025, Lux Industries, Inc. All rights reserved.
-// See the file LICENSE for licensing terms.
-
+// Lux EVM plugin — C-Chain EVM with all precompiles enabled.
+//
+// All precompiles are activated at genesis via blank imports.
+// Each chain's genesis determines which precompiles are active
+// at which block/timestamp.
 package main
 
 import (
@@ -13,6 +15,36 @@ import (
 	"github.com/luxfi/sys/ulimit"
 	"github.com/luxfi/version"
 	"github.com/luxfi/vm/rpc"
+
+	// Post-quantum cryptography
+	_ "github.com/luxfi/precompile/blake3"
+	_ "github.com/luxfi/precompile/mldsa"
+	_ "github.com/luxfi/precompile/mlkem"
+	_ "github.com/luxfi/precompile/pqcrypto"
+	_ "github.com/luxfi/precompile/slhdsa"
+
+	// Threshold signatures
+	_ "github.com/luxfi/precompile/cggmp21"
+	_ "github.com/luxfi/precompile/frost"
+	_ "github.com/luxfi/precompile/ringtail"
+
+	// Curves
+	_ "github.com/luxfi/precompile/ed25519"
+	_ "github.com/luxfi/precompile/secp256r1"
+	_ "github.com/luxfi/precompile/sr25519"
+
+	// DEX
+	_ "github.com/luxfi/precompile/dex"
+
+	// Encryption and privacy
+	_ "github.com/luxfi/precompile/ecies"
+	_ "github.com/luxfi/precompile/fhe"
+	_ "github.com/luxfi/precompile/hpke"
+	_ "github.com/luxfi/precompile/ring"
+
+	// Zero-knowledge and graph
+	_ "github.com/luxfi/precompile/graph"
+	_ "github.com/luxfi/precompile/zk"
 )
 
 func main() {
