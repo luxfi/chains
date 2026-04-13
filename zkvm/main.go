@@ -9,7 +9,7 @@ import (
 	"os"
 
 	"github.com/luxfi/log"
-	zvm "github.com/luxfi/node/vms/zkvm"
+	"github.com/luxfi/node/vms/zkvm"
 	"github.com/luxfi/sys/ulimit"
 	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/vm/rpc"
@@ -26,7 +26,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	f := &zvm.Factory{}
+	f := &zkvm.Factory{}
 	raw, err := f.New(log.Root())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "factory error: %s\n", err)

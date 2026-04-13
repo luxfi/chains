@@ -9,7 +9,7 @@ import (
 	"os"
 
 	"github.com/luxfi/log"
-	tvm "github.com/luxfi/node/vms/thresholdvm"
+	"github.com/luxfi/node/vms/thresholdvm"
 	"github.com/luxfi/sys/ulimit"
 	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/vm/rpc"
@@ -26,7 +26,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	f := &tvm.Factory{}
+	f := &thresholdvm.Factory{}
 	raw, err := f.New(log.Root())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "factory error: %s\n", err)
