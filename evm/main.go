@@ -55,12 +55,11 @@ import (
 	_ "github.com/luxfi/precompile/zk" // 0x0900 Groth16 + PLONK + fflonk + Halo2
 
 	// ── Encryption / Privacy ─────────────────────────────
-	_ "github.com/luxfi/precompile/aes"       // 0x9210 AES-256-GCM AEAD
-	_ "github.com/luxfi/precompile/chacha20"  // 0x9211 ChaCha20-Poly1305 AEAD
+	// REMOVED: aes (0x9210), chacha20 (0x9211), ecies (0x9201)
+	// Secret keys in calldata are public on-chain. Use FHE for encrypted compute.
 	_ "github.com/luxfi/precompile/curve25519" // 0x9204 Edwards25519 point ops
-	_ "github.com/luxfi/precompile/ecies"     // 0x9201 ECIES encrypt/decrypt
-	_ "github.com/luxfi/precompile/hpke"      // 0x9200 Hybrid Public Key Encryption
-	_ "github.com/luxfi/precompile/ring"      // 0x9202 Ring signatures
+	_ "github.com/luxfi/precompile/hpke"      // 0x9200 HPKE seal (public-key encrypt only)
+	_ "github.com/luxfi/precompile/ring"      // 0x9202 Ring signature verify only
 	_ "github.com/luxfi/precompile/x25519"    // 0x9203 X25519 Diffie-Hellman
 
 	// ── DEX (LX Suite 0x9010-0x9080) ─────────────────────
@@ -72,16 +71,14 @@ import (
 	// ── Blob ─────────────────────────────────────────────
 	_ "github.com/luxfi/precompile/kzg4844" // 0xB002 EIP-4844 KZG commitments
 
-	// ── Attestation ──────────────────────────────────────
-	_ "github.com/luxfi/precompile/attestation" // Remote attestation (TEE)
-
 	// ── Registry ─────────────────────────────────────────
 	_ "github.com/luxfi/precompile/registry" // Precompile registry + BLS12-381 curves
 
-	// ── REMOVED (umbrellas — use explicit imports above) ──
-	// _ "github.com/luxfi/precompile/pqcrypto"  — use mldsa + mlkem + slhdsa
-	// _ "github.com/luxfi/precompile/quantum"    — use mldsa + mlkem + slhdsa + ringtail
-	// _ "github.com/luxfi/precompile/threshold"  — use cggmp21 + frost + ringtail
+	// ── REMOVED (no init/module registration — dead imports) ──
+	// _ "github.com/luxfi/precompile/attestation" — library only, no module registration
+	// _ "github.com/luxfi/precompile/pqcrypto"    — umbrella, use mldsa + mlkem + slhdsa
+	// _ "github.com/luxfi/precompile/quantum"      — umbrella, use mldsa + mlkem + slhdsa + ringtail
+	// _ "github.com/luxfi/precompile/threshold"    — umbrella, use cggmp21 + frost + ringtail
 )
 
 func main() {
