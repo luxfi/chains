@@ -1,0 +1,8 @@
+# Plugin image: stateless FROM scratch container that serves a single
+# pre-built VM plugin binary. Binary is produced by the workflow's
+# pre-build-command on the native-arch runner and placed at /build/<vm>.
+# syntax=docker/dockerfile:1
+FROM scratch
+ARG VM
+COPY build/${VM} /plugin
+ENTRYPOINT ["/plugin"]
