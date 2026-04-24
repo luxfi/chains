@@ -1,0 +1,14 @@
+[
+  {"vm": "evm",          "image": "ghcr.io/luxfi/chains/evm",          "cgo": "1"},
+  {"vm": "dexvm",        "image": "ghcr.io/luxfi/chains/dexvm",        "cgo": "0"},
+  {"vm": "aivm",         "image": "ghcr.io/luxfi/chains/aivm",         "cgo": "0"},
+  {"vm": "bridgevm",     "image": "ghcr.io/luxfi/chains/bridgevm",     "cgo": "0"},
+  {"vm": "graphvm",      "image": "ghcr.io/luxfi/chains/graphvm",      "cgo": "0"},
+  {"vm": "identityvm",   "image": "ghcr.io/luxfi/chains/identityvm",   "cgo": "0"},
+  {"vm": "keyvm",        "image": "ghcr.io/luxfi/chains/keyvm",        "cgo": "0"},
+  {"vm": "oraclevm",     "image": "ghcr.io/luxfi/chains/oraclevm",     "cgo": "0"},
+  {"vm": "quantumvm",    "image": "ghcr.io/luxfi/chains/quantumvm",    "cgo": "0"},
+  {"vm": "relayvm",      "image": "ghcr.io/luxfi/chains/relayvm",      "cgo": "0"},
+  {"vm": "thresholdvm",  "image": "ghcr.io/luxfi/chains/thresholdvm",  "cgo": "0"},
+  {"vm": "zkvm",         "image": "ghcr.io/luxfi/chains/zkvm",         "cgo": "0"}
+]
