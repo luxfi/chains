@@ -5,7 +5,7 @@ go 1.26.1
 require (
 	github.com/luxfi/evm v0.8.49
 	github.com/luxfi/log v1.4.1
-	github.com/luxfi/precompile v0.5.10
+	github.com/luxfi/precompile v0.5.12
 	github.com/luxfi/sys v0.0.0-20260110090042-50187ec5ffd8
 	github.com/luxfi/version v1.0.1
 	github.com/luxfi/vm v1.0.40
@@ -96,14 +96,14 @@ require (
 	github.com/luxfi/consensus v1.22.70 // indirect
 	github.com/luxfi/constants v1.4.7 // indirect
 	github.com/luxfi/container v0.0.4 // indirect
-	github.com/luxfi/crypto v1.17.45 // indirect
+	github.com/luxfi/crypto v1.18.1 // indirect
 	github.com/luxfi/database v1.18.1 // indirect
-	github.com/luxfi/fhe v1.7.6 // indirect
+	github.com/luxfi/fhe v1.8.0 // indirect
 	github.com/luxfi/filesystem v0.0.1 // indirect
 	github.com/luxfi/formatting v1.0.1 // indirect
 	github.com/luxfi/geth v1.16.86-0.20260413014255-3e903c3d2e06 // indirect
 	github.com/luxfi/go-bip39 v1.1.2 // indirect
-	github.com/luxfi/gpu v0.30.0 // indirect
+	github.com/luxfi/gpu v0.31.1 // indirect
 	github.com/luxfi/ids v1.2.9 // indirect
 	github.com/luxfi/lattice/v7 v7.0.0 // indirect
 	github.com/luxfi/math v1.2.4 // indirect
@@ -188,9 +188,9 @@ require (
 	golang.org/x/text v0.35.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	gonum.org/v1/gonum v0.17.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260217215200-42d3e9bedb6d // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260217215200-42d3e9bedb6d // indirect
-	google.golang.org/grpc v1.79.1 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 // indirect
+	google.golang.org/grpc v1.80.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
