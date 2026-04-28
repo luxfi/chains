@@ -5,7 +5,7 @@ go 1.26.1
 require (
 	github.com/luxfi/evm v0.8.49
 	github.com/luxfi/log v1.4.1
-	github.com/luxfi/precompile v0.5.10
+	github.com/luxfi/precompile v0.5.11
 	github.com/luxfi/sys v0.0.0-20260110090042-50187ec5ffd8
 	github.com/luxfi/version v1.0.1
 	github.com/luxfi/vm v1.0.40
@@ -96,7 +96,7 @@ require (
 	github.com/luxfi/consensus v1.22.70 // indirect
 	github.com/luxfi/constants v1.4.7 // indirect
 	github.com/luxfi/container v0.0.4 // indirect
-	github.com/luxfi/crypto v1.17.45 // indirect
+	github.com/luxfi/crypto v1.18.1 // indirect
 	github.com/luxfi/database v1.18.1 // indirect
 	github.com/luxfi/fhe v1.7.6 // indirect
 	github.com/luxfi/filesystem v0.0.1 // indirect
