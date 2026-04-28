@@ -3,10 +3,16 @@ module github.com/luxfi/chains/aivm
 go 1.26.1
 
 require (
+	github.com/luxfi/ai v0.0.0-20251225021023-3f15131f2bd1
+	github.com/luxfi/consensus v1.22.80
+	github.com/luxfi/database v1.17.47
+	github.com/luxfi/ids v1.2.9
 	github.com/luxfi/log v1.4.1
 	github.com/luxfi/node v1.24.27
+	github.com/luxfi/runtime v1.0.1
 	github.com/luxfi/sys v0.0.0-20260110090042-50187ec5ffd8
 	github.com/luxfi/vm v1.0.39
+	github.com/stretchr/testify v1.11.1
 )
 
 require (
@@ -23,6 +29,7 @@ require (
 	github.com/cockroachdb/pebble v1.1.5 // indirect
 	github.com/cockroachdb/redact v1.1.6 // indirect
 	github.com/cockroachdb/tokenbucket v0.0.0-20250429170803-42689b6311bb // indirect
+	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.4.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -45,21 +52,17 @@ require (
 	github.com/kr/text v0.2.0 // indirect
 	github.com/luxfi/accel v1.0.6 // indirect
 	github.com/luxfi/age v1.4.0 // indirect
-	github.com/luxfi/ai v0.0.0-20251225021023-3f15131f2bd1 // indirect
 	github.com/luxfi/api v1.0.4 // indirect
 	github.com/luxfi/atomic v1.0.0 // indirect
 	github.com/luxfi/cache v1.2.1 // indirect
 	github.com/luxfi/codec v1.1.4 // indirect
 	github.com/luxfi/compress v0.0.5 // indirect
 	github.com/luxfi/concurrent v0.0.3 // indirect
-	github.com/luxfi/consensus v1.22.80 // indirect
 	github.com/luxfi/constants v1.4.7 // indirect
 	github.com/luxfi/container v0.0.4 // indirect
 	github.com/luxfi/crypto v1.17.55 // indirect
-	github.com/luxfi/database v1.17.47 // indirect
 	github.com/luxfi/filesystem v0.0.1 // indirect
 	github.com/luxfi/geth v1.16.76 // indirect
-	github.com/luxfi/ids v1.2.9 // indirect
 	github.com/luxfi/math v1.2.4 // indirect
 	github.com/luxfi/math/big v0.1.0 // indirect
 	github.com/luxfi/metric v1.5.0 // indirect
@@ -67,7 +70,6 @@ require (
 	github.com/luxfi/p2p v1.19.2-zap // indirect
 	github.com/luxfi/protocol v0.0.3 // indirect
 	github.com/luxfi/resource v0.0.1 // indirect
-	github.com/luxfi/runtime v1.0.1 // indirect
 	github.com/luxfi/sampler v1.0.0 // indirect
 	github.com/luxfi/timer v1.0.2 // indirect
 	github.com/luxfi/upgrade v1.0.0 // indirect
@@ -85,6 +87,7 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
+	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.67.5 // indirect
@@ -115,4 +118,5 @@ require (
 	google.golang.org/grpc v1.79.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
