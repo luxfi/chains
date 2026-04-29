@@ -4,9 +4,13 @@ go 1.26.1
 
 require (
 	github.com/luxfi/log v1.4.1
-	github.com/luxfi/node v1.24.27
 	github.com/luxfi/sys v0.0.0-20260110090042-50187ec5ffd8
-	github.com/luxfi/vm v1.0.39
+	github.com/luxfi/vm v1.0.40
+)
+
+require (
+	github.com/luxfi/node v1.24.29 // indirect
+	github.com/luxfi/zapdb v1.8.0 // indirect
 )
 
 require (
@@ -21,12 +25,12 @@ require (
 	github.com/cockroachdb/fifo v0.0.0-20240816210425-c5d0cb0b6fc0 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20241215232642-bb51bb14a506 // indirect
 	github.com/cockroachdb/pebble v1.1.5 // indirect
-	github.com/cockroachdb/redact v1.1.6 // indirect
+	github.com/cockroachdb/redact v1.1.8 // indirect
 	github.com/cockroachdb/tokenbucket v0.0.0-20250429170803-42689b6311bb // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.4.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/getsentry/sentry-go v0.40.0 // indirect
+	github.com/getsentry/sentry-go v0.44.1 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -38,12 +42,12 @@ require (
 	github.com/gorilla/rpc v1.2.1 // indirect
 	github.com/grpc-ecosystem/go-grpc-prometheus v1.2.0 // indirect
 	github.com/holiman/uint256 v1.3.2 // indirect
-	github.com/klauspost/compress v1.18.4 // indirect
+	github.com/klauspost/compress v1.18.5 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
-	github.com/luxfi/accel v1.0.6 // indirect
+	github.com/luxfi/accel v1.0.7 // indirect
 	github.com/luxfi/age v1.4.0 // indirect
 	github.com/luxfi/api v1.0.4 // indirect
 	github.com/luxfi/atomic v1.0.0 // indirect
@@ -51,20 +55,21 @@ require (
 	github.com/luxfi/codec v1.1.4 // indirect
 	github.com/luxfi/compress v0.0.5 // indirect
 	github.com/luxfi/concurrent v0.0.3 // indirect
-	github.com/luxfi/consensus v1.22.80 // indirect
+	github.com/luxfi/consensus v1.22.85 // indirect
 	github.com/luxfi/constants v1.4.7 // indirect
 	github.com/luxfi/container v0.0.4 // indirect
 	github.com/luxfi/crypto v1.17.55 // indirect
-	github.com/luxfi/database v1.17.47 // indirect
+	github.com/luxfi/database v1.18.2 // indirect
 	github.com/luxfi/filesystem v0.0.1 // indirect
-	github.com/luxfi/geth v1.16.76 // indirect
+	github.com/luxfi/geth v1.16.77 // indirect
 	github.com/luxfi/ids v1.2.9 // indirect
 	github.com/luxfi/math v1.2.4 // indirect
 	github.com/luxfi/math/big v0.1.0 // indirect
-	github.com/luxfi/metric v1.5.0 // indirect
+	github.com/luxfi/metric v1.5.1 // indirect
 	github.com/luxfi/mock v0.1.1 // indirect
-	github.com/luxfi/p2p v1.19.2-zap // indirect
+	github.com/luxfi/p2p v1.19.2 // indirect
 	github.com/luxfi/protocol v0.0.3 // indirect
+	github.com/luxfi/relay v0.0.0-20260429020048-c629fe160d3c
 	github.com/luxfi/resource v0.0.1 // indirect
 	github.com/luxfi/runtime v1.0.1 // indirect
 	github.com/luxfi/sampler v1.0.0 // indirect
@@ -73,7 +78,6 @@ require (
 	github.com/luxfi/validators v1.0.0 // indirect
 	github.com/luxfi/version v1.0.1 // indirect
 	github.com/luxfi/warp v1.18.5 // indirect
-	github.com/luxfi/zapdb/v4 v4.9.4 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/minio/crc64nvme v1.1.1 // indirect
@@ -97,9 +101,9 @@ require (
 	github.com/tklauser/numcpus v0.11.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
-	go.opentelemetry.io/otel v1.40.0 // indirect
-	go.opentelemetry.io/otel/metric v1.40.0 // indirect
-	go.opentelemetry.io/otel/trace v1.40.0 // indirect
+	go.opentelemetry.io/otel v1.42.0 // indirect
+	go.opentelemetry.io/otel/metric v1.42.0 // indirect
+	go.opentelemetry.io/otel/trace v1.42.0 // indirect
 	go.uber.org/mock v0.6.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
