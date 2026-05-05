@@ -43,3 +43,6 @@ type (
 	HealthArgs             = oraclevm.HealthArgs
 	HealthReply            = oraclevm.HealthReply
 )
+
+// VMID is the canonical O-Chain VM identifier.
+var VMID = oraclevm.VMID
