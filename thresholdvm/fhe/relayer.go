@@ -55,7 +55,7 @@ type CiphertextStorage interface {
 	Delete(handle common.Hash) error
 }
 
-// Relayer coordinates threshold decryption between C-Chain and T-Chain
+// Relayer coordinates threshold decryption between C-Chain and F-Chain (FHE compute per LP-134; legacy: T-Chain)
 type Relayer struct {
 	logger          log.Logger
 	decryptor       *ThresholdDecryptor
