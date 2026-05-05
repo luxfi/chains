@@ -12,7 +12,8 @@ operator daemons (no luxd validator required), the same way `mpcd` and
 |---|---|---|---|
 | R-Chain (relay) | `chains/relayvm/` (shim) | `luxfi/relay/vm/` | `luxfi/relay/cmd/relayd` |
 | O-Chain (oracle) | `chains/oraclevm/` (shim) | `luxfi/oracle/vm/` | `luxfi/oracle/cmd/oracled` |
-| T-Chain (FHE / threshold) | `luxfi/chains/thresholdvm/` (canonical) | (same) | `luxfi/fhe/cmd/fhed` (standalone FHE daemon, not chain-coupled) |
+| M-Chain (MPC threshold) | `luxfi/chains/thresholdvm/` (canonical, MPC mode) | (same) | n/a — runs in luxd |
+| F-Chain (FHE) | `luxfi/chains/thresholdvm/` (canonical, FHE mode) | (same) | `luxfi/fhe/cmd/fhed` (standalone FHE daemon) |
 | C-Chain (EVM) | `chains/evm/` | uses `chains/evm/cevm` (C++/GPU FFI shim) or pure-Go (default) via build tags | n/a — runs in luxd |
 | A-Chain (AI) | `chains/aivm/` | `luxfi/ai` | n/a |
 | I-Chain (identity) | `chains/identityvm/` | `luxfi/id` | n/a |
