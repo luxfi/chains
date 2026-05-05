@@ -152,14 +152,21 @@ func (b *Block) Height() uint64 {
 	return b.height
 }
 
-// Timestamp returns the block timestamp as Unix time (implements consensus Block interface)
-func (b *Block) Timestamp() int64 {
+// Timestamp returns the block timestamp (implements block.Block interface)
+func (b *Block) Timestamp() time.Time {
+	return b.timestamp
+}
+
+// TimestampUnix returns the block timestamp as Unix seconds.
+func (b *Block) TimestampUnix() int64 {
 	return b.timestamp.Unix()
 }
 
-// Time returns the block timestamp as time.Time
-func (b *Block) Time() time.Time {
-	return b.timestamp
+// Status returns the block status. Q-Chain does not yet track per-block
+// status separately (all blocks reaching here are processing or accepted),
+// so we return 0 (Unknown) until a status field is added.
+func (b *Block) Status() uint8 {
+	return 0
 }
 
 // Bytes returns the block bytes

@@ -24,19 +24,20 @@ import (
 	grjson "github.com/gorilla/rpc/v2/json"
 	"golang.org/x/crypto/hkdf"
 
+	"github.com/luxfi/accel"
+	"github.com/luxfi/chains/keyvm/config"
 	"github.com/luxfi/crypto/bls"
-	"github.com/luxfi/crypto/mlkem"
 	"github.com/luxfi/crypto/mldsa"
+	"github.com/luxfi/crypto/mlkem"
 	"github.com/luxfi/database"
 	"github.com/luxfi/database/versiondb"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/cache"
-	"github.com/luxfi/chains/keyvm/config"
 	"github.com/luxfi/runtime"
 	"github.com/luxfi/timer/mockable"
-	"github.com/luxfi/vm/chain"
 	vmcore "github.com/luxfi/vm"
+	"github.com/luxfi/vm/chain"
 )
 
 const (
@@ -108,6 +109,10 @@ type KeyShare struct {
 // VM implements the K-Chain Virtual Machine.
 type VM struct {
 	config.Config
+
+	// Per-VM GPU acceleration session. Reserved for future ML-KEM/ML-DSA
+	// batch operations on the K-Chain hot path.
+	accel *accel.VMSession
 
 	// Core components
 	rt           *runtime.Runtime

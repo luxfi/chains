@@ -1,0 +1,8 @@
+# luxcpp prebuilt-tarball SHA-256 sums.
+# Format: <hex sha256>  <asset filename>
+# Populate when luxfi/luxcpp publishes release tarballs.
+# Asset name pattern: luxcpp-<version>-<platform>-<arch>.tar.gz
+#   platforms: darwin, linux
+#   archs: amd64, arm64
+# Example:
+#   2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824  luxcpp-v0.26.0-darwin-arm64.tar.gz

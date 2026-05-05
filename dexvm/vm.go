@@ -22,10 +22,7 @@ import (
 	"github.com/luxfi/log"
 	"github.com/luxfi/metric"
 
-	consensuscore "github.com/luxfi/consensus/core"
-	"github.com/luxfi/database"
-	"github.com/luxfi/database/versiondb"
-	"github.com/luxfi/ids"
+	"github.com/luxfi/accel"
 	"github.com/luxfi/chains/dexvm/api"
 	"github.com/luxfi/chains/dexvm/config"
 	"github.com/luxfi/chains/dexvm/liquidity"
@@ -34,6 +31,10 @@ import (
 	"github.com/luxfi/chains/dexvm/orderbook"
 	"github.com/luxfi/chains/dexvm/perpetuals"
 	"github.com/luxfi/chains/dexvm/txs"
+	consensuscore "github.com/luxfi/consensus/core"
+	"github.com/luxfi/database"
+	"github.com/luxfi/database/versiondb"
+	"github.com/luxfi/ids"
 	"github.com/luxfi/runtime"
 	"github.com/luxfi/timer/mockable"
 	"github.com/luxfi/version"
@@ -89,6 +90,11 @@ type BlockResult struct {
 //   - Replay-safe for auditing
 type VM struct {
 	config.Config
+
+	// Per-VM GPU acceleration session. Reserved for future batch
+	// order-matching, MSM-based commitment verification, and tensor
+	// orderbook reconstruction.
+	accel *accel.VMSession
 
 	// Logger for this VM
 	log log.Logger
@@ -951,7 +957,6 @@ func (vm *VM) executeRevealOrder(tx *txs.RevealOrderTx, result *BlockResult) err
 	return nil
 }
 
-
 // matchAllOrders runs the matching engine for all orderbooks.
 // This is deterministic - same orders always produce same matches.
 func (vm *VM) matchAllOrders() []orderbook.Trade {
@@ -1513,10 +1518,10 @@ func (c *wsClient) sendOrderbookSnapshot(symbol string) {
 	bids, asks := ob.GetDepth(20)
 
 	type OrderbookSnapshot struct {
-		Symbol string                 `json:"symbol"`
+		Symbol string                  `json:"symbol"`
 		Bids   []*orderbook.PriceLevel `json:"bids"`
 		Asks   []*orderbook.PriceLevel `json:"asks"`
-		Time   int64                  `json:"time"`
+		Time   int64                   `json:"time"`
 	}
 
 	snapshot := OrderbookSnapshot{
