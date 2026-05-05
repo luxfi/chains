@@ -7,7 +7,7 @@ require (
 	github.com/gorilla/rpc v1.2.1
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/hashicorp/golang-lru v1.0.2
-	github.com/luxfi/accel v1.0.7
+	github.com/luxfi/accel v1.0.9
 	github.com/luxfi/ai v0.1.0
 	github.com/luxfi/codec v1.1.4
 	github.com/luxfi/consensus v1.22.85

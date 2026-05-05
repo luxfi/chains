@@ -226,13 +226,23 @@ or boot-time failure, not a silent semantic bug.
 
 ## 11. References
 
+Per LP-134 (Lux Chain Topology), the legacy T-Chain monolith is split into
+two operational chains served by this same `thresholdvm` substrate:
+
+- `thresholdvm` in **MPC mode → M-Chain** (CGGMP21, FROST, Ringtail-gen).
+- `thresholdvm` in **FHE mode → F-Chain** (TFHE keygen, encrypted EVM).
+
+The standalone `teleportvm` (LP-6332) is unrelated and retains its own
+"T-Chain" naming for the cross-chain teleport message bus.
+
 | LP | Topic |
 |---|---|
-| LP-019 | Threshold MPC for Bridge Signing |
-| LP-013 | FHE on GPU |
+| LP-019 | Threshold MPC for Bridge Signing (M-Chain protocols) |
+| LP-013 | FHE on GPU (F-Chain compute) |
 | LP-076 | Universal Threshold Cryptography Framework |
 | LP-077 | Linear Secret Sharing (resharing) |
 | LP-132 | QuasarGPU Execution Adapter |
-| LP-134 | Lux Chain Topology |
+| LP-134 | Lux Chain Topology — defines the M/F-Chain split |
 | LP-020 | Quasar Consensus 3.0 |
-| LP-5013 | T-Chain MPC Custody (deprecated) |
+| LP-6332 | teleportvm cross-chain message bus (separate "T-Chain") |
+| LP-5013 | T-Chain MPC Custody (deprecated, superseded by LP-134) |
