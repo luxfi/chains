@@ -15,7 +15,8 @@ import (
 	"time"
 )
 
-// Client provides access to T-Chain MPC services
+// Client provides access to thresholdvm services. Per LP-134, this serves
+// M-Chain (MPC mode) and F-Chain (FHE mode); legacy T-Chain MPC routes here.
 type Client struct {
 	endpoint   string
 	chainID    string // Requesting chain's ID
@@ -543,7 +544,7 @@ func (c *Client) Health(ctx context.Context) (map[string]interface{}, error) {
 	return result, nil
 }
 
-// IsReady checks if T-Chain MPC is ready
+// IsReady checks if thresholdvm (M-Chain MPC mode per LP-134) is ready
 func (c *Client) IsReady(ctx context.Context) (bool, error) {
 	info, err := c.GetInfo(ctx)
 	if err != nil {
