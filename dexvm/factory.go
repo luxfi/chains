@@ -19,6 +19,7 @@
 package dexvm
 
 import (
+	"github.com/luxfi/accel"
 	"github.com/luxfi/chains/dexvm/config"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
@@ -40,10 +41,18 @@ type Factory struct {
 // New implements vms.Factory interface.
 // It creates a new DEX ChainVM instance with the factory's configuration.
 // The ChainVM wrapper implements block.ChainVM for integration with the chains manager.
+// Allocates a per-VM GPU session at PriorityHigh because the DEX hot path
+// is latency-critical (1ms block times).
 func (f *Factory) New(logger log.Logger) (interface{}, error) {
+	sess, err := accel.NewVMSession("dexvm", accel.WithPriority(accel.PriorityHigh))
+	if err != nil {
+		return nil, err
+	}
+
 	// Create the ChainVM wrapper which implements block.ChainVM
 	chainVM := NewChainVM(logger)
 	// Apply factory config to inner VM
 	chainVM.inner.Config = f.Config
+	chainVM.inner.accel = sess
 	return chainVM, nil
 }
