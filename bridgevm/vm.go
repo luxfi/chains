@@ -904,7 +904,7 @@ func (vm *VM) RemoveSigner(nodeID ids.NodeID, replacementNodeID *ids.NodeID) (*S
 		)
 	}
 
-	// Trigger actual reshare protocol via T-Chain (ThresholdVM) using warp messaging
+	// Trigger actual reshare protocol via M-Chain (ThresholdVM-MPC, per LP-134) using warp messaging
 	if err := vm.triggerReshareProtocol(reshareSession, nodeID, replacement); err != nil {
 		if vm.log != nil && !vm.log.IsZero() {
 			vm.log.Warn("failed to trigger reshare protocol",
