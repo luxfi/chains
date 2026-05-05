@@ -92,6 +92,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Resolve the execution backend before serving. With cgo this links
+	// luxcpp/cevm and selects AutoEVM (CppEVM when luxfi/evm is built
+	// with -tags cevm; GoEVM otherwise). Without cgo this stays on GoEVM.
+	selectExecutionBackend(log.Root())
+
 	if err := rpc.Serve(context.Background(), log.Root(), &evm.VM{}); err != nil {
 		fmt.Fprintf(os.Stderr, "rpc.Serve error: %s\n", err)
 		os.Exit(1)
