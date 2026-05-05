@@ -1,7 +1,10 @@
 # M-Chain Integration
 
 This document describes how `chains/mchain/` plugs into the
-ThresholdVM substrate.
+`thresholdvm` substrate when running in **MPC mode** (per LP-134).
+The same substrate, running in FHE mode, serves F-Chain — see
+`F_CHAIN_INTEGRATION.md` for that side. The legacy "T-Chain" name is
+retained only for `teleportvm` (LP-6332), which is unrelated.
 
 ## Boot sequence
 
