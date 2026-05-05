@@ -1,7 +1,9 @@
 // Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
-// Package tvm implements the Threshold VM (T-Chain) - MPC as a service for all Lux chains
+// Package tvm implements the Threshold VM substrate (M-Chain MPC and F-Chain FHE per LP-134).
+// The legacy "T-Chain" label predates the LP-134 split; new code targets M-Chain (MPC ceremonies
+// for bridge custody of external wallets) or F-Chain (FHE compute). See ../README.md.
 package thresholdvm
 
 import (
