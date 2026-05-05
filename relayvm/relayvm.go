@@ -47,3 +47,6 @@ type (
 	HealthArgs             = relayvm.HealthArgs
 	HealthReply            = relayvm.HealthReply
 )
+
+// VMID is the canonical R-Chain VM identifier.
+var VMID = relayvm.VMID
