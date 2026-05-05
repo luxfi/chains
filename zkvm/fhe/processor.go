@@ -71,7 +71,7 @@ type Processor struct {
 
 	// Keys
 	publicKey *rlwe.PublicKey
-	secretKey *rlwe.SecretKey // Only for keygen - shares distributed to T-Chain
+	secretKey *rlwe.SecretKey // Only for keygen - shares distributed to M-Chain (MPC) per LP-134
 	evalKeys  *rlwe.MemEvaluationKeySet
 
 	// Threshold components
@@ -163,7 +163,7 @@ func (p *Processor) GenerateKeys() error {
 }
 
 // GenerateThresholdShares splits the secret key into threshold shares
-// These shares should be distributed to T-Chain signers
+// These shares should be distributed to M-Chain signers (per LP-134; legacy: T-Chain)
 func (p *Processor) GenerateThresholdShares(partyPoints []multiparty.ShamirPublicPoint) ([]multiparty.ShamirSecretShare, error) {
 	if p.secretKey == nil {
 		return nil, errors.New("secret key not generated")
