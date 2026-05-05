@@ -12,8 +12,8 @@ operator daemons (no luxd validator required), the same way `mpcd` and
 |---|---|---|---|
 | R-Chain (relay) | `chains/relayvm/` (shim) | `luxfi/relay/vm/` | `luxfi/relay/cmd/relayd` |
 | O-Chain (oracle) | `chains/oraclevm/` (shim) | `luxfi/oracle/vm/` | `luxfi/oracle/cmd/oracled` |
-| T-Chain (FHE / threshold) | `chains/thresholdvm/` | uses `luxfi/fhe` for FHE engine | (planned) `luxfi/fhe/cmd/fhed` |
-| C-Chain (EVM) | `chains/evm/` | uses `luxfi/cevm` (C++/GPU) or pure-Go (default) via build tags | n/a — runs in luxd |
+| T-Chain (FHE / threshold) | `luxfi/chains/thresholdvm/` (canonical) | (same) | `luxfi/fhe/cmd/fhed` (standalone FHE daemon, not chain-coupled) |
+| C-Chain (EVM) | `chains/evm/` | uses `chains/evm/cevm` (C++/GPU FFI shim) or pure-Go (default) via build tags | n/a — runs in luxd |
 | A-Chain (AI) | `chains/aivm/` | `luxfi/ai` | n/a |
 | I-Chain (identity) | `chains/identityvm/` | `luxfi/id` | n/a |
 
@@ -35,13 +35,15 @@ unchanged. The plugin's `cmd/plugin/main.go` doesn't need to be touched.
 
 ## Pluggable EVM (cevm vs Go-evm)
 
-`luxfi/cevm` ships two implementations of the EVM execution layer behind
-build tags:
+`chains/evm/cevm` is an FFI shim around `~/work/luxcpp/cevm` (C++ / GPU EVM),
+not a standalone VM — it has no operator daemon, it lives in luxd. It folds
+into this module rather than shipping as a separate `luxfi/cevm` repo. Two
+implementations behind build tags:
 
 | Tag | File | Implementation |
 |---|---|---|
-| `cgo` (default if cgo enabled) | `cevm_cgo.go` | C++ / GPU-accelerated EVM via CGO |
-| `!cgo` (CGO_ENABLED=0) | `cevm_nocgo.go` | Pure-Go fallback (drops back to luxfi/geth) |
+| `cgo` (default if cgo enabled) | `cevm/cevm_cgo.go` | C++ / GPU-accelerated EVM via CGO |
+| `!cgo` (CGO_ENABLED=0) | `cevm/cevm_nocgo.go` | Pure-Go fallback (drops back to luxfi/geth) |
 
 Operators choose at build time:
 
@@ -53,7 +55,7 @@ go build -o luxd ./cmd/luxd
 CGO_ENABLED=0 go build -o luxd ./cmd/luxd
 
 # Hanzo node uses revm via the same plugin contract
-# (separate luxd build flag; uses luxfi/cevm at the API layer, REVM under the hood)
+# (separate luxd build flag; uses chains/evm/cevm at the API layer, REVM under the hood)
 ```
 
 The plugin contract (`chain.ChainVM` from `luxfi/vm/chain`) is shared, so

@@ -37,10 +37,13 @@ jobs:
         VM=${{ matrix.image.vm }}
       pre-build-command: |
         mkdir -p build
-        (cd ${{ matrix.image.vm }} && \
-         GONOSUMCHECK=github.com/luxfi/* \
-         GONOSUMDB=github.com/luxfi/* \
-         CGO_ENABLED=${{ matrix.image.cgo }} \
-         CGO_CFLAGS="${{ matrix.image.cgo == '1' && '-O2 -D__BLST_PORTABLE__' || '' }}" \
-         go build -trimpath -ldflags="-s -w" -o ../build/${{ matrix.image.vm }} .)
+        export GONOSUMCHECK=github.com/luxfi/*
+        export GONOSUMDB=github.com/luxfi/*
+        export CGO_ENABLED=${{ matrix.image.cgo }}
+        export CGO_CFLAGS="${{ matrix.image.cgo == '1' && '-O2 -D__BLST_PORTABLE__' || '' }}"
+        if [ -f ${{ matrix.image.vm }}/main.go ]; then
+          go build -trimpath -ldflags="-s -w" -o build/${{ matrix.image.vm }} ./${{ matrix.image.vm }}
+        else
+          go build -trimpath -ldflags="-s -w" -o build/${{ matrix.image.vm }} ./${{ matrix.image.vm }}/cmd/plugin
+        fi
     secrets: inherit

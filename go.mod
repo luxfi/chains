@@ -1,14 +1,38 @@
-module github.com/luxfi/chains/evm
+module github.com/luxfi/chains
 
 go 1.26.1
 
 require (
+	github.com/consensys/gnark-crypto v0.20.1
+	github.com/gorilla/rpc v1.2.1
+	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
+	github.com/hashicorp/golang-lru v1.0.2
+	github.com/luxfi/accel v1.0.7
+	github.com/luxfi/ai v0.1.0
+	github.com/luxfi/codec v1.1.4
+	github.com/luxfi/consensus v1.22.85
+	github.com/luxfi/constants v1.4.7
+	github.com/luxfi/crypto v1.18.1
+	github.com/luxfi/database v1.18.2
 	github.com/luxfi/evm v0.8.49
+	github.com/luxfi/geth v1.16.86-0.20260413014255-3e903c3d2e06
+	github.com/luxfi/ids v1.2.9
+	github.com/luxfi/lattice/v7 v7.0.0
 	github.com/luxfi/log v1.4.1
+	github.com/luxfi/metric v1.5.1
+	github.com/luxfi/node v1.24.29
+	github.com/luxfi/oracle v0.1.1-0.20260429020431-76258cfcddf9
 	github.com/luxfi/precompile v0.5.12
+	github.com/luxfi/relay v0.0.0-20260429020048-c629fe160d3c
+	github.com/luxfi/runtime v1.0.1
 	github.com/luxfi/sys v0.0.0-20260110090042-50187ec5ffd8
+	github.com/luxfi/threshold v1.5.5
+	github.com/luxfi/timer v1.0.2
 	github.com/luxfi/version v1.0.1
 	github.com/luxfi/vm v1.0.40
+	github.com/luxfi/warp v1.18.5
+	github.com/stretchr/testify v1.11.1
+	golang.org/x/crypto v0.49.0
 )
 
 require (
@@ -21,6 +45,7 @@ require (
 	github.com/ProjectZKM/Ziren/crates/go-runtime/zkvm_runtime v0.0.0-20260311194731-d5b7577c683d // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
+	github.com/btcsuite/btcd/btcutil v1.1.6 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
@@ -30,7 +55,6 @@ require (
 	github.com/cockroachdb/pebble v1.1.5 // indirect
 	github.com/cockroachdb/redact v1.1.8 // indirect
 	github.com/cockroachdb/tokenbucket v0.0.0-20250429170803-42689b6311bb // indirect
-	github.com/consensys/gnark-crypto v0.20.1 // indirect
 	github.com/cosmos/go-bip39 v1.0.0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
 	github.com/crate-crypto/go-eth-kzg v1.5.0 // indirect
@@ -58,22 +82,22 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-sourcemap/sourcemap v2.1.4+incompatible // indirect
+	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/gofrs/flock v0.13.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/golang/mock v1.7.0-rc.1 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/pprof v0.0.0-20260302011040-a15ffb7f9dcc // indirect
 	github.com/google/renameio/v2 v2.0.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/gorilla/rpc v1.2.1 // indirect
-	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
+	github.com/gorilla/mux v1.8.1 // indirect
 	github.com/grpc-ecosystem/go-grpc-prometheus v1.2.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
 	github.com/gtank/merlin v0.1.1 // indirect
 	github.com/gtank/ristretto255 v0.2.0 // indirect
 	github.com/hashicorp/go-bexpr v0.1.16 // indirect
-	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/holiman/billy v0.0.0-20250707135307-f2f9b9aae7db // indirect
 	github.com/holiman/bloomfilter/v2 v2.0.3 // indirect
 	github.com/holiman/uint256 v1.3.2 // indirect
@@ -84,47 +108,40 @@ require (
 	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
-	github.com/luxfi/accel v1.0.7 // indirect
+	github.com/luxfi/address v1.0.1 // indirect
 	github.com/luxfi/age v1.4.0 // indirect
-	github.com/luxfi/ai v0.1.0 // indirect
 	github.com/luxfi/api v1.0.4 // indirect
 	github.com/luxfi/atomic v1.0.0 // indirect
 	github.com/luxfi/cache v1.2.1 // indirect
-	github.com/luxfi/codec v1.1.4 // indirect
 	github.com/luxfi/compress v0.0.5 // indirect
 	github.com/luxfi/concurrent v0.0.3 // indirect
-	github.com/luxfi/consensus v1.22.70 // indirect
-	github.com/luxfi/constants v1.4.7 // indirect
 	github.com/luxfi/container v0.0.4 // indirect
-	github.com/luxfi/crypto v1.18.1 // indirect
-	github.com/luxfi/database v1.18.1 // indirect
 	github.com/luxfi/fhe v1.8.0 // indirect
 	github.com/luxfi/filesystem v0.0.1 // indirect
 	github.com/luxfi/formatting v1.0.1 // indirect
-	github.com/luxfi/geth v1.16.86-0.20260413014255-3e903c3d2e06 // indirect
+	github.com/luxfi/genesis v1.8.2 // indirect
+	github.com/luxfi/go-bip32 v1.0.2 // indirect
 	github.com/luxfi/go-bip39 v1.1.2 // indirect
 	github.com/luxfi/gpu v0.31.1 // indirect
-	github.com/luxfi/ids v1.2.9 // indirect
-	github.com/luxfi/lattice/v7 v7.0.0 // indirect
-	github.com/luxfi/math v1.2.4 // indirect
+	github.com/luxfi/keychain v1.0.2 // indirect
+	github.com/luxfi/math v1.4.0 // indirect
 	github.com/luxfi/math/big v0.1.0 // indirect
 	github.com/luxfi/math/safe v0.0.1 // indirect
-	github.com/luxfi/metric v1.5.1 // indirect
 	github.com/luxfi/mock v0.1.1 // indirect
-	github.com/luxfi/node v1.23.4 // indirect
+	github.com/luxfi/net v0.0.4 // indirect
 	github.com/luxfi/p2p v1.19.2 // indirect
-	github.com/luxfi/protocol v0.0.2 // indirect
+	github.com/luxfi/protocol v0.0.3 // indirect
 	github.com/luxfi/resource v0.0.1 // indirect
 	github.com/luxfi/ringtail v0.2.0 // indirect
-	github.com/luxfi/runtime v1.0.1 // indirect
+	github.com/luxfi/rpc v1.0.2 // indirect
 	github.com/luxfi/sampler v1.0.0 // indirect
-	github.com/luxfi/threshold v1.5.5 // indirect
-	github.com/luxfi/timer v1.0.2 // indirect
+	github.com/luxfi/staking v1.1.0 // indirect
+	github.com/luxfi/tls v1.0.3 // indirect
 	github.com/luxfi/trace v0.1.4 // indirect
 	github.com/luxfi/upgrade v1.0.0 // indirect
 	github.com/luxfi/utils v1.1.4 // indirect
+	github.com/luxfi/utxo v0.2.6 // indirect
 	github.com/luxfi/validators v1.0.0 // indirect
-	github.com/luxfi/warp v1.18.5 // indirect
 	github.com/luxfi/zapdb v1.8.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -138,12 +155,14 @@ require (
 	github.com/montanaflynn/stats v0.8.2 // indirect
 	github.com/mr-tron/base58 v1.2.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
 	github.com/pion/dtls/v2 v2.2.12 // indirect
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/stun/v2 v2.0.0 // indirect
 	github.com/pion/transport/v2 v2.2.10 // indirect
 	github.com/pion/transport/v3 v3.1.1 // indirect
+	github.com/pires/go-proxyproto v0.8.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
@@ -151,12 +170,18 @@ require (
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.20.1 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
+	github.com/rs/cors v1.11.1 // indirect
 	github.com/rs/xid v1.6.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
+	github.com/sagikazarmark/locafero v0.12.0 // indirect
 	github.com/shirou/gopsutil v3.21.11+incompatible // indirect
+	github.com/spaolacci/murmur3 v1.1.0 // indirect
+	github.com/spf13/afero v1.15.0 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
+	github.com/spf13/pflag v1.0.10 // indirect
+	github.com/spf13/viper v1.21.0 // indirect
 	github.com/status-im/keycard-go v0.3.3 // indirect
-	github.com/stretchr/testify v1.11.1 // indirect
+	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/supranational/blst v0.3.16 // indirect
 	github.com/syndtr/goleveldb v1.0.1-0.20220614013038-64ee5596c38a // indirect
 	github.com/tinylib/msgp v1.6.1 // indirect
@@ -178,9 +203,10 @@ require (
 	go.opentelemetry.io/otel/trace v1.42.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.9.0 // indirect
 	go.uber.org/mock v0.6.0 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
+	go.uber.org/zap v1.27.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/crypto v0.49.0 // indirect
 	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
 	golang.org/x/net v0.52.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect

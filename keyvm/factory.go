@@ -4,10 +4,11 @@
 package keyvm
 
 import (
+	"github.com/luxfi/accel"
+	"github.com/luxfi/chains/keyvm/config"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/vms"
-	"github.com/luxfi/chains/keyvm/config"
 )
 
 var _ vms.Factory = (*Factory)(nil)
@@ -21,6 +22,8 @@ type Factory struct {
 }
 
 // New creates a new K-Chain VM instance.
+// Allocates a per-VM GPU session at PriorityHigh because key management
+// is on the hot path for cross-chain operations.
 func (f *Factory) New(logger log.Logger) (interface{}, error) {
 	// Set default configuration if not provided
 	if f.Config.ListenPort == 0 {
@@ -32,10 +35,16 @@ func (f *Factory) New(logger log.Logger) (interface{}, error) {
 		return nil, err
 	}
 
+	sess, err := accel.NewVMSession("keyvm", accel.WithPriority(accel.PriorityHigh))
+	if err != nil {
+		return nil, err
+	}
+
 	// Create and return new K-Chain VM instance
 	vm := &VM{
 		Config: f.Config,
 		log:    logger,
+		accel:  sess,
 	}
 
 	return vm, nil

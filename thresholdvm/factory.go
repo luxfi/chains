@@ -11,7 +11,7 @@ import (
 
 var _ vms.Factory = (*Factory)(nil)
 
-// VMID is the unique identifier for ThresholdVM (T-Chain)
+// VMID is the unique identifier for ThresholdVM (M-Chain — Threshold MPC; T-Chain is reserved for TeleportVM, not yet built)
 var VMID = ids.ID{'t', 'h', 'r', 'e', 's', 'h', 'o', 'l', 'd', 'v', 'm', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 
 // Factory creates new ThresholdVM instances

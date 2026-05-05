@@ -17,24 +17,25 @@ import (
 	"github.com/gorilla/rpc/v2"
 	grjson "github.com/gorilla/rpc/v2/json"
 
-	"github.com/luxfi/vm/chain"
-	vmcore "github.com/luxfi/vm"
-	"github.com/luxfi/runtime"
+	"github.com/luxfi/accel"
 	"github.com/luxfi/consensus/core/choices"
 	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/vms/artifacts"
+	"github.com/luxfi/runtime"
+	vmcore "github.com/luxfi/vm"
+	"github.com/luxfi/vm/chain"
 )
 
 const (
 	Name = "identityvm"
 
 	// Credential states
-	CredentialActive   = "active"
-	CredentialRevoked  = "revoked"
-	CredentialExpired  = "expired"
-	CredentialPending  = "pending"
+	CredentialActive  = "active"
+	CredentialRevoked = "revoked"
+	CredentialExpired = "expired"
+	CredentialPending = "pending"
 
 	// Default configuration
 	defaultCredentialTTL = 365 * 24 * time.Hour // 1 year
@@ -44,11 +45,11 @@ const (
 var (
 	_ chain.ChainVM = (*VM)(nil)
 
-	lastAcceptedKey   = []byte("lastAccepted")
-	identityPrefix    = []byte("id:")
-	credentialPrefix  = []byte("cred:")
-	issuerPrefix      = []byte("issuer:")
-	revocationPrefix  = []byte("revoke:")
+	lastAcceptedKey  = []byte("lastAccepted")
+	identityPrefix   = []byte("id:")
+	credentialPrefix = []byte("cred:")
+	issuerPrefix     = []byte("issuer:")
+	revocationPrefix = []byte("revoke:")
 
 	errUnknownIdentity   = errors.New("unknown identity")
 	errUnknownCredential = errors.New("unknown credential")
@@ -60,11 +61,11 @@ var (
 
 // Config holds IdentityVM configuration
 type Config struct {
-	CredentialTTL    int64    `json:"credentialTTL"`    // Seconds
-	MaxClaims        int      `json:"maxClaims"`
-	TrustedIssuers   []string `json:"trustedIssuers"`
-	AllowSelfIssue   bool     `json:"allowSelfIssue"`
-	RequireZKProofs  bool     `json:"requireZKProofs"`
+	CredentialTTL   int64    `json:"credentialTTL"` // Seconds
+	MaxClaims       int      `json:"maxClaims"`
+	TrustedIssuers  []string `json:"trustedIssuers"`
+	AllowSelfIssue  bool     `json:"allowSelfIssue"`
+	RequireZKProofs bool     `json:"requireZKProofs"`
 }
 
 // Identity represents a decentralized identity
@@ -88,16 +89,16 @@ type ServiceEndpoint struct {
 
 // Credential represents a verifiable credential
 type Credential struct {
-	ID              ids.ID            `json:"id"`
-	Type            []string          `json:"type"`
-	Issuer          ids.ID            `json:"issuer"`
-	Subject         ids.ID            `json:"subject"`
-	IssuanceDate    time.Time         `json:"issuanceDate"`
-	ExpirationDate  time.Time         `json:"expirationDate"`
+	ID              ids.ID                 `json:"id"`
+	Type            []string               `json:"type"`
+	Issuer          ids.ID                 `json:"issuer"`
+	Subject         ids.ID                 `json:"subject"`
+	IssuanceDate    time.Time              `json:"issuanceDate"`
+	ExpirationDate  time.Time              `json:"expirationDate"`
 	Claims          map[string]interface{} `json:"claims"`
-	Proof           *CredentialProof  `json:"proof,omitempty"`
-	Status          string            `json:"status"`
-	RevocationIndex uint64            `json:"revocationIndex,omitempty"`
+	Proof           *CredentialProof       `json:"proof,omitempty"`
+	Status          string                 `json:"status"`
+	RevocationIndex uint64                 `json:"revocationIndex,omitempty"`
 }
 
 // CredentialProof represents a proof for a credential
@@ -112,13 +113,13 @@ type CredentialProof struct {
 
 // Issuer represents a trusted credential issuer
 type Issuer struct {
-	ID          ids.ID    `json:"id"`
-	Name        string    `json:"name"`
-	PublicKey   []byte    `json:"publicKey"`
-	Types       []string  `json:"types"` // Types of credentials they can issue
-	TrustLevel  int       `json:"trustLevel"`
-	CreatedAt   time.Time `json:"createdAt"`
-	Status      string    `json:"status"`
+	ID         ids.ID    `json:"id"`
+	Name       string    `json:"name"`
+	PublicKey  []byte    `json:"publicKey"`
+	Types      []string  `json:"types"` // Types of credentials they can issue
+	TrustLevel int       `json:"trustLevel"`
+	CreatedAt  time.Time `json:"createdAt"`
+	Status     string    `json:"status"`
 }
 
 // RevocationEntry represents a credential revocation
@@ -135,6 +136,10 @@ type VM struct {
 	config Config
 	log    log.Logger
 	db     database.Database
+
+	// Per-VM GPU acceleration session. Reserved for future batch
+	// credential signature verification and DID proof checks.
+	accel *accel.VMSession
 
 	// State
 	identities    map[ids.ID]*Identity
@@ -183,9 +188,9 @@ func (vm *VM) Initialize(
 
 	// Apply configuration
 	vm.config = Config{
-		CredentialTTL: int64(defaultCredentialTTL.Seconds()),
-		MaxClaims:     defaultMaxClaims,
-		AllowSelfIssue: false,
+		CredentialTTL:   int64(defaultCredentialTTL.Seconds()),
+		MaxClaims:       defaultMaxClaims,
+		AllowSelfIssue:  false,
 		RequireZKProofs: false,
 	}
 

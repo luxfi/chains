@@ -13,8 +13,6 @@ import (
 	"time"
 
 	"github.com/gorilla/rpc/v2"
-	consensuscore "github.com/luxfi/consensus/core"
-	consensusinterfaces "github.com/luxfi/consensus/core/interfaces"
 	consensusdag "github.com/luxfi/consensus/engine/dag"
 	"github.com/luxfi/consensus/protocol/quasar"
 	"github.com/luxfi/database"
@@ -24,13 +22,12 @@ import (
 	"github.com/luxfi/metric"
 	"github.com/luxfi/node/cache"
 	"github.com/luxfi/node/utils/json"
-	"github.com/luxfi/node/version"
+	"github.com/luxfi/version"
 	"github.com/luxfi/chains/quantumvm/config"
 	"github.com/luxfi/chains/quantumvm/quantum"
 	"github.com/luxfi/timer/mockable"
-	vmcore "github.com/luxfi/vm"
+	luxvm "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
-	"github.com/luxfi/warp"
 )
 
 const (
@@ -50,6 +47,9 @@ var (
 	errVMShutdown               = errors.New("VM is shutting down")
 	errInvalidQuantumStamp      = errors.New("invalid quantum stamp")
 	errParallelProcessingFailed = errors.New("parallel transaction processing failed")
+
+	// Compile-time check that *VM satisfies chain.ChainVM (= block.ChainVM).
+	_ chain.ChainVM = (*VM)(nil)
 )
 
 // BCLookup provides blockchain alias lookup
@@ -119,25 +119,17 @@ type VM struct {
 	lock sync.RWMutex
 }
 
-// Initialize initializes the VM with the given context
-func (vm *VM) Initialize(
-	ctx context.Context,
-	// chainRuntime *runtime.Runtime,
-	chainRuntime interface{},
-	db database.Database,
-	genesisBytes []byte,
-	upgradeBytes []byte,
-	configBytes []byte,
-	toEngine chan<- vmcore.Message,
-	fxs []*vmcore.Fx,
-	appSender warp.Sender,
-) error {
+// Initialize initializes the VM. Implements chain.ChainVM.
+func (vm *VM) Initialize(ctx context.Context, init luxvm.Init) error {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
 
 	_ = ctx
-	// vm.consensusRuntime = chainRuntime
-	vm.db = db
+	vm.db = init.DB
+	if init.Log != nil {
+		vm.log = init.Log
+	}
+	genesisBytes := init.Genesis
 	// vm.blockchainID = chainRuntime.ChainID
 	// vm.NetworkID = chainRuntime.NetworkID
 
@@ -228,8 +220,8 @@ func (vm *VM) Initialize(
 	return nil
 }
 
-// BuildBlock builds a new block with pending transactions
-func (vm *VM) BuildBlock(ctx context.Context) (consensuscore.Block, error) {
+// BuildBlock builds a new block with pending transactions. Implements chain.ChainVM.
+func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
 
@@ -285,8 +277,8 @@ func (vm *VM) BuildBlock(ctx context.Context) (consensuscore.Block, error) {
 	return block, nil
 }
 
-// ParseBlock parses a block from bytes
-func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (consensuscore.Block, error) {
+// ParseBlock parses a block from bytes. Implements chain.ChainVM.
+func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (chain.Block, error) {
 	vm.lock.RLock()
 	defer vm.lock.RUnlock()
 
@@ -305,8 +297,8 @@ func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (consensuscore.
 	return block, nil
 }
 
-// GetBlock retrieves a block by its ID
-func (vm *VM) GetBlock(ctx context.Context, blockID ids.ID) (consensuscore.Block, error) {
+// GetBlock retrieves a block by its ID. Implements chain.ChainVM.
+func (vm *VM) GetBlock(ctx context.Context, blockID ids.ID) (chain.Block, error) {
 	vm.lock.RLock()
 	defer vm.lock.RUnlock()
 
@@ -318,13 +310,13 @@ func (vm *VM) GetBlock(ctx context.Context, blockID ids.ID) (consensuscore.Block
 	return vm.parseBlock(blockBytes)
 }
 
-// SetState sets the VM state
-func (vm *VM) SetState(ctx context.Context, state consensusinterfaces.State) error {
+// SetState sets the VM state. Implements chain.ChainVM.
+func (vm *VM) SetState(ctx context.Context, state uint32) error {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
 
 	// Q-Chain uses quantum state management - log state transitions generically
-	vm.log.Info("QVM state transition", "state", fmt.Sprintf("%v", state))
+	vm.log.Info("QVM state transition", "state", state)
 
 	return nil
 }
@@ -585,6 +577,51 @@ func (vm *VM) CreateHandlers(ctx context.Context) (map[string]http.Handler, erro
 // CreateStaticHandlers returns static HTTP handlers
 func (vm *VM) CreateStaticHandlers(ctx context.Context) (map[string]http.Handler, error) {
 	return nil, nil
+}
+
+// NewHTTPHandler returns the VM's HTTP handler. Implements chain.ChainVM.
+func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
+	handlers, err := vm.CreateHandlers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	mux := http.NewServeMux()
+	for path, h := range handlers {
+		if path == "" {
+			path = "/"
+		}
+		mux.Handle(path, h)
+	}
+	return mux, nil
+}
+
+// SetPreference sets the preferred block. Implements chain.ChainVM.
+// Q-Chain uses BLS+Ringtail threshold finality rather than preference,
+// so this is a no-op until preference-based fork choice is wired in.
+func (vm *VM) SetPreference(ctx context.Context, blockID ids.ID) error {
+	return nil
+}
+
+// LastAccepted returns the last accepted block ID. Implements chain.ChainVM.
+func (vm *VM) LastAccepted(ctx context.Context) (ids.ID, error) {
+	vm.lock.RLock()
+	defer vm.lock.RUnlock()
+	return vm.getLastAcceptedID(), nil
+}
+
+// GetBlockIDAtHeight returns the block ID at the given height. Implements chain.ChainVM.
+// Q-Chain does not yet maintain a height index, so this returns errNotImplemented
+// until indexer integration lands.
+func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
+	return ids.Empty, errNotImplemented
+}
+
+// WaitForEvent blocks until an event triggers block building. Implements chain.ChainVM.
+// CRITICAL: must block on ctx.Done() to avoid the notification flood loop in
+// node/chains/manager.go (matches the relayvm contract).
+func (vm *VM) WaitForEvent(ctx context.Context) (luxvm.Message, error) {
+	<-ctx.Done()
+	return luxvm.Message{}, ctx.Err()
 }
 
 // GetEngine returns the DAG consensus engine

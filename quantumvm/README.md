@@ -1,13 +1,25 @@
 # Q-chain Virtual Machine (QVM)
 
-The Q-chain Virtual Machine (QVM) is a quantum-resistant blockchain virtual machine implementation for the Lux Network. It provides advanced cryptographic features including quantum signatures and parallel transaction processing.
+The Q-chain Virtual Machine (QVM) hosts the Q lane of Lux's parallel-witness
+finality model (LP-020 Quasar). When the operator-selected witness set
+includes `WitnessQ` (policies `PolicyPQ` or `PolicyQuantum`), Q-Chain runs a
+Ringtail 2-round threshold ceremony per consensus round and emits the
+resulting threshold signature as the round's Q-witness. Q-Chain is one of
+three parallel finality producers (P, Q, Z); adding it does not change
+finality latency, only parallel verification cost.
+
+The VM also provides per-validator ML-DSA-65 (FIPS 204) identity signatures
+and a quantum stamp for individual transactions.
 
 ## Features
 
-### Quantum Resistance
-- **Ringtail Key Support**: Quantum-resistant key generation and management
-- **Quantum Signatures**: Post-quantum cryptographic signatures for transaction and block validation
-- **Quantum Stamp Validation**: Time-based quantum stamps for enhanced security
+### Q-witness production (Quasar parallel-witness finality)
+- **Ringtail threshold (Module-LWE, eprint 2024/1113)**: 2-round threshold
+  signing per consensus round, t = ⌊2n/3⌋ + 1 of n validators, combined
+  public key rooted in `qchain_ceremony_root`.
+- **Per-validator ML-DSA-65 (FIPS 204)**: identity signatures over round
+  digests, used by the Z lane (chains/zkvm) to produce the Groth16 rollup.
+- **Quantum stamp**: time-windowed transaction-level binding.
 
 ### Performance Optimization
 - **Parallel Transaction Processing**: Process multiple transactions concurrently
@@ -66,16 +78,23 @@ The QVM exposes the following RPC endpoints:
 ## Security Features
 
 ### Quantum Signatures
-The QVM implements quantum-resistant signatures using:
-- SHA-512 based hashing with quantum noise
-- XOR-based signature generation with private keys
-- Time-windowed validation to prevent replay attacks
+The QVM uses ML-DSA (FIPS 204, NIST module-lattice DSA) for per-validator
+quantum-resistant signatures:
+- ML-DSA-44/65/87 supported (NIST Level 2/3/5)
+- Quantum stamp: time-windowed binding of message + nonce + timestamp,
+  prevents stamp replay
+- GPU batch verification via `accel.DilithiumVerifyBatch` (`accel.Available()`,
+  threshold 64+ signatures)
 
-### Ringtail Keys
-Ringtail keys provide:
-- Large key sizes (default 1024 bytes)
-- Version tracking for algorithm upgrades
-- Nonce-based randomization
+### Validator key material
+Two distinct categories live on Q-Chain validators:
+- **Per-validator ML-DSA-65 identity key**: `MLDSAValidatorKey` in
+  `quantum/signer.go` (kept exposed via the legacy `GenerateRingtailKey`
+  RPC name). Used for individual round attestations and the Z-witness
+  rollup input.
+- **Ringtail threshold share**: per-validator share of the combined
+  Ringtail key, produced by the Q-Chain DKG ceremony (rooted in
+  `qchain_ceremony_root`). Lives in `luxfi/threshold/protocols/ringtail`.
 
 ### Parallel Processing Safety
 - Thread-safe transaction pool with mutex protection

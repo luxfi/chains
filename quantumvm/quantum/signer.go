@@ -54,8 +54,11 @@ type QuantumSignature struct {
 	QuantumStamp []byte
 }
 
-// RingtailKey represents a Ringtail key for quantum resistance (using ML-DSA)
-type RingtailKey struct {
+// MLDSAValidatorKey is the per-validator ML-DSA identity key used by the Q-Chain
+// (chains/quantumvm) to attest individual round digests. It is NOT the Ringtail
+// threshold share -- that lives in luxfi/threshold/protocols/ringtail and feeds
+// the Q-witness aggregation in consensus/protocol/quasar.
+type MLDSAValidatorKey struct {
 	Version    uint32
 	PublicKey  []byte
 	PrivateKey []byte
@@ -89,8 +92,12 @@ func NewQuantumSigner(log log.Logger, algorithmVersion uint32, keySize int, stam
 	}
 }
 
-// GenerateRingtailKey generates a new ML-DSA key pair
-func (qs *QuantumSigner) GenerateRingtailKey() (*RingtailKey, error) {
+// GenerateRingtailKey generates a new ML-DSA validator identity key.
+// The "Ringtail" name is preserved on the public method for wire/RPC
+// compatibility (qvm.generateRingtailKey); the underlying type is
+// MLDSAValidatorKey, which is the per-validator ML-DSA identity, not a
+// Ringtail threshold share.
+func (qs *QuantumSigner) GenerateRingtailKey() (*MLDSAValidatorKey, error) {
 	qs.mu.Lock()
 	defer qs.mu.Unlock()
 
@@ -106,7 +113,7 @@ func (qs *QuantumSigner) GenerateRingtailKey() (*RingtailKey, error) {
 		return nil, fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
-	return &RingtailKey{
+	return &MLDSAValidatorKey{
 		Version:    qs.algorithmVersion,
 		PublicKey:  mldsaPriv.PublicKey.Bytes(),
 		PrivateKey: mldsaPriv.Bytes(),
@@ -116,7 +123,7 @@ func (qs *QuantumSigner) GenerateRingtailKey() (*RingtailKey, error) {
 }
 
 // Sign creates a quantum signature for the given message using ML-DSA
-func (qs *QuantumSigner) Sign(message []byte, key *RingtailKey) (*QuantumSignature, error) {
+func (qs *QuantumSigner) Sign(message []byte, key *MLDSAValidatorKey) (*QuantumSignature, error) {
 	if key == nil {
 		return nil, ErrInvalidRingtailKey
 	}
@@ -182,11 +189,6 @@ func (qs *QuantumSigner) Verify(message []byte, sig *QuantumSignature) error {
 		return ErrQuantumStampExpired
 	}
 
-	// Verify quantum stamp exists
-	if err := qs.verifyQuantumStamp(message, sig); err != nil {
-		return fmt.Errorf("quantum stamp verification failed: %w", err)
-	}
-
 	// Restore public key
 	pubKey, err := mldsa.PublicKeyFromBytes(sig.PublicKey, qs.mldsaMode)
 	if err != nil {
@@ -207,7 +209,7 @@ func (qs *QuantumSigner) Verify(message []byte, sig *QuantumSignature) error {
 }
 
 // generateQuantumStamp generates a quantum stamp for message authentication
-func (qs *QuantumSigner) generateQuantumStamp(message []byte, key *RingtailKey) ([]byte, error) {
+func (qs *QuantumSigner) generateQuantumStamp(message []byte, key *MLDSAValidatorKey) ([]byte, error) {
 	// Combine message, key nonce, and timestamp
 	timestamp := time.Now().UnixNano()
 	data := make([]byte, len(message)+len(key.Nonce)+8)
@@ -229,16 +231,6 @@ func (qs *QuantumSigner) generateQuantumStamp(message []byte, key *RingtailKey) 
 	copy(stamp[len(hash):], noise)
 
 	return stamp, nil
-}
-
-// verifyQuantumStamp verifies a quantum stamp
-func (qs *QuantumSigner) verifyQuantumStamp(message []byte, sig *QuantumSignature) error {
-	if len(sig.QuantumStamp) < 64 {
-		return ErrInvalidQuantumSignature
-	}
-	// Quantum stamp is verified through ML-DSA signature
-	// The stamp is bound to the message in the signature
-	return nil
 }
 
 // computeSignatureID computes a unique ID for a signature
