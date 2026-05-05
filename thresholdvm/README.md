@@ -2,9 +2,18 @@
 
 **ThresholdVM is a Go library, not a chain.**
 
-It is the shared substrate that **M-Chain** (MPC ceremonies) and **F-Chain**
-(FHE compute) build on. Both chains import this package; neither chain *is*
-this package.
+Per LP-134 (Lux Chain Topology), the legacy T-Chain custody monolith is
+split into two operational chains, both served by this substrate:
+
+- `thresholdvm` in **MPC mode → M-Chain** — bridge custody for external
+  wallets, threshold signing ceremonies (CGGMP21 / FROST / Ringtail-gen).
+- `thresholdvm` in **FHE mode → F-Chain** — TFHE keygen, encrypted EVM,
+  confidential compute.
+
+`chains/thresholdvm/` is the shared library; the runtime presence lives
+on M-Chain or F-Chain depending on which adapter the runtime registers.
+The legacy "T-Chain" name is retained **only** for `teleportvm`
+(LP-6332), an unrelated cross-chain teleport message bus.
 
 ```
                     +--------------------------------+
