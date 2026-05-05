@@ -44,6 +44,7 @@ import (
 
 	"github.com/luxfi/evm/core/state"
 	evmparallel "github.com/luxfi/evm/core/parallel"
+	"github.com/luxfi/geth/common"
 	"github.com/luxfi/geth/core/types"
 	"github.com/luxfi/geth/core/vm"
 	ethparams "github.com/luxfi/geth/params"
@@ -93,19 +94,27 @@ func (e *Executor) ExecuteBlock(
 	}
 
 	// Stage 1: build cevm.Transaction shape from luxfi/geth Transactions.
+	//
+	// Sender recovery is the dominant cost of Stage 1 — secp256k1 ECDSA
+	// recovery is ~50us per tx in pure Go and dominates block validation
+	// for full-utilization C-Chain blocks. We batch every sender into one
+	// cgo dispatch into the luxcpp/crypto first-party pipeline (see
+	// cevm.BatchRecoverSenders). The batch also primes the per-tx
+	// sigCache via types.CacheSender so any subsequent types.Sender call
+	// is a cache hit.
 	signer := types.MakeSigner(config, header.Number, header.Time)
+	senders, err := cevm.BatchRecoverSenders(txs, signer)
+	if err != nil {
+		return nil, fmt.Errorf("cevm: batch sender recovery: %w", err)
+	}
 	cevmTxs := make([]cevm.Transaction, len(txs))
 	for i, tx := range txs {
-		from, err := types.Sender(signer, tx)
-		if err != nil {
-			return nil, fmt.Errorf("cevm: sender recovery for tx[%d]: %w", i, err)
-		}
 		ct := cevm.Transaction{
 			GasLimit: tx.Gas(),
 			Nonce:    tx.Nonce(),
 			Data:     tx.Data(),
 		}
-		copy(ct.From[:], from.Bytes())
+		copy(ct.From[:], senders[i].Bytes())
 		if to := tx.To(); to != nil {
 			copy(ct.To[:], to.Bytes())
 			ct.HasTo = true
@@ -149,21 +158,31 @@ func (e *Executor) ExecuteBlock(
 	// MixDigest; the cevm side treats zero as "not set".
 	copy(blockCtx.Prevrandao[:], header.MixDigest.Bytes())
 
-	// Stage 3: dispatch.
+	// Stage 3: build state snapshot of touched accounts.
+	//
+	// The GPU CALL/CREATE path needs target nonce/balance/code on-device.
+	// Walk every (caller, target) tuple, dedupe addresses, and read the
+	// account data from the StateDB. Pre-V4 the kernel returned
+	// CallNotSupported for every CALL → triggered the V3 → cevm CPU
+	// fallback. With V4 we hand the GPU the data it needs and the call
+	// completes on-device for the LP-108 P5 corpus.
+	snapshot := buildStateSnapshot(cevmTxs, statedb)
+
+	// Stage 4: dispatch.
 	threads := e.Threads
 	if threads == 0 {
 		threads = 1
 	}
-	result, err := cevm.ExecuteBlockV3(e.CevmBackend, threads, cevmTxs, &blockCtx)
+	result, err := cevm.ExecuteBlockV4(e.CevmBackend, threads, cevmTxs, &blockCtx, snapshot)
 	if err != nil {
-		return nil, fmt.Errorf("cevm: ExecuteBlockV3: %w", err)
+		return nil, fmt.Errorf("cevm: ExecuteBlockV4: %w", err)
 	}
 	if len(result.GasUsed) != len(txs) || len(result.Status) != len(txs) {
 		return nil, fmt.Errorf("cevm: result length mismatch (gas=%d status=%d txs=%d)",
 			len(result.GasUsed), len(result.Status), len(txs))
 	}
 
-	// Stage 4: detect CallNotSupported. If any tx hit it, the cevm
+	// Stage 5: detect CallNotSupported. If any tx hit it, the cevm
 	// path can't complete this block. Fall through to Go EVM rather
 	// than mix backends mid-block (which would corrupt state-trie
 	// progression).
@@ -175,7 +194,7 @@ func (e *Executor) ExecuteBlock(
 		}
 	}
 
-	// Stage 5: receipt reconstruction.
+	// Stage 6: receipt reconstruction.
 	//
 	// IMPORTANT: this stage is the parity-critical seam. Receipt
 	// fields (Status, CumulativeGasUsed, Bloom, Logs, ContractAddress,
@@ -237,3 +256,63 @@ func (e *Executor) ExecuteBlock(
 
 // Backend returns the cevm backend lane this Executor dispatches to.
 func (e *Executor) Backend() cevm.Backend { return e.CevmBackend }
+
+// buildStateSnapshot collects every (caller, target) address touched by the
+// batch and reads its account data from the StateDB. The GPU dispatch hands
+// this snapshot to the kernel host so OP_CALL / OP_CREATE can resolve
+// nonce / balance / code without a host trampoline.
+//
+// Dedupe by address: every account appears at most once in the snapshot.
+// EOAs (no contract code) are emitted with empty Code — the kernel reads
+// nonce / balance only.
+//
+// Balance encoding: 4×uint64 little-endian limbs (Balance[0] = low 64 bits)
+// to match the kernel's HostStateAccount layout exactly. uint256 → limbs
+// is just `Uint64()` per word; geth's uint256.Int already stores in this
+// order so we copy it verbatim.
+func buildStateSnapshot(txs []cevm.Transaction, statedb *state.StateDB) []cevm.StateAccount {
+	if len(txs) == 0 || statedb == nil {
+		return nil
+	}
+	seen := make(map[common.Address]struct{}, len(txs)*2)
+	out := make([]cevm.StateAccount, 0, len(txs)*2)
+	add := func(addr common.Address) {
+		if _, ok := seen[addr]; ok {
+			return
+		}
+		seen[addr] = struct{}{}
+		acct := cevm.StateAccount{Nonce: statedb.GetNonce(addr)}
+		copy(acct.Address[:], addr.Bytes())
+		if bal := statedb.GetBalance(addr); bal != nil {
+			// uint256.Int is stored as little-endian uint64 limbs:
+			// Uint64() returns word 0; words 1-3 require array
+			// access. The geth API exposes the raw words via .Bytes32
+			// (BE) — we read the LE uint64 limbs through that.
+			b32 := bal.Bytes32()
+			// b32 is big-endian; convert to little-endian limb layout
+			// matching the kernel's HostStateAccount.balance[].
+			for i := 0; i < 4; i++ {
+				var w uint64
+				for j := 0; j < 8; j++ {
+					w |= uint64(b32[31-i*8-j]) << (uint(j) * 8)
+				}
+				acct.Balance[i] = w
+			}
+		}
+		acct.Code = statedb.GetCode(addr)
+		hash := statedb.GetCodeHash(addr)
+		copy(acct.CodeHash[:], hash.Bytes())
+		out = append(out, acct)
+	}
+	for i := range txs {
+		var caller common.Address
+		copy(caller[:], txs[i].From[:])
+		add(caller)
+		if txs[i].HasTo {
+			var target common.Address
+			copy(target[:], txs[i].To[:])
+			add(target)
+		}
+	}
+	return out
+}

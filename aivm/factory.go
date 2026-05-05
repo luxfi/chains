@@ -4,6 +4,7 @@
 package aivm
 
 import (
+	"github.com/luxfi/accel"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/vms"
@@ -17,7 +18,13 @@ var VMID = ids.ID{'a', 'i', 'v', 'm'}
 // Factory implements vms.Factory interface for creating AIVM instances
 type Factory struct{}
 
-// New creates a new AIVM instance
+// New creates a new AIVM instance.
+// Allocates a per-VM GPU session at PriorityNormal for future batch
+// attestation verification and tensor proof checks.
 func (f *Factory) New(log.Logger) (interface{}, error) {
-	return &VM{}, nil
+	sess, err := accel.NewVMSession("aivm", accel.WithPriority(accel.PriorityNormal))
+	if err != nil {
+		return nil, err
+	}
+	return &VM{accel: sess}, nil
 }

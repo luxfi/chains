@@ -4,11 +4,16 @@ VMS := $(shell ls -d */ 2>/dev/null | sed 's|/||' | grep -v '.github\|build\|nod
 
 all: $(VMS)
 
+# evm has main.go at root; all other VMs ship their plugin under cmd/plugin.
 $(VMS):
-	cd $@ && go build -trimpath -ldflags="-s -w" -o ../build/$@ .
+	@if [ -f $@/main.go ]; then \
+		go build -trimpath -ldflags="-s -w" -o build/$@ ./$@; \
+	else \
+		go build -trimpath -ldflags="-s -w" -o build/$@ ./$@/cmd/plugin; \
+	fi
 
 test:
-	@for vm in $(VMS); do echo "=== $$vm ==="; cd $$vm && go test ./... && cd ..; done
+	go test ./...
 
 clean:
 	rm -rf build/

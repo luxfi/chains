@@ -21,12 +21,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/luxfi/accel"
 	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/runtime"
-	"github.com/luxfi/vm/chain"
 	vmcore "github.com/luxfi/vm"
+	"github.com/luxfi/vm/chain"
 
 	"github.com/luxfi/consensus/engine/dag/vertex"
 	"github.com/luxfi/node/version"
@@ -94,6 +95,11 @@ type VM struct {
 
 	// Database
 	db database.Database
+
+	// Per-VM GPU acceleration session. Reserved for future batch
+	// attestation verification and tensor proof checks. Allocated by
+	// the factory; safe to be nil in tests.
+	accel *accel.VMSession
 
 	// Core AI VM from luxfi/ai package
 	core *aivm.VM
