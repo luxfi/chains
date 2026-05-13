@@ -12,7 +12,7 @@ require (
 	github.com/luxfi/codec v1.1.4
 	github.com/luxfi/consensus v1.22.85
 	github.com/luxfi/constants v1.4.7
-	github.com/luxfi/crypto v1.18.1
+	github.com/luxfi/crypto v1.19.0
 	github.com/luxfi/database v1.18.2
 	github.com/luxfi/evm v0.8.49
 	github.com/luxfi/geth v1.16.86-0.20260413014255-3e903c3d2e06
