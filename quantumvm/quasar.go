@@ -27,7 +27,7 @@ import (
 // Both are produced in parallel during signing.
 type BlockSigs struct {
 	BLS      *quasar.BLSSignature
-	Ringtail *quasar.RingtailSignature
+	Ringtail *quasar.CoronaSignature
 }
 
 // Quasar is the core Post-Quantum BFT consensus engine for Q-Chain.
@@ -64,7 +64,7 @@ type PendingBlock struct {
 	BlockHash          []byte
 	Height             uint64
 	BLSSignatures      []*quasar.BLSSignature      // Classical threshold signatures (parallel)
-	RingtailSignatures []*quasar.RingtailSignature // Post-quantum threshold signatures (parallel)
+	CoronaSignatures []*quasar.CoronaSignature // Post-quantum threshold signatures (parallel)
 	BLSFinalized       bool                        // BLS threshold reached
 	RingtailFinalized  bool                        // Ringtail threshold reached
 	Finalized          bool                        // BOTH complete = quantum finality
@@ -156,7 +156,7 @@ func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte
 			BlockHash:          blockHash,
 			Height:             height,
 			BLSSignatures:      make([]*quasar.BLSSignature, 0),
-			RingtailSignatures: make([]*quasar.RingtailSignature, 0),
+			CoronaSignatures: make([]*quasar.CoronaSignature, 0),
 		}
 		q.pendingBlocks[blockID] = pending
 	}
@@ -171,7 +171,7 @@ func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte
 	// Run both lanes in parallel
 	var (
 		blsSig *quasar.BLSSignature
-		pqSig  *quasar.RingtailSignature
+		pqSig  *quasar.CoronaSignature
 		blsErr error
 		pqErr  error
 	)
@@ -199,14 +199,14 @@ func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte
 		defer wg.Done()
 		sessionID := int(height) // Use height as session ID
 		prfKey := blockHash[:32] // Use block hash prefix as PRF key
-		round1Data, err := qcore.RingtailRound1(validatorID, sessionID, prfKey)
+		round1Data, err := qcore.CoronaRound1(validatorID, sessionID, prfKey)
 		if err != nil {
 			pqErr = err
 			return
 		}
 		// Round1Data contains D matrix and MACs - we store the party ID and a marker
 		// The actual signature aggregation happens via Round2 + Finalize
-		pqSig = &quasar.RingtailSignature{
+		pqSig = &quasar.CoronaSignature{
 			Signature:   []byte{byte(round1Data.PartyID)}, // Store party ID, full data in aggregation
 			ValidatorID: validatorID,
 			SignerIndex: round1Data.PartyID,
@@ -225,14 +225,14 @@ func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte
 
 	q.mu.Lock()
 	pending.BLSSignatures = append(pending.BLSSignatures, blsSig)
-	pending.RingtailSignatures = append(pending.RingtailSignatures, pqSig)
+	pending.CoronaSignatures = append(pending.CoronaSignatures, pqSig)
 	q.mu.Unlock()
 
 	q.log.Debug("Block signed with Quasar (BLS + Ringtail parallel)",
 		"blockID", blockID,
 		"height", height,
 		"blsSigCount", len(pending.BLSSignatures),
-		"ringtailSigCount", len(pending.RingtailSignatures),
+		"coronaSigCount", len(pending.CoronaSignatures),
 	)
 
 	return &BlockSigs{BLS: blsSig, Ringtail: pqSig}, nil
@@ -259,8 +259,8 @@ func (q *Quasar) AddBLSSignature(blockID ids.ID, sig *quasar.BLSSignature) error
 	return nil
 }
 
-// AddRingtailSignature adds a Ringtail signature from another validator
-func (q *Quasar) AddRingtailSignature(blockID ids.ID, sig *quasar.RingtailSignature) error {
+// AddCoronaSignature adds a Ringtail signature from another validator
+func (q *Quasar) AddCoronaSignature(blockID ids.ID, sig *quasar.CoronaSignature) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -269,11 +269,11 @@ func (q *Quasar) AddRingtailSignature(blockID ids.ID, sig *quasar.RingtailSignat
 		return fmt.Errorf("pending block not found: %s", blockID)
 	}
 
-	pending.RingtailSignatures = append(pending.RingtailSignatures, sig)
+	pending.CoronaSignatures = append(pending.CoronaSignatures, sig)
 
 	q.log.Debug("Added Ringtail signature",
 		"blockID", blockID,
-		"ringtailSigCount", len(pending.RingtailSignatures),
+		"coronaSigCount", len(pending.CoronaSignatures),
 		"threshold", q.threshold,
 	)
 
@@ -327,12 +327,12 @@ func (q *Quasar) TryFinalize(ctx context.Context, blockID ids.ID) (*quasar.Aggre
 
 	// Check Ringtail threshold
 	if !pending.RingtailFinalized {
-		if len(pending.RingtailSignatures) >= q.threshold {
+		if len(pending.CoronaSignatures) >= q.threshold {
 			// Ringtail finalized when threshold reached
 			pending.RingtailFinalized = true
 			q.log.Debug("Ringtail threshold reached",
 				"blockID", blockID,
-				"count", len(pending.RingtailSignatures),
+				"count", len(pending.CoronaSignatures),
 			)
 		}
 	}
@@ -359,7 +359,7 @@ func (q *Quasar) TryFinalize(ctx context.Context, blockID ids.ID) (*quasar.Aggre
 		q.log.Info("║ Block ID:", log.Stringer("blockID", blockID))
 		q.log.Info("║ Height:", log.Uint64("height", pending.Height))
 		q.log.Info("║ BLS Signatures:", log.Int("count", len(pending.BLSSignatures)))
-		q.log.Info("║ Ringtail Signatures:", log.Int("count", len(pending.RingtailSignatures)))
+		q.log.Info("║ Ringtail Signatures:", log.Int("count", len(pending.CoronaSignatures)))
 		q.log.Info("║ Quantum Finality:", log.Bool("complete", true))
 		q.log.Info("═══════════════════════════════════════════════════════════════════")
 
@@ -369,7 +369,7 @@ func (q *Quasar) TryFinalize(ctx context.Context, blockID ids.ID) (*quasar.Aggre
 	q.log.Debug("Insufficient signatures for quantum finalization",
 		"blockID", blockID,
 		"blsHave", len(pending.BLSSignatures),
-		"ringtailHave", len(pending.RingtailSignatures),
+		"ringtailHave", len(pending.CoronaSignatures),
 		"blsFinalized", pending.BLSFinalized,
 		"ringtailFinalized", pending.RingtailFinalized,
 		"need", q.threshold,
