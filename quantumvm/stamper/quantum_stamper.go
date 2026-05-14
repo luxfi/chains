@@ -141,7 +141,7 @@ func NewQuantumStamper(log log.Logger, mode QuantumStampMode, cacheSize int) (*Q
 		return nil, fmt.Errorf("failed to initialize signers: %w", err)
 	}
 
-	// Initialize Ringtail quantum signer for additional security
+	// Initialize Corona quantum signer for additional security
 	qs.quantumSigner = quantum.NewQuantumSigner(log, 1, 256, 5*time.Minute, cacheSize)
 
 	// Start worker goroutines

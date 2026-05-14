@@ -21,7 +21,7 @@ import (
 
 var (
 	ErrInvalidQuantumSignature   = errors.New("invalid quantum signature")
-	ErrInvalidRingtailKey        = errors.New("invalid ringtail key")
+	ErrInvalidCoronaKey        = errors.New("invalid corona key")
 	ErrQuantumStampExpired       = errors.New("quantum stamp expired")
 	ErrQuantumVerificationFailed = errors.New("quantum verification failed")
 	ErrUnsupportedAlgorithm      = errors.New("unsupported quantum algorithm")
@@ -50,13 +50,13 @@ type QuantumSignature struct {
 	Timestamp    time.Time
 	PublicKey    []byte
 	Signature    []byte
-	RingtailKey  []byte
+	CoronaKey  []byte
 	QuantumStamp []byte
 }
 
 // MLDSAValidatorKey is the per-validator ML-DSA identity key used by the Q-Chain
-// (chains/quantumvm) to attest individual round digests. It is NOT the Ringtail
-// threshold share -- that lives in luxfi/threshold/protocols/ringtail and feeds
+// (chains/quantumvm) to attest individual round digests. It is NOT the Corona
+// threshold share -- that lives in luxfi/threshold/protocols/corona and feeds
 // the Q-witness aggregation in consensus/protocol/quasar.
 type MLDSAValidatorKey struct {
 	Version    uint32
@@ -92,12 +92,12 @@ func NewQuantumSigner(log log.Logger, algorithmVersion uint32, keySize int, stam
 	}
 }
 
-// GenerateRingtailKey generates a new ML-DSA validator identity key.
-// The "Ringtail" name is preserved on the public method for wire/RPC
-// compatibility (qvm.generateRingtailKey); the underlying type is
+// GenerateCoronaKey generates a new ML-DSA validator identity key.
+// The "Corona" name is preserved on the public method for wire/RPC
+// compatibility (qvm.generateCoronaKey); the underlying type is
 // MLDSAValidatorKey, which is the per-validator ML-DSA identity, not a
-// Ringtail threshold share.
-func (qs *QuantumSigner) GenerateRingtailKey() (*MLDSAValidatorKey, error) {
+// Corona threshold share.
+func (qs *QuantumSigner) GenerateCoronaKey() (*MLDSAValidatorKey, error) {
 	qs.mu.Lock()
 	defer qs.mu.Unlock()
 
@@ -125,7 +125,7 @@ func (qs *QuantumSigner) GenerateRingtailKey() (*MLDSAValidatorKey, error) {
 // Sign creates a quantum signature for the given message using ML-DSA
 func (qs *QuantumSigner) Sign(message []byte, key *MLDSAValidatorKey) (*QuantumSignature, error) {
 	if key == nil {
-		return nil, ErrInvalidRingtailKey
+		return nil, ErrInvalidCoronaKey
 	}
 
 	// Restore ML-DSA key if not cached
@@ -162,7 +162,7 @@ func (qs *QuantumSigner) Sign(message []byte, key *MLDSAValidatorKey) (*QuantumS
 		Timestamp:    time.Now(),
 		PublicKey:    key.PublicKey,
 		Signature:    signature,
-		RingtailKey:  key.PublicKey,
+		CoronaKey:  key.PublicKey,
 		QuantumStamp: stamp,
 	}
 

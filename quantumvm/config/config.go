@@ -22,8 +22,8 @@ type Config struct {
 	// Quantum signature algorithm version
 	QuantumAlgorithmVersion uint32
 
-	// Ringtail key size in bytes
-	RingtailKeySize int
+	// Corona key size in bytes
+	CoronaKeySize int
 
 	// Enable quantum stamp validation
 	QuantumStampEnabled bool
@@ -40,8 +40,8 @@ type Config struct {
 	// Maximum quantum signature cache size
 	QuantumSigCacheSize int
 
-	// Enable Ringtail key support
-	RingtailEnabled bool
+	// Enable Corona key support
+	CoronaEnabled bool
 
 	// Minimum confirmations for quantum stamps
 	MinQuantumConfirmations uint32
@@ -58,13 +58,13 @@ func DefaultConfig() Config {
 		QuantumVerificationFee:  500,
 		MaxParallelTxs:          100,
 		QuantumAlgorithmVersion: 1,
-		RingtailKeySize:         1024,
+		CoronaKeySize:         1024,
 		QuantumStampEnabled:     true,
 		QuantumStampWindow:      30 * time.Second,
 		QuantumTime:             time.Unix(1704067200, 0), // Jan 1, 2025
 		ParallelBatchSize:       10,
 		QuantumSigCacheSize:     10000,
-		RingtailEnabled:         true,
+		CoronaEnabled:         true,
 		MinQuantumConfirmations: 1,
 		GPUBatchThreshold:       8,
 	}
@@ -86,8 +86,8 @@ func (c *Config) Validate() error {
 	if c.QuantumSigCacheSize <= 0 {
 		c.QuantumSigCacheSize = 10000
 	}
-	if c.RingtailKeySize < 512 {
-		c.RingtailKeySize = 1024
+	if c.CoronaKeySize < 512 {
+		c.CoronaKeySize = 1024
 	}
 	if c.GPUBatchThreshold <= 0 {
 		c.GPUBatchThreshold = 8

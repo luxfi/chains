@@ -1,12 +1,12 @@
 // Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 //
-// Q-Chain Ringtail witness producer for Quasar parallel-witness finality
+// Q-Chain Corona witness producer for Quasar parallel-witness finality
 // (LP-020 §2 Consensus Modes, witness set bit WitnessQ).
 //
 // The Q-Chain VM is the parallel finality witness for the Q lane. Each
 // consensus round, the Quasar driver pushes a 32-byte round digest to this
-// adapter; the adapter drives the underlying Ringtail 2-round threshold
+// adapter; the adapter drives the underlying Corona 2-round threshold
 // ceremony (Module-LWE, eprint 2024/1113) and returns the resulting
 // threshold signature as the round's Q-witness.
 //
@@ -26,7 +26,7 @@ import (
 // QWitnessAdapter adapts the Q-Chain Quasar engine to the consensus
 // QWitnessProducer interface used by the Quasar round driver.
 //
-// TODO(pqz): wire to a real per-round Ringtail ceremony driver. The current
+// TODO(pqz): wire to a real per-round Corona ceremony driver. The current
 // quantumvm.Quasar engine signs per-block by validator id; a per-consensus-
 // round driver is required to land a true Q-witness. See LP-020 §9
 // Implementation, "Three-lane signing".
@@ -42,11 +42,11 @@ func NewQWitnessAdapter(engine *Quasar) *QWitnessAdapter {
 }
 
 // ErrQWitnessNotWired is returned by QWitnessAdapter.Witness until the
-// per-round Ringtail driver lands. The interface is in place so the
+// per-round Corona driver lands. The interface is in place so the
 // consensus driver can be configured today.
-var ErrQWitnessNotWired = errors.New("Q-Chain per-round Ringtail driver not wired (TODO LP-020 §9)")
+var ErrQWitnessNotWired = errors.New("Q-Chain per-round Corona driver not wired (TODO LP-020 §9)")
 
-// Witness produces a Ringtail threshold signature over the round digest.
+// Witness produces a Corona threshold signature over the round digest.
 // Signature matches consensus/protocol/quasar.QWitnessProducer.
 //
 // Returns ErrQWitnessNotWired today; the round driver treats this as the
@@ -58,9 +58,9 @@ func (a *QWitnessAdapter) Witness(ctx context.Context, digest [32]byte) ([]byte,
 	if a.engine == nil {
 		return nil, ErrQWitnessNotWired
 	}
-	// Eventual implementation: drive a Ringtail 2-round threshold ceremony
-	// (a.engine.SignBlock + AddRingtailSignature loop with consensus peers,
-	// then TryFinalize) and return the aggregated Ringtail bytes from the
+	// Eventual implementation: drive a Corona 2-round threshold ceremony
+	// (a.engine.SignBlock + AddCoronaSignature loop with consensus peers,
+	// then TryFinalize) and return the aggregated Corona bytes from the
 	// resulting AggregatedSignature.
 	_ = ctx
 	_ = digest

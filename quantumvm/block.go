@@ -127,7 +127,7 @@ func (b *Block) Verify(ctx context.Context) error {
 			sigs[i] = tx.GetQuantumSignature()
 		}
 
-		if b.vm.Config.RingtailEnabled {
+		if b.vm.Config.CoronaEnabled {
 			if err := b.vm.quantumSigner.ParallelVerify(msgs, sigs); err != nil {
 				return errBlockVerificationFailed
 			}

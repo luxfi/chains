@@ -1,17 +1,17 @@
 // Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
-// Package ringtail_general declares the M-Chain general-purpose
-// Ringtail (Ring-LWE) threshold protocol surface.
+// Package corona_general declares the M-Chain general-purpose
+// Corona (Ring-LWE) threshold protocol surface.
 //
-// This is **not** consensus-Ringtail. Consensus uses Ringtail at
+// This is **not** consensus-Corona. Consensus uses Corona at
 // fixed parameters as the post-quantum cert lane (Q-Chain runs that
-// ceremony, see LP-073). General-purpose Ringtail is for app-level
+// ceremony, see LP-073). General-purpose Corona is for app-level
 // threshold signing under a different parameter set; it lives on
 // M-Chain.
 //
-// Interface-only; implementation in chains/mchain/protocol/ringtail/.
-package ringtail_general
+// Interface-only; implementation in chains/mchain/protocol/corona/.
+package corona_general
 
 import (
 	"context"
@@ -19,8 +19,8 @@ import (
 	"github.com/luxfi/chains/thresholdvm/types"
 )
 
-// Verifier validates Ringtail-general share payloads. Registered as
-// the LaneMChainRingtailGen verifier in the M-Chain LaneRegistry.
+// Verifier validates Corona-general share payloads. Registered as
+// the LaneMChainCoronaGen verifier in the M-Chain LaneRegistry.
 type Verifier interface {
 	VerifyShare(subject [32]byte, share types.Share, payload []byte) error
 	VerifyFinal(subject [32]byte, proof types.Proof) error

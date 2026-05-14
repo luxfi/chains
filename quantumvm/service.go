@@ -69,25 +69,25 @@ func (s *Service) GetBlock(r *http.Request, args *GetBlockArgs, reply *GetBlockR
 	return nil
 }
 
-// GenerateRingtailKeyArgs are the arguments for GenerateRingtailKey
-type GenerateRingtailKeyArgs struct{}
+// GenerateCoronaKeyArgs are the arguments for GenerateCoronaKey
+type GenerateCoronaKeyArgs struct{}
 
-// GenerateRingtailKeyReply is the reply for GenerateRingtailKey
-type GenerateRingtailKeyReply struct {
+// GenerateCoronaKeyReply is the reply for GenerateCoronaKey
+type GenerateCoronaKeyReply struct {
 	PublicKey string `json:"publicKey"`
 	Version   uint32 `json:"version"`
 	KeySize   int    `json:"keySize"`
 }
 
-// GenerateRingtailKey generates a new Ringtail key pair
-func (s *Service) GenerateRingtailKey(r *http.Request, args *GenerateRingtailKeyArgs, reply *GenerateRingtailKeyReply) error {
-	if !s.vm.Config.RingtailEnabled {
-		return errors.New("ringtail keys are not enabled")
+// GenerateCoronaKey generates a new Corona key pair
+func (s *Service) GenerateCoronaKey(r *http.Request, args *GenerateCoronaKeyArgs, reply *GenerateCoronaKeyReply) error {
+	if !s.vm.Config.CoronaEnabled {
+		return errors.New("corona keys are not enabled")
 	}
 
-	key, err := s.vm.quantumSigner.GenerateRingtailKey()
+	key, err := s.vm.quantumSigner.GenerateCoronaKey()
 	if err != nil {
-		return fmt.Errorf("failed to generate ringtail key: %w", err)
+		return fmt.Errorf("failed to generate corona key: %w", err)
 	}
 
 	reply.PublicKey = fmt.Sprintf("%x", key.PublicKey)
@@ -197,7 +197,7 @@ type GetHealthReply struct {
 	Healthy         bool   `json:"healthy"`
 	Version         string `json:"version"`
 	QuantumEnabled  bool   `json:"quantumEnabled"`
-	RingtailEnabled bool   `json:"ringtailEnabled"`
+	CoronaEnabled bool   `json:"coronaEnabled"`
 	PendingTxCount  int    `json:"pendingTxCount"`
 	ParallelWorkers int    `json:"parallelWorkers"`
 }
@@ -212,7 +212,7 @@ func (s *Service) GetHealth(r *http.Request, args *GetHealthArgs, reply *GetHeal
 	reply.Healthy = health.Healthy
 	reply.Version = health.Details["version"]
 	reply.QuantumEnabled = s.vm.Config.QuantumStampEnabled
-	reply.RingtailEnabled = s.vm.Config.RingtailEnabled
+	reply.CoronaEnabled = s.vm.Config.CoronaEnabled
 	reply.PendingTxCount = s.vm.txPool.PendingCount()
 	reply.ParallelWorkers = s.vm.parallelWorkers
 
@@ -229,9 +229,9 @@ type GetConfigReply struct {
 	QuantumVerificationFee  uint64 `json:"quantumVerificationFee"`
 	MaxParallelTxs          int    `json:"maxParallelTxs"`
 	QuantumAlgorithmVersion uint32 `json:"quantumAlgorithmVersion"`
-	RingtailKeySize         int    `json:"ringtailKeySize"`
+	CoronaKeySize         int    `json:"coronaKeySize"`
 	QuantumStampEnabled     bool   `json:"quantumStampEnabled"`
-	RingtailEnabled         bool   `json:"ringtailEnabled"`
+	CoronaEnabled         bool   `json:"coronaEnabled"`
 	ParallelBatchSize       int    `json:"parallelBatchSize"`
 }
 
@@ -242,9 +242,9 @@ func (s *Service) GetConfig(r *http.Request, args *GetConfigArgs, reply *GetConf
 	reply.QuantumVerificationFee = s.vm.Config.QuantumVerificationFee
 	reply.MaxParallelTxs = s.vm.Config.MaxParallelTxs
 	reply.QuantumAlgorithmVersion = s.vm.Config.QuantumAlgorithmVersion
-	reply.RingtailKeySize = s.vm.Config.RingtailKeySize
+	reply.CoronaKeySize = s.vm.Config.CoronaKeySize
 	reply.QuantumStampEnabled = s.vm.Config.QuantumStampEnabled
-	reply.RingtailEnabled = s.vm.Config.RingtailEnabled
+	reply.CoronaEnabled = s.vm.Config.CoronaEnabled
 	reply.ParallelBatchSize = s.vm.Config.ParallelBatchSize
 
 	return nil

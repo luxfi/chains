@@ -19,7 +19,7 @@ import (
 	"github.com/luxfi/threshold/protocols/cmp"
 	"github.com/luxfi/threshold/protocols/frost"
 	"github.com/luxfi/threshold/protocols/lss"
-	"github.com/luxfi/threshold/protocols/ringtail"
+	"github.com/luxfi/threshold/protocols/corona"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -849,12 +849,12 @@ func TestBLSThresholdWithDifferentSignerSets(t *testing.T) {
 }
 
 // =============================================================================
-// Ringtail (Post-Quantum) Threshold Network Tests
+// Corona (Post-Quantum) Threshold Network Tests
 // =============================================================================
 
-// TestRingtailSessionInit tests Ringtail session initialization
+// TestCoronaSessionInit tests Corona session initialization
 // This verifies the protocol can be started without requiring full MPC execution.
-func TestRingtailSessionInit(t *testing.T) {
+func TestCoronaSessionInit(t *testing.T) {
 	require := require.New(t)
 
 	workerPool := pool.NewPool(4)
@@ -865,7 +865,7 @@ func TestRingtailSessionInit(t *testing.T) {
 
 	// Verify keygen session can be created
 	for _, id := range pIDs {
-		startFunc := ringtail.Keygen(id, pIDs, threshold, workerPool)
+		startFunc := corona.Keygen(id, pIDs, threshold, workerPool)
 		require.NotNil(startFunc, "Keygen should return a function for %s", id)
 
 		session, err := startFunc([]byte("test-session"))
@@ -875,7 +875,7 @@ func TestRingtailSessionInit(t *testing.T) {
 
 	// Verify sign session can be created with mock config
 	for _, id := range pIDs {
-		cfg := &ringtail.Config{
+		cfg := &corona.Config{
 			ID:           id,
 			Threshold:    threshold,
 			Participants: pIDs,
@@ -884,13 +884,13 @@ func TestRingtailSessionInit(t *testing.T) {
 		}
 
 		message := []byte("test message")
-		signFunc := ringtail.SignWithConfig(cfg, pIDs[:threshold], message, workerPool)
+		signFunc := corona.SignWithConfig(cfg, pIDs[:threshold], message, workerPool)
 		require.NotNil(signFunc, "Sign should return a function for %s", id)
 	}
 
 	// Verify refresh session can be created
 	for _, id := range pIDs {
-		cfg := &ringtail.Config{
+		cfg := &corona.Config{
 			ID:           id,
 			Threshold:    threshold,
 			Participants: pIDs,
@@ -898,11 +898,11 @@ func TestRingtailSessionInit(t *testing.T) {
 			PrivateShare: make([]byte, 32),
 		}
 
-		refreshFunc := ringtail.Refresh(cfg, pIDs, threshold, workerPool)
+		refreshFunc := corona.Refresh(cfg, pIDs, threshold, workerPool)
 		require.NotNil(refreshFunc, "Refresh should return a function for %s", id)
 	}
 
-	t.Log("Ringtail session initialization verified for keygen, sign, and refresh")
+	t.Log("Corona session initialization verified for keygen, sign, and refresh")
 }
 
 // =============================================================================

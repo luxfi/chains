@@ -16,20 +16,20 @@ type CertLane uint8
 
 const (
 	LaneBLS              CertLane = 0
-	LaneRingtail         CertLane = 1
+	LaneCorona         CertLane = 1
 	LaneMLDSAGroth16     CertLane = 2
 	LaneAChainAttest     CertLane = 3
 	LaneBChainBridge     CertLane = 4
 	LaneMChainCGGMP21    CertLane = 5
 	LaneMChainFROST      CertLane = 6
-	LaneMChainRingtailGen CertLane = 7
+	LaneMChainCoronaGen CertLane = 7
 	LaneFChainTFHE       CertLane = 8
 	LaneFChainBootstrap  CertLane = 9
 )
 
 // IsMChain reports whether the lane is owned by M-Chain.
 func (l CertLane) IsMChain() bool {
-	return l == LaneMChainCGGMP21 || l == LaneMChainFROST || l == LaneMChainRingtailGen
+	return l == LaneMChainCGGMP21 || l == LaneMChainFROST || l == LaneMChainCoronaGen
 }
 
 // IsFChain reports whether the lane is owned by F-Chain.
