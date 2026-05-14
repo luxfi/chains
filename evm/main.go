@@ -24,12 +24,14 @@ import (
 	// ── VRF ──────────────────────────────────────────────
 	_ "github.com/luxfi/precompile/vrf" // 0x3213 ECVRF verify (RFC 9381)
 
-	// ── Post-Quantum (FIPS 203/204/205) ──────────────────
-	_ "github.com/luxfi/precompile/mldsa"    // 0x0200..06 ML-DSA verify (Dilithium)
-	_ "github.com/luxfi/precompile/mlkem"    // 0x0200..07 ML-KEM encap/decap (Kyber)
-	_ "github.com/luxfi/precompile/slhdsa"   // 0x0600..01 SLH-DSA verify (SPHINCS+)
-	_ "github.com/luxfi/precompile/ringtail" // 0x0200..0B Ringtail lattice threshold
-	_ "github.com/luxfi/precompile/xwing"    // 0x2221 X-Wing hybrid KEM (X25519+ML-KEM)
+	// ── Post-Quantum (FIPS 203/204/205) — LP-4200 unified block ──────────
+	_ "github.com/luxfi/precompile/mlkem"  // 0x012201 ML-KEM   (FIPS 203 — Module-LWE KEM)
+	_ "github.com/luxfi/precompile/mldsa"  // 0x012202 ML-DSA   (FIPS 204 — Module-LWE signature)
+	_ "github.com/luxfi/precompile/slhdsa" // 0x012203 SLH-DSA  (FIPS 205 — hash-based signature)
+	_ "github.com/luxfi/precompile/pulsar" // 0x012204 Pulsar   (Module-LWE threshold FIPS 204)
+	_ "github.com/luxfi/precompile/p3q"    // 0x012205 P3Q      (strict-PQ STARK / FRI / cSHAKE256)
+	_ "github.com/luxfi/precompile/corona" // 0x012206 Corona   (Ring-LWE threshold)
+	_ "github.com/luxfi/precompile/xwing"  // 0x2221   X-Wing hybrid KEM (X25519+ML-KEM)
 
 	// ── Hashing / ZK Curves ─────────────────────────────
 	_ "github.com/luxfi/precompile/babyjubjub" // 0x0500..07 Baby Jubjub (BN254 twisted Edwards)

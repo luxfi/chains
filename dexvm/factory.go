@@ -12,7 +12,7 @@
 //   - LX-First arbitrage strategy support
 //
 // Architecture:
-//   - Uses Quasar consensus (BLS + Ringtail + ML-DSA) for finality
+//   - Uses Quasar consensus (BLS + Corona + ML-DSA) for finality
 //   - Integrates with Warp 1.5 for cross-chain messaging
 //   - Supports both spot and perpetual trading
 //   - Designed for institutional-grade performance

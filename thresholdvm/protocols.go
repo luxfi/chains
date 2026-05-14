@@ -30,7 +30,7 @@ const (
 	ProtocolBLS Protocol = "bls" // BLS threshold signatures
 
 	// Post-Quantum Threshold
-	ProtocolRingtail Protocol = "ringtail" // Post-quantum lattice-based threshold
+	ProtocolCorona Protocol = "corona" // Post-quantum lattice-based threshold
 
 	// Experimental
 	ProtocolFrost Protocol = "frost" // FROST (Flexible Round-Optimized Schnorr Threshold)
@@ -57,8 +57,8 @@ type ProtocolOptions struct {
 	// BLS Options
 	BLSScheme string `json:"blsScheme,omitempty"` // basic, min-pk, min-sig
 
-	// Ringtail Options
-	RingtailSecurityLevel int `json:"ringtailSecurityLevel,omitempty"` // 128, 192, 256
+	// Corona Options
+	CoronaSecurityLevel int `json:"coronaSecurityLevel,omitempty"` // 128, 192, 256
 
 	// General Options
 	TimeoutSeconds int  `json:"timeoutSeconds,omitempty"`
@@ -150,7 +150,7 @@ func NewProtocolRegistry(workerPool *pool.Pool) *ProtocolRegistry {
 	reg.Register(&LSSHandler{pool: workerPool})
 	reg.Register(&CGGMP21Handler{pool: workerPool})
 	reg.Register(&BLSHandler{})
-	reg.Register(&RingtailHandler{})
+	reg.Register(&CoronaHandler{})
 
 	return reg
 }
@@ -564,38 +564,38 @@ func (h *BLSHandler) Refresh(ctx context.Context, share KeyShare) (KeyShare, err
 }
 
 // =============================================================================
-// Ringtail Handler (Post-Quantum)
+// Corona Handler (Post-Quantum)
 // =============================================================================
 
-// RingtailHandler implements ProtocolHandler for post-quantum threshold signatures
-type RingtailHandler struct{}
+// CoronaHandler implements ProtocolHandler for post-quantum threshold signatures
+type CoronaHandler struct{}
 
-func (h *RingtailHandler) Name() Protocol {
-	return ProtocolRingtail
+func (h *CoronaHandler) Name() Protocol {
+	return ProtocolCorona
 }
 
-func (h *RingtailHandler) SupportedCurves() []string {
+func (h *CoronaHandler) SupportedCurves() []string {
 	return []string{"lattice"}
 }
 
-func (h *RingtailHandler) Keygen(ctx context.Context, partyID party.ID, partyIDs []party.ID, threshold int) (KeyShare, error) {
-	return nil, errors.New("Ringtail keygen not yet implemented")
+func (h *CoronaHandler) Keygen(ctx context.Context, partyID party.ID, partyIDs []party.ID, threshold int) (KeyShare, error) {
+	return nil, errors.New("Corona keygen not yet implemented")
 }
 
-func (h *RingtailHandler) Sign(ctx context.Context, share KeyShare, message []byte, signers []party.ID) (Signature, error) {
-	return nil, errors.New("Ringtail sign not yet implemented")
+func (h *CoronaHandler) Sign(ctx context.Context, share KeyShare, message []byte, signers []party.ID) (Signature, error) {
+	return nil, errors.New("Corona sign not yet implemented")
 }
 
-func (h *RingtailHandler) Verify(pubKey []byte, message []byte, signature Signature) (bool, error) {
-	return false, errors.New("Ringtail verify not yet implemented")
+func (h *CoronaHandler) Verify(pubKey []byte, message []byte, signature Signature) (bool, error) {
+	return false, errors.New("Corona verify not yet implemented")
 }
 
-func (h *RingtailHandler) Reshare(ctx context.Context, share KeyShare, newPartyIDs []party.ID, newThreshold int) (KeyShare, error) {
-	return nil, errors.New("Ringtail reshare not supported")
+func (h *CoronaHandler) Reshare(ctx context.Context, share KeyShare, newPartyIDs []party.ID, newThreshold int) (KeyShare, error) {
+	return nil, errors.New("Corona reshare not supported")
 }
 
-func (h *RingtailHandler) Refresh(ctx context.Context, share KeyShare) (KeyShare, error) {
-	return nil, errors.New("Ringtail refresh not supported")
+func (h *CoronaHandler) Refresh(ctx context.Context, share KeyShare) (KeyShare, error) {
+	return nil, errors.New("Corona refresh not supported")
 }
 
 // =============================================================================
@@ -638,8 +638,8 @@ func GetProtocolInfo() []ProtocolInfo {
 			SupportsRefresh: false,
 		},
 		{
-			Name:            string(ProtocolRingtail),
-			Description:     "Ringtail - Post-quantum lattice-based threshold signatures",
+			Name:            string(ProtocolCorona),
+			Description:     "Corona - Post-quantum lattice-based threshold signatures",
 			SupportedCurves: []string{"lattice"},
 			KeySize:         2048, // Varies by security level
 			SignatureSize:   2420, // Dilithium3 size

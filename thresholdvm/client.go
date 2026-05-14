@@ -110,7 +110,7 @@ func (c *Client) call(ctx context.Context, method string, params interface{}, re
 // KeygenRequest contains parameters for key generation
 type KeygenRequest struct {
 	KeyID        string `json:"keyId"`
-	Protocol     string `json:"protocol"`     // lss, cggmp21, bls, ringtail
+	Protocol     string `json:"protocol"`     // lss, cggmp21, bls, corona
 	Threshold    int    `json:"threshold"`    // Optional
 	TotalParties int    `json:"totalParties"` // Optional
 }

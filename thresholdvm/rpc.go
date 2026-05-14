@@ -175,7 +175,7 @@ func (vm *VM) handleRPCMethod(method string, params json.RawMessage) (interface{
 // KeygenParams contains parameters for key generation
 type KeygenParams struct {
 	KeyID        string `json:"keyId"`
-	Protocol     string `json:"protocol"`     // lss, cggmp21, bls, ringtail
+	Protocol     string `json:"protocol"`     // lss, cggmp21, bls, corona
 	RequestedBy  string `json:"requestedBy"`  // Chain ID
 	Threshold    int    `json:"threshold"`    // Optional override
 	TotalParties int    `json:"totalParties"` // Optional override

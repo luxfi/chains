@@ -50,8 +50,8 @@ func TestQuantumSigner(t *testing.T) {
 	)
 	require.NotNil(signer)
 
-	// Generate Ringtail key (now using real ML-DSA)
-	key, err := signer.GenerateRingtailKey()
+	// Generate Corona key (now using real ML-DSA)
+	key, err := signer.GenerateCoronaKey()
 	require.NoError(err)
 	require.NotNil(key)
 	// ML-DSA-44 key sizes: public=1312, private=2560
@@ -93,7 +93,7 @@ func TestParallelVerification(t *testing.T) {
 	signatures := make([]*quantum.QuantumSignature, numSigs)
 
 	for i := 0; i < numSigs; i++ {
-		key, err := signer.GenerateRingtailKey()
+		key, err := signer.GenerateCoronaKey()
 		require.NoError(err)
 
 		message := []byte(string(rune('a'+i)) + " test message")
@@ -125,7 +125,7 @@ func TestConfigValidation(t *testing.T) {
 	cfg.MaxParallelTxs = -1
 	cfg.ParallelBatchSize = 0
 	cfg.QuantumSigCacheSize = -100
-	cfg.RingtailKeySize = 256
+	cfg.CoronaKeySize = 256
 
 	require.NoError(cfg.Validate())
 
@@ -133,7 +133,7 @@ func TestConfigValidation(t *testing.T) {
 	require.Greater(cfg.MaxParallelTxs, 0)
 	require.Greater(cfg.ParallelBatchSize, 0)
 	require.Greater(cfg.QuantumSigCacheSize, 0)
-	require.GreaterOrEqual(cfg.RingtailKeySize, 1024)
+	require.GreaterOrEqual(cfg.CoronaKeySize, 1024)
 }
 
 func TestGPUBatchVerifyFallback(t *testing.T) {
@@ -155,7 +155,7 @@ func TestGPUBatchVerifyFallback(t *testing.T) {
 	signatures := make([]*quantum.QuantumSignature, numSigs)
 
 	for i := 0; i < numSigs; i++ {
-		key, err := signer.GenerateRingtailKey()
+		key, err := signer.GenerateCoronaKey()
 		require.NoError(err)
 
 		message := []byte(fmt.Sprintf("batch test message %d", i))
@@ -198,7 +198,7 @@ func TestQuasarNTTMethods(t *testing.T) {
 	}
 
 	// Forward NTT should produce 256-element output
-	nttDomain, err := q.NTTForwardRingtail(coeffs)
+	nttDomain, err := q.NTTForwardCorona(coeffs)
 	require.NoError(err)
 	require.Len(nttDomain, 256)
 
@@ -213,13 +213,13 @@ func TestQuasarNTTMethods(t *testing.T) {
 	require.True(differ, "NTT output should differ from input")
 
 	// Inverse NTT should produce valid output
-	recovered, err := q.NTTInverseRingtail(nttDomain)
+	recovered, err := q.NTTInverseCorona(nttDomain)
 	require.NoError(err)
 	require.Len(recovered, 256)
 
 	// Batch NTT should handle multiple polynomials
 	polys := [][]uint64{coeffs, nttDomain}
-	batchResult, err := q.BatchNTTForwardRingtail(polys)
+	batchResult, err := q.BatchNTTForwardCorona(polys)
 	require.NoError(err)
 	require.Len(batchResult, 2)
 }
@@ -253,7 +253,7 @@ func TestQuantumStampExpiration(t *testing.T) {
 	)
 
 	// Generate key and sign message
-	key, err := signer.GenerateRingtailKey()
+	key, err := signer.GenerateCoronaKey()
 	require.NoError(err)
 
 	message := []byte("test message")

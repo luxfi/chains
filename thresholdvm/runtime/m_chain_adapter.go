@@ -29,7 +29,7 @@ type MChainAdapter interface {
 
 	// Registry returns the M-Chain LaneRegistry. Must be owned by
 	// OwnerMChain and have verifiers for LaneMChainCGGMP21,
-	// LaneMChainFROST, LaneMChainRingtailGen registered.
+	// LaneMChainFROST, LaneMChainCoronaGen registered.
 	Registry() *cert.LaneRegistry
 
 	// CeremonyRoot returns mchain_ceremony_root at the current epoch.
