@@ -57,7 +57,7 @@ const (
 	KindUnknown        CeremonyKind = 0
 	KindCGGMP21        CeremonyKind = 1 // M-Chain: ECDSA threshold
 	KindFROST          CeremonyKind = 2 // M-Chain: Schnorr/EdDSA threshold
-	KindRingtailGen    CeremonyKind = 3 // M-Chain: PQ general-purpose threshold
+	KindCoronaGen    CeremonyKind = 3 // M-Chain: PQ general-purpose threshold
 	KindTFHEKeygen     CeremonyKind = 4 // M-Chain → F-Chain: TFHE bootstrap-key gen
 	KindTFHECompute    CeremonyKind = 5 // F-Chain: encrypted compute attestation
 	KindTFHEBootstrap  CeremonyKind = 6 // F-Chain: blind-rotate / bootstrap proof
@@ -65,7 +65,7 @@ const (
 
 // IsMChain reports whether the kind belongs to the M-Chain operational chain.
 func (k CeremonyKind) IsMChain() bool {
-	return k == KindCGGMP21 || k == KindFROST || k == KindRingtailGen
+	return k == KindCGGMP21 || k == KindFROST || k == KindCoronaGen
 }
 
 // IsFChain reports whether the kind belongs to the F-Chain operational chain.

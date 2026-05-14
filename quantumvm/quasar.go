@@ -4,7 +4,7 @@
 // Quasar: Quantum-Safe Finality Engine
 //
 // Like stellar fusion combining hydrogen into helium, Quasar unifies
-// classical BLS signatures with post-quantum Ringtail signatures.
+// classical BLS signatures with post-quantum Corona signatures.
 // Both burn in parallel - classical for speed, quantum for eternity.
 //
 // No block escapes the event horizon without quantum finality.
@@ -23,24 +23,24 @@ import (
 	"github.com/luxfi/log"
 )
 
-// BlockSigs contains both BLS and Ringtail signatures for a block.
+// BlockSigs contains both BLS and Corona signatures for a block.
 // Both are produced in parallel during signing.
 type BlockSigs struct {
 	BLS      *quasar.BLSSignature
-	Ringtail *quasar.CoronaSignature
+	Corona *quasar.CoronaSignature
 }
 
 // Quasar is the core Post-Quantum BFT consensus engine for Q-Chain.
 // Like a supermassive black hole, it pulls all blocks to quantum finality
-// using dual BLS+Ringtail threshold signatures:
+// using dual BLS+Corona threshold signatures:
 // - BLS threshold signatures (classical security, fast path)
-// - Ringtail threshold signatures (post-quantum, Ring-LWE based)
+// - Corona threshold signatures (post-quantum, Ring-LWE based)
 //
 // Blocks are NOT considered produced without BOTH thresholds being met.
 type Quasar struct {
 	mu sync.RWMutex
 
-	// Core Quasar engine - provides both BLS and Ringtail signing directly
+	// Core Quasar engine - provides both BLS and Corona signing directly
 	quasar *quasar.Quasar
 
 	// Validator configuration
@@ -57,7 +57,7 @@ type Quasar struct {
 }
 
 // PendingBlock tracks a block awaiting dual signature finality.
-// Both BLS AND Ringtail must reach threshold for quantum finality.
+// Both BLS AND Corona must reach threshold for quantum finality.
 // Signatures are collected in parallel - either can complete first.
 type PendingBlock struct {
 	BlockID            ids.ID
@@ -66,7 +66,7 @@ type PendingBlock struct {
 	BLSSignatures      []*quasar.BLSSignature      // Classical threshold signatures (parallel)
 	CoronaSignatures []*quasar.CoronaSignature // Post-quantum threshold signatures (parallel)
 	BLSFinalized       bool                        // BLS threshold reached
-	RingtailFinalized  bool                        // Ringtail threshold reached
+	CoronaFinalized  bool                        // Corona threshold reached
 	Finalized          bool                        // BOTH complete = quantum finality
 }
 
@@ -87,7 +87,7 @@ func NewQuasar(cfg QuasarConfig) (*Quasar, error) {
 		cfg.TotalNodes = 3 // Default 3-node network
 	}
 
-	// Initialize Quasar core with BLS + Ringtail
+	// Initialize Quasar core with BLS + Corona
 	qcore, err := quasar.NewQuasar(cfg.Threshold)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Quasar core: %w", err)
@@ -106,12 +106,12 @@ func NewQuasar(cfg QuasarConfig) (*Quasar, error) {
 	return q, nil
 }
 
-// InitializeDualThreshold sets up BLS and Ringtail threshold keys for a new epoch
+// InitializeDualThreshold sets up BLS and Corona threshold keys for a new epoch
 func (q *Quasar) InitializeDualThreshold(ctx context.Context) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	// Generate dual threshold keys (BLS + Ringtail)
+	// Generate dual threshold keys (BLS + Corona)
 	config, err := quasar.GenerateDualKeys(q.threshold, q.totalNodes)
 	if err != nil {
 		return fmt.Errorf("failed to generate dual threshold keys: %w", err)
@@ -139,13 +139,13 @@ func (q *Quasar) InitializeDualThreshold(ctx context.Context) error {
 	q.log.Info("───────────────────────────────────────────────────────────────────")
 	q.log.Info("║ Threshold:", log.Int("t", q.threshold), log.Int("n", q.totalNodes))
 	q.log.Info("║ BLS Threshold Mode:", log.Bool("enabled", signer.IsThresholdMode()))
-	q.log.Info("║ Ringtail PQ Mode:", log.Bool("enabled", signer.IsDualThresholdMode()))
+	q.log.Info("║ Corona PQ Mode:", log.Bool("enabled", signer.IsDualThresholdMode()))
 	q.log.Info("═══════════════════════════════════════════════════════════════════")
 
 	return nil
 }
 
-// SignBlock creates both BLS and Ringtail signatures for a block in parallel.
+// SignBlock creates both BLS and Corona signatures for a block in parallel.
 // Returns both signatures; both must reach threshold for quantum finality.
 func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte, height uint64) (*BlockSigs, error) {
 	q.mu.Lock()
@@ -194,7 +194,7 @@ func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte
 		}
 	}()
 
-	// Ringtail signing (Round 1 - D matrix + MACs)
+	// Corona signing (Round 1 - D matrix + MACs)
 	go func() {
 		defer wg.Done()
 		sessionID := int(height) // Use height as session ID
@@ -220,7 +220,7 @@ func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte
 		return nil, fmt.Errorf("BLS sign failed: %w", blsErr)
 	}
 	if pqErr != nil {
-		return nil, fmt.Errorf("Ringtail sign failed: %w", pqErr)
+		return nil, fmt.Errorf("Corona sign failed: %w", pqErr)
 	}
 
 	q.mu.Lock()
@@ -228,14 +228,14 @@ func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte
 	pending.CoronaSignatures = append(pending.CoronaSignatures, pqSig)
 	q.mu.Unlock()
 
-	q.log.Debug("Block signed with Quasar (BLS + Ringtail parallel)",
+	q.log.Debug("Block signed with Quasar (BLS + Corona parallel)",
 		"blockID", blockID,
 		"height", height,
 		"blsSigCount", len(pending.BLSSignatures),
 		"coronaSigCount", len(pending.CoronaSignatures),
 	)
 
-	return &BlockSigs{BLS: blsSig, Ringtail: pqSig}, nil
+	return &BlockSigs{BLS: blsSig, Corona: pqSig}, nil
 }
 
 // AddBLSSignature adds a BLS signature from another validator
@@ -259,7 +259,7 @@ func (q *Quasar) AddBLSSignature(blockID ids.ID, sig *quasar.BLSSignature) error
 	return nil
 }
 
-// AddCoronaSignature adds a Ringtail signature from another validator
+// AddCoronaSignature adds a Corona signature from another validator
 func (q *Quasar) AddCoronaSignature(blockID ids.ID, sig *quasar.CoronaSignature) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -271,7 +271,7 @@ func (q *Quasar) AddCoronaSignature(blockID ids.ID, sig *quasar.CoronaSignature)
 
 	pending.CoronaSignatures = append(pending.CoronaSignatures, sig)
 
-	q.log.Debug("Added Ringtail signature",
+	q.log.Debug("Added Corona signature",
 		"blockID", blockID,
 		"coronaSigCount", len(pending.CoronaSignatures),
 		"threshold", q.threshold,
@@ -281,7 +281,7 @@ func (q *Quasar) AddCoronaSignature(blockID ids.ID, sig *quasar.CoronaSignature)
 }
 
 // TryFinalize attempts to finalize a block if BOTH threshold signatures are collected.
-// Quantum finality requires both BLS AND Ringtail thresholds to be met.
+// Quantum finality requires both BLS AND Corona thresholds to be met.
 func (q *Quasar) TryFinalize(ctx context.Context, blockID ids.ID) (*quasar.AggregatedSignature, bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -325,12 +325,12 @@ func (q *Quasar) TryFinalize(ctx context.Context, blockID ids.ID) (*quasar.Aggre
 		}
 	}
 
-	// Check Ringtail threshold
-	if !pending.RingtailFinalized {
+	// Check Corona threshold
+	if !pending.CoronaFinalized {
 		if len(pending.CoronaSignatures) >= q.threshold {
-			// Ringtail finalized when threshold reached
-			pending.RingtailFinalized = true
-			q.log.Debug("Ringtail threshold reached",
+			// Corona finalized when threshold reached
+			pending.CoronaFinalized = true
+			q.log.Debug("Corona threshold reached",
 				"blockID", blockID,
 				"count", len(pending.CoronaSignatures),
 			)
@@ -338,7 +338,7 @@ func (q *Quasar) TryFinalize(ctx context.Context, blockID ids.ID) (*quasar.Aggre
 	}
 
 	// Both must be finalized for quantum finality
-	if pending.BLSFinalized && pending.RingtailFinalized {
+	if pending.BLSFinalized && pending.CoronaFinalized {
 		pending.Finalized = true
 		q.finalizedBlocks[blockID] = true
 
@@ -359,7 +359,7 @@ func (q *Quasar) TryFinalize(ctx context.Context, blockID ids.ID) (*quasar.Aggre
 		q.log.Info("║ Block ID:", log.Stringer("blockID", blockID))
 		q.log.Info("║ Height:", log.Uint64("height", pending.Height))
 		q.log.Info("║ BLS Signatures:", log.Int("count", len(pending.BLSSignatures)))
-		q.log.Info("║ Ringtail Signatures:", log.Int("count", len(pending.CoronaSignatures)))
+		q.log.Info("║ Corona Signatures:", log.Int("count", len(pending.CoronaSignatures)))
 		q.log.Info("║ Quantum Finality:", log.Bool("complete", true))
 		q.log.Info("═══════════════════════════════════════════════════════════════════")
 
@@ -369,9 +369,9 @@ func (q *Quasar) TryFinalize(ctx context.Context, blockID ids.ID) (*quasar.Aggre
 	q.log.Debug("Insufficient signatures for quantum finalization",
 		"blockID", blockID,
 		"blsHave", len(pending.BLSSignatures),
-		"ringtailHave", len(pending.CoronaSignatures),
+		"coronaHave", len(pending.CoronaSignatures),
 		"blsFinalized", pending.BLSFinalized,
-		"ringtailFinalized", pending.RingtailFinalized,
+		"coronaFinalized", pending.CoronaFinalized,
 		"need", q.threshold,
 	)
 
@@ -428,21 +428,21 @@ func (q *Quasar) AddValidator(validatorID string, weight uint64) error {
 	return nil
 }
 
-// NTTForwardRingtail transforms Ringtail polynomial coefficients to NTT domain
+// NTTForwardCorona transforms Corona polynomial coefficients to NTT domain
 // using GPU acceleration when available. This enables O(n log n) polynomial
-// multiplication in the Ring-LWE scheme used by Ringtail threshold signatures.
-func (q *Quasar) NTTForwardRingtail(coefficients []uint64) ([]uint64, error) {
+// multiplication in the Ring-LWE scheme used by Corona threshold signatures.
+func (q *Quasar) NTTForwardCorona(coefficients []uint64) ([]uint64, error) {
 	params := accellattice.NTTParams{
-		N:       256,     // Ring dimension for Ringtail (X^256 + 1)
+		N:       256,     // Ring dimension for Corona (X^256 + 1)
 		Modulus: 8380417, // Dilithium prime q
 		Root:    1753,    // Primitive 256th root of unity mod q
 	}
 	return accellattice.NTTForward(params, coefficients)
 }
 
-// NTTInverseRingtail transforms NTT-domain values back to coefficient form
+// NTTInverseCorona transforms NTT-domain values back to coefficient form
 // using GPU acceleration when available.
-func (q *Quasar) NTTInverseRingtail(evaluations []uint64) ([]uint64, error) {
+func (q *Quasar) NTTInverseCorona(evaluations []uint64) ([]uint64, error) {
 	params := accellattice.NTTParams{
 		N:       256,
 		Modulus: 8380417,
@@ -451,9 +451,9 @@ func (q *Quasar) NTTInverseRingtail(evaluations []uint64) ([]uint64, error) {
 	return accellattice.NTTInverse(params, evaluations)
 }
 
-// BatchNTTForwardRingtail transforms multiple polynomials in parallel on GPU.
-// Used when processing multiple Ringtail signature shares simultaneously.
-func (q *Quasar) BatchNTTForwardRingtail(polys [][]uint64) ([][]uint64, error) {
+// BatchNTTForwardCorona transforms multiple polynomials in parallel on GPU.
+// Used when processing multiple Corona signature shares simultaneously.
+func (q *Quasar) BatchNTTForwardCorona(polys [][]uint64) ([][]uint64, error) {
 	params := accellattice.NTTParams{
 		N:       256,
 		Modulus: 8380417,
@@ -482,7 +482,7 @@ func (q *Quasar) Cleanup(minHeight uint64) {
 }
 
 // QuasarBridge is an alias for Quasar - the hybrid P/Q consensus bridge
-// that connects P-Chain BLS + Q-Chain Ringtail for dual signature finality
+// that connects P-Chain BLS + Q-Chain Corona for dual signature finality
 type QuasarBridge = Quasar
 
 // QuasarBridgeConfig is an alias for QuasarConfig

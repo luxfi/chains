@@ -82,8 +82,8 @@ type VM struct {
 	quantumSigner *quantum.QuantumSigner
 	quantumCache  *cache.LRU[ids.ID, *quantum.QuantumSignature]
 
-	// Hybrid P/Q consensus bridge (connects P-Chain BLS + Q-Chain Ringtail)
-	// Uses Quasar consensus for dual BLS+Ringtail threshold signatures
+	// Hybrid P/Q consensus bridge (connects P-Chain BLS + Q-Chain Corona)
+	// Uses Quasar consensus for dual BLS+Corona threshold signatures
 	quasarBridge *QuasarBridge
 
 	// Consensus and validation
@@ -147,7 +147,7 @@ func (vm *VM) Initialize(ctx context.Context, init luxvm.Init) error {
 	vm.quantumSigner = quantum.NewQuantumSigner(
 		vm.log,
 		vm.Config.QuantumAlgorithmVersion,
-		vm.Config.RingtailKeySize,
+		vm.Config.CoronaKeySize,
 		vm.Config.QuantumStampWindow,
 		vm.Config.QuantumSigCacheSize,
 	)
@@ -194,7 +194,7 @@ func (vm *VM) Initialize(ctx context.Context, init luxvm.Init) error {
 		return fmt.Errorf("failed to initialize HTTP handlers: %w", err)
 	}
 
-	// Initialize Quasar hybrid consensus bridge (BLS + Ringtail)
+	// Initialize Quasar hybrid consensus bridge (BLS + Corona)
 	quasarCfg := QuasarBridgeConfig{
 		ValidatorID: vm.blockchainID.String(),
 		Threshold:   0, // Will be set to 2/3+1 based on total nodes
@@ -211,9 +211,9 @@ func (vm *VM) Initialize(ctx context.Context, init luxvm.Init) error {
 	vm.log.Info("║ QVM INITIALIZED with Quasar PQ-BFT Consensus                    ║")
 	vm.log.Info("───────────────────────────────────────────────────────────────────")
 	vm.log.Info("║ Quantum Signatures: ML-DSA (NIST PQC)", log.Bool("enabled", vm.Config.QuantumStampEnabled))
-	vm.log.Info("║ Ringtail Threshold: Ring-LWE PQ", log.Bool("enabled", vm.Config.RingtailEnabled))
+	vm.log.Info("║ Corona Threshold: Ring-LWE PQ", log.Bool("enabled", vm.Config.CoronaEnabled))
 	vm.log.Info("║ BLS Threshold: Classical fast path", log.Bool("enabled", true))
-	vm.log.Info("║ Quasar Hybrid: BLS + Ringtail dual signing", log.Bool("enabled", true))
+	vm.log.Info("║ Quasar Hybrid: BLS + Corona dual signing", log.Bool("enabled", true))
 	vm.log.Info("║ Parallel TX Processing:", log.Int("maxParallel", vm.Config.MaxParallelTxs))
 	vm.log.Info("═══════════════════════════════════════════════════════════════════")
 
@@ -413,7 +413,7 @@ func (vm *VM) signBlockWithQuantum(block *Block) error {
 	ctx := context.Background()
 	blockData := block.Bytes()
 
-	// Use Quasar bridge for dual BLS+Ringtail threshold signing
+	// Use Quasar bridge for dual BLS+Corona threshold signing
 	if vm.quasarBridge != nil {
 		_, err := vm.quasarBridge.SignBlock(ctx, block.ID(), blockData, block.Height())
 		if err != nil {
@@ -427,9 +427,9 @@ func (vm *VM) signBlockWithQuantum(block *Block) error {
 	}
 
 	// Also sign with ML-DSA for quantum resistance (standalone signature)
-	key, err := vm.quantumSigner.GenerateRingtailKey()
+	key, err := vm.quantumSigner.GenerateCoronaKey()
 	if err != nil {
-		return fmt.Errorf("failed to generate ringtail key: %w", err)
+		return fmt.Errorf("failed to generate corona key: %w", err)
 	}
 
 	sig, err := vm.quantumSigner.Sign(blockData, key)
@@ -560,7 +560,7 @@ func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
 		Details: map[string]string{
 			"version":         Version,
 			"quantumEnabled":  fmt.Sprintf("%v", vm.Config.QuantumStampEnabled),
-			"ringtailEnabled": fmt.Sprintf("%v", vm.Config.RingtailEnabled),
+			"coronaEnabled": fmt.Sprintf("%v", vm.Config.CoronaEnabled),
 			"pendingTxs":      fmt.Sprintf("%d", vm.txPool.PendingCount()),
 		},
 	}, nil
@@ -596,7 +596,7 @@ func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
 }
 
 // SetPreference sets the preferred block. Implements chain.ChainVM.
-// Q-Chain uses BLS+Ringtail threshold finality rather than preference,
+// Q-Chain uses BLS+Corona threshold finality rather than preference,
 // so this is a no-op until preference-based fork choice is wired in.
 func (vm *VM) SetPreference(ctx context.Context, blockID ids.ID) error {
 	return nil
@@ -633,7 +633,7 @@ func (vm *VM) GetEngine() consensusdag.Engine {
 }
 
 // GetQuasarBridge returns the Quasar hybrid consensus bridge
-// This provides BLS + Ringtail dual threshold signatures for PQ finality
+// This provides BLS + Corona dual threshold signatures for PQ finality
 func (vm *VM) GetQuasarBridge() *QuasarBridge {
 	vm.lock.RLock()
 	defer vm.lock.RUnlock()
@@ -641,7 +641,7 @@ func (vm *VM) GetQuasarBridge() *QuasarBridge {
 }
 
 // GetHybridBridge returns the hybrid finality bridge for P/Q chain consensus
-// This connects P-Chain BLS signatures with Q-Chain Ringtail for quantum finality
+// This connects P-Chain BLS signatures with Q-Chain Corona for quantum finality
 // Deprecated: Use GetQuasarBridge() for proper type safety
 func (vm *VM) GetHybridBridge() interface{} {
 	return vm.GetQuasarBridge()
@@ -658,7 +658,7 @@ func (vm *VM) SetHybridBridge(bridge interface{}) {
 }
 
 // StampBlock implements QChainStamper interface for hybrid finality
-// Uses Quasar BLS+Ringtail for dual post-quantum threshold signatures
+// Uses Quasar BLS+Corona for dual post-quantum threshold signatures
 func (vm *VM) StampBlock(blockID interface{}, pChainHeight uint64, message []byte) (interface{}, error) {
 	vm.lock.RLock()
 	defer vm.lock.RUnlock()
@@ -694,7 +694,7 @@ func (vm *VM) StampBlock(blockID interface{}, pChainHeight uint64, message []byt
 	}
 
 	// Fallback: Generate quantum stamp using ML-DSA signer
-	key, err := vm.quantumSigner.GenerateRingtailKey()
+	key, err := vm.quantumSigner.GenerateCoronaKey()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate key for stamp: %w", err)
 	}
@@ -717,7 +717,7 @@ func (vm *VM) StampBlock(blockID interface{}, pChainHeight uint64, message []byt
 func (vm *VM) VerifyStamp(stamp interface{}) error {
 	switch s := stamp.(type) {
 	case *quasar.QuasarSignature:
-		// Quasar BLS + Ringtail threshold signature
+		// Quasar BLS + Corona threshold signature
 		if s.BLS == nil || len(s.BLS.Signature) == 0 {
 			return errors.New("invalid Quasar BLS signature")
 		}

@@ -47,7 +47,7 @@ func TestRegister_MChainOwnedLanes(t *testing.T) {
 	for _, lane := range []types.CertLane{
 		types.LaneMChainCGGMP21,
 		types.LaneMChainFROST,
-		types.LaneMChainRingtailGen,
+		types.LaneMChainCoronaGen,
 	} {
 		if err := r.Register(stubVerifier{lane: lane}); err != nil {
 			t.Fatalf("register %d: %v", lane, err)
@@ -56,7 +56,7 @@ func TestRegister_MChainOwnedLanes(t *testing.T) {
 	for _, lane := range []types.CertLane{
 		types.LaneMChainCGGMP21,
 		types.LaneMChainFROST,
-		types.LaneMChainRingtailGen,
+		types.LaneMChainCoronaGen,
 	} {
 		if _, err := r.Verifier(lane); err != nil {
 			t.Fatalf("lookup %d: %v", lane, err)
