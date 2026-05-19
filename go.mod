@@ -15,14 +15,14 @@ require (
 	github.com/luxfi/crypto v1.19.0
 	github.com/luxfi/database v1.18.2
 	github.com/luxfi/evm v0.8.49
-	github.com/luxfi/geth v1.16.86-0.20260413014255-3e903c3d2e06
+	github.com/luxfi/geth v1.16.91
 	github.com/luxfi/ids v1.2.9
-	github.com/luxfi/lattice/v7 v7.0.0
+	github.com/luxfi/lattice/v7 v7.1.0
 	github.com/luxfi/log v1.4.1
 	github.com/luxfi/metric v1.5.1
 	github.com/luxfi/node v1.24.29
 	github.com/luxfi/oracle v0.1.1-0.20260429020431-76258cfcddf9
-	github.com/luxfi/precompile v0.5.12
+	github.com/luxfi/precompile v0.5.17
 	github.com/luxfi/relay v0.0.0-20260429020048-c629fe160d3c
 	github.com/luxfi/runtime v1.0.1
 	github.com/luxfi/sys v0.0.0-20260110090042-50187ec5ffd8
@@ -58,7 +58,6 @@ require (
 	github.com/cosmos/go-bip39 v1.0.0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
 	github.com/crate-crypto/go-eth-kzg v1.5.0 // indirect
-	github.com/crate-crypto/go-ipa v0.0.0-20240724233137-53bbb0ceb27a // indirect
 	github.com/crate-crypto/go-kzg-4844 v1.1.0 // indirect
 	github.com/cronokirby/saferith v0.33.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
@@ -71,7 +70,6 @@ require (
 	github.com/emicklei/dot v1.11.0 // indirect
 	github.com/ethereum/c-kzg-4844/v2 v2.1.7 // indirect
 	github.com/ethereum/go-bigmodexpfix v0.0.0-20250911101455-f9e208c548ab // indirect
-	github.com/ethereum/go-verkle v0.2.2 // indirect
 	github.com/ferranbt/fastssz v1.0.0 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
@@ -116,23 +114,26 @@ require (
 	github.com/luxfi/compress v0.0.5 // indirect
 	github.com/luxfi/concurrent v0.0.3 // indirect
 	github.com/luxfi/container v0.0.4 // indirect
+	github.com/luxfi/corona v0.3.1 // indirect
+	github.com/luxfi/crypto/ipa v1.2.4 // indirect
 	github.com/luxfi/fhe v1.8.0 // indirect
 	github.com/luxfi/filesystem v0.0.1 // indirect
 	github.com/luxfi/formatting v1.0.1 // indirect
 	github.com/luxfi/genesis v1.8.2 // indirect
 	github.com/luxfi/go-bip32 v1.0.2 // indirect
 	github.com/luxfi/go-bip39 v1.1.2 // indirect
-	github.com/luxfi/gpu v0.31.1 // indirect
+	github.com/luxfi/gpu v1.0.1 // indirect
 	github.com/luxfi/keychain v1.0.2 // indirect
+	github.com/luxfi/lens v0.1.3 // indirect
 	github.com/luxfi/math v1.4.0 // indirect
 	github.com/luxfi/math/big v0.1.0 // indirect
 	github.com/luxfi/math/safe v0.0.1 // indirect
 	github.com/luxfi/mock v0.1.1 // indirect
 	github.com/luxfi/net v0.0.4 // indirect
 	github.com/luxfi/p2p v1.19.2 // indirect
-	github.com/luxfi/protocol v0.0.3 // indirect
+	github.com/luxfi/pq v1.0.1-0.20260512064747-3d4c9414e15e // indirect
+	github.com/luxfi/proto v0.0.0-proto-rename // indirect
 	github.com/luxfi/resource v0.0.1 // indirect
-	github.com/luxfi/ringtail v0.2.0 // indirect
 	github.com/luxfi/rpc v1.0.2 // indirect
 	github.com/luxfi/sampler v1.0.0 // indirect
 	github.com/luxfi/staking v1.1.0 // indirect
@@ -152,7 +153,7 @@ require (
 	github.com/minio/sha256-simd v1.0.1 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/mitchellh/pointerstructure v1.2.1 // indirect
-	github.com/montanaflynn/stats v0.8.2 // indirect
+	github.com/montanaflynn/stats v0.9.0 // indirect
 	github.com/mr-tron/base58 v1.2.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
@@ -222,3 +223,17 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+// Local replaces — transient until luxfi/threshold and luxfi/evm
+// publish tags that include protocols/corona and the LP-4200
+// precompile registry cleanup respectively. Remove these blocks
+// once chains pins ship the new tag bump.
+replace (
+	github.com/luxfi/evm => ../evm
+	github.com/luxfi/precompile => ../precompile
+	github.com/luxfi/threshold => ../threshold
+)
+
+// Local-dev overlay for the protocol → proto rename.
+// Strip once GitHub admin renames luxfi/protocol → luxfi/proto and a real tag exists.
+replace github.com/luxfi/proto => ../protocol
