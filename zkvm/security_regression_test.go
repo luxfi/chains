@@ -98,14 +98,29 @@ func TestRegressionH01_Groth16SubgroupCheck(t *testing.T) {
 	}
 }
 
-// TestRegressionH02_STARKDisabled verifies that STARK proofs return an explicit
-// error rather than false-positive structural validation.
-// Finding H-02: STARK verify only checked commitment lengths and FRI layer
-// presence without verifying the FRI protocol or constraint composition.
+// TestRegressionH02_STARKDisabled verifies that STARK proofs do NOT
+// false-positive on structural validation alone. The original H-02
+// finding was that STARK verify only checked commitment lengths and FRI
+// layer presence without verifying the FRI protocol or constraint
+// composition.
+//
+// Z-Chain is now P3Q-native (LP-4800) — STARK proofs dispatch to the
+// P3Q (Plonky3 fork) verifier. The invariant H-02 enforces is unchanged:
+// without a real verifier wired, a bogus payload MUST return error, never
+// silently validate. Until the FFI binding publishes, the precompile
+// returns ErrVerifierNotRegistered which the ZKVM surfaces as
+// "P3Q verifier binding pending".
 func TestRegressionH02_STARKDisabled(t *testing.T) {
 	verifier := newTestProofVerifier(t)
 	// Force non-dummy keys so the proof type switch is reached
 	verifier.dummyKeys = false
+
+	// Proof data MUST start with the P3Q MagicHeader "P3Q1" or the
+	// structural pre-check rejects it before we ever reach the FFI
+	// dispatch. We give it a valid header so the test exercises the
+	// "no FFI registered → binding pending" path, which is the
+	// post-LP-4800 equivalent of the old "not yet implemented".
+	proofData := append([]byte("P3Q1"), make([]byte, 1020)...)
 
 	tx := &Transaction{
 		Type:    TransactionTypeTransfer,
@@ -118,7 +133,7 @@ func TestRegressionH02_STARKDisabled(t *testing.T) {
 		},
 		Proof: &ZKProof{
 			ProofType:    "stark",
-			ProofData:    make([]byte, 1024),
+			ProofData:    proofData,
 			PublicInputs: [][]byte{make([]byte, 32), make([]byte, 32)},
 		},
 	}
@@ -128,8 +143,11 @@ func TestRegressionH02_STARKDisabled(t *testing.T) {
 	if err == nil {
 		t.Fatal("STARK proof must return error -- H-02 regression")
 	}
-	if !strings.Contains(err.Error(), "not yet implemented") {
-		t.Errorf("expected 'not yet implemented' in error, got: %v", err)
+	// Accept either the binding-pending path (no FFI registered) OR
+	// any explicit verifier-side error. The invariant is "must NOT
+	// silently validate", which both paths preserve.
+	if !strings.Contains(err.Error(), "P3Q") && !strings.Contains(err.Error(), "binding pending") {
+		t.Errorf("expected P3Q dispatch error, got: %v", err)
 	}
 }
 
