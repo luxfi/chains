@@ -19,7 +19,6 @@ import (
 	"github.com/luxfi/threshold/protocols/cmp"
 	"github.com/luxfi/threshold/protocols/frost"
 	"github.com/luxfi/threshold/protocols/lss"
-	"github.com/luxfi/threshold/protocols/corona"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -852,58 +851,18 @@ func TestBLSThresholdWithDifferentSignerSets(t *testing.T) {
 // Corona (Post-Quantum) Threshold Network Tests
 // =============================================================================
 
-// TestCoronaSessionInit tests Corona session initialization
-// This verifies the protocol can be started without requiring full MPC execution.
-func TestCoronaSessionInit(t *testing.T) {
-	require := require.New(t)
-
-	workerPool := pool.NewPool(4)
-	defer workerPool.TearDown()
-
-	pIDs := testPartyIDs(3)
-	threshold := 2
-
-	// Verify keygen session can be created
-	for _, id := range pIDs {
-		startFunc := corona.Keygen(id, pIDs, threshold, workerPool)
-		require.NotNil(startFunc, "Keygen should return a function for %s", id)
-
-		session, err := startFunc([]byte("test-session"))
-		require.NoError(err)
-		require.NotNil(session)
-	}
-
-	// Verify sign session can be created with mock config
-	for _, id := range pIDs {
-		cfg := &corona.Config{
-			ID:           id,
-			Threshold:    threshold,
-			Participants: pIDs,
-			PublicKey:    make([]byte, 32),
-			PrivateShare: make([]byte, 32),
-		}
-
-		message := []byte("test message")
-		signFunc := corona.SignWithConfig(cfg, pIDs[:threshold], message, workerPool)
-		require.NotNil(signFunc, "Sign should return a function for %s", id)
-	}
-
-	// Verify refresh session can be created
-	for _, id := range pIDs {
-		cfg := &corona.Config{
-			ID:           id,
-			Threshold:    threshold,
-			Participants: pIDs,
-			PublicKey:    make([]byte, 32),
-			PrivateShare: make([]byte, 32),
-		}
-
-		refreshFunc := corona.Refresh(cfg, pIDs, threshold, workerPool)
-		require.NotNil(refreshFunc, "Refresh should return a function for %s", id)
-	}
-
-	t.Log("Corona session initialization verified for keygen, sign, and refresh")
-}
+// TestCoronaSessionInit was a structural smoke test against the legacy
+// luxfi/threshold/protocols/corona (Feldman-DKG impl) which was deleted in
+// the threshold v1.7.0 refactor (2026-05-19). The corrected R-LWE
+// construction now lives in luxfi/corona and is exposed via the
+// keyera-lifecycle adapter at github.com/luxfi/threshold/protocols/corona,
+// which uses NewSigner / Bootstrap / Reshare / Reanchor rather than the
+// protocol-executor StartFunc pattern this test exercised.
+//
+// The StartFunc protocol-executor pattern is still covered by
+// TestCMPKeygenStartFunc, TestFROSTKeygenStartFunc, TestLSSKeygenStartFunc,
+// TestBLSThresholdSigningFullExecution. A keyera-lifecycle smoke test
+// for the new corona adapter belongs in luxfi/threshold itself.
 
 // =============================================================================
 // CMP Sign Timeout Tests
