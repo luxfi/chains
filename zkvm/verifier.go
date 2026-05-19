@@ -14,6 +14,7 @@ import (
 
 	"github.com/luxfi/accel"
 	"github.com/luxfi/log"
+	"github.com/luxfi/precompile/p3q"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
@@ -103,8 +104,8 @@ func (pv *ProofVerifier) VerifyTransactionProof(tx *Transaction) error {
 		err = pv.verifyPLONKProof(tx)
 	case "bulletproofs":
 		err = errors.New("zkvm: Bulletproof verification not yet implemented, use groth16 or plonk")
-	case "stark":
-		err = errors.New("zkvm: STARK verification not yet implemented, use groth16 or plonk")
+	case "stark", "p3q":
+		err = pv.verifyP3QSTARK(tx)
 	default:
 		err = errors.New("unsupported proof type")
 	}
@@ -895,11 +896,48 @@ func deserializePLONKVerifyingKey(data []byte) (*PLONKVerifyingKey, error) {
 	return vk, nil
 }
 
-// STARK verification is disabled. The previous implementation only performed
-// structural checks (commitment lengths, FRI layer presence) without actually
-// verifying the FRI protocol or constraint composition. Accepting structurally-
-// valid but mathematically-invalid proofs is worse than rejecting all proofs.
-// Use groth16 or plonk proof types.
+// verifyP3QSTARK verifies a P3Q proof — Lux post-quantum STARK (Plonky3
+// fork, cSHAKE256 Merkle hashes over the Goldilocks 64-bit prime field).
+//
+// Z-Chain is P3Q-native per LP-4800. Proofs flow through the same
+// verifier primitive that backs the EVM precompile at slot 0x012205,
+// dispatching via the in-process Go entry-point. The chain-wide single
+// source of truth for the Rust FFI backend is registered once at node
+// startup via p3q.RegisterVerifier; this method calls it through
+// p3q.Verify which adds the wire-format check (MagicHeader "P3Q1") and
+// hides the atomic-value plumbing from the caller.
+//
+// When the FFI verifier has not been registered yet — e.g. during a
+// fresh build before the Rust crate publishes its Go bindings —
+// p3q.Verify returns ErrVerifierNotRegistered. We surface that as
+// "P3Q binding pending" rather than "not implemented" because the
+// proof type IS implemented (precompile, gas, structural validation,
+// dispatch) — only the FFI binding is awaiting publish.
+func (pv *ProofVerifier) verifyP3QSTARK(tx *Transaction) error {
+	if tx.Proof == nil || len(tx.Proof.ProofData) == 0 {
+		return errors.New("zkvm: P3Q proof bytes missing")
+	}
+
+	// Flatten public inputs to bytes — P3Q wire format is a single byte
+	// slice. The Rust verifier re-decodes the structured Goldilocks
+	// field elements internally; in-process callers just pass-through.
+	var pub []byte
+	for _, in := range tx.Proof.PublicInputs {
+		pub = append(pub, in...)
+	}
+
+	ok, err := p3q.Verify(tx.Proof.ProofData, pub)
+	if err != nil {
+		if errors.Is(err, p3q.ErrVerifierNotRegistered) {
+			return errors.New("zkvm: P3Q verifier binding pending — proof type recognized, FFI backend not registered")
+		}
+		return fmt.Errorf("zkvm: P3Q verify error: %w", err)
+	}
+	if !ok {
+		return errors.New("zkvm: P3Q proof invalid")
+	}
+	return nil
+}
 
 // Bulletproof verification is disabled. The previous implementation only checked
 // that L/R vectors were present and a0/b0 were non-zero, without verifying the
