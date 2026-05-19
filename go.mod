@@ -7,14 +7,14 @@ require (
 	github.com/gorilla/rpc v1.2.1
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/hashicorp/golang-lru v1.0.2
-	github.com/luxfi/accel v1.0.9
+	github.com/luxfi/accel v1.1.0
 	github.com/luxfi/ai v0.1.0
 	github.com/luxfi/codec v1.1.4
 	github.com/luxfi/consensus v1.22.85
 	github.com/luxfi/constants v1.4.7
-	github.com/luxfi/crypto v1.19.0
-	github.com/luxfi/database v1.18.2
-	github.com/luxfi/evm v0.8.49
+	github.com/luxfi/crypto v1.19.3
+	github.com/luxfi/database v1.18.3
+	github.com/luxfi/evm v0.18.13
 	github.com/luxfi/geth v1.16.91
 	github.com/luxfi/ids v1.2.9
 	github.com/luxfi/lattice/v7 v7.1.0
@@ -22,11 +22,11 @@ require (
 	github.com/luxfi/metric v1.5.1
 	github.com/luxfi/node v1.24.29
 	github.com/luxfi/oracle v0.1.1-0.20260429020431-76258cfcddf9
-	github.com/luxfi/precompile v0.5.17
+	github.com/luxfi/precompile v0.5.23
 	github.com/luxfi/relay v0.0.0-20260429020048-c629fe160d3c
 	github.com/luxfi/runtime v1.0.1
 	github.com/luxfi/sys v0.0.0-20260110090042-50187ec5ffd8
-	github.com/luxfi/threshold v1.6.8
+	github.com/luxfi/threshold v1.8.0
 	github.com/luxfi/timer v1.0.2
 	github.com/luxfi/version v1.0.1
 	github.com/luxfi/vm v1.0.40
@@ -42,7 +42,6 @@ require (
 	github.com/ChainSafe/go-schnorrkel v1.1.0 // indirect
 	github.com/DataDog/zstd v1.5.7 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
-	github.com/ProjectZKM/Ziren/crates/go-runtime/zkvm_runtime v0.0.0-20260311194731-d5b7577c683d // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/btcsuite/btcd/btcutil v1.1.6 // indirect
@@ -116,7 +115,7 @@ require (
 	github.com/luxfi/container v0.0.4 // indirect
 	github.com/luxfi/corona v0.4.0 // indirect
 	github.com/luxfi/crypto/ipa v1.2.4 // indirect
-	github.com/luxfi/fhe v1.8.0 // indirect
+	github.com/luxfi/fhe v1.8.2 // indirect
 	github.com/luxfi/filesystem v0.0.1 // indirect
 	github.com/luxfi/formatting v1.0.1 // indirect
 	github.com/luxfi/genesis v1.8.2 // indirect
@@ -125,13 +124,13 @@ require (
 	github.com/luxfi/gpu v1.0.1 // indirect
 	github.com/luxfi/keychain v1.0.2 // indirect
 	github.com/luxfi/lens v0.1.3 // indirect
-	github.com/luxfi/math v1.4.0 // indirect
+	github.com/luxfi/math v1.4.1 // indirect
 	github.com/luxfi/math/big v0.1.0 // indirect
 	github.com/luxfi/math/safe v0.0.1 // indirect
 	github.com/luxfi/mock v0.1.1 // indirect
 	github.com/luxfi/net v0.0.4 // indirect
 	github.com/luxfi/p2p v1.19.2 // indirect
-	github.com/luxfi/pq v1.0.1-0.20260512064747-3d4c9414e15e // indirect
+	github.com/luxfi/pq v1.0.3 // indirect
 	github.com/luxfi/protocol v0.0.3 // indirect
 	github.com/luxfi/resource v0.0.1 // indirect
 	github.com/luxfi/corona v0.2.0 // indirect
@@ -223,14 +222,4 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-)
-
-// Local replaces — transient until luxfi/threshold and luxfi/evm
-// publish tags that include protocols/corona and the LP-4200
-// precompile registry cleanup respectively. Remove these blocks
-// once chains pins ship the new tag bump.
-replace (
-	github.com/luxfi/evm => ../evm
-	github.com/luxfi/precompile => ../precompile
-	github.com/luxfi/threshold => ../threshold
 )
