@@ -82,6 +82,14 @@ func handleSendTransaction(vm *VM) http.HandlerFunc {
 			return
 		}
 
+		// Fee policy: refuse zero-fee user txs at the public entry
+		// before mempool/heap pressure. Internal callers (consensus
+		// replay) bypass this gate by reaching Mempool directly.
+		if err := vm.gateUserTx(&tx); err != nil {
+			http.Error(w, err.Error(), http.StatusPaymentRequired)
+			return
+		}
+
 		// Add to mempool
 		if err := vm.mempool.AddTransaction(&tx); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
