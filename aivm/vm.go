@@ -31,6 +31,7 @@ import (
 
 	"github.com/luxfi/consensus/engine/dag/vertex"
 	"github.com/luxfi/node/version"
+	"github.com/luxfi/node/vms/types/fee"
 
 	"github.com/luxfi/ai/pkg/aivm"
 	"github.com/luxfi/ai/pkg/attestation"
@@ -118,6 +119,12 @@ type VM struct {
 	// Logging
 	log log.Logger
 
+	// Fee policy gating user-submitted task admission. user-tx-
+	// accepting (HTTP /tasks -> SubmitTask) so attach a FlatPolicy at
+	// MinTxFeeFloor; consensus-internal paths bypass.
+	feePolicy fee.Policy
+	networkID uint32
+
 	mu      sync.RWMutex
 	running bool
 }
@@ -153,6 +160,9 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	vm.rt = init.Runtime
 	vm.db = init.DB
 	vm.toEngine = init.ToEngine
+	if vm.rt != nil {
+		vm.networkID = vm.rt.NetworkID
+	}
 
 	if logger, ok := vm.rt.Log.(log.Logger); ok {
 		vm.log = logger
@@ -184,6 +194,14 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 
 	// Initialize attestation verifier (local nvtrust - no cloud dependency)
 	vm.verifier = attestation.NewVerifier()
+
+	// Pin fee policy. A-Chain accepts user inference tasks so attach
+	// the canonical FlatPolicy at MinTxFeeFloor; fee.Validate refuses
+	// zero-fee user-facing chains at boot.
+	vm.feePolicy = newFeePolicy(vm.networkID)
+	if err := fee.Validate(vm.feePolicy); err != nil {
+		return fmt.Errorf("aivm: fee policy: %w", err)
+	}
 
 	// Start core VM
 	if err := vm.core.Start(ctx); err != nil {
@@ -288,14 +306,26 @@ func (vm *VM) VerifyGPUAttestation(att *attestation.GPUAttestation) (*attestatio
 	return vm.verifier.VerifyGPUAttestation(att)
 }
 
-// SubmitTask submits a new AI task
+// SubmitTask submits a new AI task. This is the canonical user-task
+// admission point on A-Chain — the HTTP /tasks handler routes through
+// here. The FeePolicy gate refuses zero-fee tasks before they touch
+// the core queue. Internal callers (consensus replay) bypass by
+// reaching vm.core.SubmitTask directly.
 func (vm *VM) SubmitTask(task *aivm.Task) error {
 	vm.mu.Lock()
-	defer vm.mu.Unlock()
+	running := vm.running
+	vm.mu.Unlock()
 
-	if !vm.running {
+	if !running {
 		return ErrNotInitialized
 	}
+
+	if err := vm.gateUserTask(task); err != nil {
+		return err
+	}
+
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
 
 	return vm.core.SubmitTask(task)
 }
