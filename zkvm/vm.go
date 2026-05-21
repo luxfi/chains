@@ -21,6 +21,7 @@ import (
 	"github.com/luxfi/warp"
 
 	"github.com/luxfi/node/version"
+	"github.com/luxfi/node/vms/types/fee"
 )
 
 var (
@@ -89,6 +90,12 @@ type VM struct {
 
 	// Logging
 	log log.Logger
+
+	// Fee policy gating user-submitted tx admission. user-tx-accepting
+	// (HTTP /sendTransaction -> Mempool.AddTransaction) so attach a
+	// FlatPolicy at MinTxFeeFloor; consensus-internal paths bypass.
+	feePolicy fee.Policy
+	networkID uint32
 
 	mu sync.RWMutex
 }
@@ -191,6 +198,18 @@ func (vm *VM) Initialize(
 
 	// Initialize mempool
 	vm.mempool = NewMempool(1000, vm.log) // Max 1000 pending txs
+
+	// Pin fee policy from runtime networkID. Z-Chain accepts user-
+	// submitted shielded txs so attach the canonical FlatPolicy at
+	// MinTxFeeFloor; fee.Validate refuses zero-fee user-facing chains
+	// at boot, before any block is accepted.
+	if init.Runtime != nil {
+		vm.networkID = init.Runtime.NetworkID
+	}
+	vm.feePolicy = newFeePolicy(vm.networkID)
+	if err := fee.Validate(vm.feePolicy); err != nil {
+		return fmt.Errorf("zkvm: fee policy: %w", err)
+	}
 
 	// Initialize genesis block
 	genesis, err := ParseGenesis(init.Genesis)
