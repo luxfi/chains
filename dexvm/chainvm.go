@@ -17,6 +17,7 @@ import (
 	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
+	"github.com/luxfi/node/vms/types/fee"
 
 	"github.com/luxfi/chains/dexvm/orderbook"
 	"github.com/luxfi/vm"
@@ -70,6 +71,13 @@ type ChainVM struct {
 
 	// Initialization state
 	initialized bool
+
+	// Fee policy gating user-submitted tx admission. Set at Init time
+	// from init.Runtime.NetworkID. user-tx-accepting -> FlatPolicy at
+	// MinTxFeeFloor. Internal (consensus engine -> VM) paths bypass
+	// this gate; only SubmitTx consults it. See feegate.go.
+	feePolicy fee.Policy
+	networkID uint32
 }
 
 // NewChainVM creates a new ChainVM that wraps a functional DEX VM
@@ -92,6 +100,18 @@ func (cvm *ChainVM) Initialize(
 
 	// Store the message channel
 	cvm.toEngine = vmInit.ToEngine
+
+	// Pin fee policy from runtime networkID. D-Chain is user-tx-
+	// accepting so we attach the canonical FlatPolicy at MinTxFeeFloor;
+	// boot-time Validate (fee.Validate) refuses zero-fee user-facing
+	// chains before they ever accept a block.
+	if vmInit.Runtime != nil {
+		cvm.networkID = vmInit.Runtime.NetworkID
+	}
+	cvm.feePolicy = newFeePolicy(cvm.networkID)
+	if err := fee.Validate(cvm.feePolicy); err != nil {
+		return fmt.Errorf("dexvm: fee policy: %w", err)
+	}
 
 	// Initialize the inner VM
 	if err := cvm.inner.Initialize(
@@ -334,8 +354,19 @@ func (cvm *ChainVM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.
 	return ids.Empty, errBlockNotFound
 }
 
-// SubmitTx adds a transaction to the pending pool
+// SubmitTx adds a transaction to the pending pool. This is the canonical
+// user-mempool entry on D-Chain — every public submission funnels through
+// here. The FeePolicy gate refuses zero-fee tx before the bytes touch
+// pendingTxs.
+//
+// Internal callers (consensus engine -> VM, replay) feed pendingTxs
+// directly via BuildBlock; they do NOT route through SubmitTx, so the
+// fee gate stays out of the consensus-internal path.
 func (cvm *ChainVM) SubmitTx(tx []byte) error {
+	if err := cvm.gateUserTxBytes(tx); err != nil {
+		return err
+	}
+
 	cvm.lock.Lock()
 	defer cvm.lock.Unlock()
 
