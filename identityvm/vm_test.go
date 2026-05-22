@@ -379,7 +379,8 @@ func TestServiceCreateIdentityRPC(t *testing.T) {
 		"method": "identity.CreateIdentity",
 		"params": [{
 			"publicKey": "`+publicKey+`",
-			"metadata": {"name": "RPC Test User"}
+			"metadata": {"name": "RPC Test User"},
+			"fee": 1000000
 		}],
 		"id": 1
 	}`))
@@ -413,7 +414,8 @@ func TestServiceRegisterIssuerRPC(t *testing.T) {
 			"name": "RPC Test Issuer",
 			"publicKey": "`+publicKey+`",
 			"types": ["VerifiableCredential", "EducationCredential"],
-			"trustLevel": 5
+			"trustLevel": 5,
+			"fee": 1000000
 		}],
 		"id": 1
 	}`))
@@ -450,7 +452,8 @@ func TestServiceIssueCredentialRPC(t *testing.T) {
 			"subjectId": "`+subject.ID.String()+`",
 			"type": ["VerifiableCredential", "TestCredential"],
 			"claims": {"degree": "Bachelor", "year": 2024},
-			"ttlSeconds": 3600
+			"ttlSeconds": 3600,
+			"fee": 1000000
 		}],
 		"id": 1
 	}`))
@@ -522,7 +525,8 @@ func TestServiceRevokeCredentialRPC(t *testing.T) {
 		"params": [{
 			"credentialId": "`+cred.ID.String()+`",
 			"revokerId": "`+issuer.ID.String()+`",
-			"reason": "Testing revocation via RPC"
+			"reason": "Testing revocation via RPC",
+			"fee": 1000000
 		}],
 		"id": 1
 	}`))
