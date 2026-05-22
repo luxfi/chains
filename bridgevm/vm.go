@@ -17,6 +17,7 @@ import (
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/version"
+	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/runtime"
 	"github.com/luxfi/threshold/pkg/party"
 	"github.com/luxfi/threshold/pkg/pool"
@@ -196,6 +197,12 @@ type VM struct {
 	lastAcceptedID ids.ID
 	pendingBlocks  map[ids.ID]*Block
 
+	// Fee policy gating user-submitted bridge transfers
+	// (InitiateBridgeTransfer). FlatPolicy at MinTxFeeFloor;
+	// consensus-internal paths bypass.
+	feePolicy fee.Policy
+	networkID uint32
+
 	mu sync.RWMutex
 }
 
@@ -268,6 +275,17 @@ func (vm *VM) Initialize(
 	vm.pendingBlocks = make(map[ids.ID]*Block)
 	vm.pendingBridges = make(map[ids.ID]*BridgeRequest)
 	vm.chainClients = make(map[string]ChainClient)
+
+	// Pin fee policy. B-Chain accepts user-submitted bridge transfers
+	// so attach the canonical FlatPolicy at MinTxFeeFloor; fee.Validate
+	// refuses zero-fee user-facing chains at boot.
+	if vm.rt != nil {
+		vm.networkID = vm.rt.NetworkID
+	}
+	vm.feePolicy = newFeePolicy(vm.networkID)
+	if err := fee.Validate(vm.feePolicy); err != nil {
+		return fmt.Errorf("bridgevm: fee policy: %w", err)
+	}
 
 	// Parse configuration (use JSON like other VMs)
 	if len(vmInit.Config) > 0 {

@@ -51,6 +51,11 @@ type BridgeMessage struct {
 	Signature []byte `json:"signature"`
 	SignedBy  []int  `json:"signedBy"` // Indices of signers who participated
 
+	// Fee is the user-paid tx burn in nLUX. Must be >=
+	// fee.MinTxFeeFloor; refused at the fee gate before any MPC
+	// signing capacity is consumed.
+	Fee uint64 `json:"fee"`
+
 	// Delivery confirmation
 	DeliveryConfirmation *DeliveryConfirmation `json:"deliveryConfirmation,omitempty"`
 }
