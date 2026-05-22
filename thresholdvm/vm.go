@@ -23,6 +23,7 @@ import (
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/version"
+	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/runtime"
 	"github.com/luxfi/threshold/pkg/party"
 	"github.com/luxfi/threshold/pkg/pool"
@@ -135,6 +136,10 @@ type VM struct {
 	// Network Stats
 	stats *vmStats
 
+	// Fee policy. M-Chain is service-only (committee-driven, no
+	// user mempool) so this is the NoUserTxPolicy sentinel.
+	feePolicy fee.Policy
+
 	mu sync.RWMutex
 }
 
@@ -234,6 +239,14 @@ func (vm *VM) Initialize(
 	vm.quotaResetTime = time.Now().Add(24 * time.Hour)
 	vm.stats = &vmStats{
 		SignaturesByChain: make(map[string]uint64),
+	}
+
+	// Pin fee policy. M-Chain is service-only (committee-driven, no
+	// user mempool) so attach the NoUserTxPolicy sentinel.
+	// fee.Validate passes for the sentinel even with zero MinTxFee.
+	vm.feePolicy = newFeePolicy()
+	if err := fee.Validate(vm.feePolicy); err != nil {
+		return fmt.Errorf("thresholdvm: fee policy: %w", err)
 	}
 
 	// Parse configuration
