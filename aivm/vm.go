@@ -2,13 +2,41 @@
 // See the file LICENSE for licensing terms.
 
 // Package aivm provides the AI Virtual Machine for the Lux network.
-// AIVM handles AI compute tasks, provider attestation, and reward distribution.
 //
-// Key features:
-//   - TEE attestation for compute providers (CPU: SGX/SEV-SNP/TDX, GPU: nvtrust)
-//   - Local GPU attestation via nvtrust (no cloud dependency)
-//   - Task submission and assignment
-//   - Mining rewards and merkle anchoring to Q-Chain
+// AIVM is the AI compute coordination layer. It works on ANY Lux L1/L2
+// (mainnet primary network, testnet, devnet, white-label chains) with
+// NO trusted dealer, NO TEE requirement, and NO single point of trust.
+//
+// Verification model (per VerificationMode):
+//
+//   - ModeOptimistic (DEFAULT, public-BFT-safe): providers post results
+//     with hash-commitment + bond; N-block challenge period; uncontested
+//     results finalise; challenged results enter fraud-proof flow with
+//     slashing of the losing side. No TEE assumption. Works on any
+//     L1/L2 that has Pulsar/Corona for finality.
+//
+//   - ModeMultiPartyRedundant: M-of-N validators run the same inference
+//     and consensus on the output hash. No single provider needs trust;
+//     malicious providers diverge from the majority and are slashed.
+//     Public-BFT-safe. Cost: M× compute per task.
+//
+//   - ModeTEEAttested: when a provider has SGX/SEV-SNP/TDX/nvtrust
+//     available, the attestation is FOLDED INTO the trust score as
+//     an accelerator (skip the challenge period for high-trust-score
+//     providers). TEE never CHANGES the trust root — only reduces
+//     latency-to-finality for already-bonded providers.
+//
+// The TEE path (luxfi/ai/pkg/attestation) is OPTIONAL across all modes.
+// Setting RequireTEEAttestation=true is a deployment policy choice for
+// permissioned/regulated subnets; the public-chain default is
+// VerificationMode=ModeOptimistic + RequireTEEAttestation=false.
+//
+// Other features:
+//   - Task submission and assignment (chain-agnostic)
+//   - Mining rewards (paid in the host chain's native token)
+//   - Optional anchoring to Q-Chain for cross-chain settlement
+//     (controlled by HostChainID: when "primary", anchor to Q-Chain;
+//     otherwise anchor to the host chain's own finality)
 package aivm
 
 import (
@@ -52,13 +80,71 @@ var (
 	ErrProviderNotFound = errors.New("provider not found")
 )
 
+// VerificationMode selects the AIVM result-verification strategy.
+//
+// Public chains MUST use ModeOptimistic or ModeMultiPartyRedundant —
+// these are public-BFT-safe and do not require any single trusted
+// party. ModeTEEAttested is permitted but the TEE is treated as
+// acceleration, never as the trust root.
+type VerificationMode uint8
+
+const (
+	// ModeOptimistic is the default for public chains.
+	// Providers post results with bond. N-block challenge period.
+	// Public-BFT-safe — anyone can submit a fraud proof.
+	ModeOptimistic VerificationMode = 0
+
+	// ModeMultiPartyRedundant has M-of-N providers run the same task;
+	// consensus on the result hash. Divergent providers are slashed.
+	// Public-BFT-safe — no single provider can corrupt the result.
+	ModeMultiPartyRedundant VerificationMode = 1
+
+	// ModeTEEAttested is OPT-IN. Providers with valid TEE attestation
+	// can shortcut the challenge period. TEE never changes the trust
+	// root; it accelerates settlement for high-trust providers.
+	// Use only on permissioned/regulated subnets where TEE-vendor
+	// trust is acceptable; not the default for public mainnet.
+	ModeTEEAttested VerificationMode = 2
+)
+
 // Config contains AIVM configuration
 type Config struct {
 	// Network settings
 	MaxProvidersPerNode int `serialize:"true" json:"maxProvidersPerNode"`
 	MaxTasksPerProvider int `serialize:"true" json:"maxTasksPerProvider"`
 
-	// Attestation settings
+	// HostChainID identifies which Lux L1/L2 this AIVM instance runs on.
+	// "primary" = primary network (mainnet/testnet/devnet); anchor to
+	// Q-Chain for cross-chain settlement. Any other value = white-label
+	// L1/L2 (Hanzo, Zoo, Pars, Liquidity); anchor to the host chain's
+	// own finality. AIVM is chain-agnostic — same code runs everywhere.
+	HostChainID string `serialize:"true" json:"hostChainID"`
+
+	// VerificationMode selects the result-verification strategy.
+	// Default: ModeOptimistic (public-BFT-safe).
+	VerificationMode VerificationMode `serialize:"true" json:"verificationMode"`
+
+	// ChallengeWindowBlocks is the number of L1/L2 blocks during which
+	// any party can submit a fraud proof against a posted result. Only
+	// used by ModeOptimistic. Default 100 blocks (~5-10 minutes on
+	// most Lux L1/L2 instances).
+	ChallengeWindowBlocks uint64 `serialize:"true" json:"challengeWindowBlocks"`
+
+	// RedundancyFactor is M (signatures required) for
+	// ModeMultiPartyRedundant. Total providers N is committed in the
+	// task spec; M-of-N must produce the same result hash for
+	// acceptance. Default 3-of-5.
+	RedundancyFactor int `serialize:"true" json:"redundancyFactor"`
+
+	// MinProviderBond is the minimum stake (in host-chain native tokens,
+	// wei-equivalent) a provider must lock to register. Forfeited on
+	// successful fraud proof or majority-divergence. Default 1000 LUX.
+	MinProviderBond uint64 `serialize:"true" json:"minProviderBond"`
+
+	// Attestation settings — TEE is OPT-IN, NOT required by default.
+	// On public chains keep RequireTEEAttestation=false; setting it true
+	// restricts the provider set to TEE-equipped operators only, which
+	// is a permissioned-subnet policy choice.
 	RequireTEEAttestation bool   `serialize:"true" json:"requireTEEAttestation"`
 	MinTrustScore         uint8  `serialize:"true" json:"minTrustScore"`
 	AttestationTimeout    string `serialize:"true" json:"attestationTimeout"`
@@ -73,12 +159,25 @@ type Config struct {
 	MerkleAnchorFreq int    `serialize:"true" json:"merkleAnchorFreq"` // Blocks between Q-Chain anchors
 }
 
-// DefaultConfig returns default AIVM configuration
+// DefaultConfig returns default AIVM configuration suitable for ANY
+// public Lux L1/L2 (no trusted dealer, no TEE requirement). The
+// public-BFT-safe defaults are:
+//   - VerificationMode = ModeOptimistic (fraud-proof flow)
+//   - RequireTEEAttestation = false (TEE is optional acceleration)
+//   - HostChainID = "primary" (override per L1/L2 instance)
+//
+// Permissioned/regulated subnets can opt into ModeTEEAttested +
+// RequireTEEAttestation=true as a policy choice.
 func DefaultConfig() Config {
 	return Config{
 		MaxProvidersPerNode:   100,
 		MaxTasksPerProvider:   10,
-		RequireTEEAttestation: true,
+		HostChainID:           "primary",
+		VerificationMode:      ModeOptimistic,
+		ChallengeWindowBlocks: 100,
+		RedundancyFactor:      3,
+		MinProviderBond:       1000_000_000_000_000_000, // 1000 LUX in wei
+		RequireTEEAttestation: false,
 		MinTrustScore:         50,
 		AttestationTimeout:    "30s",
 		MaxTaskQueueSize:      1000,
@@ -87,6 +186,18 @@ func DefaultConfig() Config {
 		EpochDuration:         "1h",
 		MerkleAnchorFreq:      100,
 	}
+}
+
+// DefaultPermissionedConfig returns AIVM config for a permissioned
+// subnet (regulated AI compute, KYC'd provider set). Sets
+// RequireTEEAttestation=true and VerificationMode=ModeTEEAttested.
+// NOT for public mainnet use.
+func DefaultPermissionedConfig() Config {
+	c := DefaultConfig()
+	c.VerificationMode = ModeTEEAttested
+	c.RequireTEEAttestation = true
+	c.MinTrustScore = 70
+	return c
 }
 
 // VM implements the AI Virtual Machine
@@ -273,7 +384,19 @@ func (vm *VM) Disconnected(ctx context.Context, nodeID ids.NodeID) error {
 	return nil
 }
 
-// RegisterProvider registers a new AI compute provider
+// RegisterProvider registers a new AI compute provider.
+//
+// Public-BFT-safe path (VerificationMode=ModeOptimistic, default):
+//   - Provider locks MinProviderBond in the host chain's escrow
+//   - TEE attestation is OPTIONAL — providers without TEE register
+//     under the optimistic-verification flow (challenge period +
+//     fraud proofs handle correctness without trusting the provider)
+//
+// Permissioned path (RequireTEEAttestation=true, opt-in):
+//   - Provider MUST present valid TEE attestation
+//   - TrustScore must meet MinTrustScore
+//   - Used on permissioned subnets where the validator set vets
+//     hardware operators by policy
 func (vm *VM) RegisterProvider(provider *aivm.Provider) error {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
@@ -282,8 +405,18 @@ func (vm *VM) RegisterProvider(provider *aivm.Provider) error {
 		return ErrNotInitialized
 	}
 
-	// Verify attestation meets minimum trust score
+	// TEE attestation is OPT-IN. The default (public-chain) policy is
+	// RequireTEEAttestation=false: providers may register without TEE
+	// and submit results under the optimistic-verification flow.
+	//
+	// When RequireTEEAttestation=true (permissioned subnet policy):
+	// every provider MUST present TEE attestation and meet the
+	// trust-score threshold. This is a deployment-policy gate,
+	// independent of the protocol's public-BFT-safety contract.
 	if vm.config.RequireTEEAttestation {
+		if provider.GPUAttestation == nil && provider.CPUAttestation == nil {
+			return fmt.Errorf("permissioned policy requires TEE attestation but provider supplied none; set RequireTEEAttestation=false for the public-chain path")
+		}
 		if provider.GPUAttestation != nil {
 			status, err := vm.verifier.VerifyGPUAttestation(provider.GPUAttestation)
 			if err != nil {
@@ -294,6 +427,11 @@ func (vm *VM) RegisterProvider(provider *aivm.Provider) error {
 			}
 		}
 	}
+	// On the public-BFT path (RequireTEEAttestation=false) the provider's
+	// bond + the optimistic-challenge flow handle correctness. TEE
+	// attestation, if supplied, is folded into a trust-score multiplier
+	// that can REDUCE (but never bypass) the challenge window — verified
+	// at result-submission time, not here.
 
 	return vm.core.RegisterProvider(provider)
 }

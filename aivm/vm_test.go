@@ -37,7 +37,14 @@ func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 	require.Equal(100, cfg.MaxProvidersPerNode)
 	require.Equal(10, cfg.MaxTasksPerProvider)
-	require.True(cfg.RequireTEEAttestation)
+	// Public-BFT-safe default: TEE attestation NOT required.
+	// Providers without TEE register via the optimistic-verification
+	// flow (challenge period + fraud proofs).
+	require.False(cfg.RequireTEEAttestation, "public-chain default must NOT require TEE")
+	require.Equal(ModeOptimistic, cfg.VerificationMode, "public-chain default is optimistic mode")
+	require.Equal("primary", cfg.HostChainID, "default host chain is primary network")
+	require.Equal(uint64(100), cfg.ChallengeWindowBlocks)
+	require.Equal(3, cfg.RedundancyFactor)
 	require.Equal(uint8(50), cfg.MinTrustScore)
 	require.Equal("30s", cfg.AttestationTimeout)
 	require.Equal(1000, cfg.MaxTaskQueueSize)
@@ -45,6 +52,27 @@ func TestDefaultConfig(t *testing.T) {
 	require.Equal(uint64(1000000000), cfg.BaseReward) // 1 LUX
 	require.Equal("1h", cfg.EpochDuration)
 	require.Equal(100, cfg.MerkleAnchorFreq)
+}
+
+// TestDefaultPermissionedConfig pins the permissioned-subnet opt-in
+// path. NOT for public mainnet use.
+func TestDefaultPermissionedConfig(t *testing.T) {
+	require := require.New(t)
+
+	cfg := DefaultPermissionedConfig()
+	require.True(cfg.RequireTEEAttestation, "permissioned config requires TEE")
+	require.Equal(ModeTEEAttested, cfg.VerificationMode)
+	require.Equal(uint8(70), cfg.MinTrustScore)
+}
+
+// TestVerificationMode_PublicBFTSafe pins that the default mode is
+// one of the public-BFT-safe modes (Optimistic or MultiPartyRedundant),
+// NEVER TEE-attested as the trust root.
+func TestVerificationMode_PublicBFTSafe(t *testing.T) {
+	require := require.New(t)
+	cfg := DefaultConfig()
+	publicSafe := cfg.VerificationMode == ModeOptimistic || cfg.VerificationMode == ModeMultiPartyRedundant
+	require.True(publicSafe, "default VerificationMode must be public-BFT-safe (Optimistic or MultiPartyRedundant), got %v", cfg.VerificationMode)
 }
 
 func TestConfigJSON(t *testing.T) {
