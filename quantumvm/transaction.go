@@ -22,6 +22,9 @@ type Transaction interface {
 	Execute() error
 	GetQuantumSignature() *quantum.QuantumSignature
 	Timestamp() time.Time
+	// Fee returns the user-paid tx burn in nLUX. Must satisfy the
+	// chain's FeePolicy (>= fee.MinTxFeeFloor on Q-Chain).
+	Fee() uint64
 }
 
 // BaseTransaction provides common transaction functionality
@@ -30,6 +33,7 @@ type BaseTransaction struct {
 	timestamp        time.Time
 	nonce            uint64
 	data             []byte
+	fee              uint64
 	quantumSignature *quantum.QuantumSignature
 }
 
@@ -68,6 +72,18 @@ func (tx *BaseTransaction) GetQuantumSignature() *quantum.QuantumSignature {
 func (tx *BaseTransaction) Timestamp() time.Time {
 	return tx.timestamp
 }
+
+// Fee returns the user-paid tx burn (nLUX). Defaults to zero on a
+// zero-value BaseTransaction — callers must set it explicitly for the
+// fee gate to accept the tx.
+func (tx *BaseTransaction) Fee() uint64 {
+	return tx.fee
+}
+
+// SetFee sets the user-paid tx burn in nLUX. Convenience setter for
+// tests + tx builders; production callers should pass the fee at
+// construction time.
+func (tx *BaseTransaction) SetFee(f uint64) { tx.fee = f }
 
 // Verify verifies the transaction
 func (tx *BaseTransaction) Verify() error {
