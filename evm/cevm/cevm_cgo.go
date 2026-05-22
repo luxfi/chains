@@ -2,32 +2,35 @@
 
 package cevm
 
-// External Go consumers building from $GOMODCACHE need libevm/headers fetched
-// into the location ${SRCDIR}/../../../../luxcpp expects. Run `go generate`
-// (or invoke the script directly) before `go build`. See fetch-luxcpp.sh.
+// Linkage goes through the lux-cevm pkg-config bundle (libevm + libevm-gpu).
+// The C header "go_bridge.h" ships under
+// $LUXCPP_PREFIX/include/cevm/lib/evm/gpu/, which is in the .pc Cflags.
+//
+// Build + install the .pc bundle with:
+//
+//   cmake -S ~/work/luxcpp/cevm -B ~/work/luxcpp/cevm/build \
+//         -DCMAKE_INSTALL_PREFIX=$HOME/work/luxcpp/install
+//   cmake --build ~/work/luxcpp/cevm/build
+//   cmake --install ~/work/luxcpp/cevm/build
+//
+// Then `export PKG_CONFIG_PATH=$HOME/work/luxcpp/install/lib/pkgconfig`.
+//
+// luxcpp-gpu / cevm_precompiles / metal-hosts / kernel-metal are folded into
+// libevm-gpu's static archive in the v0.19 build, so the .pc only needs
+// -levm -levm-gpu plus the Metal/Foundation frameworks on darwin and a
+// stdc++ on linux.
+//
+// External Go consumers building from $GOMODCACHE need the .pc + libs
+// installed locally; this build no longer falls back to ${SRCDIR}-relative
+// luxcpp paths. fetch-luxcpp.sh is kept for the headers-only bootstrap path
+// but the install step is the canonical one.
 //
 //go:generate ./fetch-luxcpp.sh
 
 /*
-// System / homebrew install paths — primary, used when libs are installed.
-#cgo CFLAGS: -I/usr/local/include -I/opt/homebrew/include
-// luxcpp source-tree / fetch-luxcpp.sh layout — fallback.
-#cgo CFLAGS: -I${SRCDIR}/../../../../luxcpp/cevm/lib/evm/gpu
-
-#cgo LDFLAGS: -L/usr/local/lib
-#cgo darwin LDFLAGS: -L/opt/homebrew/lib
-#cgo LDFLAGS: -L${SRCDIR}/../../../../luxcpp/cevm/build/lib
-#cgo LDFLAGS: -L${SRCDIR}/../../../../luxcpp/cevm/build/lib/evm
-#cgo LDFLAGS: -L${SRCDIR}/../../../../luxcpp/cevm/build/lib/evm/luxcpp-gpu
-#cgo LDFLAGS: -L${SRCDIR}/../../../../luxcpp/cevm/build/lib/cevm_precompiles
-#cgo LDFLAGS: -Wl,-rpath,/usr/local/lib
-#cgo darwin LDFLAGS: -Wl,-rpath,/opt/homebrew/lib
-#cgo LDFLAGS: -Wl,-rpath,${SRCDIR}/../../../../luxcpp/cevm/build/lib
-#cgo LDFLAGS: -Wl,-rpath,${SRCDIR}/../../../../luxcpp/cevm/build/lib/evm/luxcpp-gpu
-#cgo LDFLAGS: -levm
-#cgo darwin LDFLAGS: -levm-gpu -levm-metal-hosts -levm-kernel-metal -levm-gpu -lluxgpu -lcevm_precompiles -lstdc++
-#cgo darwin LDFLAGS: -framework Metal -framework Foundation
-#cgo linux  LDFLAGS: -Wl,--start-group -levm-gpu -lluxgpu -lcevm_precompiles -Wl,--end-group -lstdc++
+#cgo pkg-config: lux-cevm
+#cgo darwin LDFLAGS: -framework Metal -framework Foundation -lstdc++
+#cgo linux  LDFLAGS: -lstdc++
 
 #include <stdlib.h>
 #include "go_bridge.h"
