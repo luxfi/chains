@@ -174,6 +174,10 @@ type CreateKeyArgs struct {
 	Threshold   int      `json:"threshold"`
 	TotalShares int      `json:"totalShares"`
 	Tags        []string `json:"tags"`
+	// Fee is the user-paid tx burn in nLUX. Must be >=
+	// fee.MinTxFeeFloor (1 mLUX). Refused at the fee gate before any
+	// key material is allocated.
+	Fee uint64 `json:"fee"`
 }
 
 // CreateKeyReply contains the response for CreateKey.
@@ -185,6 +189,13 @@ type CreateKeyReply struct {
 
 // CreateKey creates a new distributed key.
 func (s *Service) CreateKey(r *http.Request, args *CreateKeyArgs, reply *CreateKeyReply) error {
+	// Fee gate: refuse zero-fee user requests before allocating key
+	// material or consuming MPC capacity. Consensus-internal callers
+	// bypass via VM.CreateKey direct.
+	if err := s.vm.gateUserFee(args.Fee); err != nil {
+		return err
+	}
+
 	// Use defaults if not specified
 	threshold := args.Threshold
 	if threshold == 0 {
@@ -226,6 +237,8 @@ func (s *Service) CreateKey(r *http.Request, args *CreateKeyArgs, reply *CreateK
 type DeleteKeyArgs struct {
 	ID    string `json:"id"`
 	Force bool   `json:"force"`
+	// Fee is the user-paid tx burn in nLUX; see CreateKeyArgs.
+	Fee uint64 `json:"fee"`
 }
 
 // DeleteKeyReply contains the response for DeleteKey.
@@ -236,6 +249,10 @@ type DeleteKeyReply struct {
 
 // DeleteKey deletes a key.
 func (s *Service) DeleteKey(r *http.Request, args *DeleteKeyArgs, reply *DeleteKeyReply) error {
+	if err := s.vm.gateUserFee(args.Fee); err != nil {
+		return err
+	}
+
 	keyID, err := ids.FromString(args.ID)
 	if err != nil {
 		return err
@@ -255,6 +272,8 @@ func (s *Service) DeleteKey(r *http.Request, args *DeleteKeyArgs, reply *DeleteK
 type EncryptArgs struct {
 	KeyID     string `json:"keyId"`
 	Plaintext string `json:"plaintext"` // Base64-encoded
+	// Fee is the user-paid tx burn in nLUX; see CreateKeyArgs.
+	Fee uint64 `json:"fee"`
 }
 
 // EncryptReply contains the response for Encrypt.
@@ -266,6 +285,10 @@ type EncryptReply struct {
 
 // Encrypt encrypts data.
 func (s *Service) Encrypt(r *http.Request, args *EncryptArgs, reply *EncryptReply) error {
+	if err := s.vm.gateUserFee(args.Fee); err != nil {
+		return err
+	}
+
 	keyID, err := ids.FromString(args.KeyID)
 	if err != nil {
 		return err

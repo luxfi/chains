@@ -34,6 +34,7 @@ import (
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/cache"
+	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/runtime"
 	"github.com/luxfi/timer/mockable"
 	vmcore "github.com/luxfi/vm"
@@ -138,6 +139,11 @@ type VM struct {
 	pendingTxs []*Transaction
 	txLock     sync.Mutex
 
+	// Fee policy gating user-submitted RPCs (CreateKey, DeleteKey,
+	// Encrypt). FlatPolicy at MinTxFeeFloor; consensus-internal
+	// paths bypass.
+	feePolicy fee.Policy
+
 	// State management
 	state         database.Database
 	lastAccepted  ids.ID
@@ -198,6 +204,20 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	vm.pendingTxs = make([]*Transaction, 0)
 	vm.pendingBlocks = make(map[ids.ID]*Block)
 	vm.shutdownLock.Unlock()
+
+	// Pin networkID for fee policy + asset derivation.
+	if vm.rt != nil {
+		vm.networkID = vm.rt.NetworkID
+	}
+	// Honour an explicit config-supplied NetworkID if set (legacy
+	// override path; runtime.NetworkID is the canonical source).
+	if vm.Config.NetworkID != 0 {
+		vm.networkID = vm.Config.NetworkID
+	}
+	vm.feePolicy = newFeePolicy(vm.networkID)
+	if err := fee.Validate(vm.feePolicy); err != nil {
+		return fmt.Errorf("keyvm: fee policy: %w", err)
+	}
 
 	// Initialize caches
 	vm.mlkemCache = cache.NewLRU[ids.ID, *mlkem.PrivateKey](vm.Config.ShareCacheSize)
