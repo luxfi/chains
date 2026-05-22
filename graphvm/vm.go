@@ -17,12 +17,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
+	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/runtime"
 	vmcore "github.com/luxfi/vm"
+	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/warp"
 
 	nodeversion "github.com/luxfi/node/version"
@@ -82,6 +83,10 @@ type VM struct {
 	// Synchronization
 	schemaMu sync.RWMutex
 	queryMu  sync.RWMutex
+
+	// G-Chain is read-only; the policy refuses all user-tx at the boundary.
+	// See feegate.go.
+	feePolicy fee.Policy
 }
 
 // GraphSchema represents a GraphQL schema definition
@@ -168,6 +173,12 @@ func (vm *VM) Initialize(
 	vm.subscriptions = make(map[ids.ID]*Subscription)
 	vm.dataIndexes = make(map[string]*DataIndex)
 	vm.chainSources = make(map[ids.ID]*ChainDataSource)
+
+	// Fee gate: read-only chain → NoUserTxPolicy (refuses all user-tx).
+	vm.feePolicy = newFeePolicy()
+	if err := fee.Validate(vm.feePolicy); err != nil {
+		return fmt.Errorf("feepolicy: %w", err)
+	}
 
 	// Parse genesis if needed
 	if len(vmInit.Genesis) > 0 {
