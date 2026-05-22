@@ -116,8 +116,16 @@ func (vm *VM) ProcessBridgeMessage(ctx context.Context, message *BridgeMessage) 
 	return nil
 }
 
-// InitiateBridgeTransfer initiates a new bridge transfer with MPC signing
+// InitiateBridgeTransfer initiates a new bridge transfer with MPC signing.
+// This is the canonical user-tx admission point on B-Chain. The
+// FeePolicy gate refuses zero-fee transfers before any MPC signing
+// capacity is consumed. Consensus-internal callers bypass by
+// reaching pendingBridges / bridgeSigner directly.
 func (vm *VM) InitiateBridgeTransfer(ctx context.Context, message *BridgeMessage) error {
+	if err := vm.gateUserBridgeMessage(message); err != nil {
+		return err
+	}
+
 	vm.log.Info("initiating bridge transfer",
 		log.String("messageID", message.ID.String()),
 		log.String("sourceChain", message.SourceChain),
