@@ -22,6 +22,7 @@ import (
 	"github.com/luxfi/metric"
 	"github.com/luxfi/node/cache"
 	"github.com/luxfi/node/utils/json"
+	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/version"
 	"github.com/luxfi/chains/quantumvm/config"
 	"github.com/luxfi/chains/quantumvm/quantum"
@@ -115,6 +116,11 @@ type VM struct {
 	httpServer *http.Server
 	rpcServer  *rpc.Server
 
+	// Fee policy gating user-submitted tx admission (IssueTx).
+	// FlatPolicy at MinTxFeeFloor on Q-Chain; consensus-internal
+	// callers bypass via txPool.AddTransaction.
+	feePolicy fee.Policy
+
 	// Synchronization
 	lock sync.RWMutex
 }
@@ -158,6 +164,17 @@ func (vm *VM) Initialize(ctx context.Context, init luxvm.Init) error {
 		vm.Config.ParallelBatchSize,
 		vm.log,
 	)
+
+	// Pin fee policy. Q-Chain accepts user-submitted txs through
+	// IssueTx so attach the canonical FlatPolicy at MinTxFeeFloor;
+	// fee.Validate refuses zero-fee user-facing chains at boot.
+	if init.Runtime != nil {
+		vm.NetworkID = init.Runtime.NetworkID
+	}
+	vm.feePolicy = newFeePolicy(vm.NetworkID)
+	if err := fee.Validate(vm.feePolicy); err != nil {
+		return fmt.Errorf("quantumvm: fee policy: %w", err)
+	}
 
 	// Set up worker pool for parallel processing
 	vm.parallelWorkers = vm.Config.MaxParallelTxs
