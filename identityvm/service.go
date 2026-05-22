@@ -23,6 +23,8 @@ type Service struct {
 type CreateIdentityArgs struct {
 	PublicKey string            `json:"publicKey"` // Base64-encoded
 	Metadata  map[string]string `json:"metadata"`
+	// Fee is the user-paid tx burn in nLUX; must satisfy MinTxFeeFloor.
+	Fee uint64 `json:"fee"`
 }
 
 // CreateIdentityReply is the reply for CreateIdentity
@@ -33,6 +35,9 @@ type CreateIdentityReply struct {
 
 // CreateIdentity creates a new decentralized identity
 func (s *Service) CreateIdentity(r *http.Request, args *CreateIdentityArgs, reply *CreateIdentityReply) error {
+	if err := s.vm.gateUserFee(args.Fee); err != nil {
+		return err
+	}
 	publicKey, err := base64.StdEncoding.DecodeString(args.PublicKey)
 	if err != nil {
 		return err
@@ -133,6 +138,8 @@ type IssueCredentialArgs struct {
 	Type       []string               `json:"type"`
 	Claims     map[string]interface{} `json:"claims"`
 	TTLSeconds int64                  `json:"ttlSeconds"` // Optional, uses default if 0
+	// Fee is the user-paid tx burn in nLUX.
+	Fee uint64 `json:"fee"`
 }
 
 // IssueCredentialReply is the reply for IssueCredential
@@ -143,6 +150,9 @@ type IssueCredentialReply struct {
 
 // IssueCredential issues a new verifiable credential
 func (s *Service) IssueCredential(r *http.Request, args *IssueCredentialArgs, reply *IssueCredentialReply) error {
+	if err := s.vm.gateUserFee(args.Fee); err != nil {
+		return err
+	}
 	issuerID, err := ids.FromString(args.IssuerID)
 	if err != nil {
 		return err
@@ -259,6 +269,8 @@ type RevokeCredentialArgs struct {
 	CredentialID string `json:"credentialId"`
 	RevokerID    string `json:"revokerId"`
 	Reason       string `json:"reason"`
+	// Fee is the user-paid tx burn in nLUX.
+	Fee uint64 `json:"fee"`
 }
 
 // RevokeCredentialReply is the reply for RevokeCredential
@@ -268,6 +280,9 @@ type RevokeCredentialReply struct {
 
 // RevokeCredential revokes a credential
 func (s *Service) RevokeCredential(r *http.Request, args *RevokeCredentialArgs, reply *RevokeCredentialReply) error {
+	if err := s.vm.gateUserFee(args.Fee); err != nil {
+		return err
+	}
 	credID, err := ids.FromString(args.CredentialID)
 	if err != nil {
 		return err
@@ -291,6 +306,8 @@ type CreateProofArgs struct {
 	CredentialID        string   `json:"credentialId"`
 	ZKProof             string   `json:"zkProof,omitempty"` // Base64-encoded
 	SelectiveDisclosure []string `json:"selectiveDisclosure,omitempty"`
+	// Fee is the user-paid tx burn in nLUX.
+	Fee uint64 `json:"fee"`
 }
 
 // CreateProofReply is the reply for CreateProof
@@ -306,6 +323,9 @@ type CreateProofReply struct {
 
 // CreateProof creates a credential proof artifact
 func (s *Service) CreateProof(r *http.Request, args *CreateProofArgs, reply *CreateProofReply) error {
+	if err := s.vm.gateUserFee(args.Fee); err != nil {
+		return err
+	}
 	credID, err := ids.FromString(args.CredentialID)
 	if err != nil {
 		return err
@@ -342,6 +362,8 @@ type RegisterIssuerArgs struct {
 	PublicKey  string   `json:"publicKey"` // Base64-encoded
 	Types      []string `json:"types"`
 	TrustLevel int      `json:"trustLevel"`
+	// Fee is the user-paid tx burn in nLUX.
+	Fee uint64 `json:"fee"`
 }
 
 // RegisterIssuerReply is the reply for RegisterIssuer
@@ -351,6 +373,9 @@ type RegisterIssuerReply struct {
 
 // RegisterIssuer registers a new credential issuer
 func (s *Service) RegisterIssuer(r *http.Request, args *RegisterIssuerArgs, reply *RegisterIssuerReply) error {
+	if err := s.vm.gateUserFee(args.Fee); err != nil {
+		return err
+	}
 	publicKey, err := base64.StdEncoding.DecodeString(args.PublicKey)
 	if err != nil {
 		return err

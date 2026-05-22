@@ -23,6 +23,7 @@ import (
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/vms/artifacts"
+	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/runtime"
 	vmcore "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
@@ -153,6 +154,13 @@ type VM struct {
 	lastAccepted   *Block
 	lastAcceptedID ids.ID
 
+	// Fee policy gating user-submitted mutating RPCs (CreateIdentity,
+	// IssueCredential, RevokeCredential, CreateProof,
+	// RegisterIssuer). FlatPolicy at MinTxFeeFloor; consensus-
+	// internal callers bypass via direct VM methods.
+	feePolicy fee.Policy
+	networkID uint32
+
 	mu sync.RWMutex
 
 	// RPC
@@ -211,6 +219,17 @@ func (vm *VM) Initialize(
 	vm.rpcServer.RegisterCodec(grjson.NewCodec(), "application/json")
 	vm.rpcServer.RegisterCodec(grjson.NewCodec(), "application/json;charset=UTF-8")
 	vm.rpcServer.RegisterService(&Service{vm: vm}, "identity")
+
+	// Pin fee policy. I-Chain accepts user mutating RPCs so attach
+	// the canonical FlatPolicy at MinTxFeeFloor; fee.Validate
+	// refuses zero-fee user-facing chains at boot.
+	if vm.rt != nil {
+		vm.networkID = vm.rt.NetworkID
+	}
+	vm.feePolicy = newFeePolicy(vm.networkID)
+	if err := fee.Validate(vm.feePolicy); err != nil {
+		return fmt.Errorf("identityvm: fee policy: %w", err)
+	}
 
 	// Load last accepted block
 	if err := vm.loadLastAccepted(); err != nil {
