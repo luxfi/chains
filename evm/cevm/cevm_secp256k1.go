@@ -8,39 +8,32 @@ package cevm
 // Phase 1 of GPU sig-batch ECDSA recovery wiring for the cevm BlockExecutor.
 //
 // The C primitive lives in luxcpp/crypto:
-//   header: ~/work/luxcpp/crypto/include/lux/crypto/secp256k1.h
-//   body:   ~/work/luxcpp/crypto/secp256k1/cpp/ecrecover.cpp
-//   metal:  ~/work/luxcpp/crypto/secp256k1/gpu/metal/secp256k1_first_party_driver.mm
+//   header: $LUXCPP_PREFIX/include/lux/crypto/secp256k1.h
+//   body:   $LUXCPP_DIR/crypto/secp256k1/cpp/ecrecover.cpp (built into
+//           libsecp256k1_cpu.a, shipped in $LUXCPP_PREFIX/lib)
+//   metal:  $LUXCPP_DIR/crypto/secp256k1/gpu/metal/secp256k1_first_party_driver.mm
+//           (built into libsecp256k1_metal.a, still consumed from the build
+//           tree — see the Metal anchor block below)
 //
 // The CPU oracle (the entry point exposed to consumers) is
 // `secp256k1_ecrecover_address_batch` declared at secp256k1.h:113. It takes
 // hashes and (r||s||v) sigs and writes 20-byte Ethereum addresses out.
 //
-// We link directly against the luxcpp/crypto build tree:
+// CPU linkage goes through the lux-crypto-secp256k1 pkg-config bundle
+// (secp256k1_cpu + keccak_cpu). libsecp256k1_cpu.a depends on _keccak256
+// from libkeccak_cpu.a (used by the pubkey -> address step), so both
+// archives are required and the .pc bundles them together.
 //
-//   ${SRCDIR}/../../../../luxcpp/crypto/build/secp256k1/libsecp256k1_cpu.a
-//   ${SRCDIR}/../../../../luxcpp/crypto/build/keccak/libkeccak_cpu.a
+// Build the bundle once with:
 //
-// libsecp256k1_cpu.a depends on _keccak256 from libkeccak_cpu.a (used by the
-// pubkey -> address step), so both archives are required.
-//
-// If the link fails with "library 'secp256k1_cpu' not found", build the libs
-// from the luxcpp/crypto source tree:
-//
-//   cmake -S ~/work/luxcpp/crypto -B ~/work/luxcpp/crypto/build && \
-//     cmake --build ~/work/luxcpp/crypto/build \
-//       --target secp256k1_cpu keccak_cpu
+//   cmake -S ~/work/luxcpp/crypto -B ~/work/luxcpp/crypto/build \
+//         -DCMAKE_INSTALL_PREFIX=$HOME/work/luxcpp/install
+//   cmake --build ~/work/luxcpp/crypto/build \
+//         --target secp256k1_cpu keccak_cpu
+//   cmake --install ~/work/luxcpp/crypto/build
 
 /*
-// luxcpp/crypto headers — pulled directly from the source tree.
-#cgo CFLAGS: -I${SRCDIR}/../../../../luxcpp/crypto/include
-
-// luxcpp/crypto static libraries — built in-tree by:
-//   cmake -S ~/work/luxcpp/crypto -B ~/work/luxcpp/crypto/build && \
-//   cmake --build ~/work/luxcpp/crypto/build --target secp256k1
-#cgo LDFLAGS: -L${SRCDIR}/../../../../luxcpp/crypto/build/secp256k1
-#cgo LDFLAGS: -L${SRCDIR}/../../../../luxcpp/crypto/build/keccak
-#cgo LDFLAGS: -lsecp256k1_cpu -lkeccak_cpu -lstdc++
+#cgo pkg-config: lux-crypto-secp256k1
 //
 // Metal driver: dispatch in cpp/ecrecover.cpp resolves the GPU symbol via
 // dlsym(RTLD_DEFAULT, ...). For dlsym to find it the .o must actually be in
@@ -48,8 +41,13 @@ package cevm
 // `-l<arch>` would let the linker drop it. We solve this with the anchor in
 // cevm_secp256k1_metal_anchor_darwin.c which takes the symbol's address.
 //
+// libsecp256k1_metal.a is NOT in the lux-crypto-secp256k1 .pc bundle: it
+// requires Metal/Foundation frameworks and only builds on Apple. Keep the
+// build-tree path until a separate lux-crypto-secp256k1-metal .pc lands.
+//
 // CPU path is still the fallback when LUX_SECP256K1_BACKEND=cpu, when
 // LUX_SECP256K1_METALLIB is unset, or on non-darwin builds.
+#cgo darwin LDFLAGS: -L${SRCDIR}/../../../../luxcpp/crypto/build/secp256k1
 #cgo darwin LDFLAGS: -lsecp256k1_metal -framework Metal -framework Foundation
 
 #include <stdint.h>
