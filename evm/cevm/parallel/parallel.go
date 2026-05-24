@@ -40,8 +40,13 @@
 package parallel
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"strings"
+	"sync"
 
+	"github.com/luxfi/crypto/backend"
 	"github.com/luxfi/evm/core/state"
 	evmparallel "github.com/luxfi/evm/core/parallel"
 	"github.com/luxfi/geth/common"
@@ -52,6 +57,58 @@ import (
 
 	"github.com/luxfi/chains/evm/cevm"
 )
+
+// ErrGPUEVMRequired is the sentinel ExecuteBlock returns when the cevm
+// V4 path cannot complete a block on-device and the caller must NOT
+// silently shadow-execute it on the Go EVM. Strict mode (the default)
+// propagates this error; legacy mode collapses it to (nil, nil) so the
+// caller falls through.
+//
+// Strict mode is the production target. The legacy fallback exists only
+// for the V4→V5 cevm transition window; flip LUX_CEVM_STRICT=0 to
+// re-enable it for emergency rollback. Once the V5 kernel implements
+// CALL/CREATE on device, the strict path becomes unconditional and the
+// env var is retired.
+var ErrGPUEVMRequired = errors.New("cevm: GPU EVM cannot execute this block (V4 ABI); waiting for V5 kernel — Go EVM fallback disabled by LUX_CEVM_STRICT")
+
+const envCEVMStrict = "LUX_CEVM_STRICT"
+
+var (
+	strictOnce sync.Once
+	strictMode bool
+)
+
+// strictGPUEVM reports whether the silent Go EVM fallback is disabled.
+// Read once at first call (not init) so test suites can set the env var
+// before exercising ExecuteBlock.
+func strictGPUEVM() bool {
+	strictOnce.Do(func() {
+		v := strings.ToLower(strings.TrimSpace(os.Getenv(envCEVMStrict)))
+		switch v {
+		case "0", "false", "no", "off":
+			strictMode = false
+		default:
+			// Default ON: do NOT silently shadow-execute on Go EVM. The
+			// fallback was the lie that hid the missing GPU CALL/CREATE.
+			strictMode = true
+		}
+	})
+	return strictMode
+}
+
+// declineBlock is the single fallback exit point. It records the
+// fallback reason for observability, then returns either the strict
+// sentinel error (default) or the legacy (nil, nil) opt-out result.
+func declineBlock(reason string, blockNumber, txIndex uint64) ([]*types.Receipt, error) {
+	backend.RecordFallback(backend.FallbackUnsupported, "cevm:"+reason)
+	if strictGPUEVM() {
+		return nil, fmt.Errorf("%w: reason=%s block=%d tx_index=%d",
+			ErrGPUEVMRequired, reason, blockNumber, txIndex)
+	}
+	log.Debug("cevm: declining block to Go EVM (LUX_CEVM_STRICT=0)",
+		"reason", reason, "block", blockNumber, "tx_index", txIndex)
+	return nil, nil
+}
 
 // Executor is a luxfi/evm/core/parallel.BlockExecutor that dispatches
 // every block to cevm.ExecuteBlockV3 in one cgo call.
@@ -126,13 +183,11 @@ func (e *Executor) ExecuteBlock(
 		}
 		// Value + GasPrice are uint64 in cevm.Transaction; transactions
 		// with values exceeding uint64 (rare but legal) cannot run
-		// through this backend. Fall through.
+		// through this backend. Decline the block.
 		if tx.Value().IsUint64() {
 			ct.Value = tx.Value().Uint64()
 		} else {
-			log.Debug("cevm: tx value exceeds uint64, falling through",
-				"tx_index", i, "block", header.Number)
-			return nil, nil
+			return declineBlock("value_overflow_uint64", header.Number.Uint64(), uint64(i))
 		}
 		if tx.GasPrice() != nil && tx.GasPrice().IsUint64() {
 			ct.GasPrice = tx.GasPrice().Uint64()
@@ -182,15 +237,14 @@ func (e *Executor) ExecuteBlock(
 			len(result.GasUsed), len(result.Status), len(txs))
 	}
 
-	// Stage 5: detect CallNotSupported. If any tx hit it, the cevm
-	// path can't complete this block. Fall through to Go EVM rather
-	// than mix backends mid-block (which would corrupt state-trie
-	// progression).
+	// Stage 5: detect CallNotSupported. The cevm V4 kernel returns
+	// TxCallNotSupported for CALL/CREATE/DELEGATECALL/STATICCALL
+	// opcodes. The V5 kernel (spec at chains/evm/cevm/V5_ABI.md)
+	// implements these on device; until it lands, decline the block
+	// rather than mix backends mid-block.
 	for i, st := range result.Status {
 		if st == cevm.TxCallNotSupported {
-			log.Debug("cevm: tx hit CALL/CREATE; falling through",
-				"tx_index", i, "block", header.Number)
-			return nil, nil
+			return declineBlock("call_or_create_unsupported_v4", header.Number.Uint64(), uint64(i))
 		}
 	}
 
@@ -221,9 +275,7 @@ func (e *Executor) ExecuteBlock(
 		}
 	}
 	if !allValueTransfer {
-		log.Debug("cevm: block has non-value-transfer txs; falling through until V3 logs ABI",
-			"block", header.Number)
-		return nil, nil
+		return declineBlock("non_value_transfer_logs_abi_pending_v5", header.Number.Uint64(), 0)
 	}
 
 	receipts := make([]*types.Receipt, len(txs))
