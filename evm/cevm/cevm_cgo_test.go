@@ -51,7 +51,7 @@ func TestExecuteBlockSmoke_AllBackends(t *testing.T) {
 
 	for _, b := range AvailableBackends() {
 		t.Run(BackendName(b), func(t *testing.T) {
-			r, err := ExecuteBlock(b, txs)
+			r, err := ExecuteBlockV1(b, txs)
 			if err != nil {
 				t.Fatalf("ExecuteBlock(%s): %v", BackendName(b), err)
 			}
@@ -137,7 +137,7 @@ func TestGPUBytecodeExecution(t *testing.T) {
 	for i := range txs {
 		txs[i] = bytecodeTx(uint64(i), code)
 	}
-	r, err := ExecuteBlock(GPUMetal, txs)
+	r, err := ExecuteBlockV1(GPUMetal, txs)
 	if err != nil {
 		t.Fatalf("GPU bytecode execute: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestConcurrentExecuteBlock(t *testing.T) {
 		txs[i] = bytecodeTx(uint64(i), code)
 	}
 
-	ref, err := ExecuteBlock(GPUMetal, txs)
+	ref, err := ExecuteBlockV1(GPUMetal, txs)
 	if err != nil {
 		t.Fatalf("reference ExecuteBlock: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestConcurrentExecuteBlock(t *testing.T) {
 		go func() {
 			defer func() { doneCh <- struct{}{} }()
 			for i := 0; i < iterations; i++ {
-				r, err := ExecuteBlock(GPUMetal, txs)
+				r, err := ExecuteBlockV1(GPUMetal, txs)
 				if err != nil {
 					errCh <- err
 					return
@@ -337,7 +337,7 @@ func TestConcurrent_Stress(t *testing.T) {
 	}
 
 	// Single-goroutine reference run for total-gas assertion.
-	ref, err := ExecuteBlock(backend, makeBlock(0))
+	ref, err := ExecuteBlockV1(backend, makeBlock(0))
 	if err != nil {
 		t.Fatalf("reference: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestConcurrent_Stress(t *testing.T) {
 				}
 			}()
 			block := makeBlock(seed)
-			r, err := ExecuteBlock(backend, block)
+			r, err := ExecuteBlockV1(backend, block)
 			if err != nil {
 				failed.Add(1)
 				t.Errorf("goroutine %d: ExecuteBlock: %v", seed, err)
@@ -399,7 +399,7 @@ func TestExecuteBlock_LargeCode(t *testing.T) {
 	}
 	tx := bytecodeTx(0, code)
 	tx.GasLimit = 50_000_000
-	r, err := ExecuteBlock(CPUSequential, []Transaction{tx})
+	r, err := ExecuteBlockV1(CPUSequential, []Transaction{tx})
 	if err != nil {
 		t.Fatalf("large code: %v", err)
 	}
@@ -419,7 +419,7 @@ func TestExecuteBlock_LargeData(t *testing.T) {
 	}
 	tx := smokeTx(0)
 	tx.Data = data
-	r, err := ExecuteBlock(CPUSequential, []Transaction{tx})
+	r, err := ExecuteBlockV1(CPUSequential, []Transaction{tx})
 	if err != nil {
 		t.Fatalf("large data: %v", err)
 	}
@@ -437,7 +437,7 @@ func TestExecuteBlock_EmptyCodeAndData(t *testing.T) {
 	// Explicitly clear in case smokeTx ever changes.
 	tx.Code = nil
 	tx.Data = nil
-	r, err := ExecuteBlock(CPUSequential, []Transaction{tx})
+	r, err := ExecuteBlockV1(CPUSequential, []Transaction{tx})
 	if err != nil {
 		t.Fatalf("empty code+data: %v", err)
 	}
@@ -470,7 +470,7 @@ func TestBackendUnavailable(t *testing.T) {
 			t.Errorf("requesting unavailable backend %s panicked: %v", missing, r)
 		}
 	}()
-	r, err := ExecuteBlock(missing, []Transaction{tx})
+	r, err := ExecuteBlockV1(missing, []Transaction{tx})
 	if err != nil {
 		t.Logf("unavailable backend %s returned error (expected): %v", missing, err)
 		return
@@ -503,7 +503,7 @@ func TestExecuteBlock_GasParity_AcrossBackends(t *testing.T) {
 
 	results := make(map[Backend]uint64)
 	for _, b := range available {
-		r, err := ExecuteBlock(b, makeTxs())
+		r, err := ExecuteBlockV1(b, makeTxs())
 		if err != nil {
 			t.Logf("ExecuteBlock(%s): %v (skipping in parity check)", b, err)
 			continue

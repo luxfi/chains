@@ -16,8 +16,18 @@ func BackendName(b Backend) string { return b.String() }
 // LibraryABIVersion returns the Go-side constant when there's no library.
 func LibraryABIVersion() uint32 { return ABIVersion }
 
-// ExecuteBlock returns an error when built without CGo.
-func ExecuteBlock(backend Backend, txs []Transaction) (*BlockResult, error) {
+// ExecuteBlock is the canonical entry — returns an error under !cgo.
+func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext, state []StateAccount) (*BlockResultV2, error) {
+	if len(txs) == 0 {
+		return &BlockResultV2{ABIVersion: ABIVersion}, nil
+	}
+	_ = ctx
+	_ = state
+	return nil, fmt.Errorf("cevm: built without CGo, cannot execute transactions (rebuild with CGO_ENABLED=1)")
+}
+
+// Deprecated: use ExecuteBlock.
+func ExecuteBlockV1(backend Backend, txs []Transaction) (*BlockResult, error) {
 	if len(txs) == 0 {
 		return &BlockResult{}, nil
 	}

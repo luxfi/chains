@@ -228,9 +228,9 @@ func (e *Executor) ExecuteBlock(
 	if threads == 0 {
 		threads = 1
 	}
-	result, err := cevm.ExecuteBlockV4(e.CevmBackend, threads, cevmTxs, &blockCtx, snapshot)
+	result, err := cevm.ExecuteBlock(e.CevmBackend, threads, cevmTxs, &blockCtx, snapshot)
 	if err != nil {
-		return nil, fmt.Errorf("cevm: ExecuteBlockV4: %w", err)
+		return nil, fmt.Errorf("cevm: ExecuteBlock: %w", err)
 	}
 	if len(result.GasUsed) != len(txs) || len(result.Status) != len(txs) {
 		return nil, fmt.Errorf("cevm: result length mismatch (gas=%d status=%d txs=%d)",
