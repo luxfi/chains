@@ -76,7 +76,7 @@ func TestPluginExists(t *testing.T) {
 // TestExecuteBlockEmpty must succeed on both cgo and nocgo paths: the API
 // contract is "empty input ⇒ empty result, no error" regardless of build.
 func TestExecuteBlockEmpty(t *testing.T) {
-	result, err := ExecuteBlock(CPUSequential, nil)
+	result, err := ExecuteBlockV1(CPUSequential, nil)
 	if err != nil {
 		t.Fatalf("ExecuteBlock(nil) returned error: %v", err)
 	}
