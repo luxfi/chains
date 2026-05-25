@@ -147,7 +147,7 @@ Expected (NVIDIA box, CUDA available):
 backend{default=auto resolved=gpu cgo=true gpu=true gpu_backend=cuda devices=N accel=<ver>}
 ```
 
-## 7. LUX_GPU_DISABLE kill switch
+## 7. GPU_DISABLE kill switch
 
 ```bash
 cd ~/work/lx/dex
@@ -156,14 +156,14 @@ cd ~/work/lx/dex
 go run /tmp/probe.go
 
 # Forced CPU
-LUX_GPU_DISABLE=1 go run /tmp/probe.go
+GPU_DISABLE=1 go run /tmp/probe.go
 ```
 
 Second run should report `gpu=false disabled=true`. Re-run the parity test
 under the kill switch and it must still pass (CPU oracle on both paths).
 
 ```bash
-LUX_GPU_DISABLE=1 go test -count=1 -v -run TestMatchOrder_GPUMatchesCPU ./pkg/lx/
+GPU_DISABLE=1 go test -count=1 -v -run TestMatchOrder_GPUMatchesCPU ./pkg/lx/
 ```
 
 Expected single log line:
@@ -185,7 +185,7 @@ go test -count=1 ./evm/cevm/parallel/
 To re-enable the legacy fallback during V5 transition (emergency rollback):
 
 ```bash
-LUX_CEVM_STRICT=0 go test -count=1 ./evm/cevm/parallel/
+CEVM_STRICT=0 go test -count=1 ./evm/cevm/parallel/
 ```
 
 V5 kernel work tracked at `chains/evm/cevm/V5_ABI.md`. Until that lands,
@@ -244,7 +244,7 @@ overhead dominates and CPU wins.
 - **cevm V5 kernel**: CALL/CREATE on device per `chains/evm/cevm/V5_ABI.md`.
   Without V5, strict-mode cevm refuses any CALL-containing block. Operators
   needing the legacy fallback during the V5 transition set
-  `LUX_CEVM_STRICT=0`.
+  `CEVM_STRICT=0`.
 - **Precompile-engine → MatchOrderGPU bridge**: the `lux/precompile/dex`
   engine's matching path uses its own embedded path today. Hooking it to
   `MatchOrderGPU` is one small Go change in `engine_embedded.go::Swap` /
