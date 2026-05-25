@@ -65,13 +65,13 @@ import (
 // caller falls through.
 //
 // Strict mode is the production target. The legacy fallback exists only
-// for the V4→V5 cevm transition window; flip LUX_CEVM_STRICT=0 to
-// re-enable it for emergency rollback. Once the V5 kernel implements
-// CALL/CREATE on device, the strict path becomes unconditional and the
-// env var is retired.
-var ErrGPUEVMRequired = errors.New("cevm: GPU EVM cannot execute this block (V4 ABI); waiting for V5 kernel — Go EVM fallback disabled by LUX_CEVM_STRICT")
+// for the V4→V5 cevm transition window; flip CEVM_STRICT=0 to re-enable
+// it for emergency rollback. Once the V5 kernel implements CALL/CREATE
+// on device, the strict path becomes unconditional and the env var is
+// retired.
+var ErrGPUEVMRequired = errors.New("cevm: GPU EVM cannot execute this block (V4 ABI); waiting for V5 kernel — Go EVM fallback disabled by CEVM_STRICT")
 
-const envCEVMStrict = "LUX_CEVM_STRICT"
+const envCEVMStrict = "CEVM_STRICT"
 
 var (
 	strictOnce sync.Once
@@ -105,7 +105,7 @@ func declineBlock(reason string, blockNumber, txIndex uint64) ([]*types.Receipt,
 		return nil, fmt.Errorf("%w: reason=%s block=%d tx_index=%d",
 			ErrGPUEVMRequired, reason, blockNumber, txIndex)
 	}
-	log.Debug("cevm: declining block to Go EVM (LUX_CEVM_STRICT=0)",
+	log.Debug("cevm: declining block to Go EVM (CEVM_STRICT=0)",
 		"reason", reason, "block", blockNumber, "tx_index", txIndex)
 	return nil, nil
 }
