@@ -127,7 +127,10 @@ func copyU64(ptr *C.uint64_t, want uint32) []uint64 {
 // either way reachable) — runtime.KeepAlive(ctxs) at the end guarantees
 // the GC won't collect it while the C call is still in flight. The pinner
 // is unpinned via defer on every return path including errors.
-func ExecuteBlock(backend Backend, txs []Transaction) (*BlockResult, error) {
+// Deprecated: use ExecuteBlock with the full (backend, threads, txs, ctx,
+// state) signature. V1 only returns total gas + per-tx gas; no state root,
+// no per-tx status, no block context. Retained for test-file compatibility.
+func ExecuteBlockV1(backend Backend, txs []Transaction) (*BlockResult, error) {
 	if len(txs) == 0 {
 		return &BlockResult{}, nil
 	}
@@ -170,6 +173,8 @@ func ExecuteBlock(backend Backend, txs []Transaction) (*BlockResult, error) {
 //
 // Thread safety: same as ExecuteBlock — safe under concurrent goroutines.
 // Memory safety: same pinner + KeepAlive contract as ExecuteBlock.
+// Deprecated: use ExecuteBlock. V2 is the pre-blockctx, pre-state-snapshot
+// entry; retained for test-file compatibility.
 func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*BlockResultV2, error) {
 	if len(txs) == 0 {
 		return &BlockResultV2{ABIVersion: ABIVersion}, nil
@@ -240,6 +245,8 @@ func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*Blo
 // over Data/Code, KeepAlive over the ctxs slice, defer-free of the result.
 // The BlockContext itself is passed by value into a stack-allocated C
 // struct, so it doesn't need pinning.
+// Deprecated: use ExecuteBlock. V3 is the pre-state-snapshot entry;
+// retained for test-file compatibility.
 func ExecuteBlockV3(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext) (*BlockResultV2, error) {
 	if len(txs) == 0 {
 		return &BlockResultV2{ABIVersion: ABIVersion}, nil
@@ -332,6 +339,23 @@ func ExecuteBlockV3(backend Backend, numThreads uint32, txs []Transaction, ctx *
 // for the duration of the cgo call via runtime.KeepAlive.
 //
 // Thread safety / memory safety: same contract as ExecuteBlockV3.
+// ExecuteBlock is the single canonical entry point for cevm block execution.
+// Takes a state snapshot, runs the block on the chosen backend, returns
+// (gas_used, per-tx status, state_root). One way to dispatch — no version
+// proliferation. ExecuteBlockV4 is the same function under the legacy name
+// (kept until consumers migrate).
+//
+// The underlying C ABI is gpu_execute_block_v4 in luxcpp/cevm. When the
+// luxcpp side adds CALL/CREATE-on-device + per-tx logs, this single Go
+// entry switches to the new C entry — callers don't change.
+func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext, state []StateAccount) (*BlockResultV2, error) {
+	return ExecuteBlockV4(backend, numThreads, txs, ctx, state)
+}
+
+// ExecuteBlockV4 is the legacy name for ExecuteBlock. New code uses
+// ExecuteBlock; this is retained for test-file compatibility.
+//
+// Deprecated: use ExecuteBlock.
 func ExecuteBlockV4(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext, state []StateAccount) (*BlockResultV2, error) {
 	if len(txs) == 0 {
 		return &BlockResultV2{ABIVersion: ABIVersion}, nil
