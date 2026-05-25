@@ -127,44 +127,23 @@ func copyU64(ptr *C.uint64_t, want uint32) []uint64 {
 // either way reachable) — runtime.KeepAlive(ctxs) at the end guarantees
 // the GC won't collect it while the C call is still in flight. The pinner
 // is unpinned via defer on every return path including errors.
-// Deprecated: use ExecuteBlock with the full (backend, threads, txs, ctx,
-// state) signature. V1 only returns total gas + per-tx gas; no state root,
-// no per-tx status, no block context. Retained for test-file compatibility.
+// Deprecated: use ExecuteBlock. V1 (no threads, no ctx, no state, smaller
+// BlockResult shape) is now a thin adapter over the canonical ExecuteBlock —
+// retained only for test-file compatibility.
 func ExecuteBlockV1(backend Backend, txs []Transaction) (*BlockResult, error) {
-	if len(txs) == 0 {
+	r, err := ExecuteBlock(backend, 0, txs, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	if r == nil {
 		return &BlockResult{}, nil
 	}
-
-	var pinner runtime.Pinner
-	defer pinner.Unpin()
-	ctxs := buildTxs(txs, &pinner)
-
-	result := C.gpu_execute_block(
-		&ctxs[0],
-		C.uint32_t(len(ctxs)),
-		C.uint8_t(backend),
-	)
-	// Always free the C-allocated result, even on the error path. The C
-	// implementation of gpu_free_result is null-safe so this is a no-op
-	// when result.gas_used is nil.
-	defer C.gpu_free_result(&result)
-
-	// Defensive: the cgo call above is synchronous so ctxs is reachable
-	// throughout, but make the contract explicit so a future refactor that
-	// moves the C call into a goroutine or callback path doesn't silently
-	// break pointer reachability.
-	runtime.KeepAlive(ctxs)
-
-	if result.ok == 0 {
-		return nil, fmt.Errorf("cevm: execute_block failed")
-	}
-
 	return &BlockResult{
-		GasUsed:      copyU64(result.gas_used, uint32(result.num_txs)),
-		TotalGas:     uint64(result.total_gas),
-		ExecTimeMs:   float64(result.exec_time_ms),
-		Conflicts:    uint32(result.conflicts),
-		ReExecutions: uint32(result.re_executions),
+		GasUsed:      r.GasUsed,
+		TotalGas:     r.TotalGas,
+		ExecTimeMs:   r.ExecTimeMs,
+		Conflicts:    r.Conflicts,
+		ReExecutions: r.ReExecutions,
 	}, nil
 }
 
@@ -173,172 +152,20 @@ func ExecuteBlockV1(backend Backend, txs []Transaction) (*BlockResult, error) {
 //
 // Thread safety: same as ExecuteBlock — safe under concurrent goroutines.
 // Memory safety: same pinner + KeepAlive contract as ExecuteBlock.
-// Deprecated: use ExecuteBlock. V2 is the pre-blockctx, pre-state-snapshot
-// entry; retained for test-file compatibility.
+// Deprecated: use ExecuteBlock. V2 (no block context, no state snapshot)
+// is now a thin adapter over the canonical ExecuteBlock — retained only
+// for test-file compatibility.
 func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*BlockResultV2, error) {
-	if len(txs) == 0 {
-		return &BlockResultV2{ABIVersion: ABIVersion}, nil
-	}
-
-	var pinner runtime.Pinner
-	defer pinner.Unpin()
-	ctxs := buildTxs(txs, &pinner)
-
-	// Pass EVM_GPU_REV_DEFAULT (Cancun = 12). v0.26 added a revision
-	// parameter so callers can target older hard forks; we always pass
-	// Cancun for production consensus paths.
-	result := C.gpu_execute_block_v2(
-		&ctxs[0],
-		C.uint32_t(len(ctxs)),
-		C.uint8_t(backend),
-		C.uint32_t(numThreads),
-		C.uint8_t(12), // EVM_GPU_REV_CANCUN = EVM_GPU_REV_DEFAULT
-	)
-	defer C.gpu_free_result_v2(&result)
-	runtime.KeepAlive(ctxs)
-
-	if result.ok == 0 {
-		return nil, fmt.Errorf("cevm: execute_block_v2 failed")
-	}
-	if uint32(result.abi_version) != ABIVersion {
-		return nil, fmt.Errorf("cevm: ABI version mismatch in result (lib=%d expected=%d)",
-			uint32(result.abi_version), ABIVersion)
-	}
-
-	br := &BlockResultV2{
-		GasUsed:      copyU64(result.gas_used, uint32(result.num_txs)),
-		TotalGas:     uint64(result.total_gas),
-		ExecTimeMs:   float64(result.exec_time_ms),
-		Conflicts:    uint32(result.conflicts),
-		ReExecutions: uint32(result.re_executions),
-		ABIVersion:   uint32(result.abi_version),
-	}
-	for i := 0; i < 32; i++ {
-		br.StateRoot[i] = byte(result.state_root[i])
-	}
-	if result.status != nil && result.num_txs > 0 {
-		const maxTxsPerBlock = 1 << 24
-		want := uint32(result.num_txs)
-		if want > maxTxsPerBlock {
-			return nil, fmt.Errorf("cevm: result.num_txs=%d exceeds sanity bound", want)
-		}
-		statSlice := unsafe.Slice((*uint8)(unsafe.Pointer(result.status)), int(want))
-		br.Status = make([]TxStatus, want)
-		for i, s := range statSlice {
-			br.Status[i] = TxStatus(s)
-		}
-	}
-	return br, nil
+	return ExecuteBlock(backend, numThreads, txs, nil, nil)
 }
 
-// ExecuteBlockV3 runs a block through the C++ EVM with an explicit block
-// context and returns the V2 result shape (state root + per-tx status).
-//
-// Pass `ctx == nil` for V2 semantics (zero-initialised block context — chain
-// id, timestamp, etc. all resolve to zero). Pass a populated *BlockContext
-// to feed CHAINID, TIMESTAMP, NUMBER, BASEFEE, COINBASE, etc. through to
-// every backend that consumes them (Metal kernel reads it directly; CPU
-// kernel path picks it up once the parallel agent's wiring lands; CUDA
-// host drops it until that backend grows the same overload).
-//
-// Thread safety and memory safety are identical to ExecuteBlockV2: pinner
-// over Data/Code, KeepAlive over the ctxs slice, defer-free of the result.
-// The BlockContext itself is passed by value into a stack-allocated C
-// struct, so it doesn't need pinning.
-// Deprecated: use ExecuteBlock. V3 is the pre-state-snapshot entry;
-// retained for test-file compatibility.
+// Deprecated: use ExecuteBlock. V3 (block context, no state snapshot) is
+// now a thin adapter over the canonical ExecuteBlock — retained only for
+// test-file compatibility.
 func ExecuteBlockV3(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext) (*BlockResultV2, error) {
-	if len(txs) == 0 {
-		return &BlockResultV2{ABIVersion: ABIVersion}, nil
-	}
-
-	var pinner runtime.Pinner
-	defer pinner.Unpin()
-	ctxs := buildTxs(txs, &pinner)
-
-	// CBlockContext is layout-compatible with cevm.BlockContext: same
-	// field order, same widths, no padding deltas. Build it on the stack
-	// so we don't need to pin it. When ctx==nil we pass a NULL pointer
-	// and the C side defaults to a zero block context.
-	var cctxStorage C.CBlockContext
-	var cctxPtr *C.CBlockContext
-	if ctx != nil {
-		cctxStorage.origin = *(*[20]C.uint8_t)(unsafe.Pointer(&ctx.Origin[0]))
-		cctxStorage.gas_price = C.uint64_t(ctx.GasPrice)
-		cctxStorage.timestamp = C.uint64_t(ctx.Timestamp)
-		cctxStorage.number = C.uint64_t(ctx.Number)
-		cctxStorage.prevrandao = *(*[32]C.uint8_t)(unsafe.Pointer(&ctx.Prevrandao[0]))
-		cctxStorage.gas_limit = C.uint64_t(ctx.GasLimit)
-		cctxStorage.chain_id = C.uint64_t(ctx.ChainID)
-		cctxStorage.base_fee = C.uint64_t(ctx.BaseFee)
-		cctxStorage.blob_base_fee = C.uint64_t(ctx.BlobBaseFee)
-		cctxStorage.coinbase = *(*[20]C.uint8_t)(unsafe.Pointer(&ctx.Coinbase[0]))
-		cctxStorage.blob_hashes = *(*[8][32]C.uint8_t)(unsafe.Pointer(&ctx.BlobHashes[0][0]))
-		nbh := ctx.NumBlobHashes
-		if nbh > 8 {
-			nbh = 8
-		}
-		cctxStorage.num_blob_hashes = C.uint32_t(nbh)
-		cctxPtr = &cctxStorage
-	}
-
-	result := C.gpu_execute_block_v3(
-		&ctxs[0],
-		C.uint32_t(len(ctxs)),
-		C.uint8_t(backend),
-		C.uint32_t(numThreads),
-		C.uint8_t(12), // EVM_GPU_REV_CANCUN
-		cctxPtr,
-	)
-	defer C.gpu_free_result_v2(&result)
-	runtime.KeepAlive(ctxs)
-	runtime.KeepAlive(cctxStorage)
-
-	if result.ok == 0 {
-		return nil, fmt.Errorf("cevm: execute_block_v3 failed")
-	}
-	if uint32(result.abi_version) != ABIVersion {
-		return nil, fmt.Errorf("cevm: ABI version mismatch in result (lib=%d expected=%d)",
-			uint32(result.abi_version), ABIVersion)
-	}
-
-	br := &BlockResultV2{
-		GasUsed:      copyU64(result.gas_used, uint32(result.num_txs)),
-		TotalGas:     uint64(result.total_gas),
-		ExecTimeMs:   float64(result.exec_time_ms),
-		Conflicts:    uint32(result.conflicts),
-		ReExecutions: uint32(result.re_executions),
-		ABIVersion:   uint32(result.abi_version),
-	}
-	for i := 0; i < 32; i++ {
-		br.StateRoot[i] = byte(result.state_root[i])
-	}
-	if result.status != nil && result.num_txs > 0 {
-		const maxTxsPerBlock = 1 << 24
-		want := uint32(result.num_txs)
-		if want > maxTxsPerBlock {
-			return nil, fmt.Errorf("cevm: result.num_txs=%d exceeds sanity bound", want)
-		}
-		statSlice := unsafe.Slice((*uint8)(unsafe.Pointer(result.status)), int(want))
-		br.Status = make([]TxStatus, want)
-		for i, s := range statSlice {
-			br.Status[i] = TxStatus(s)
-		}
-	}
-	return br, nil
+	return ExecuteBlock(backend, numThreads, txs, ctx, nil)
 }
 
-// ExecuteBlockV4 runs a block with both an explicit BlockContext and a
-// caller-supplied state snapshot. The snapshot lets the GPU CALL/CREATE
-// path resolve target nonce / balance / code on-device instead of
-// returning CallNotSupported. Pass an empty `state` for V3 semantics.
-//
-// State packing: each StateAccount is copied into a flat C array; account
-// code is concatenated into a single blob and each entry indexes into the
-// blob via (offset, size). The blob and the C account array are kept alive
-// for the duration of the cgo call via runtime.KeepAlive.
-//
-// Thread safety / memory safety: same contract as ExecuteBlockV3.
 // ExecuteBlock is the single canonical entry point for cevm block execution.
 // Takes a state snapshot, runs the block on the chosen backend, returns
 // (gas_used, per-tx status, state_root). One way to dispatch — no version
@@ -766,9 +593,15 @@ func runHealthProbe(b Backend, p healthProbe, isGPU bool) HealthProbeResult {
 		pr.Err = fmt.Errorf("probe %q: 0 gas — kernel did not execute", p.name)
 		return pr
 	}
-	// Call-bridge probe on GPU: any returning status is fine. The point is
-	// that the dispatcher reached the bridge and returned cleanly.
-	if p.callBridge && isGPU {
+	// Call-bridge probe: any returning status is fine on every backend.
+	// CALL/CREATE/DELEGATECALL/STATICCALL/CREATE2 still emit
+	// CallNotSupported across CPU and GPU paths today (V5 kernel work
+	// pending). The probe's purpose is to confirm the dispatcher reached
+	// the bridge and returned cleanly — not to assert successful CALL
+	// execution. Under the old V2 wire shape this hid behind a status
+	// mask; now that the canonical ExecuteBlock surfaces the real kernel
+	// status, the exception is explicit.
+	if p.callBridge {
 		pr.OK = true
 		return pr
 	}
