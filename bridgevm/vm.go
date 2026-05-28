@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
@@ -23,6 +22,7 @@ import (
 	"github.com/luxfi/threshold/pkg/pool"
 	"github.com/luxfi/threshold/protocols/cmp/config"
 	vmcore "github.com/luxfi/vm"
+	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/warp"
 )
 
@@ -188,6 +188,12 @@ type VM struct {
 	// Bridge state
 	pendingBridges map[ids.ID]*BridgeRequest
 	bridgeRegistry *BridgeRegistry
+
+	// Permissionless settlement: authoritative quote engine + swap
+	// state, exposed via bridge_estimateFee / bridge_submitRequest /
+	// bridge_getStatus (see rpc.go).
+	quoteEngine *QuoteEngine
+	swapStore   SwapStore
 
 	// Chain connectivity
 	chainClients map[string]ChainClient
@@ -360,6 +366,12 @@ func (vm *VM) Initialize(
 		CompletedBridges: make(map[ids.ID]*CompletedBridge),
 		DailyVolume:      make(map[string]uint64),
 	}
+
+	// Authoritative quote engine + swap store. The price feed default
+	// seeds the assets the bridge handles at genesis; a future PR adds
+	// a quorum-signed oracle feed without changing the RPC surface.
+	vm.quoteEngine = &QuoteEngine{Feed: defaultPriceFeed()}
+	vm.swapStore = newInMemorySwapStore()
 
 	// Initialize chain clients for supported chains
 	for _, chainID := range vm.config.SupportedChains {
