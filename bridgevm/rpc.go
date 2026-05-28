@@ -5,13 +5,25 @@ package bridgevm
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/gorilla/rpc/v2"
 	"github.com/luxfi/ids"
 )
 
-// Service provides JSON-RPC endpoints for BridgeVM LP-333 signer management
+// Service provides JSON-RPC endpoints for BridgeVM:
+//   - LP-333 signer-set management (RegisterValidator, GetSignerSetInfo, …)
+//   - Permissionless bridge settlement
+//     (EstimateFee, SubmitRequest, GetStatus, CancelRequest, …)
+//
+// Any client that can reach /ext/bc/B/rpc has equal authority — the
+// daemon at cmd/bridge is one such client. There are no privileged
+// methods on this surface; rate-limiting and auth (when desired) are
+// applied at the ingress layer.
 type Service struct {
 	vm *VM
 }
@@ -315,6 +327,227 @@ func (s *Service) SlashSigner(_ *http.Request, args *SlashSignerArgs, reply *Sla
 }
 
 // =============================================================================
+// Permissionless settlement RPC
+// =============================================================================
+
+// EstimateFeeArgs are the bridge_estimateFee request body.
+type EstimateFeeArgs struct {
+	SourceChain string `json:"sourceChain"`
+	DestChain   string `json:"destChain"`
+	SourceAsset string `json:"sourceAsset"`
+	DestAsset   string `json:"destAsset"`
+	Amount      string `json:"amount"`
+	Refuel      bool   `json:"refuel,omitempty"`
+}
+
+// EstimateFeeReply is the bridge_estimateFee response.
+type EstimateFeeReply struct {
+	FeeAmount     string `json:"feeAmount"`
+	NetAmount     string `json:"netAmount"`
+	EstimatedTime int    `json:"estimatedTime"`
+}
+
+// EstimateFee answers bridge_estimateFee. Authoritative settlement
+// math runs in the VM (see quote.go) so the result is what the
+// chain will pay.
+func (s *Service) EstimateFee(_ *http.Request, args *EstimateFeeArgs, reply *EstimateFeeReply) error {
+	if s.vm == nil || s.vm.quoteEngine == nil {
+		return errors.New("bridgevm: quote engine not configured")
+	}
+	amt, err := strconv.ParseFloat(strings.TrimSpace(args.Amount), 64)
+	if err != nil || amt <= 0 {
+		return fmt.Errorf("bridgevm: amount must be a positive number (got %q)", args.Amount)
+	}
+	res, err := s.vm.quoteEngine.Quote(QuoteInput{
+		Amount:             amt,
+		SourceNetwork:      args.SourceChain,
+		SourceAsset:        args.SourceAsset,
+		DestinationNetwork: args.DestChain,
+		DestinationAsset:   args.DestAsset,
+		Refuel:             args.Refuel,
+	})
+	if err != nil {
+		return err
+	}
+	reply.FeeAmount = formatAmount(res.ServiceFee)
+	reply.NetAmount = formatAmount(res.ReceiveAmount)
+	reply.EstimatedTime = res.EstimatedTime
+	return nil
+}
+
+// SubmitRequestArgs is the bridge_submitRequest request body.
+type SubmitRequestArgs struct {
+	SourceChain string `json:"sourceChain"`
+	DestChain   string `json:"destChain"`
+	SourceAsset string `json:"sourceAsset"`
+	DestAsset   string `json:"destAsset"`
+	Amount      string `json:"amount"`
+	Recipient   string `json:"recipient"`
+	Sender      string `json:"sender"`
+	Refuel      bool   `json:"refuel,omitempty"`
+}
+
+// SubmitRequestReply is the bridge_submitRequest response.
+type SubmitRequestReply BridgeRequestRecord
+
+// SubmitRequest creates a new bridge request server-side and snapshots
+// the quote into the record so the daemon's signing pipeline pays out
+// what the chain committed to.
+func (s *Service) SubmitRequest(_ *http.Request, args *SubmitRequestArgs, reply *SubmitRequestReply) error {
+	if s.vm == nil || s.vm.swapStore == nil {
+		return errors.New("bridgevm: swap store not configured")
+	}
+	if args.SourceChain == "" || args.DestChain == "" || args.Recipient == "" {
+		return errors.New("bridgevm: missing required field (sourceChain, destChain, recipient)")
+	}
+	amt, err := strconv.ParseFloat(strings.TrimSpace(args.Amount), 64)
+	if err != nil || amt <= 0 {
+		return fmt.Errorf("bridgevm: amount must be a positive number (got %q)", args.Amount)
+	}
+
+	// Snapshot the quote — chain commits to these economics at create
+	// time so post-create price flapping does not change the payout.
+	res, err := s.vm.quoteEngine.Quote(QuoteInput{
+		Amount:             amt,
+		SourceNetwork:      args.SourceChain,
+		SourceAsset:        args.SourceAsset,
+		DestinationNetwork: args.DestChain,
+		DestinationAsset:   args.DestAsset,
+		Refuel:             args.Refuel,
+	})
+	if err != nil {
+		return err
+	}
+
+	rec := &BridgeRequestRecord{
+		SourceChain: args.SourceChain,
+		DestChain:   args.DestChain,
+		SourceAsset: args.SourceAsset,
+		DestAsset:   args.DestAsset,
+		Amount:      strings.TrimSpace(args.Amount),
+		Recipient:   args.Recipient,
+		Sender:      args.Sender,
+		Status:      StatusPending,
+		FeeAmount:   formatAmount(res.ServiceFee),
+		NetAmount:   formatAmount(res.ReceiveAmount),
+	}
+	if err := s.vm.swapStore.Put(rec); err != nil {
+		return err
+	}
+	*reply = SubmitRequestReply(*rec)
+	return nil
+}
+
+// GetStatusArgs is the bridge_getStatus request body.
+type GetStatusArgs struct {
+	RequestID string `json:"requestId"`
+}
+
+// GetStatusReply is the bridge_getStatus response.
+type GetStatusReply BridgeRequestRecord
+
+// GetStatus answers bridge_getStatus from the authoritative swap store.
+func (s *Service) GetStatus(_ *http.Request, args *GetStatusArgs, reply *GetStatusReply) error {
+	if s.vm == nil || s.vm.swapStore == nil {
+		return errors.New("bridgevm: swap store not configured")
+	}
+	rec, err := s.vm.swapStore.Get(args.RequestID)
+	if err != nil {
+		return err
+	}
+	*reply = GetStatusReply(*rec)
+	return nil
+}
+
+// CancelRequestArgs is the bridge_cancelRequest request body.
+type CancelRequestArgs struct {
+	RequestID string `json:"requestId"`
+}
+
+// CancelRequestReply is the bridge_cancelRequest response.
+type CancelRequestReply struct {
+	Success bool `json:"success"`
+}
+
+// CancelRequest answers bridge_cancelRequest. Idempotent — cancelling
+// an already-terminal swap is a no-op success so retries are safe.
+func (s *Service) CancelRequest(_ *http.Request, args *CancelRequestArgs, reply *CancelRequestReply) error {
+	if s.vm == nil || s.vm.swapStore == nil {
+		return errors.New("bridgevm: swap store not configured")
+	}
+	rec, err := s.vm.swapStore.Get(args.RequestID)
+	if err != nil {
+		return err
+	}
+	if rec.Status == StatusCompleted ||
+		rec.Status == StatusFailed ||
+		rec.Status == StatusCancelled {
+		reply.Success = true
+		return nil
+	}
+	if _, err := s.vm.swapStore.Patch(args.RequestID, func(r *BridgeRequestRecord) {
+		r.Status = StatusCancelled
+	}); err != nil {
+		return err
+	}
+	reply.Success = true
+	return nil
+}
+
+// HealthArgs are empty (no params).
+type HealthArgs struct{}
+
+// HealthReply is the bridge_health response.
+type HealthReply struct {
+	Status   string `json:"status"`
+	MPCReady bool   `json:"mpcReady"`
+}
+
+// Health answers bridge_health. Liveness probe used by daemons + load
+// balancers before routing traffic at this node.
+func (s *Service) Health(_ *http.Request, _ *HealthArgs, reply *HealthReply) error {
+	reply.Status = "healthy"
+	if s.vm != nil && s.vm.mpcKeyManager != nil {
+		reply.MPCReady = len(s.vm.mpcKeyManager.GetGroupPublicKey()) > 0
+	}
+	return nil
+}
+
+// GetMPCPublicKeyArgs are empty.
+type GetMPCPublicKeyArgs struct{}
+
+// GetMPCPublicKeyReply is the bridge_getMPCPublicKey response.
+type GetMPCPublicKeyReply struct {
+	PublicKey string `json:"publicKey"`
+}
+
+// GetMPCPublicKey answers bridge_getMPCPublicKey with the active
+// threshold-signing group public key.
+func (s *Service) GetMPCPublicKey(_ *http.Request, _ *GetMPCPublicKeyArgs, reply *GetMPCPublicKeyReply) error {
+	if s.vm == nil || s.vm.mpcKeyManager == nil {
+		return errors.New("bridgevm: MPC key manager not configured")
+	}
+	key := s.vm.mpcKeyManager.GetGroupPublicKey()
+	if len(key) == 0 {
+		return errors.New("bridgevm: group public key not yet established")
+	}
+	reply.PublicKey = hexEncode(key)
+	return nil
+}
+
+// hexEncode formats a byte slice as lowercase hex (no 0x prefix), the
+// canonical JSON-RPC encoding for raw MPC bytes.
+func hexEncode(b []byte) string {
+	const hexChars = "0123456789abcdef"
+	out := make([]byte, len(b)*2)
+	for i, v := range b {
+		out[i*2] = hexChars[v>>4]
+		out[i*2+1] = hexChars[v&0x0f]
+	}
+	return string(out)
+}
+
+// =============================================================================
 // HTTP Handler Integration
 // =============================================================================
 
@@ -429,13 +662,66 @@ func (h *jsonRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		err = h.service.SlashSigner(r, &args, &reply)
 		result = reply
 
+	case "bridge_estimateFee", "bridge.estimateFee":
+		var args EstimateFeeArgs
+		if err := json.Unmarshal(req.Params, &args); err != nil {
+			h.writeError(w, req.ID, -32602, "invalid params", err)
+			return
+		}
+		var reply EstimateFeeReply
+		err = h.service.EstimateFee(r, &args, &reply)
+		result = reply
+
+	case "bridge_submitRequest", "bridge.submitRequest":
+		var args SubmitRequestArgs
+		if err := json.Unmarshal(req.Params, &args); err != nil {
+			h.writeError(w, req.ID, -32602, "invalid params", err)
+			return
+		}
+		var reply SubmitRequestReply
+		err = h.service.SubmitRequest(r, &args, &reply)
+		result = reply
+
+	case "bridge_getStatus", "bridge.getStatus":
+		var args GetStatusArgs
+		if err := json.Unmarshal(req.Params, &args); err != nil {
+			h.writeError(w, req.ID, -32602, "invalid params", err)
+			return
+		}
+		var reply GetStatusReply
+		err = h.service.GetStatus(r, &args, &reply)
+		result = reply
+
+	case "bridge_cancelRequest", "bridge.cancelRequest":
+		var args CancelRequestArgs
+		if err := json.Unmarshal(req.Params, &args); err != nil {
+			h.writeError(w, req.ID, -32602, "invalid params", err)
+			return
+		}
+		var reply CancelRequestReply
+		err = h.service.CancelRequest(r, &args, &reply)
+		result = reply
+
+	case "bridge_health", "bridge.health":
+		var reply HealthReply
+		err = h.service.Health(r, &HealthArgs{}, &reply)
+		result = reply
+
+	case "bridge_getMPCPublicKey", "bridge.getMPCPublicKey":
+		var reply GetMPCPublicKeyReply
+		err = h.service.GetMPCPublicKey(r, &GetMPCPublicKeyArgs{}, &reply)
+		result = reply
+
 	default:
 		h.writeError(w, req.ID, -32601, "method not found", nil)
 		return
 	}
 
 	if err != nil {
-		h.writeError(w, req.ID, -32000, "server error", err)
+		// Surface the actual error in the message so callers can
+		// dispatch on it (e.g. "swap not found" vs "price unknown")
+		// rather than parsing the opaque `data` envelope.
+		h.writeError(w, req.ID, -32000, err.Error(), nil)
 		return
 	}
 
