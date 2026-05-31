@@ -535,6 +535,192 @@ func (s *Service) GetMPCPublicKey(_ *http.Request, _ *GetMPCPublicKeyArgs, reply
 	return nil
 }
 
+// =============================================================================
+// Discovery: bridge_getInfo / bridge_getSupportedChains / bridge_getChainConfig
+// =============================================================================
+//
+// These four methods close the gap between the daemon's bchain client
+// (internal/bchain.Client) and the VM-side authoritative surface. Before
+// them, the daemon called bridge_estimateFee/submitRequest/getStatus/
+// cancelRequest/health/getMPCPublicKey directly against this RPC but
+// fell back to its own assumed values for info/supported-chains/chain-
+// config/signature lookups — a centralization vector if the daemon's
+// cached view drifted from chain consensus.
+//
+// All four are read-only: they answer from VM state (config + registry
+// + swapStore) and never mutate anything. Cancellable via the caller's
+// HTTP timeout — these handlers never block on consensus.
+
+// GetBridgeInfoArgs are empty.
+type GetBridgeInfoArgs struct{}
+
+// GetBridgeInfoReply is bridge_getInfo's response. Mirrors the wire shape
+// the daemon's bchain.BridgeInfo decodes.
+type GetBridgeInfoReply struct {
+	Version         string   `json:"version"`
+	NodeID          string   `json:"nodeId"`
+	ChainID         string   `json:"chainId"`
+	MPCReady        bool     `json:"mpcReady"`
+	MPCPublicKey    string   `json:"mpcPublicKey"`
+	Threshold       int      `json:"threshold"`
+	TotalParties    int      `json:"totalParties"`
+	SupportedChains []string `json:"supportedChains"`
+	TotalBridged    string   `json:"totalBridged"`
+	TotalFees       string   `json:"totalFees"`
+}
+
+// GetBridgeInfo answers bridge_getInfo. Read-only snapshot of node-level
+// bridge state for dashboards + daemon discovery. Authoritative — no
+// daemon-cached fallback. When MPC has not generated a group key the
+// MPCPublicKey field is empty (not an error) so callers can render
+// "MPC pending" without dispatching on an error code.
+func (s *Service) GetBridgeInfo(_ *http.Request, _ *GetBridgeInfoArgs, reply *GetBridgeInfoReply) error {
+	if s.vm == nil {
+		return errors.New("bridgevm: VM not initialized")
+	}
+	reply.Version = Version.String()
+	if s.vm.rt != nil {
+		reply.NodeID = s.vm.rt.NodeID.String()
+	}
+	reply.ChainID = "B"
+	if s.vm.mpcKeyManager != nil {
+		key := s.vm.mpcKeyManager.GetGroupPublicKey()
+		reply.MPCReady = len(key) > 0
+		if reply.MPCReady {
+			reply.MPCPublicKey = hexEncode(key)
+		}
+	}
+	reply.Threshold = s.vm.config.MPCThreshold
+	reply.TotalParties = s.vm.config.MPCTotalParties
+	reply.SupportedChains = append([]string(nil), s.vm.config.SupportedChains...)
+
+	// Aggregate totals from the registry. Stringified so the daemon's
+	// bigint-safe decode (parseAmount) consumes them directly.
+	var totalBridged uint64
+	if s.vm.bridgeRegistry != nil {
+		s.vm.bridgeRegistry.mu.RLock()
+		for _, v := range s.vm.bridgeRegistry.Validators {
+			totalBridged += v.TotalBridged
+		}
+		s.vm.bridgeRegistry.mu.RUnlock()
+	}
+	reply.TotalBridged = strconv.FormatUint(totalBridged, 10)
+	// TotalFees is not tracked in registry yet; expose 0 explicitly so
+	// the daemon's JSON decode doesn't surface an "empty result" error.
+	reply.TotalFees = "0"
+	return nil
+}
+
+// GetSupportedChainsArgs are empty.
+type GetSupportedChainsArgs struct{}
+
+// GetSupportedChainsReply is the bridge_getSupportedChains response —
+// the list of ChainConfig snapshots the VM is configured to bridge.
+type GetSupportedChainsReply struct {
+	Chains []ChainConfigReply `json:"chains"`
+}
+
+// ChainConfigReply is one chain's bridge config (wire-stable; matches
+// bchain.ChainConfig).
+type ChainConfigReply struct {
+	ChainID        string            `json:"chainId"`
+	ChainName      string            `json:"chainName"`
+	RPCEndpoint    string            `json:"rpcEndpoint"`
+	BridgeContract string            `json:"bridgeContract"`
+	TokenContracts map[string]string `json:"tokenContracts"`
+	NativeCurrency string            `json:"nativeCurrency"`
+	BlockTime      int               `json:"blockTime"`
+	Confirmations  int               `json:"confirmations"`
+	Enabled        bool              `json:"enabled"`
+}
+
+// GetSupportedChains answers bridge_getSupportedChains. The VM's
+// SupportedChains config drives the result; per-chain RPC endpoints /
+// token contracts are not yet stored chain-side, so we surface the
+// minimal stable shape (ChainID + Enabled) and leave the optional
+// fields empty. The daemon already treats those as informational.
+func (s *Service) GetSupportedChains(_ *http.Request, _ *GetSupportedChainsArgs, reply *GetSupportedChainsReply) error {
+	if s.vm == nil {
+		return errors.New("bridgevm: VM not initialized")
+	}
+	out := make([]ChainConfigReply, 0, len(s.vm.config.SupportedChains))
+	for _, id := range s.vm.config.SupportedChains {
+		out = append(out, ChainConfigReply{
+			ChainID:       id,
+			ChainName:     id,
+			Confirmations: int(s.vm.config.MinConfirmations),
+			Enabled:       true,
+		})
+	}
+	reply.Chains = out
+	return nil
+}
+
+// GetChainConfigArgs is the bridge_getChainConfig request body.
+type GetChainConfigArgs struct {
+	ChainID string `json:"chainId"`
+}
+
+// GetChainConfigReply is the bridge_getChainConfig response.
+type GetChainConfigReply ChainConfigReply
+
+// GetChainConfig answers bridge_getChainConfig for one chain. Returns
+// an explicit error when the chain isn't in the SupportedChains set so
+// callers can distinguish "unknown chain" from "RPC mis-routed".
+func (s *Service) GetChainConfig(_ *http.Request, args *GetChainConfigArgs, reply *GetChainConfigReply) error {
+	if s.vm == nil {
+		return errors.New("bridgevm: VM not initialized")
+	}
+	want := strings.TrimSpace(args.ChainID)
+	if want == "" {
+		return errors.New("bridgevm: chainId required")
+	}
+	for _, id := range s.vm.config.SupportedChains {
+		if strings.EqualFold(id, want) {
+			*reply = GetChainConfigReply{
+				ChainID:       id,
+				ChainName:     id,
+				Confirmations: int(s.vm.config.MinConfirmations),
+				Enabled:       true,
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("bridgevm: chain %q not in supportedChains", want)
+}
+
+// GetSignatureArgs is the bridge_getSignature request body.
+type GetSignatureArgs struct {
+	RequestID string `json:"requestId"`
+}
+
+// GetSignatureReply is the bridge_getSignature response.
+type GetSignatureReply struct {
+	Signature string `json:"signature"`
+	SessionID string `json:"sessionId,omitempty"`
+}
+
+// GetSignature answers bridge_getSignature. The signature lives on the
+// BridgeRequestRecord (populated by the MPC signing pipeline once the
+// threshold quorum aggregates shares). Returns an error when the swap
+// exists but the signature is not yet available so callers can poll
+// without conflating "no such swap" with "still signing".
+func (s *Service) GetSignature(_ *http.Request, args *GetSignatureArgs, reply *GetSignatureReply) error {
+	if s.vm == nil || s.vm.swapStore == nil {
+		return errors.New("bridgevm: swap store not configured")
+	}
+	rec, err := s.vm.swapStore.Get(strings.TrimSpace(args.RequestID))
+	if err != nil {
+		return err
+	}
+	if rec.Signature == "" {
+		return fmt.Errorf("bridgevm: signature not yet available for %s (status=%s)", rec.RequestID, rec.Status)
+	}
+	reply.Signature = rec.Signature
+	reply.SessionID = rec.RequestID
+	return nil
+}
+
 // hexEncode formats a byte slice as lowercase hex (no 0x prefix), the
 // canonical JSON-RPC encoding for raw MPC bytes.
 func hexEncode(b []byte) string {
@@ -710,6 +896,36 @@ func (h *jsonRPCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "bridge_getMPCPublicKey", "bridge.getMPCPublicKey":
 		var reply GetMPCPublicKeyReply
 		err = h.service.GetMPCPublicKey(r, &GetMPCPublicKeyArgs{}, &reply)
+		result = reply
+
+	case "bridge_getInfo", "bridge.getInfo":
+		var reply GetBridgeInfoReply
+		err = h.service.GetBridgeInfo(r, &GetBridgeInfoArgs{}, &reply)
+		result = reply
+
+	case "bridge_getSupportedChains", "bridge.getSupportedChains":
+		var reply GetSupportedChainsReply
+		err = h.service.GetSupportedChains(r, &GetSupportedChainsArgs{}, &reply)
+		result = reply
+
+	case "bridge_getChainConfig", "bridge.getChainConfig":
+		var args GetChainConfigArgs
+		if err := json.Unmarshal(req.Params, &args); err != nil {
+			h.writeError(w, req.ID, -32602, "invalid params", err)
+			return
+		}
+		var reply GetChainConfigReply
+		err = h.service.GetChainConfig(r, &args, &reply)
+		result = reply
+
+	case "bridge_getSignature", "bridge.getSignature":
+		var args GetSignatureArgs
+		if err := json.Unmarshal(req.Params, &args); err != nil {
+			h.writeError(w, req.ID, -32602, "invalid params", err)
+			return
+		}
+		var reply GetSignatureReply
+		err = h.service.GetSignature(r, &args, &reply)
 		result = reply
 
 	default:
