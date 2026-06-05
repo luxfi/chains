@@ -16,7 +16,7 @@
 //
 // Host launcher ABI — exposed by every plugin under the per-backend
 // symbol prefix `lux_<backend>_*`. The C signatures come straight from
-// the GPU plugin install tree backends/{metal/src/dex_launchers.mm,
+// the GPU plugin backends/{metal/src/dex_launchers.mm,
 // vulkan/src/dex_launchers.cpp}:
 //
 //   int amm_xyk_batch(const void* reserves, const void* amounts,
@@ -343,10 +343,17 @@ func activeGPU() (*gpuHandle, error) {
 //	outs[i] = (amounts[i] * reserves[i].ReserveY)
 //	       / (reserves[i].ReserveX + amounts[i])
 //
-// Byte-equal across all five GPU backends and to the CPU oracle at
+// Byte-equal across all five GPU backends, the pure-Go reference in
+// dexvm_gpu_cpu.go::ammSwapCPU, and the canonical OSS oracle at
 // ~/work/lux/dex/pkg/lx::ConstantProductOut. Slices must be the same
 // length; a length mismatch is a caller bug (returns an error rather
 // than panicking).
+//
+// Dispatch policy: try the loaded GPU plugin first; if none is
+// loaded (init() found no dylib) OR the plugin returns rc != 0 mid-
+// batch, fall through to ammSwapCPU. The fallback produces byte-
+// identical output, so a node with no GPU produces the same
+// consensus state as one with a GPU.
 //
 // Memory safety: every passed Go slice is pinned with runtime.Pinner
 // for the duration of the C call. The pinner is unpinned via defer
@@ -354,19 +361,23 @@ func activeGPU() (*gpuHandle, error) {
 // keeps the slices reachable until C returns even if the compiler
 // sees no further Go-side reference.
 func AMMSwap(reserves []LuxAmmReservePair, amounts []uint64) ([]uint64, error) {
-	h, err := activeGPU()
-	if err != nil {
-		return nil, err
-	}
 	if len(reserves) != len(amounts) {
 		return nil, fmt.Errorf("dexvm.AMMSwap: reserves (n=%d) != amounts (n=%d)",
 			len(reserves), len(amounts))
 	}
 	n := len(reserves)
-	outs := make([]uint64, n)
 	if n == 0 {
-		return outs, nil
+		return []uint64{}, nil
 	}
+
+	h, err := activeGPU()
+	if err != nil {
+		// No plugin loaded — pure-Go path. Byte-equal to the GPU
+		// kernel's CPU oracle by construction.
+		return ammSwapCPU(reserves, amounts)
+	}
+
+	outs := make([]uint64, n)
 
 	var pinner runtime.Pinner
 	defer pinner.Unpin()
@@ -385,56 +396,92 @@ func AMMSwap(reserves []LuxAmmReservePair, amounts []uint64) ([]uint64, error) {
 	runtime.KeepAlive(amounts)
 	runtime.KeepAlive(outs)
 	if rc != 0 {
-		return nil, fmt.Errorf("dexvm.AMMSwap: %s plugin returned rc=%d",
-			h.backend, int(rc))
+		// Plugin failed mid-batch — drop to CPU so the caller still
+		// gets a consistent answer. A persistent non-zero rc means a
+		// real plugin bug (the dispatch interface is rc=0 on success
+		// for every backend); the CPU fallback keeps the dexvm
+		// transition deterministic while operators investigate.
+		return ammSwapCPU(reserves, amounts)
 	}
 	return outs, nil
 }
 
-// CLOBArena is the opaque handle to a device-resident BookArena. The
-// pointer crosses the cgo boundary as void* — Go never dereferences
-// it, only passes it to ArenaDestroy or CLOBMatch.
+// CLOBArena is the opaque handle to a BookArena. Under cgo two storage
+// modes coexist behind the same Go type:
+//
+//   - When a GPU plugin is loaded at init(), ArenaCreate allocates a
+//     device-resident BookArena via the plugin's create call and
+//     stores the void* in ptr. CLOBMatch passes ptr straight through
+//     to the plugin, which mutates the device arena in place; the
+//     Go side never dereferences ptr.
+//
+//   - When no plugin loaded (or ArenaCreate's plugin call returned
+//     rc != 0 / NULL), the bridge transparently allocates a Go-side
+//     arena (cpu) and CLOBMatch runs the pure-Go matcher from
+//     dexvm_gpu_cpu.go. Output is byte-equal to the kernel.
+//
+// Exactly one of (ptr, cpu) is non-nil for any live arena. The two
+// modes never mix on the same arena — once an arena is created in one
+// mode, every subsequent CLOBMatch on it uses that mode. This keeps
+// the host BookArena and device BookArena from drifting on a node
+// that fails GPU dispatch mid-life.
 //
 // ArenaCreate hands ownership to the Go caller; ArenaDestroy releases
 // it. The arena lives across many CLOBMatch calls — that's the
-// entire reason it's device-resident: the BookArena holds the
-// resting bids/asks for a single book, and successive CLOBMatch
-// calls on the same book MUST share state.
+// entire reason it's stateful: the BookArena holds the resting
+// bids/asks for a single book, and successive CLOBMatch calls on the
+// same book MUST share state.
 type CLOBArena struct {
-	ptr unsafe.Pointer
+	ptr unsafe.Pointer // device-resident arena (GPU mode); nil in CPU mode
+	cpu *clobArenaCPU  // Go-side arena (CPU mode); nil in GPU mode
 }
 
-// ArenaCreate allocates a fresh device-resident BookArena (zero
-// initialized). The returned handle is owned by the caller; call
-// ArenaDestroy to free it. Concurrent ArenaCreate is safe.
+// ArenaCreate allocates a fresh BookArena. Returns a device-resident
+// arena when a GPU plugin is loaded and the plugin's create call
+// succeeds; otherwise falls back to a Go-side arena. Concurrent
+// ArenaCreate is safe (each call returns an independent arena).
 func ArenaCreate() (*CLOBArena, error) {
 	h, err := activeGPU()
 	if err != nil {
-		return nil, err
+		// No plugin — Go-side arena.
+		return &CLOBArena{cpu: &clobArenaCPU{}}, nil
 	}
 	var raw unsafe.Pointer
 	rc := C.call_dex_clob_arena_create(h.fnArenaCreate, &raw)
-	if rc != 0 {
-		return nil, fmt.Errorf("dexvm.ArenaCreate: %s plugin returned rc=%d",
-			h.backend, int(rc))
-	}
-	if raw == nil {
-		return nil, fmt.Errorf("dexvm.ArenaCreate: %s plugin returned NULL arena",
-			h.backend)
+	if rc != 0 || raw == nil {
+		// Plugin couldn't allocate — fall back to Go-side arena so the
+		// dexvm transition isn't blocked by a transient device failure.
+		// Subsequent CLOBMatch on this arena will use the CPU path,
+		// keeping the BookArena consistent with the matcher that
+		// mutates it.
+		return &CLOBArena{cpu: &clobArenaCPU{}}, nil
 	}
 	return &CLOBArena{ptr: raw}, nil
 }
 
-// ArenaDestroy releases the device-resident BookArena. Calling it on
-// a nil arena is a no-op (matches the C-side symmetry). Calling it
-// twice on the same arena is UB at the plugin level — don't.
+// ArenaDestroy releases the BookArena. A nil arena is a no-op (matches
+// the C-side symmetry). Calling ArenaDestroy twice on the same arena
+// is safe: the second call sees a cleared (ptr, cpu) pair and returns
+// cleanly. UB at the plugin level for double-destroy is avoided by
+// nilling the ptr after the first destroy.
 func ArenaDestroy(a *CLOBArena) error {
-	if a == nil || a.ptr == nil {
+	if a == nil {
+		return nil
+	}
+	if a.cpu != nil {
+		a.cpu = nil
+		return nil
+	}
+	if a.ptr == nil {
 		return nil
 	}
 	h, err := activeGPU()
 	if err != nil {
-		return err
+		// Plugin disappeared between create and destroy (e.g. dylib
+		// unloaded by an out-of-process operator). The device arena
+		// is unreachable; drop the pointer so the handle is inert.
+		a.ptr = nil
+		return nil
 	}
 	rc := C.call_dex_clob_arena_destroy(h.fnArenaDestroy, a.ptr)
 	a.ptr = nil
@@ -451,20 +498,42 @@ func ArenaDestroy(a *CLOBArena) error {
 // num_fills) plus a num_fills uint32 mirror for callers that want it
 // without re-parsing the 68 bytes.
 //
-// Single matcher pass per call; concurrency is across book_ids — each
-// book gets its own arena, and independent arenas can be matched in
-// parallel on different goroutines without serialization.
+// Dispatch policy mirrors AMMSwap:
+//
+//   - CPU-arena: route to clobMatchCPU directly. The Go matcher is
+//     byte-equal to the kernel's CPU oracle.
+//   - GPU-arena: try the plugin; on rc != 0, return the error (we
+//     can't fall back to CPU here because the device-side arena
+//     would diverge from any Go-side mirror — the arena IS the state).
+//
+// Single matcher pass per call. Concurrency is per-arena: different
+// arenas (i.e. different book_ids) can be matched in parallel on
+// different goroutines without serialization. The Go arena's
+// per-arena mutex (and the plugin's per-arena stream) serialise
+// concurrent calls on the same arena.
 func CLOBMatch(a *CLOBArena, calldata []byte) (out [LuxCLOBOutLen]byte, numFills uint32, err error) {
-	h, gerr := activeGPU()
-	if gerr != nil {
-		return out, 0, gerr
-	}
-	if a == nil || a.ptr == nil {
+	if a == nil || (a.ptr == nil && a.cpu == nil) {
 		return out, 0, fmt.Errorf("dexvm.CLOBMatch: arena is nil")
 	}
 	if len(calldata) != LuxCLOBCalldataLen {
 		return out, 0, fmt.Errorf("dexvm.CLOBMatch: calldata len=%d, want %d",
 			len(calldata), LuxCLOBCalldataLen)
+	}
+
+	// CPU-arena: pure-Go matcher. Same path the nocgo build uses.
+	if a.cpu != nil {
+		return clobMatchCPU(a.cpu, calldata)
+	}
+
+	// GPU-arena: plugin call.
+	h, gerr := activeGPU()
+	if gerr != nil {
+		// Plugin disappeared between create and now — no safe fallback
+		// because the resting state is in device memory we can no
+		// longer reach. The caller surface this as a hard error;
+		// telemetry should pin GPUPluginPath() to find the missing
+		// plugin and a restart will re-init() onto the CPU path.
+		return out, 0, gerr
 	}
 
 	var pinner runtime.Pinner

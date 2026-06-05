@@ -43,7 +43,7 @@ func constantProductOutCPU(rx, ry, amount uint64) uint64 {
 // compares the kernel output to the CPU oracle.
 //
 // To run: build the plugin (e.g. via cmake at
-// the GPU plugin build tree ) and set
+// the GPU plugin dev tree ) and set
 //
 //	export LUX_GPU_PLUGIN_DIR=/path/to/dir/containing/libluxgpu_backend_metal.dylib
 //	go test -tags cgo ./dexvm/ -run TestGPUAMMSwapRoundTrip -v
@@ -100,16 +100,14 @@ func TestGPUAMMSwapRoundTrip(t *testing.T) {
 }
 
 // TestGPUAMMSwapEmpty verifies the n=0 fast path — no plugin call,
-// just a zero-length slice. Runs regardless of whether a plugin is
-// loaded so the bookkeeping path stays covered on CPU-only hosts.
+// just a zero-length slice. The same expectation holds whether or
+// not a GPU plugin is loaded: with the pure-Go fallback in
+// dexvm_gpu_cpu.go, an empty input is a legal no-op on every path.
+// Previously this test required ErrGPUNotAvailable when no plugin
+// loaded; the dispatch policy now falls through to ammSwapCPU on
+// that branch, and ammSwapCPU on n=0 is just `return []uint64{}, nil`.
 func TestGPUAMMSwapEmpty(t *testing.T) {
 	outs, err := AMMSwap(nil, nil)
-	if AutoBackend() == GPUBackendNone {
-		if err != ErrGPUNotAvailable {
-			t.Fatalf("AMMSwap on n=0 with no plugin: got err=%v, want ErrGPUNotAvailable", err)
-		}
-		return
-	}
 	if err != nil {
 		t.Fatalf("AMMSwap(nil, nil): %v", err)
 	}
