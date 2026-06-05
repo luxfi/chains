@@ -3,51 +3,73 @@
 
 //go:build !cgo
 
-// dexvm_gpu_nocgo.go — nocgo stub for the GPU plugin bridge.
+// dexvm_gpu_nocgo.go — !cgo build of the GPU plugin bridge.
 //
-// When CGO_ENABLED=0 the dlopen path in dexvm_gpu.go is unreachable,
-// so every public method returns ErrGPUNotAvailable and AutoBackend()
-// reports GPUBackendNone. The package surface is identical to the
-// cgo build — consumers compile unconditionally and branch on
-// AutoBackend() at runtime.
+// CGO_ENABLED=0 means dlopen is unreachable, so no plugin can ever
+// load here. Every public function routes straight into the pure-Go
+// reference implementation in dexvm_gpu_cpu.go. Output is byte-
+// identical to the kernel's CPU oracle, so a node built with
+// CGO_ENABLED=0 still produces consensus-safe AMM/CLOB results — it
+// just doesn't get GPU acceleration.
+//
+// AutoBackend() still reports GPUBackendNone here. Callers that
+// branch on AutoBackend() for telemetry ("which backend is hot?")
+// keep working; callers that branch on it for *correctness* were
+// already wrong, because the cgo build's CPU fallback path lives
+// under the same backend tag.
 
 package dexvm
 
-// AutoBackend reports GPUBackendNone under !cgo — dlopen is unreachable.
+import "fmt"
+
+// AutoBackend reports GPUBackendNone under !cgo — no plugin is
+// loaded, the Go CPU path serves the same surface.
 func AutoBackend() GPUBackend { return GPUBackendNone }
 
 // GPUPluginPath returns "" under !cgo — no plugin was loaded.
 func GPUPluginPath() string { return "" }
 
-// CLOBArena is a zero-sized opaque type so the package surface
-// compiles uniformly under both build tags. The nocgo build never
-// returns a non-nil arena from ArenaCreate.
-type CLOBArena struct{}
+// CLOBArena is the public handle; the !cgo build holds the Go-side
+// arena directly. Symmetric with the cgo build's CLOBArena (which
+// holds the device pointer + a Go-side mirror for fallback).
+type CLOBArena struct {
+	cpu *clobArenaCPU
+}
 
-// AMMSwap returns ErrGPUNotAvailable under !cgo.
+// AMMSwap evaluates the xy=k swap formula per pool. Routes straight
+// into the pure-Go reference — see ammSwapCPU. Byte-equal to the
+// canonical Go reference at lx.BatchEvalConstantProductCPU and to
+// every GPU backend's kernel.
 func AMMSwap(reserves []LuxAmmReservePair, amounts []uint64) ([]uint64, error) {
-	_ = reserves
-	_ = amounts
-	return nil, ErrGPUNotAvailable
+	return ammSwapCPU(reserves, amounts)
 }
 
-// ArenaCreate returns ErrGPUNotAvailable under !cgo.
+// ArenaCreate allocates a fresh CPU-side BookArena. Returns a handle
+// the caller passes to CLOBMatch / ArenaDestroy. Concurrent calls are
+// safe — each arena is independent.
 func ArenaCreate() (*CLOBArena, error) {
-	return nil, ErrGPUNotAvailable
+	return &CLOBArena{cpu: &clobArenaCPU{}}, nil
 }
 
-// ArenaDestroy returns ErrGPUNotAvailable under !cgo. A nil arena is
-// still a no-op for symmetry with the cgo build.
+// ArenaDestroy releases the arena. A nil arena is a no-op (matches
+// the cgo build's C-side symmetry). A double-destroy is also safe
+// — the second call sees the nil inner pointer and returns cleanly.
 func ArenaDestroy(a *CLOBArena) error {
 	if a == nil {
 		return nil
 	}
-	return ErrGPUNotAvailable
+	a.cpu = nil
+	return nil
 }
 
-// CLOBMatch returns ErrGPUNotAvailable under !cgo.
+// CLOBMatch runs one matcher step on the arena. Routes straight into
+// the pure-Go reference — see clobMatchCPU. A nil arena (or an arena
+// already passed through ArenaDestroy) returns the same "arena is nil"
+// error string as the cgo bridge's nil-arena guard, so callers can
+// build a single err == nil branch that works under both build modes.
 func CLOBMatch(a *CLOBArena, calldata []byte) (out [LuxCLOBOutLen]byte, numFills uint32, err error) {
-	_ = a
-	_ = calldata
-	return out, 0, ErrGPUNotAvailable
+	if a == nil || a.cpu == nil {
+		return out, 0, fmt.Errorf("dexvm.CLOBMatch: arena is nil")
+	}
+	return clobMatchCPU(a.cpu, calldata)
 }
