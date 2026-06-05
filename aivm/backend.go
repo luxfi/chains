@@ -94,7 +94,7 @@ func candidatePaths(c backendCandidate) []string {
 		)
 	}
 	if dir := os.Getenv("LUX_GPU_PLUGIN_DIR"); dir != "" {
-		// Match the on-disk layout shipped by the GPU plugin install tree:
+		// Match the on-disk layout shipped by the GPU plugin:
 		// `build/backends/<kind>/<filename>` from the default CMake build,
 		// plus the per-flavor subdirs the kernel team uses for matrix
 		// builds (metal-only, vulkan-m1, …).

@@ -6,7 +6,7 @@ package bridgevm
 // BridgeVM GPU substrate — host-side ABI for the five BridgeVM kernels
 // (signer_apply, liquidity_apply, message_inbox, message_outbox, transition).
 //
-// The kernels live in the GPU plugin install tree under
+// The kernels live in the GPU plugin under
 // ops/bridgevm/<backend>/ + backends/<backend>/src/bridgevm_launchers.{cpp,mm}
 // and are shipped inside the plugin shared libraries libluxgpu_backend_<x>.so /
 // .dylib. The Go side dlopens whichever plugin is on disk at process start
