@@ -415,90 +415,25 @@ func setActiveGPU(b *gpuBackend) {
 }
 
 // ActiveGPUBackend returns the package-level GPUBackend handle. Under
-// cgo this is the *gpuBackend chosen by init()'s probe, or a sentinel
-// noGPUBackend stub when no plugin loaded. The returned handle's
-// methods are safe to call from any goroutine — every vtbl call
-// holds the backend mutex.
+// cgo this is the *gpuBackend chosen by init()'s probe, or the shared
+// cpuBackend (defined in quantumvm_gpu_cpu.go) when no plugin loaded.
+// The returned handle's methods are safe to call from any goroutine —
+// every vtbl call holds the backend mutex.
+//
+// gpuBackend.MLDSAVerifyBatch / MLDSASignBatch / SLHDSAVerifyBatch all
+// route to the same cpuBackend helpers on any GPU-side error, so the
+// caller never has to maintain a parallel CPU fallback. The GPU is a
+// strict positive overlay: when it's there and the slot accepts the
+// input, callers get acceleration; otherwise they get the FIPS 204/205
+// pure-Go reference.
 func ActiveGPUBackend() GPUBackend {
 	activeGPUMu.RLock()
 	b := activeGPU
 	activeGPUMu.RUnlock()
 	if b == nil {
-		return noGPUBackend{}
+		return cpuBackend{}
 	}
 	return b
-}
-
-// noGPUBackend is the cgo build's stub for the "no plugin loaded" case.
-// Distinct from the !cgo noGPUBackend so the !cgo file can ship without
-// any cgo machinery; same method semantics.
-type noGPUBackend struct{}
-
-func (noGPUBackend) Backend() Backend { return BackendNone }
-
-func (noGPUBackend) Close() error { return nil }
-
-func (noGPUBackend) MLDSAVerifyBatch(
-	mode MLDSAMode,
-	pubkeys [][]byte,
-	messages [][]byte,
-	msgLens []int,
-	msgWidthHint uint32,
-	signatures [][]byte,
-	results []bool,
-) error {
-	_ = mode
-	_ = messages
-	_ = msgLens
-	_ = msgWidthHint
-	_ = signatures
-	_ = results
-	if len(pubkeys) == 0 {
-		return nil
-	}
-	return ErrGPUNotAvailable
-}
-
-func (noGPUBackend) MLDSASignBatch(
-	mode MLDSAMode,
-	skeys []byte,
-	msgs []byte,
-	msgLens []int,
-	msgWidthHint uint32,
-	count int,
-	sigsOut []byte,
-	sigLensOut []uint32,
-) error {
-	_ = mode
-	_ = skeys
-	_ = msgs
-	_ = msgLens
-	_ = msgWidthHint
-	_ = sigsOut
-	_ = sigLensOut
-	if count == 0 {
-		return nil
-	}
-	return ErrGPUNotAvailable
-}
-
-func (noGPUBackend) SLHDSAVerifyBatch(
-	variant SLHDSAVariant,
-	pubkeys [][]byte,
-	messages [][]byte,
-	msgLens []int,
-	signatures [][]byte,
-	results []bool,
-) error {
-	_ = variant
-	_ = messages
-	_ = msgLens
-	_ = signatures
-	_ = results
-	if len(pubkeys) == 0 {
-		return nil
-	}
-	return ErrGPUNotAvailable
 }
 
 // =============================================================================
@@ -537,10 +472,38 @@ func (b *gpuBackend) Close() error {
 	return nil
 }
 
-// MLDSAVerifyBatch dispatches op_mldsa_verify_batch from the loaded
-// vtbl. See the GPUBackend interface doc + backend_plugin.h v14 block
-// for the contract.
+// MLDSAVerifyBatch tries the GPU plugin's op_mldsa_verify_batch first.
+// On any GPU-side error (NOT_SUPPORTED, missing slot, invalid argument,
+// device lost, internal, etc.) it falls through to the same circl-backed
+// pure-Go reference (mldsaVerifyBatchCPU) the !cgo build uses
+// unconditionally — the GPU is a strict positive overlay over the FIPS
+// 204 Go path, never the only path to a correct answer.
+//
+// See the GPUBackend interface doc + backend_plugin.h v14 block for the
+// vtbl-side contract.
 func (b *gpuBackend) MLDSAVerifyBatch(
+	mode MLDSAMode,
+	pubkeys [][]byte,
+	messages [][]byte,
+	msgLens []int,
+	msgWidthHint uint32,
+	signatures [][]byte,
+	results []bool,
+) error {
+	if err := b.tryMLDSAVerifyBatchGPU(mode, pubkeys, messages, msgLens, msgWidthHint, signatures, results); err == nil {
+		return nil
+	}
+	return mldsaVerifyBatchCPU(mode, pubkeys, messages, msgLens, msgWidthHint, signatures, results)
+}
+
+// tryMLDSAVerifyBatchGPU runs the vtbl dispatch and returns any error
+// it encounters — including ErrGPUNotAvailable when the mode gate
+// blocks the call or when the plugin isn't loaded. The public wrapper
+// translates ANY non-nil return into a CPU fall-through. Boundary
+// errors (length mismatches, etc.) are caught both here and in the
+// CPU helper — the caller gets the same error either way; falling
+// through is harmless and keeps the call sites cleaner.
+func (b *gpuBackend) tryMLDSAVerifyBatchGPU(
 	mode MLDSAMode,
 	pubkeys [][]byte,
 	messages [][]byte,
@@ -552,7 +515,8 @@ func (b *gpuBackend) MLDSAVerifyBatch(
 	if mode != MLDSAMode65 {
 		// v14 vtbl only exposes ML-DSA-65 at op_mldsa_verify_batch.
 		// Modes 44 / 87 will land at sibling slots in a future ABI
-		// bump (see backend_plugin.h v14 block).
+		// bump (see backend_plugin.h v14 block); the CPU helper has
+		// the same gate.
 		return ErrGPUNotAvailable
 	}
 	n := len(pubkeys)
@@ -657,9 +621,32 @@ func (b *gpuBackend) MLDSAVerifyBatch(
 	return nil
 }
 
-// MLDSASignBatch dispatches op_mldsa_sign_batch from the loaded vtbl.
-// See the GPUBackend interface doc + backend_plugin.h v14 block.
+// MLDSASignBatch tries the GPU plugin's op_mldsa_sign_batch first. On
+// any GPU-side error it falls through to the same circl-backed
+// pure-Go reference (mldsaSignBatchCPU). Both paths use FIPS 204
+// deterministic mode (rnd = 0^32) so the signatures are byte-identical
+// for the same (sk, msg) inputs — that's what makes the fall-through
+// a strict positive overlay rather than a correctness wedge.
+//
+// See the GPUBackend interface doc + backend_plugin.h v14 block for
+// the vtbl-side contract.
 func (b *gpuBackend) MLDSASignBatch(
+	mode MLDSAMode,
+	skeys []byte,
+	msgs []byte,
+	msgLens []int,
+	msgWidthHint uint32,
+	count int,
+	sigsOut []byte,
+	sigLensOut []uint32,
+) error {
+	if err := b.tryMLDSASignBatchGPU(mode, skeys, msgs, msgLens, msgWidthHint, count, sigsOut, sigLensOut); err == nil {
+		return nil
+	}
+	return mldsaSignBatchCPU(mode, skeys, msgs, msgLens, msgWidthHint, count, sigsOut, sigLensOut)
+}
+
+func (b *gpuBackend) tryMLDSASignBatchGPU(
 	mode MLDSAMode,
 	skeys []byte,
 	msgs []byte,
@@ -771,10 +758,28 @@ func (b *gpuBackend) MLDSASignBatch(
 	return nil
 }
 
-// SLHDSAVerifyBatch dispatches the SHAKE-128f or SHAKE-192f variant of
-// op_slhdsa_verify_batch from the loaded vtbl. The 10 other FIPS 205
-// variants are not exposed at v14 — they return ErrGPUNotAvailable.
+// SLHDSAVerifyBatch tries the GPU plugin's SHAKE-128f / SHAKE-192f
+// variant of op_slhdsa_verify_batch first. On any GPU-side error (or
+// for the 10 unsupported FIPS 205 variants) it falls through to the
+// circl-backed Go reference (slhdsaVerifyBatchCPU).
+//
+// See the GPUBackend interface doc + backend_plugin.h v14 block for
+// the vtbl-side contract.
 func (b *gpuBackend) SLHDSAVerifyBatch(
+	variant SLHDSAVariant,
+	pubkeys [][]byte,
+	messages [][]byte,
+	msgLens []int,
+	signatures [][]byte,
+	results []bool,
+) error {
+	if err := b.trySLHDSAVerifyBatchGPU(variant, pubkeys, messages, msgLens, signatures, results); err == nil {
+		return nil
+	}
+	return slhdsaVerifyBatchCPU(variant, pubkeys, messages, msgLens, signatures, results)
+}
+
+func (b *gpuBackend) trySLHDSAVerifyBatchGPU(
 	variant SLHDSAVariant,
 	pubkeys [][]byte,
 	messages [][]byte,
