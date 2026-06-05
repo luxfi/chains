@@ -12,7 +12,7 @@
 // the lux-gpu-kernels plugin DSO and reaches the per-op kernel through
 // function pointers inside a vtbl populated by the plugin's
 // `lux_gpu_backend_init` entry point. This keeps the chains module
-// compilable without lux-private/gpu-kernels present in the build tree —
+// compilable without the lux GPU plugin present in the build tree —
 // the plugin is fully optional. When no libluxgpu_backend_*.{so,dylib}
 // is findable on the dlopen search path, AutoBackend() returns
 // BackendNone, every GPUBackend method returns ErrGPUNotAvailable, and
@@ -38,18 +38,11 @@ package quantumvm
 #cgo darwin LDFLAGS: -ldl
 #cgo linux  LDFLAGS: -ldl
 
-// Workspace-relative path to the ABI v14 plugin header. From
-// ${SRCDIR} = ~/work/lux/chains/quantumvm we walk three levels up
-// (chains → lux → work) and one down (lux-private/gpu-kernels/include)
-// to reach the canonical header. External consumers building from
-// $GOMODCACHE need lux-private/gpu-kernels checked out at the standard
-// sibling location; this matches the convention LLM.md establishes
-// for every other workspace-coupled component (LUXCPP_DIR etc.).
-//
-// Header-only inclusion: we DO NOT link against any luxcpp / lux-gpu
-// library. The plugin DSO is dlopen'd at runtime; the only compile-
-// time dependency is the C struct layout in backend_plugin.h.
-#cgo CFLAGS: -I${SRCDIR}/../../../lux-private/gpu-kernels/include
+// The plugin DSO is dlopen'd at runtime; the only compile-time
+// dependency is the C struct layout in backend_plugin.h, which is
+// vendored under chains/internal/luxgpu/include/lux/gpu/ as the public
+// ABI surface. No link against any external library.
+#cgo CFLAGS: -I${SRCDIR}/../internal/luxgpu/include
 
 #include <dlfcn.h>
 #include <stdint.h>
@@ -231,7 +224,7 @@ const pluginEntrySymbol = "lux_gpu_backend_init"
 // pluginEnv overrides the dlopen search path. When set, every probe joins
 // the env value to the bare basename before calling dlopen — useful for
 // in-tree development against a freshly-built plugin under
-// ~/work/lux-private/gpu-kernels/build/ without installing it.
+// the GPU plugin build tree  without installing it.
 const pluginEnv = "LUX_GPU_PLUGIN_DIR"
 
 // probeOrder is the dlopen probe sequence fixed by the spec:

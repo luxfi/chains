@@ -8,7 +8,7 @@ package thresholdvm
 // GPU bridge — dlopen + dlsym substrate for the MPCVM state-machine kernels.
 //
 // This file binds Go to the host launchers exported by the per-backend GPU
-// plugins in lux-private/gpu-kernels/backends/<X>/. Unlike the cevm bridge
+// plugins in the lux GPU plugin backends/<X>/. Unlike the cevm bridge
 // which links statically through pkg-config (libevm + libevm-gpu), the
 // thresholdvm bridge is a runtime overlay: zero compile-time dependency on
 // the plugin, no pkg-config, no link-time resolution. Either the dlopen
@@ -17,8 +17,8 @@ package thresholdvm
 // protocol/, factory.go, executor.go — unchanged).
 //
 // Symbols expected per backend (host launchers in
-// lux-private/gpu-kernels/backends/<X>/src/mpcvm_launchers.{cpp,mm} and
-// the kernel TUs in lux-private/gpu-kernels/ops/mpcvm/<X>/):
+// the lux GPU plugin backends/<X>/src/mpcvm_launchers.{cpp,mm} and
+// the kernel TUs in the lux GPU plugin ops/mpcvm/<X>/):
 //
 //   lux_<X>_mpcvm_ceremony_apply       (begin/cancel + contribution dedup)
 //   lux_<X>_mpcvm_ceremony_sweep       (DKG finalize -> key share assignment)
@@ -56,7 +56,7 @@ package thresholdvm
 
 // =============================================================================
 // Function-pointer typedefs — match the extern "C" launcher signatures in
-// lux-private/gpu-kernels/backends/<X>/src/mpcvm_launchers.{cpp,mm}.
+// the lux GPU plugin backends/<X>/src/mpcvm_launchers.{cpp,mm}.
 //
 // All pointers are HOST pointers. The launcher wraps them into the backend's
 // native buffer type (MTLBuffer, VkBuffer, cudaMalloc, etc.) and uploads /
