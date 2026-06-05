@@ -224,7 +224,7 @@ const pluginEntrySymbol = "lux_gpu_backend_init"
 // pluginEnv overrides the dlopen search path. When set, every probe joins
 // the env value to the bare basename before calling dlopen — useful for
 // in-tree development against a freshly-built plugin under
-// the GPU plugin build tree  without installing it.
+// the GPU plugin dev tree  without installing it.
 const pluginEnv = "LUX_GPU_PLUGIN_DIR"
 
 // probeOrder is the dlopen probe sequence fixed by the spec:

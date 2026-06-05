@@ -11,7 +11,7 @@ package bridgevm
 // cleanly when AutoBackend() == BackendNone (no libluxgpu_backend_*.so on
 // the search path), which is the common case in a public chains checkout.
 //
-// When a plugin IS present (e.g. dev box with the GPU plugin install tree
+// When a plugin IS present (e.g. dev box with the GPU plugin
 // built and $LUX_GPU_PLUGIN_DIR set to the build/backends/<bk>/ dir), the
 // test exercises signer_apply with a zero descriptor + zero ops + a sized
 // signers arena and asserts:
