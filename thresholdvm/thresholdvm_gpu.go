@@ -208,10 +208,15 @@ import (
 	"unsafe"
 )
 
-// ErrGPUNotAvailable is returned by GPUBackend methods when no plugin was
-// resolved at init() time. Callers check this to fall back to the CPU
-// reference (the protocol/ + executor.go state machine, which is unchanged
-// by this bridge).
+// ErrGPUNotAvailable is the historical "no plugin loaded" sentinel.
+// Retained for ABI compatibility with callers that branch on
+// `errors.Is(err, ErrGPUNotAvailable)`. The bridge no longer surfaces
+// it on the main happy path: when the GPU plugin isn't dlopen'd OR a
+// launcher returns a non-zero rc, the bridge falls through to the
+// pure-Go reference in thresholdvm_gpu_cpu.go. The substrate ALWAYS
+// produces a result — the GPU is a positive-performance overlay, never
+// a correctness gate. Returned only on input-validation failures (nil
+// desc, empty arena) where neither path can run.
 var ErrGPUNotAvailable = errors.New("thresholdvm: GPU backend not available (no plugin dlopened)")
 
 // GPUBackendKind is the resolved plugin family. Matches the dlopen probe
@@ -503,11 +508,18 @@ func (g *GPUBackend) CeremonyApply(
 	ceremonyOps []GPUCeremonyOp,
 	ceremonies []GPUCeremony,
 ) (applied uint32, err error) {
-	if g == nil || g.handle == nil || g.fnCeremonyApply == nil {
+	// Input validation is shared across cgo / nocgo / GPU / CPU. nil
+	// desc or empty arena returns ErrGPUNotAvailable so caller
+	// `errors.Is(err, ErrGPUNotAvailable)` fires consistently.
+	if desc == nil || len(ceremonies) == 0 {
 		return 0, ErrGPUNotAvailable
 	}
-	if desc == nil || len(ceremonies) == 0 {
-		return 0, fmt.Errorf("thresholdvm.CeremonyApply: nil desc or empty ceremonies")
+	// Fall through to the pure-Go reference whenever the GPU plugin
+	// isn't usable: nil receiver, no dlopen handle, missing launcher
+	// symbol. thresholdvm_gpu_cpu.go is byte-equivalent to the CUDA
+	// kernel; the bridge ALWAYS produces a result.
+	if g == nil || g.handle == nil || g.fnCeremonyApply == nil {
+		return ceremonyApplyCPU(desc, ceremonyOps, ceremonies)
 	}
 	var (
 		ceremonyApplied     uint32
@@ -543,7 +555,9 @@ func (g *GPUBackend) CeremonyApply(
 	runtime.KeepAlive(emptyContribOps)
 	runtime.KeepAlive(emptyContributions)
 	if rc != 0 {
-		return 0, fmt.Errorf("thresholdvm.CeremonyApply: launcher rc=%d", int(rc))
+		// Launcher failed — fall back to the Go reference so the
+		// caller still gets a correct, byte-equivalent result.
+		return ceremonyApplyCPU(desc, ceremonyOps, ceremonies)
 	}
 	return ceremonyApplied, nil
 }
@@ -563,12 +577,12 @@ func (g *GPUBackend) KeyShareApply(
 	contributions []GPUContribution,
 	nextShareID uint64,
 ) (roundAdvance, finalized, failed uint32, err error) {
-	if g == nil || g.handle == nil || g.fnCeremonySweep == nil {
-		return 0, 0, 0, ErrGPUNotAvailable
-	}
 	if desc == nil || len(ceremonies) == 0 ||
 		len(keyShares) == 0 || len(contributions) == 0 {
-		return 0, 0, 0, fmt.Errorf("thresholdvm.KeyShareApply: nil desc or empty arena")
+		return 0, 0, 0, ErrGPUNotAvailable
+	}
+	if g == nil || g.handle == nil || g.fnCeremonySweep == nil {
+		return keyShareApplyCPU(desc, ceremonies, keyShares, contributions, nextShareID)
 	}
 	rc := C.call_ceremony_sweep(
 		g.fnCeremonySweep,
@@ -590,7 +604,7 @@ func (g *GPUBackend) KeyShareApply(
 	runtime.KeepAlive(keyShares)
 	runtime.KeepAlive(contributions)
 	if rc != 0 {
-		return 0, 0, 0, fmt.Errorf("thresholdvm.KeyShareApply: launcher rc=%d", int(rc))
+		return keyShareApplyCPU(desc, ceremonies, keyShares, contributions, nextShareID)
 	}
 	return roundAdvance, finalized, failed, nil
 }
@@ -607,11 +621,11 @@ func (g *GPUBackend) ContributionApply(
 	contributions []GPUContribution,
 	nextContributionID uint64,
 ) (applied uint32, err error) {
-	if g == nil || g.handle == nil || g.fnCeremonyApply == nil {
+	if desc == nil || len(ceremonies) == 0 || len(contributions) == 0 {
 		return 0, ErrGPUNotAvailable
 	}
-	if desc == nil || len(ceremonies) == 0 || len(contributions) == 0 {
-		return 0, fmt.Errorf("thresholdvm.ContributionApply: nil desc or empty arena")
+	if g == nil || g.handle == nil || g.fnCeremonyApply == nil {
+		return contributionApplyCPU(desc, contributionOps, ceremonies, contributions, nextContributionID)
 	}
 	var (
 		ceremonyApplied     uint32
@@ -644,7 +658,8 @@ func (g *GPUBackend) ContributionApply(
 	runtime.KeepAlive(ceremonies)
 	runtime.KeepAlive(contributions)
 	if rc != 0 {
-		return 0, fmt.Errorf("thresholdvm.ContributionApply: launcher rc=%d", int(rc))
+		// Launcher failed — fall back to the Go reference.
+		return contributionApplyCPU(desc, contributionOps, ceremonies, contributions, nextContributionID)
 	}
 	return contributionApplied, nil
 }
@@ -664,16 +679,13 @@ func (g *GPUBackend) MPCTransition(
 	contributions []GPUContribution,
 	state *GPUMPCVMState,
 ) (*GPUMPCVMTransitionResult, error) {
-	if g == nil || g.handle == nil {
-		return nil, ErrGPUNotAvailable
-	}
-	if g.fnComputeLeaves == nil || g.fnComposeRoot == nil {
-		return nil, fmt.Errorf("thresholdvm.MPCTransition: %w (compute_leaves or compose_root missing)",
-			ErrGPUNotAvailable)
-	}
 	if desc == nil || state == nil ||
 		len(ceremonies) == 0 || len(keyShares) == 0 || len(contributions) == 0 {
-		return nil, fmt.Errorf("thresholdvm.MPCTransition: nil desc/state or empty arena")
+		return nil, ErrGPUNotAvailable
+	}
+	if g == nil || g.handle == nil ||
+		g.fnComputeLeaves == nil || g.fnComposeRoot == nil {
+		return mpcTransitionCPU(desc, ceremonies, keyShares, contributions, state)
 	}
 
 	// Scratch buffers consumed by compute_leaves and feeding compose_root.
@@ -709,7 +721,8 @@ func (g *GPUBackend) MPCTransition(
 		nil,
 	)
 	if rc != 0 {
-		return nil, fmt.Errorf("thresholdvm.MPCTransition compute_leaves: launcher rc=%d", int(rc))
+		// Launcher failed — fall back to the Go reference.
+		return mpcTransitionCPU(desc, ceremonies, keyShares, contributions, state)
 	}
 
 	rc = C.call_compose_root(
@@ -744,7 +757,8 @@ func (g *GPUBackend) MPCTransition(
 	runtime.KeepAlive(shareMask)
 	runtime.KeepAlive(contributionMask)
 	if rc != 0 {
-		return nil, fmt.Errorf("thresholdvm.MPCTransition compose_root: launcher rc=%d", int(rc))
+		// Launcher failed — fall back to the Go reference.
+		return mpcTransitionCPU(desc, ceremonies, keyShares, contributions, state)
 	}
 	return &result, nil
 }
