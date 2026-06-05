@@ -7,12 +7,14 @@ package thresholdvm
 
 import "errors"
 
-// ErrGPUNotAvailable is returned by GPUBackend methods when the build was
-// produced without CGo. The thresholdvm GPU substrate is a runtime overlay
-// that requires dlopen()/dlsym() — under !cgo there is no way to reach the
-// host launchers, so every method on GPUBackend short-circuits to this
-// error and callers fall back to the CPU reference (the Go state machine
-// in protocol/, factory.go, executor.go — unchanged).
+// ErrGPUNotAvailable is retained for ABI compatibility with callers
+// that branch on `errors.Is(err, ErrGPUNotAvailable)`. Under !cgo the
+// GPU plugin is unreachable (dlopen requires CGo), but the four
+// substrate methods on GPUBackend still produce correct results by
+// delegating to the pure-Go reference in thresholdvm_gpu_cpu.go. The
+// sentinel is now only returned on input-validation failures (nil
+// desc, empty arena) — never on a missing GPU plugin, which is no
+// longer a fatal condition.
 var ErrGPUNotAvailable = errors.New("thresholdvm: GPU backend not available (built without CGo)")
 
 // GPUBackendKind mirrors the cgo variant so the package surface is
@@ -31,9 +33,10 @@ const (
 func (k GPUBackendKind) String() string { return "none" }
 
 // =============================================================================
-// Wire structs — same fields as the cgo variant so external callers that
-// build with -tags '!cgo' still see the same package API. The sizes are
-// not asserted here because no kernel ever runs against them.
+// Wire structs — byte-equivalent to the cgo variant and to the
+// device-side __align__(16) layouts in mpcvm_kernels_common.cuh. Sizes
+// are pinned by TestGPULayoutSizes (thresholdvm_gpu_test.go), which
+// runs in BOTH build flavors and surfaces any drift immediately.
 // =============================================================================
 
 type GPUCeremony struct {
@@ -142,53 +145,78 @@ type GPUMPCVMTransitionResult struct {
 	MPCVMStateRoot         [32]byte
 }
 
-// GPUBackend is the no-op nocgo placeholder. Every method returns
-// ErrGPUNotAvailable; IsAvailable() returns false.
+// GPUBackend is the nocgo no-op handle. Carries no resolved symbols —
+// every state-machine method routes straight to the pure-Go reference
+// in thresholdvm_gpu_cpu.go. IsAvailable() returns false so diagnostic
+// code can still surface "thresholdvm-gpu: no plugin resolved
+// (CPU-only)".
 type GPUBackend struct {
 	Kind GPUBackendKind
 	Path string
 }
 
-// Backend always returns nil under !cgo — the bridge has no plugin to load.
+// Backend always returns nil under !cgo. The bridge methods are still
+// useful through a nil receiver — they delegate to the CPU reference.
 func Backend() *GPUBackend { return nil }
 
-// IsAvailable reports false for every GPUBackend under !cgo.
+// IsAvailable reports false for every GPUBackend under !cgo. The
+// substrate methods STILL produce correct results — IsAvailable()
+// only answers "is there an accelerated path?", not "can the
+// substrate transition?".
 func (g *GPUBackend) IsAvailable() bool { return false }
 
+// CeremonyApply delegates to the pure-Go reference. Under !cgo there
+// is no plugin to call, but the same canonical algorithm runs in Go.
 func (g *GPUBackend) CeremonyApply(
-	_ *GPUMPCVMRoundDescriptor,
-	_ []GPUCeremonyOp,
-	_ []GPUCeremony,
+	desc *GPUMPCVMRoundDescriptor,
+	ceremonyOps []GPUCeremonyOp,
+	ceremonies []GPUCeremony,
 ) (uint32, error) {
-	return 0, ErrGPUNotAvailable
+	if desc == nil || len(ceremonies) == 0 {
+		return 0, ErrGPUNotAvailable
+	}
+	return ceremonyApplyCPU(desc, ceremonyOps, ceremonies)
 }
 
+// KeyShareApply delegates to the pure-Go reference.
 func (g *GPUBackend) KeyShareApply(
-	_ *GPUMPCVMRoundDescriptor,
-	_ []GPUCeremony,
-	_ []GPUKeyShare,
-	_ []GPUContribution,
-	_ uint64,
+	desc *GPUMPCVMRoundDescriptor,
+	ceremonies []GPUCeremony,
+	keyShares []GPUKeyShare,
+	contributions []GPUContribution,
+	nextShareID uint64,
 ) (uint32, uint32, uint32, error) {
-	return 0, 0, 0, ErrGPUNotAvailable
+	if desc == nil || len(ceremonies) == 0 || len(keyShares) == 0 || len(contributions) == 0 {
+		return 0, 0, 0, ErrGPUNotAvailable
+	}
+	return keyShareApplyCPU(desc, ceremonies, keyShares, contributions, nextShareID)
 }
 
+// ContributionApply delegates to the pure-Go reference.
 func (g *GPUBackend) ContributionApply(
-	_ *GPUMPCVMRoundDescriptor,
-	_ []GPUContributionOp,
-	_ []GPUCeremony,
-	_ []GPUContribution,
-	_ uint64,
+	desc *GPUMPCVMRoundDescriptor,
+	contributionOps []GPUContributionOp,
+	ceremonies []GPUCeremony,
+	contributions []GPUContribution,
+	nextContributionID uint64,
 ) (uint32, error) {
-	return 0, ErrGPUNotAvailable
+	if desc == nil || len(ceremonies) == 0 || len(contributions) == 0 {
+		return 0, ErrGPUNotAvailable
+	}
+	return contributionApplyCPU(desc, contributionOps, ceremonies, contributions, nextContributionID)
 }
 
+// MPCTransition delegates to the pure-Go reference.
 func (g *GPUBackend) MPCTransition(
-	_ *GPUMPCVMRoundDescriptor,
-	_ []GPUCeremony,
-	_ []GPUKeyShare,
-	_ []GPUContribution,
-	_ *GPUMPCVMState,
+	desc *GPUMPCVMRoundDescriptor,
+	ceremonies []GPUCeremony,
+	keyShares []GPUKeyShare,
+	contributions []GPUContribution,
+	state *GPUMPCVMState,
 ) (*GPUMPCVMTransitionResult, error) {
-	return nil, ErrGPUNotAvailable
+	if desc == nil || state == nil ||
+		len(ceremonies) == 0 || len(keyShares) == 0 || len(contributions) == 0 {
+		return nil, ErrGPUNotAvailable
+	}
+	return mpcTransitionCPU(desc, ceremonies, keyShares, contributions, state)
 }
