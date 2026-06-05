@@ -25,13 +25,29 @@ func TestAutoBackend_Probes(t *testing.T) {
 	t.Logf("AutoBackend() = %s", b)
 }
 
-// TestActiveGPUBackend_NoBackendReturnsErr exercises the noGPUBackend
-// stub returned when no plugin was loaded. Every method must return
-// ErrGPUNotAvailable so callers can route to the CPU verify path via
-// errors.Is.
+// TestActiveGPUBackend_NoBackendReturnsErr exercises the cpuBackend
+// returned when no plugin was loaded. Pre-decomplecting, this test
+// asserted ErrGPUNotAvailable on every non-empty batch — that contract
+// is gone: the bridge now routes straight into the FIPS 204/205 Go
+// path (circl) regardless of whether a plugin loaded, because the GPU
+// is a strict positive overlay over the canonical Go implementation,
+// not the only path to a correct answer.
+//
+// What survives from the pre-decomplect surface:
+//   - AutoBackend() still reports BackendNone when no plugin loaded.
+//   - Backend() on the returned handle still reports BackendNone (the
+//     handle is cpuBackend{}, not a *gpuBackend).
+//   - Empty-batch calls still short-circuit to a no-op.
+//   - Unsupported modes (44/87) still surface ErrGPUNotAvailable so
+//     callers branching on the sentinel for telemetry keep working.
+//
+// What changed: a non-empty batch at MLDSAMode65 used to return
+// ErrGPUNotAvailable; it now succeeds (no error) and writes the FIPS
+// 204 verify result into results[i] — false for an all-zero pubkey +
+// all-zero sig (honest "this signature is invalid").
 func TestActiveGPUBackend_NoBackendReturnsErr(t *testing.T) {
 	if AutoBackend() != BackendNone {
-		t.Skip("plugin loaded — noGPUBackend stub not exercised on this host")
+		t.Skip("plugin loaded — cpuBackend not exercised on this host")
 	}
 	g := ActiveGPUBackend()
 	if g.Backend() != BackendNone {
@@ -39,18 +55,33 @@ func TestActiveGPUBackend_NoBackendReturnsErr(t *testing.T) {
 	}
 	err := g.MLDSAVerifyBatch(MLDSAMode65, nil, nil, nil, 0, nil, nil)
 	if err != nil {
-		// Empty batch is a legal no-op even when no plugin loaded;
-		// length 0 short-circuits before the noGPUBackend stub runs.
+		// Empty batch is a legal no-op — length 0 short-circuits
+		// before any per-element work, regardless of backend.
 		t.Fatalf("MLDSAVerifyBatch(empty) = %v, want nil", err)
 	}
+	results := make([]bool, 1)
 	err = g.MLDSAVerifyBatch(MLDSAMode65,
 		[][]byte{make([]byte, MLDSA65PublicKeySize)},
 		[][]byte{nil},
 		nil, 0,
 		[][]byte{make([]byte, MLDSA65SignatureSize)},
+		results)
+	if err != nil {
+		t.Fatalf("MLDSAVerifyBatch(cpuBackend, zero inputs) = %v, want nil", err)
+	}
+	if results[0] {
+		t.Fatalf("MLDSAVerifyBatch(cpuBackend, zero pubkey + zero sig) = true, want false")
+	}
+	// Unsupported modes still route to the ErrGPUNotAvailable sentinel
+	// — both the cgo path's vtbl gate and the cpuBackend's mode gate
+	// agree on this: ML-DSA-65 only, modes 44/87 not wired.
+	err = g.MLDSAVerifyBatch(MLDSAMode44,
+		[][]byte{make([]byte, 1)},
+		[][]byte{nil}, nil, 0,
+		[][]byte{make([]byte, 1)},
 		make([]bool, 1))
 	if !errors.Is(err, ErrGPUNotAvailable) {
-		t.Fatalf("MLDSAVerifyBatch on noGPUBackend = %v, want ErrGPUNotAvailable", err)
+		t.Fatalf("MLDSAVerifyBatch(MLDSAMode44) = %v, want ErrGPUNotAvailable", err)
 	}
 }
 
