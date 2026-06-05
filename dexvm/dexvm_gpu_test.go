@@ -19,8 +19,6 @@
 package dexvm
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -45,18 +43,11 @@ func constantProductOutCPU(rx, ry, amount uint64) uint64 {
 // compares the kernel output to the CPU oracle.
 //
 // To run: build the plugin (e.g. via cmake at
-// ~/work/lux-private/gpu-kernels/build/) and set
+// the GPU plugin build tree ) and set
 //
-//	export LUX_GPU_PLUGIN_DIR=$HOME/work/lux-private/gpu-kernels/build-metal/backends/metal
+//	export LUX_GPU_PLUGIN_DIR=/path/to/dir/containing/libluxgpu_backend_metal.dylib
 //	go test -tags cgo ./dexvm/ -run TestGPUAMMSwapRoundTrip -v
 func TestGPUAMMSwapRoundTrip(t *testing.T) {
-	if os.Getenv("LUX_GPU_PLUGIN_DIR") == "" {
-		// Best-effort: try the common build-tree paths so the test
-		// runs without explicit env setup when run from a dev box
-		// with a fresh checkout.
-		findAndSetPluginDir(t)
-	}
-
 	backend := AutoBackend()
 	if backend == GPUBackendNone {
 		t.Skipf("no GPU plugin loaded — set LUX_GPU_PLUGIN_DIR to a directory "+
@@ -127,39 +118,3 @@ func TestGPUAMMSwapEmpty(t *testing.T) {
 	}
 }
 
-// findAndSetPluginDir best-effort probe of the well-known build-tree
-// locations under ~/work/lux-private/gpu-kernels. Sets
-// LUX_GPU_PLUGIN_DIR if a candidate dylib exists. The test still
-// skips cleanly if none is found.
-func findAndSetPluginDir(t *testing.T) {
-	t.Helper()
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
-	root := filepath.Join(home, "work", "lux-private", "gpu-kernels")
-	candidates := []struct {
-		subdir string
-		name   string
-	}{
-		{"build-metal/backends/metal", "libluxgpu_backend_metal.dylib"},
-		{"build/backends/metal", "libluxgpu_backend_metal.dylib"},
-		{"build/backends/vulkan", "libluxgpu_backend_vulkan.dylib"},
-		{"build/backends/vulkan", "libluxgpu_backend_vulkan.so"},
-		{"build/backends/webgpu", "libluxgpu_backend_webgpu.dylib"},
-		{"build/backends/webgpu", "libluxgpu_backend_webgpu.so"},
-		{"build/backends/cuda", "libluxgpu_backend_cuda.so"},
-		{"build/backends/hip", "libluxgpu_backend_hip.so"},
-	}
-	for _, c := range candidates {
-		path := filepath.Join(root, c.subdir, c.name)
-		if _, err := os.Stat(path); err == nil {
-			// Found one — set the dir and trigger a re-probe by
-			// telling the operator to re-run the binary; init() has
-			// already run, so we can only inform the user via t.Logf.
-			t.Logf("found candidate plugin: %s (LUX_GPU_PLUGIN_DIR must be set "+
-				"BEFORE the test binary starts so init() can dlopen it)", path)
-			return
-		}
-	}
-}
