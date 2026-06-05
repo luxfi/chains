@@ -201,7 +201,7 @@ func (k BackendKind) String() string {
 // Layout-drift guards — match ops/aivm/cuda/aivm_kernels_common.cuh exactly.
 //
 // The struct bytes Go hands to C MUST match the on-disk layout file at
-// the GPU plugin install tree ops/aivm/op.yaml — every kernel reads them
+// the GPU plugin ops/aivm/op.yaml — every kernel reads them
 // via reinterpret_cast. A silent layout shift produces consensus-divergent
 // state roots. init() refuses to load if any size drifts.
 // =============================================================================
@@ -436,7 +436,7 @@ func init() {
 			panic(fmt.Sprintf(
 				"aivm: layout drift — Go sizeof(%s)=%d but on-device layout=%d. "+
 					"Re-sync chains/aivm/aivm_gpu.go against "+
-					"the GPU plugin install tree ops/aivm/cuda/aivm_kernels_common.cuh.",
+					"the GPU plugin ops/aivm/cuda/aivm_kernels_common.cuh.",
 				c.name, c.got, c.want))
 		}
 	}

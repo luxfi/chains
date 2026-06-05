@@ -43,7 +43,7 @@ func constantProductOutCPU(rx, ry, amount uint64) uint64 {
 // compares the kernel output to the CPU oracle.
 //
 // To run: build the plugin (e.g. via cmake at
-// the GPU plugin build tree ) and set
+// the GPU plugin dev tree ) and set
 //
 //	export LUX_GPU_PLUGIN_DIR=/path/to/dir/containing/libluxgpu_backend_metal.dylib
 //	go test -tags cgo ./dexvm/ -run TestGPUAMMSwapRoundTrip -v

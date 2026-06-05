@@ -10,7 +10,7 @@ package bridgevm
 // resolves the five lux_<bk>_bridgevm_* host launcher symbols via dlsym(3).
 //
 // Direct dlopen — NOT pkg-config. The plugin lives in
-// the GPU plugin install tree (a private repo); the public chains module
+// the GPU plugin (a private repo); the public chains module
 // must build without it present. Linking via pkg-config would couple the
 // public build to a private dep; dlopen + dlsym lets us probe at runtime
 // and degrade cleanly to ErrGPUNotAvailable when the plugin is absent.
@@ -141,6 +141,7 @@ static const char* dl_err(void) {
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -313,11 +314,110 @@ func tryLoad(bk Backend, path string) bool {
 // concrete struct) so the !cgo stub can satisfy the same surface.
 // =============================================================================
 
-// ActiveGPUBackend returns an invocable GPUBackend. When no plugin is loaded
-// the returned backend's methods all return ErrGPUNotAvailable; the caller
-// can route to the CPU oracle. Always non-nil — there is no error path here.
+// ActiveGPUBackend returns an invocable GPUBackend. It tries the dlopen'd GPU
+// plugin first and falls through to the pure-Go CPU oracle in
+// bridgevm_gpu_cpu.go on ErrGPUNotAvailable. The returned backend therefore
+// always executes the transition — there is no "GPU unavailable" path the
+// caller has to handle, only a "did the GPU or the CPU run it" introspection
+// question answered by Backend().
+//
+// The internal cgoBackend type is still exported via the same interface so
+// existing call-sites and tests that probe the GPU layer directly (e.g.
+// TestStubReturnsErrGPUNotAvailable, which constructs cgoBackend{tag:
+// BackendNone} to assert the ErrGPUNotAvailable contract on the bare GPU
+// layer) keep working unchanged.
 func ActiveGPUBackend() GPUBackend {
-	return cgoBackend{tag: AutoBackend()}
+	return gpuOrCPU{gpu: cgoBackend{tag: AutoBackend()}, cpu: cpuBackend{}}
+}
+
+// gpuOrCPU is the composite backend returned by ActiveGPUBackend() under
+// cgo. Each method tries the cgoBackend first and, on ErrGPUNotAvailable,
+// dispatches to the cpuBackend in bridgevm_gpu_cpu.go. The CPU oracle is
+// byte-equal to the GPU plugin (non-strict mode) — same descriptors, same
+// arenas, same outputs — so the caller sees a single, deterministic
+// state transition regardless of which side actually ran it.
+//
+// Backend() reports whichever path is currently live: the GPU plugin's
+// tag when a plugin is loaded, BackendNone when only the CPU oracle is.
+type gpuOrCPU struct {
+	gpu cgoBackend
+	cpu cpuBackend
+}
+
+func (b gpuOrCPU) Backend() Backend {
+	if b.gpu.tag != BackendNone {
+		return b.gpu.tag
+	}
+	return BackendNone
+}
+
+func (b gpuOrCPU) SignerApply(
+	desc *BridgeVMRoundDescriptor,
+	ops []SignerOp,
+	signers []Signer,
+) (uint32, error) {
+	applied, err := b.gpu.SignerApply(desc, ops, signers)
+	if errors.Is(err, ErrGPUNotAvailable) {
+		return b.cpu.SignerApply(desc, ops, signers)
+	}
+	return applied, err
+}
+
+func (b gpuOrCPU) LiquidityApply(
+	desc *BridgeVMRoundDescriptor,
+	ops []LiquidityOp,
+	liquidity []LiquidityEntry,
+) (uint32, uint64, uint64, error) {
+	applied, lo, hi, err := b.gpu.LiquidityApply(desc, ops, liquidity)
+	if errors.Is(err, ErrGPUNotAvailable) {
+		return b.cpu.LiquidityApply(desc, ops, liquidity)
+	}
+	return applied, lo, hi, err
+}
+
+func (b gpuOrCPU) MessageInbox(
+	desc *BridgeVMRoundDescriptor,
+	inMsgs []Message,
+	signers []Signer,
+	daily []DailyLimit,
+	inbox []Message,
+) (uint32, uint64, uint64, error) {
+	applied, lo, hi, err := b.gpu.MessageInbox(desc, inMsgs, signers, daily, inbox)
+	if errors.Is(err, ErrGPUNotAvailable) {
+		return b.cpu.MessageInbox(desc, inMsgs, signers, daily, inbox)
+	}
+	return applied, lo, hi, err
+}
+
+func (b gpuOrCPU) MessageOutbox(
+	desc *BridgeVMRoundDescriptor,
+	reqs []OutboundReq,
+	daily []DailyLimit,
+	outbox []Message,
+	epoch *BridgeVMEpochState,
+) (uint32, uint64, uint64, error) {
+	applied, lo, hi, err := b.gpu.MessageOutbox(desc, reqs, daily, outbox, epoch)
+	if errors.Is(err, ErrGPUNotAvailable) {
+		return b.cpu.MessageOutbox(desc, reqs, daily, outbox, epoch)
+	}
+	return applied, lo, hi, err
+}
+
+func (b gpuOrCPU) BridgeTransition(
+	desc *BridgeVMRoundDescriptor,
+	signers []Signer,
+	liquidity []LiquidityEntry,
+	daily []DailyLimit,
+	inbox []Message,
+	outbox []Message,
+	epoch *BridgeVMEpochState,
+	result *BridgeVMTransitionResult,
+) error {
+	err := b.gpu.BridgeTransition(desc, signers, liquidity, daily, inbox, outbox, epoch, result)
+	if errors.Is(err, ErrGPUNotAvailable) {
+		return b.cpu.BridgeTransition(desc, signers, liquidity, daily, inbox, outbox, epoch, result)
+	}
+	return err
 }
 
 type cgoBackend struct {

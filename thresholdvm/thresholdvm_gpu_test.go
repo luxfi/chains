@@ -11,7 +11,7 @@ import (
 
 // TestGPULayoutSizes pins the on-wire struct sizes to the device-side
 // __align__(16) values declared in
-// the GPU plugin install tree ops/mpcvm/cuda/mpcvm_kernels_common.cuh.
+// the GPU plugin ops/mpcvm/cuda/mpcvm_kernels_common.cuh.
 // Any drift would produce silently-wrong kernel results — the same check
 // runs inside assertSizes() at init() under cgo; this test pins it for
 // nocgo builds AND lets `go test` surface the mismatch immediately
