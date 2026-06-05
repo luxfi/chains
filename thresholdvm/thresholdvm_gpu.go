@@ -203,7 +203,6 @@ import "C"
 import (
 	"errors"
 	"fmt"
-	"os"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -825,27 +824,3 @@ func tryLoadPlugin(kind GPUBackendKind, candidates ...string) *GPUBackend {
 	return b
 }
 
-// =============================================================================
-// Env override — LUX_THRESHOLDVM_GPU_BACKEND=cuda|hip|metal|vulkan|webgpu|none
-// pins the backend choice. Useful for tests + ops to force a specific path.
-// =============================================================================
-
-func envBackendOverride() (GPUBackendKind, bool) {
-	v := os.Getenv("LUX_THRESHOLDVM_GPU_BACKEND")
-	switch v {
-	case "cuda":
-		return GPUBackendCUDA, true
-	case "hip":
-		return GPUBackendHIP, true
-	case "metal":
-		return GPUBackendMetal, true
-	case "vulkan":
-		return GPUBackendVulkan, true
-	case "webgpu":
-		return GPUBackendWebGPU, true
-	case "none":
-		return GPUBackendNone, true
-	default:
-		return GPUBackendNone, false
-	}
-}
