@@ -3,96 +3,34 @@
 // Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
-package quantumvm
+// quantumvm_gpu_nocgo.go — !cgo build of the GPU plugin bridge.
+//
+// CGO_ENABLED=0 means dlopen is unreachable, so no plugin can ever
+// load here. Instead of the prior all-stub policy (every GPUBackend
+// method returned ErrGPUNotAvailable, forcing callers to maintain a
+// parallel CPU verify path), the bridge now routes every call straight
+// into the pure-Go reference in quantumvm_gpu_cpu.go (circl-backed
+// FIPS 204/205). Output is byte-identical to the cgo build's CPU
+// fallback path on every fixture, so a node with CGO_ENABLED=0 still
+// produces consensus-safe quantum-signature results — just without
+// GPU acceleration.
+//
+// AutoBackend() still reports BackendNone here. Callers that branch on
+// AutoBackend() for telemetry ("which backend is hot?") keep working;
+// callers that branch on it for *correctness* were already wrong,
+// because the cgo build's CPU fallback path lives under the same tag.
 
-// !cgo build: no plugin DSO is loadable without cgo (we cannot call
-// dlopen / dlsym from pure Go), so every GPUBackend method returns
-// ErrGPUNotAvailable and AutoBackend() reports BackendNone. The cgo
-// build's quantumvm_gpu.go does the runtime probe; this file keeps the
-// package surface identical regardless of CGO_ENABLED.
+package quantumvm
 
 func init() {
 	setActiveBackend(BackendNone)
 }
 
-// noGPUBackend is the !cgo implementation of the GPUBackend interface —
-// every method returns ErrGPUNotAvailable so callers route to the CPU
-// verify path cleanly.
-type noGPUBackend struct{}
-
 // ActiveGPUBackend returns the package-level GPUBackend handle. Under
-// !cgo this is always a stub returning ErrGPUNotAvailable on every
-// method call.
+// !cgo this is the shared CPU implementation defined in
+// quantumvm_gpu_cpu.go — the same FIPS 204/205 circl-backed code path
+// the cgo build falls through to when no plugin satisfies the dlopen
+// probe (or when a loaded plugin returns NOT_SUPPORTED at the vtbl).
 func ActiveGPUBackend() GPUBackend {
-	return noGPUBackend{}
-}
-
-func (noGPUBackend) Backend() Backend { return BackendNone }
-
-func (noGPUBackend) Close() error { return nil }
-
-func (noGPUBackend) MLDSAVerifyBatch(
-	mode MLDSAMode,
-	pubkeys [][]byte,
-	messages [][]byte,
-	msgLens []int,
-	msgWidthHint uint32,
-	signatures [][]byte,
-	results []bool,
-) error {
-	_ = mode
-	_ = messages
-	_ = msgLens
-	_ = msgWidthHint
-	_ = signatures
-	_ = results
-	// Empty batch is a legal no-op — match the cgo implementation's
-	// short-circuit so callers don't have to special-case "no plugin
-	// loaded AND empty batch" at the call site.
-	if len(pubkeys) == 0 {
-		return nil
-	}
-	return ErrGPUNotAvailable
-}
-
-func (noGPUBackend) MLDSASignBatch(
-	mode MLDSAMode,
-	skeys []byte,
-	msgs []byte,
-	msgLens []int,
-	msgWidthHint uint32,
-	count int,
-	sigsOut []byte,
-	sigLensOut []uint32,
-) error {
-	_ = mode
-	_ = skeys
-	_ = msgs
-	_ = msgLens
-	_ = msgWidthHint
-	_ = sigsOut
-	_ = sigLensOut
-	if count == 0 {
-		return nil
-	}
-	return ErrGPUNotAvailable
-}
-
-func (noGPUBackend) SLHDSAVerifyBatch(
-	variant SLHDSAVariant,
-	pubkeys [][]byte,
-	messages [][]byte,
-	msgLens []int,
-	signatures [][]byte,
-	results []bool,
-) error {
-	_ = variant
-	_ = messages
-	_ = msgLens
-	_ = signatures
-	_ = results
-	if len(pubkeys) == 0 {
-		return nil
-	}
-	return ErrGPUNotAvailable
+	return cpuBackend{}
 }
