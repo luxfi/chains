@@ -17,17 +17,12 @@ package thresholdvm
 // path, then the bare leaf-name (relying on the dynamic linker's default
 // search path: $DYLD_LIBRARY_PATH, $LD_LIBRARY_PATH, system dirs).
 //
-// LUX_THRESHOLDVM_GPU_BACKEND overrides the probe — when set to a backend
-// name we try ONLY that one. When set to "none" we skip the probe entirely.
-//
 // The probe is intentionally silent on failure: a host with no GPU still
 // boots; thresholdvm just runs on the CPU reference (the existing
 // protocol/, factory.go, executor.go state machine, unchanged by this
-// bridge). Failure paths log to stderr at most once at init() under
-// LUX_THRESHOLDVM_GPU_DEBUG=1 for diagnostics.
+// bridge).
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -39,35 +34,13 @@ func init() {
 	gpuBackendOnce.Do(func() {
 		assertSizes()
 		gpuBackend = probeGPUBackend()
-		if debugProbe() {
-			if gpuBackend == nil || !gpuBackend.IsAvailable() {
-				fmt.Fprintln(os.Stderr,
-					"[lux-thresholdvm-gpu] no plugin resolved, falling back to CPU")
-			} else {
-				fmt.Fprintf(os.Stderr,
-					"[lux-thresholdvm-gpu] resolved backend=%s path=%s\n",
-					gpuBackend.Kind, gpuBackend.Path)
-			}
-		}
 	})
-}
-
-func debugProbe() bool {
-	v := os.Getenv("LUX_THRESHOLDVM_GPU_DEBUG")
-	return v == "1" || v == "true"
 }
 
 // probeGPUBackend walks the canonical backend priority list and returns the
 // first one that dlopens AND resolves the required symbol pair. Returns
 // nil when nothing matches (CPU-only mode).
 func probeGPUBackend() *GPUBackend {
-	if kind, set := envBackendOverride(); set {
-		if kind == GPUBackendNone {
-			return nil
-		}
-		return tryLoadPlugin(kind, candidatesFor(kind)...)
-	}
-
 	order := []GPUBackendKind{
 		GPUBackendCUDA,
 		GPUBackendHIP,
