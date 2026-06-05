@@ -58,7 +58,7 @@ func probeGPUBackend() *GPUBackend {
 
 // candidatesFor returns up to three dylib filename candidates for the given
 // backend, ordered: LUXCPP_PREFIX/lib install path, lux-gpu-kernels build-tree
-// path under LUX_PRIVATE_GPU_KERNELS_DIR, then bare leaf-name for the
+// path under LUX_GPU_PLUGIN_DIR, then bare leaf-name for the
 // dynamic-linker default search path.
 //
 // On darwin the convention is libluxgpu_backend_<X>.dylib; on linux it's
@@ -81,25 +81,9 @@ func candidatesFor(kind GPUBackendKind) []string {
 		}
 	}
 
-	if kernels := os.Getenv("LUX_PRIVATE_GPU_KERNELS_DIR"); kernels != "" {
+	if dir := os.Getenv("LUX_GPU_PLUGIN_DIR"); dir != "" {
 		for _, leaf := range leaves {
-			// build/<backend>_backend/<leaf> is the cmake output convention
-			// for both metal_backend/ and webgpu_backend/.
-			sub := backendBuildDirname(kind)
-			if sub != "" {
-				out = append(out, filepath.Join(kernels, "build", sub, leaf))
-			}
-		}
-	} else if home := os.Getenv("HOME"); home != "" {
-		// Default lux-private path per the project memory note (2026-05-28):
-		// "luxcpp/metal + luxcpp/webgpu ARCHIVED. Plugin source + shaders
-		// now at lux-private/gpu-kernels/{metal,webgpu,kernels/...}".
-		root := filepath.Join(home, "work", "lux-private", "gpu-kernels")
-		for _, leaf := range leaves {
-			sub := backendBuildDirname(kind)
-			if sub != "" {
-				out = append(out, filepath.Join(root, "build", sub, leaf))
-			}
+			out = append(out, filepath.Join(dir, leaf))
 		}
 	}
 
@@ -136,7 +120,7 @@ func backendDylibLeaves(kind GPUBackendKind) []string {
 }
 
 // backendBuildDirname maps each backend to its cmake build subdirectory
-// under lux-private/gpu-kernels/build/.
+// under the lux GPU plugin build/.
 func backendBuildDirname(kind GPUBackendKind) string {
 	switch kind {
 	case GPUBackendCUDA:

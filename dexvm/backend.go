@@ -14,11 +14,11 @@
 //   lux_<backend>_dex_clob_arena_destroy
 //
 // The plugin sources live at:
-//   ~/work/lux-private/gpu-kernels/backends/<X>/src/dex_launchers.{mm,cpp}
-//   ~/work/lux-private/gpu-kernels/ops/dex/<X>/...
+//   the GPU plugin install tree backends/<X>/src/dex_launchers.{mm,cpp}
+//   the GPU plugin install tree ops/dex/<X>/...
 //
 // Public ABI header (single source of truth for byte layouts):
-//   ~/work/lux-private/gpu-kernels/include/lux/gpu/dex.h
+//   the GPU plugin install tree include/lux/gpu/dex.h
 //
 // The cgo file (dexvm_gpu.go) does the dlopen + dlsym. The nocgo file
 // (dexvm_gpu_nocgo.go) is a thin stub returning ErrGPUNotAvailable.
@@ -83,9 +83,9 @@ var ErrGPUNotAvailable = errors.New("dexvm: GPU plugin not available")
 // LuxAmmReservePair mirrors include/lux/gpu/dex.h::LuxAmmReservePair.
 // 16 bytes, packed (no padding), little-endian uint64 fields.
 // MUST match:
-//   ~/work/lux-private/gpu-kernels/include/lux/gpu/dex.h::LuxAmmReservePair
+//   the GPU plugin install tree include/lux/gpu/dex.h::LuxAmmReservePair
 //   ~/work/lux/dex/pkg/lx/amm.go::ReservePair
-//   ~/work/lux-private/gpu-kernels/ops/dex/{cuda,metal,wgsl}/amm_xyk*
+//   the GPU plugin install tree ops/dex/{cuda,metal,wgsl}/amm_xyk*
 type LuxAmmReservePair struct {
 	ReserveX uint64
 	ReserveY uint64

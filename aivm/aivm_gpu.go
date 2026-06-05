@@ -5,7 +5,7 @@
 // Unlike cevm/cevm_cgo.go (which links libevm + libevm-gpu via pkg-config),
 // AIVM resolves its GPU backend at PROCESS START via dlopen/dlsym against
 // the lux-gpu-kernels plugin DSOs. This keeps the chains module compilable
-// without lux-private/gpu-kernels present in the build tree — the plugin
+// without the lux GPU plugin present in the build tree — the plugin
 // is fully optional.
 //
 // Lookup order (handled by backend.go):
@@ -201,7 +201,7 @@ func (k BackendKind) String() string {
 // Layout-drift guards — match ops/aivm/cuda/aivm_kernels_common.cuh exactly.
 //
 // The struct bytes Go hands to C MUST match the on-disk layout file at
-// ~/work/lux-private/gpu-kernels/ops/aivm/op.yaml — every kernel reads them
+// the GPU plugin install tree ops/aivm/op.yaml — every kernel reads them
 // via reinterpret_cast. A silent layout shift produces consensus-divergent
 // state roots. init() refuses to load if any size drifts.
 // =============================================================================
@@ -436,7 +436,7 @@ func init() {
 			panic(fmt.Sprintf(
 				"aivm: layout drift — Go sizeof(%s)=%d but on-device layout=%d. "+
 					"Re-sync chains/aivm/aivm_gpu.go against "+
-					"~/work/lux-private/gpu-kernels/ops/aivm/cuda/aivm_kernels_common.cuh.",
+					"the GPU plugin install tree ops/aivm/cuda/aivm_kernels_common.cuh.",
 				c.name, c.got, c.want))
 		}
 	}
