@@ -6,12 +6,12 @@ package quantumvm
 // Q-Chain GPU substrate — host-side ABI v14 plugin bridge for batched
 // post-quantum signature verification + signing.
 //
-// The kernels live in ~/work/lux-private/gpu-kernels under
+// The kernels live in the GPU plugin install tree under
 // ops/crypto/{mldsa,slhdsa}/<backend>/ and are shipped inside the
 // libluxgpu_backend_<x>.{so,dylib} plugin shared libraries. The Go side
 // dlopens whichever plugin is on disk at process start, populates the
 // ABI v14 backend descriptor via the `lux_gpu_backend_init` entry point
-// (see lux-private/gpu-kernels/include/lux/gpu/backend_plugin.h), and
+// (see the lux GPU plugin include/lux/gpu/backend_plugin.h), and
 // invokes the op_mldsa_verify_batch / op_mldsa_sign_batch /
 // op_slhdsa_verify_batch slots from the resulting vtbl.
 //

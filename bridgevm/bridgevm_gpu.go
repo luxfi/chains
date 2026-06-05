@@ -10,7 +10,7 @@ package bridgevm
 // resolves the five lux_<bk>_bridgevm_* host launcher symbols via dlsym(3).
 //
 // Direct dlopen — NOT pkg-config. The plugin lives in
-// ~/work/lux-private/gpu-kernels (a private repo); the public chains module
+// the GPU plugin install tree (a private repo); the public chains module
 // must build without it present. Linking via pkg-config would couple the
 // public build to a private dep; dlopen + dlsym lets us probe at runtime
 // and degrade cleanly to ErrGPUNotAvailable when the plugin is absent.
@@ -20,7 +20,7 @@ package bridgevm
 //   1. $LUX_GPU_PLUGIN_DIR (explicit override, useful in tests / CI).
 //   2. $LUXCPP_PREFIX/lib/lux-gpu/         (the install tree).
 //   3. $LUXCPP_PREFIX/lib/                 (legacy install tree).
-//   4. $HOME/work/lux-private/gpu-kernels/build/backends/<bk>/  (dev tree).
+//   4. $HOME/work/the lux GPU plugin build/backends/<bk>/  (dev tree).
 //   5. The current working directory.
 //   6. The system loader's default path (dlopen with bare name).
 //
@@ -225,14 +225,7 @@ func candidatePluginPaths(bk Backend) []string {
 		paths = append(paths, filepath.Join(prefix, "lib", name))
 	}
 
-	// 4) Dev tree — the canonical layout from gpu-kernels' build/.
-	if home, err := os.UserHomeDir(); err == nil {
-		paths = append(paths,
-			filepath.Join(home, "work", "lux-private", "gpu-kernels",
-				"build", "backends", bk.String(), name))
-	}
-
-	// 5) CWD — last resort before falling back to the loader default.
+	// 4) CWD — last resort before falling back to the loader default.
 	if cwd, err := os.Getwd(); err == nil {
 		paths = append(paths, filepath.Join(cwd, name))
 	}
