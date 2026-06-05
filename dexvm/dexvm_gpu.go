@@ -16,7 +16,7 @@
 //
 // Host launcher ABI — exposed by every plugin under the per-backend
 // symbol prefix `lux_<backend>_*`. The C signatures come straight from
-// ~/work/lux-private/gpu-kernels/backends/{metal/src/dex_launchers.mm,
+// the GPU plugin install tree backends/{metal/src/dex_launchers.mm,
 // vulkan/src/dex_launchers.cpp}:
 //
 //   int amm_xyk_batch(const void* reserves, const void* amounts,

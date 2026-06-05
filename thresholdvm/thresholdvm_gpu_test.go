@@ -11,7 +11,7 @@ import (
 
 // TestGPULayoutSizes pins the on-wire struct sizes to the device-side
 // __align__(16) values declared in
-// ~/work/lux-private/gpu-kernels/ops/mpcvm/cuda/mpcvm_kernels_common.cuh.
+// the GPU plugin install tree ops/mpcvm/cuda/mpcvm_kernels_common.cuh.
 // Any drift would produce silently-wrong kernel results — the same check
 // runs inside assertSizes() at init() under cgo; this test pins it for
 // nocgo builds AND lets `go test` surface the mismatch immediately
@@ -81,7 +81,7 @@ func TestGPUBackendKindString(t *testing.T) {
 // with a zero fixture, assert no error. The two acceptable outcomes are:
 //
 //  1. The plugin is dlopen'd (e.g. on a dev box with the metal_backend
-//     dylib in lux-private/gpu-kernels/build/metal_backend/). The launcher
+//     dylib in the lux GPU plugin build/metal_backend/). The launcher
 //     runs against the zero fixture and returns rc=0 (zero ops applied).
 //
 //  2. The plugin is absent. Backend() returns nil; we get ErrGPUNotAvailable.
@@ -93,7 +93,7 @@ func TestGPUBackendKindString(t *testing.T) {
 func TestGPUBridgeZeroFixture(t *testing.T) {
 	b := Backend()
 	if b == nil || !b.IsAvailable() {
-		t.Logf("no GPU plugin resolved (expected on CI without a dylib in LUX_PRIVATE_GPU_KERNELS_DIR/build/)")
+		t.Logf("no GPU plugin resolved (expected on CI without a dylib in LUX_GPU_PLUGIN_DIR/build/)")
 		// Re-prove the error contract by calling through the nil receiver:
 		// the GPUBackend method set on nil must return ErrGPUNotAvailable
 		// rather than panicking. This is the substrate contract.

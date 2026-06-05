@@ -78,14 +78,14 @@ func locatePlugin(t *testing.T) (BackendKind, string) {
 // We use the FULL openGPUBackend path (the same one production init()
 // uses) rather than rolling our own dlsym so the test exercises the real
 // resolution sequence. If openGPUBackend can't find the plugin file
-// (CI without lux-private/gpu-kernels), we Skip.
+// (CI without the lux GPU plugin), we Skip.
 func TestRoundTripAttestation(t *testing.T) {
 	// Force a re-probe in case the package-level activeBackend was loaded
 	// before the test environment was set up.
 	kind, path := locatePlugin(t)
 	if kind == AvailableNone || path == "" {
 		t.Skip("aivm: no lux-gpu-kernels plugin DSO found on this host " +
-			"(set LUX_PRIVATE_GPU_KERNELS_DIR or LUX_GPU_PLUGIN_DIR)")
+			"(set LUX_GPU_PLUGIN_DIR or LUX_GPU_PLUGIN_DIR)")
 	}
 	t.Logf("aivm: using plugin %s at %s", kind, path)
 
