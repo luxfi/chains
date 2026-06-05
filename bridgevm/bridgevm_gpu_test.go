@@ -11,7 +11,7 @@ package bridgevm
 // cleanly when AutoBackend() == BackendNone (no libluxgpu_backend_*.so on
 // the search path), which is the common case in a public chains checkout.
 //
-// When a plugin IS present (e.g. dev box with ~/work/lux-private/gpu-kernels
+// When a plugin IS present (e.g. dev box with the GPU plugin install tree
 // built and $LUX_GPU_PLUGIN_DIR set to the build/backends/<bk>/ dir), the
 // test exercises signer_apply with a zero descriptor + zero ops + a sized
 // signers arena and asserts:
@@ -111,7 +111,7 @@ func TestSignerApplyZeroFixture(t *testing.T) {
 	bk := AutoBackend()
 	if bk == BackendNone {
 		t.Skip("no GPU plugin loaded; set LUX_GPU_PLUGIN_DIR=" +
-			os.Getenv("HOME") + "/work/lux-private/gpu-kernels/build/backends/<bk> to exercise")
+			os.Getenv("HOME") + "/work/the lux GPU plugin build/backends/<bk> to exercise")
 	}
 
 	// Zero descriptor → signer_op_count=0, kernel walks no ops. The mode

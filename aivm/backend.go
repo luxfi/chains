@@ -23,7 +23,7 @@ import (
 // Search rules:
 //
 //  1. LUX_GPU_PLUGIN_DIR (env) — direct directory.
-//  2. LUX_PRIVATE_GPU_KERNELS_DIR (env) — root of lux-private/gpu-kernels.
+//  2. LUX_GPU_PLUGIN_DIR (env) — root of the lux GPU plugin.
 //     Probes `<dir>/build/backends/<kind>/<filename>` and
 //     `<dir>/build/metal-only/backends/<kind>/<filename>`.
 //  3. Default install: $LUXCPP_PREFIX/lib (when LUXCPP_PREFIX is set).
@@ -78,9 +78,9 @@ func platformCandidates() []backendCandidate {
 //
 //   - LUX_GPU_PLUGIN_DIR/<filename>
 //   - LUX_GPU_PLUGIN_DIR/backends/<subdir>/<filename>
-//   - LUX_PRIVATE_GPU_KERNELS_DIR/build/backends/<subdir>/<filename>
-//   - LUX_PRIVATE_GPU_KERNELS_DIR/build/metal-only/backends/<subdir>/<filename>
-//   - LUX_PRIVATE_GPU_KERNELS_DIR/build/vulkan-m1/backends/<subdir>/<filename>
+//   - LUX_GPU_PLUGIN_DIR/build/backends/<subdir>/<filename>
+//   - LUX_GPU_PLUGIN_DIR/build/metal-only/backends/<subdir>/<filename>
+//   - LUX_GPU_PLUGIN_DIR/build/vulkan-m1/backends/<subdir>/<filename>
 //   - LUXCPP_PREFIX/lib/<filename>
 //   - bare filename (DT_RUNPATH / DT_RPATH / system search)
 //
@@ -93,8 +93,8 @@ func candidatePaths(c backendCandidate) []string {
 			filepath.Join(dir, "backends", c.subdir, c.filename),
 		)
 	}
-	if dir := os.Getenv("LUX_PRIVATE_GPU_KERNELS_DIR"); dir != "" {
-		// Match the on-disk layout shipped by ~/work/lux-private/gpu-kernels:
+	if dir := os.Getenv("LUX_GPU_PLUGIN_DIR"); dir != "" {
+		// Match the on-disk layout shipped by the GPU plugin install tree:
 		// `build/backends/<kind>/<filename>` from the default CMake build,
 		// plus the per-flavor subdirs the kernel team uses for matrix
 		// builds (metal-only, vulkan-m1, …).
@@ -157,7 +157,7 @@ func autoLoadBackend() *GPUBackend {
 // to decide whether to opt into the GPU path.
 func ActiveGPUBackend() *GPUBackend {
 	if activeBackend == nil {
-		// Defensive: if init() ran before LUX_PRIVATE_GPU_KERNELS_DIR was
+		// Defensive: if init() ran before LUX_GPU_PLUGIN_DIR was
 		// set (rare, mostly tests), re-probe via the once-guarded loader.
 		// Once activeBackend is set the once-guard keeps subsequent calls
 		// cheap.
