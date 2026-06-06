@@ -313,7 +313,7 @@ func (b *Block) Bytes() []byte {
 		return b.bytes
 	}
 
-	bytes, err := Codec.Marshal(codecVersion, b)
+	bytes, err := marshalBlock(b)
 	if err != nil {
 		return nil
 	}
