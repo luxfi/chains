@@ -244,7 +244,14 @@ func (v *Vertex) serialize() []byte {
 	binary.BigEndian.PutUint32(b4, uint32(len(v.txs)))
 	buf = append(buf, b4...)
 	for _, tx := range v.txs {
-		txBytes, _ := Codec.Marshal(codecVersion, tx)
+		txBytes, err := marshalTransaction(tx)
+		if err != nil {
+			// serialization is deterministic over validated txs; this is a
+			// programmer error (e.g. oversize slice). Surface it by returning
+			// a sentinel that downstream Verify/Accept will reject rather
+			// than silently dropping the tx.
+			return nil
+		}
 		binary.BigEndian.PutUint32(b4, uint32(len(txBytes)))
 		buf = append(buf, b4...)
 		buf = append(buf, txBytes...)
@@ -295,7 +302,7 @@ func deserializeVertex(data []byte, vm *VM) (*Vertex, error) {
 			return nil, errInvalidBlock
 		}
 		tx := &Transaction{}
-		if _, err := Codec.Unmarshal(data[pos:pos+int(txLen)], tx); err != nil {
+		if err := unmarshalTransaction(data[pos:pos+int(txLen)], tx); err != nil {
 			return nil, err
 		}
 		if tx.ID == ids.Empty {
