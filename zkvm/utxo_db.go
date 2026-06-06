@@ -86,7 +86,7 @@ func (udb *UTXODB) AddUTXO(utxo *UTXO) error {
 	}
 
 	// Serialize UTXO
-	utxoBytes, err := Codec.Marshal(codecVersion, utxo)
+	utxoBytes, err := marshalUTXO(utxo)
 	if err != nil {
 		return err
 	}
@@ -140,7 +140,7 @@ func (udb *UTXODB) GetUTXO(commitment []byte) (*UTXO, error) {
 	}
 
 	var utxo UTXO
-	if _, err := Codec.Unmarshal(utxoBytes, &utxo); err != nil {
+	if err := unmarshalUTXO(utxoBytes, &utxo); err != nil {
 		return nil, err
 	}
 
@@ -306,7 +306,7 @@ func (udb *UTXODB) getUTXONoLock(commitment []byte) (*UTXO, error) {
 	}
 
 	var utxo UTXO
-	if _, err := Codec.Unmarshal(utxoBytes, &utxo); err != nil {
+	if err := unmarshalUTXO(utxoBytes, &utxo); err != nil {
 		return nil, err
 	}
 

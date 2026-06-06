@@ -261,7 +261,7 @@ func (b *Block) Bytes() []byte {
 		return b.bytes
 	}
 
-	bytes, err := Codec.Marshal(codecVersion, b)
+	bytes, err := marshalBlock(b)
 	if err != nil {
 		// Log error and return nil
 		return nil
@@ -293,14 +293,16 @@ type SetupParams struct {
 	FHEPublicParams []byte `json:"fhePublicParams,omitempty"`
 }
 
-// ParseGenesis parses genesis bytes (supports both JSON and Codec formats)
+// ParseGenesis parses genesis bytes. Supports both JSON (human-authored
+// genesis files) and the canonical big-endian binary layout (built from
+// marshalGenesis).
 func ParseGenesis(genesisBytes []byte) (*Genesis, error) {
 	var genesis Genesis
 	if len(genesisBytes) > 0 {
 		// Try JSON first (simple genesis)
 		if err := json.Unmarshal(genesisBytes, &genesis); err != nil {
-			// Fall back to Codec (complex genesis with binary data)
-			if _, err := Codec.Unmarshal(genesisBytes, &genesis); err != nil {
+			// Fall back to hand-rolled binary (genesis with raw byte fields)
+			if err := unmarshalGenesis(genesisBytes, &genesis); err != nil {
 				return nil, err
 			}
 		}
