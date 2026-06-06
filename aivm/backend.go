@@ -176,39 +176,15 @@ func ActiveGPUBackend() *GPUBackend {
 // switch that lets callers opt into the GPU-accelerated AIVM transition
 // path. AutoAIVM = pick whatever ActiveGPUBackend() resolved. CPUAIVM =
 // force the Go fallback. Set per-process at startup; no per-call dispatch.
+//
+// `Mode` and the AutoAIVM / CPUAIVM / GPUAIVM constants live in the
+// build-tag-free aivm_gpu_types.go (so the nocgo build sees the same
+// surface). This file owns the cgo-side package-level state.
 // =============================================================================
-
-// Mode selects the AIVM transition execution mode. AutoAIVM (the default)
-// uses the resolved GPU backend if available and falls back to CPUAIVM
-// otherwise. CPUAIVM forces the Go path even when a plugin is loaded.
-type Mode uint8
-
-const (
-	// AutoAIVM picks the GPU plugin when available, else CPUAIVM.
-	AutoAIVM Mode = 0
-	// CPUAIVM forces the pure-Go transition path.
-	CPUAIVM Mode = 1
-	// GPUAIVM forces the GPU path. Panics if no plugin is loaded.
-	GPUAIVM Mode = 2
-)
-
-// String returns the human-readable name for the mode.
-func (m Mode) String() string {
-	switch m {
-	case AutoAIVM:
-		return "auto"
-	case CPUAIVM:
-		return "cpu"
-	case GPUAIVM:
-		return "gpu"
-	default:
-		return "unknown"
-	}
-}
 
 var (
 	modeMu     sync.RWMutex
-	activeMode Mode = AutoAIVM
+	activeMode = AutoAIVM
 )
 
 // SetBackend selects the active AIVM transition mode for the process.

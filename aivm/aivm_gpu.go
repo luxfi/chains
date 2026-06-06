@@ -1,12 +1,26 @@
 //go:build cgo
 
-// Package aivm GPU backend — runtime-loaded plugin bridge.
+// Package aivm GPU backend — runtime-loaded plugin bridge with CPU
+// fall-through.
 //
-// Unlike cevm/cevm_cgo.go (which links libevm + libevm-gpu via pkg-config),
-// AIVM resolves its GPU backend at PROCESS START via dlopen/dlsym against
-// the lux-gpu-kernels plugin DSOs. This keeps the chains module compilable
-// without the lux GPU plugin present in the build tree — the plugin
-// is fully optional.
+// Two pieces:
+//
+//  1. dlopen/dlsym against a lux-gpu-kernels plugin DSO at process start
+//     (backend.go handles the probe). Resolves six host launchers per
+//     backend (cuda / hip / metal / vulkan / webgpu).
+//
+//  2. Each public method tries the GPU plugin first; on
+//     ErrGPUNotAvailable (no plugin loaded) OR any plugin-side error
+//     (rc != 0) it falls through to the canonical pure-Go reference
+//     defined in aivm_gpu_cpu.go. GPU is a strict positive overlay —
+//     the CPU answer is the canonical truth. Both build modes produce
+//     byte-identical output on every fixture.
+//
+// Layout structs (Attestation, ModelRegistryEntry, …), BackendKind /
+// Mode enums, ErrGPUNotAvailable, and the init() layout-drift guard
+// all live in the build-tag-free aivm_gpu_types.go so both cgo and
+// !cgo share ONE copy. The pure-Go reference implementations of the
+// six kernels live in aivm_gpu_cpu.go (also no build tag).
 //
 // Lookup order (handled by backend.go):
 //
@@ -153,303 +167,20 @@ static void lux_dlclose(void* handle) {
 import "C"
 
 import (
-	"errors"
 	"fmt"
 	"runtime"
 	"sync"
 	"unsafe"
 )
 
-// ErrGPUNotAvailable is returned by every GPUBackend method when no plugin
-// was loadable at init time. Callers fall through to the existing Go path.
-var ErrGPUNotAvailable = errors.New("aivm: no GPU plugin available")
-
-// BackendKind identifies which lux-gpu-kernels plugin satisfied the
-// runtime dlopen probe. AvailableNone is the sentinel "fall through to Go".
-type BackendKind uint8
-
-const (
-	AvailableNone   BackendKind = 0
-	AvailableCUDA   BackendKind = 1
-	AvailableHIP    BackendKind = 2
-	AvailableMetal  BackendKind = 3
-	AvailableVulkan BackendKind = 4
-	AvailableWebGPU BackendKind = 5
-)
-
-// String returns the human-readable name for the backend kind.
-func (k BackendKind) String() string {
-	switch k {
-	case AvailableNone:
-		return "none"
-	case AvailableCUDA:
-		return "cuda"
-	case AvailableHIP:
-		return "hip"
-	case AvailableMetal:
-		return "metal"
-	case AvailableVulkan:
-		return "vulkan"
-	case AvailableWebGPU:
-		return "webgpu"
-	default:
-		return fmt.Sprintf("backend(%d)", uint8(k))
-	}
-}
-
-// =============================================================================
-// Layout-drift guards — match ops/aivm/cuda/aivm_kernels_common.cuh exactly.
-//
-// The struct bytes Go hands to C MUST match the on-disk layout file at
-// the GPU plugin install tree ops/aivm/op.yaml — every kernel reads them
-// via reinterpret_cast. A silent layout shift produces consensus-divergent
-// state roots. init() refuses to load if any size drifts.
-// =============================================================================
-
-// Attestation mirrors aivm::cuda::Attestation (144 bytes).
-type Attestation struct {
-	TEEQuoteDigest [32]byte
-	Measurement    [32]byte
-	AttestingKey   [48]byte
-	ExpiryNS       uint64
-	Kind           uint32
-	EvidenceOffset uint32
-	EvidenceLen    uint32
-	Status         uint32
-	Occupied       uint32
-	_pad0          uint32
-}
-
-// ModelRegistryEntry mirrors aivm::cuda::ModelRegistryEntry (160 bytes).
-type ModelRegistryEntry struct {
-	ModelRoot      [32]byte
-	WeightHash     [32]byte
-	LicenseRoot    [32]byte
-	OwnerAddr      [20]byte
-	_pad0          uint32
-	Version        uint64
-	ParameterCount uint64
-	Modality       uint32
-	Occupied       uint32
-	_pad1          uint64
-	_pad2          uint64
-}
-
-// AuditAnchor mirrors aivm::cuda::AuditAnchor (128 bytes).
-type AuditAnchor struct {
-	CommitRoot                [32]byte
-	ParentRoot                [32]byte
-	ValidatorSetRootAtCommit  [32]byte
-	Height                    uint64
-	TimestampNS               uint64
-	Occupied                  uint32
-	_pad0                     uint32
-	_pad1                     uint64
-}
-
-// AIVMEpochState mirrors aivm::cuda::AIVMEpochState (160 bytes).
-type AIVMEpochState struct {
-	CurrentEpoch             uint64
-	NextEpochHeight          uint64
-	TotalActiveAttestations  uint64
-	ActiveModelCount         uint32
-	ExpiredAttestationCount  uint32
-	AttestationRoot          [32]byte
-	ModelRegistryRoot        [32]byte
-	AuditRoot                [32]byte
-	AIVMStateRoot            [32]byte
-}
-
-// AIVMRoundDescriptor mirrors aivm::cuda::AIVMRoundDescriptor (96 bytes).
-type AIVMRoundDescriptor struct {
-	ChainID            uint64
-	Round              uint64
-	TimestampNS        uint64
-	Epoch              uint64
-	Mode               uint32
-	AttestationOpCount uint32
-	ModelOpCount       uint32
-	AnchorOpCount      uint32
-	ClosingFlag        uint32
-	_pad0              uint32
-	_pad1              uint64
-	ParentAIVMRoot     [32]byte
-}
-
-// AttestationOp mirrors aivm::cuda::AttestationOp (144 bytes).
-type AttestationOp struct {
-	TEEQuoteDigest [32]byte
-	Measurement    [32]byte
-	AttestingKey   [48]byte
-	ExpiryNS       uint64
-	Kind           uint32
-	EvidenceOffset uint32
-	EvidenceLen    uint32
-	Epoch          uint32
-	_pad0          uint32
-	_pad1          uint32
-}
-
-// ModelOp mirrors aivm::cuda::ModelOp (160 bytes).
-type ModelOp struct {
-	ModelRoot      [32]byte
-	WeightHash     [32]byte
-	LicenseRoot    [32]byte
-	OwnerAddr      [20]byte
-	_pad0          uint32
-	ParameterCount uint64
-	Modality       uint32
-	Kind           uint32
-	Epoch          uint32
-	_pad1          uint32
-	_pad2          uint64
-	_pad3          uint64
-}
-
-// AnchorOp mirrors aivm::cuda::AnchorOp (128 bytes).
-type AnchorOp struct {
-	CommitRoot                [32]byte
-	ParentRoot                [32]byte
-	ValidatorSetRootAtCommit  [32]byte
-	Height                    uint64
-	TimestampNS               uint64
-	Epoch                     uint32
-	_pad0                     uint32
-	_pad1                     uint64
-}
-
-// AIVMTransitionResult mirrors aivm::cuda::AIVMTransitionResult (192 bytes).
-type AIVMTransitionResult struct {
-	Status                uint32
-	AttestationApplyCount uint32
-	ModelApplyCount       uint32
-	AnchorApplyCount      uint32
-	ActiveAttestations    uint32
-	ExpiredAttestations   uint32
-	ModelCount            uint32
-	AnchorCount           uint32
-	Epoch                 uint64
-	TotalModels           uint64
-	TotalAnchors          uint64
-	_pad0                 uint64
-	AttestationRoot       [32]byte
-	ModelRegistryRoot     [32]byte
-	AuditRoot             [32]byte
-	AIVMStateRoot         [32]byte
-}
-
-// InferenceWeights mirrors aivm::cuda::InferenceWeights (672 bytes).
-// 32→16→1 quantized classifier weights.
-const (
-	InferenceInDim  = 32
-	InferenceHidden = 16
-	InferenceOutDim = 1
-)
-
-type InferenceWeights struct {
-	W1              [InferenceInDim * InferenceHidden]int8
-	B1              [InferenceHidden]int32
-	W2              [InferenceHidden * InferenceOutDim]int8
-	B2              [InferenceOutDim]int32
-	Shift1          int8
-	Shift2          int8
-	_pad0           [2]uint8
-	ModelHash       [32]byte
-	ModelConfigHash [32]byte
-	_pad1           [8]uint8
-}
-
-// InferenceOp mirrors aivm::cuda::InferenceOp (144 bytes).
-type InferenceOp struct {
-	ModelHash      [32]byte
-	PolicyHash     [32]byte
-	Salt           [32]byte
-	Mode           uint32
-	InputOffset    uint32
-	InputLen       uint32
-	OutputOffset   uint32
-	OutputCapacity uint32
-	_pad0          uint32
-	RoundID        uint64
-	TimestampNS    uint64
-	_pad1          [8]uint8
-}
-
-// InferenceResult mirrors aivm::cuda::InferenceResult (112 bytes).
-type InferenceResult struct {
-	Status            uint32
-	OutputLen         uint32
-	InputCommitment   [32]byte
-	OutputCommitment  [32]byte
-	AttestationRoot   [32]byte
-	_pad0             [8]uint8
-}
-
-// ProofVerifyOp mirrors aivm::cuda::ProofVerifyOp (240 bytes).
-type ProofVerifyOp struct {
-	Measurement  [32]byte
-	AttestingKey [48]byte
-	Signature    [96]byte
-	MessageHash  [32]byte
-	ExpiryNS     uint64
-	TimestampNS  uint64
-	Kind         uint32
-	Nonce        uint32
-	_pad0        [8]uint8
-}
-
-// ProofVerifyResult mirrors aivm::cuda::ProofVerifyResult (48 bytes).
-type ProofVerifyResult struct {
-	Status      uint32
-	Kind        uint32
-	BindingHash [32]byte
-	_pad0       [8]uint8
-}
-
-// Layout-drift guard — refuse to load if any struct size disagrees with
-// the on-device layout in aivm_kernels_common.cuh / aivm_gpu_layout.hpp.
-// Any disagreement here means Go would write garbage at the C boundary.
-func init() {
-	type sz struct {
-		name string
-		got  uintptr
-		want uintptr
-	}
-	checks := []sz{
-		{"Attestation", unsafe.Sizeof(Attestation{}), 144},
-		{"ModelRegistryEntry", unsafe.Sizeof(ModelRegistryEntry{}), 160},
-		{"AuditAnchor", unsafe.Sizeof(AuditAnchor{}), 128},
-		{"AIVMEpochState", unsafe.Sizeof(AIVMEpochState{}), 160},
-		{"AIVMRoundDescriptor", unsafe.Sizeof(AIVMRoundDescriptor{}), 96},
-		{"AttestationOp", unsafe.Sizeof(AttestationOp{}), 144},
-		{"ModelOp", unsafe.Sizeof(ModelOp{}), 160},
-		{"AnchorOp", unsafe.Sizeof(AnchorOp{}), 128},
-		{"AIVMTransitionResult", unsafe.Sizeof(AIVMTransitionResult{}), 192},
-		{"InferenceWeights", unsafe.Sizeof(InferenceWeights{}), 672},
-		{"InferenceOp", unsafe.Sizeof(InferenceOp{}), 144},
-		{"InferenceResult", unsafe.Sizeof(InferenceResult{}), 112},
-		{"ProofVerifyOp", unsafe.Sizeof(ProofVerifyOp{}), 240},
-		{"ProofVerifyResult", unsafe.Sizeof(ProofVerifyResult{}), 48},
-	}
-	for _, c := range checks {
-		if c.got != c.want {
-			panic(fmt.Sprintf(
-				"aivm: layout drift — Go sizeof(%s)=%d but on-device layout=%d. "+
-					"Re-sync chains/aivm/aivm_gpu.go against "+
-					"the GPU plugin install tree ops/aivm/cuda/aivm_kernels_common.cuh.",
-				c.name, c.got, c.want))
-		}
-	}
-}
-
 // =============================================================================
 // GPUBackend — handle to an open plugin DSO + its six resolved launchers.
 // =============================================================================
 
 // GPUBackend is a handle to an open lux-gpu-kernels plugin. Zero value is
-// usable (every method returns ErrGPUNotAvailable). The active backend is
-// stored at package level by backend.go's init(); call ActiveGPUBackend()
-// to retrieve it.
+// usable (every method falls through to the canonical CPU reference in
+// aivm_gpu_cpu.go). The active backend is stored at package level by
+// backend.go's init(); call ActiveGPUBackend() to retrieve it.
 type GPUBackend struct {
 	mu        sync.Mutex
 	kind      BackendKind
@@ -581,121 +312,128 @@ func (b *GPUBackend) Close() error {
 // the Go side beyond a defer'd KeepAlive on every input/output buffer.
 // =============================================================================
 
-// AttestationApply runs the GPU attestation kernel. `attestations` is read+
-// written in place; `appliedOut` is the count of successfully applied ops.
+// AttestationApply runs the attestation kernel. Tries the GPU plugin
+// first; falls through to attestationApplyCPU on missing plugin or any
+// plugin-side error. Byte-equal to the C++ CPU oracle by construction.
 func (b *GPUBackend) AttestationApply(
 	desc *AIVMRoundDescriptor,
 	ops []AttestationOp,
 	attestations []Attestation,
 	appliedOut *uint32,
 ) error {
-	if !b.IsAvailable() {
-		return ErrGPUNotAvailable
-	}
 	if desc == nil || appliedOut == nil {
-		return errors.New("aivm: AttestationApply: nil desc or appliedOut")
+		return errAttestationNilInput
 	}
 	if len(attestations) == 0 {
-		return errors.New("aivm: AttestationApply: empty attestations table")
+		return errAttestationEmptyTable
 	}
 
-	var opsPtr unsafe.Pointer
-	if len(ops) > 0 {
-		opsPtr = unsafe.Pointer(&ops[0])
+	if b.IsAvailable() {
+		var opsPtr unsafe.Pointer
+		if len(ops) > 0 {
+			opsPtr = unsafe.Pointer(&ops[0])
+		}
+		rc := C.call_aivm_attestation(
+			b.fnAttest,
+			unsafe.Pointer(desc),
+			opsPtr,
+			unsafe.Pointer(&attestations[0]),
+			unsafe.Pointer(appliedOut),
+			C.uint32_t(len(attestations)),
+		)
+		runtime.KeepAlive(desc)
+		runtime.KeepAlive(ops)
+		runtime.KeepAlive(attestations)
+		runtime.KeepAlive(appliedOut)
+		if rc == 0 {
+			return nil
+		}
+		// Plugin-side error — fall through to the CPU reference. GPU is
+		// a strict positive overlay; the CPU answer is canonical.
 	}
-	rc := C.call_aivm_attestation(
-		b.fnAttest,
-		unsafe.Pointer(desc),
-		opsPtr,
-		unsafe.Pointer(&attestations[0]),
-		unsafe.Pointer(appliedOut),
-		C.uint32_t(len(attestations)),
-	)
-	runtime.KeepAlive(desc)
-	runtime.KeepAlive(ops)
-	runtime.KeepAlive(attestations)
-	runtime.KeepAlive(appliedOut)
-	if rc != 0 {
-		return fmt.Errorf("aivm: %s_aivm_attestation_apply returned %d", b.kind, int(rc))
-	}
+	attestationApplyCPU(desc, ops, attestations, appliedOut)
 	return nil
 }
 
-// ProvenanceApply runs the GPU provenance (model-registry) kernel.
+// ProvenanceApply runs the provenance (model-registry) kernel. Tries
+// the GPU plugin first; falls through to provenanceApplyCPU on missing
+// plugin or any plugin-side error.
 func (b *GPUBackend) ProvenanceApply(
 	desc *AIVMRoundDescriptor,
 	ops []ModelOp,
 	models []ModelRegistryEntry,
 	appliedOut *uint32,
 ) error {
-	if !b.IsAvailable() {
-		return ErrGPUNotAvailable
-	}
 	if desc == nil || appliedOut == nil {
-		return errors.New("aivm: ProvenanceApply: nil desc or appliedOut")
+		return errProvenanceNilInput
 	}
 	if len(models) == 0 {
-		return errors.New("aivm: ProvenanceApply: empty models table")
+		return errProvenanceEmptyTable
 	}
 
-	var opsPtr unsafe.Pointer
-	if len(ops) > 0 {
-		opsPtr = unsafe.Pointer(&ops[0])
+	if b.IsAvailable() {
+		var opsPtr unsafe.Pointer
+		if len(ops) > 0 {
+			opsPtr = unsafe.Pointer(&ops[0])
+		}
+		rc := C.call_aivm_provenance(
+			b.fnProv,
+			unsafe.Pointer(desc),
+			opsPtr,
+			unsafe.Pointer(&models[0]),
+			unsafe.Pointer(appliedOut),
+			C.uint32_t(len(models)),
+		)
+		runtime.KeepAlive(desc)
+		runtime.KeepAlive(ops)
+		runtime.KeepAlive(models)
+		runtime.KeepAlive(appliedOut)
+		if rc == 0 {
+			return nil
+		}
 	}
-	rc := C.call_aivm_provenance(
-		b.fnProv,
-		unsafe.Pointer(desc),
-		opsPtr,
-		unsafe.Pointer(&models[0]),
-		unsafe.Pointer(appliedOut),
-		C.uint32_t(len(models)),
-	)
-	runtime.KeepAlive(desc)
-	runtime.KeepAlive(ops)
-	runtime.KeepAlive(models)
-	runtime.KeepAlive(appliedOut)
-	if rc != 0 {
-		return fmt.Errorf("aivm: %s_aivm_provenance_apply returned %d", b.kind, int(rc))
-	}
+	provenanceApplyCPU(desc, ops, models, appliedOut)
 	return nil
 }
 
-// AnchorApply runs the GPU audit-anchor kernel.
+// AnchorApply runs the audit-anchor kernel. Tries the GPU plugin
+// first; falls through to anchorApplyCPU on missing plugin or any
+// plugin-side error.
 func (b *GPUBackend) AnchorApply(
 	desc *AIVMRoundDescriptor,
 	ops []AnchorOp,
 	anchors []AuditAnchor,
 	appliedOut *uint32,
 ) error {
-	if !b.IsAvailable() {
-		return ErrGPUNotAvailable
-	}
 	if desc == nil || appliedOut == nil {
-		return errors.New("aivm: AnchorApply: nil desc or appliedOut")
+		return errAnchorNilInput
 	}
 	if len(anchors) == 0 {
-		return errors.New("aivm: AnchorApply: empty anchors table")
+		return errAnchorEmptyTable
 	}
 
-	var opsPtr unsafe.Pointer
-	if len(ops) > 0 {
-		opsPtr = unsafe.Pointer(&ops[0])
+	if b.IsAvailable() {
+		var opsPtr unsafe.Pointer
+		if len(ops) > 0 {
+			opsPtr = unsafe.Pointer(&ops[0])
+		}
+		rc := C.call_aivm_anchor(
+			b.fnAnchor,
+			unsafe.Pointer(desc),
+			opsPtr,
+			unsafe.Pointer(&anchors[0]),
+			unsafe.Pointer(appliedOut),
+			C.uint32_t(len(anchors)),
+		)
+		runtime.KeepAlive(desc)
+		runtime.KeepAlive(ops)
+		runtime.KeepAlive(anchors)
+		runtime.KeepAlive(appliedOut)
+		if rc == 0 {
+			return nil
+		}
 	}
-	rc := C.call_aivm_anchor(
-		b.fnAnchor,
-		unsafe.Pointer(desc),
-		opsPtr,
-		unsafe.Pointer(&anchors[0]),
-		unsafe.Pointer(appliedOut),
-		C.uint32_t(len(anchors)),
-	)
-	runtime.KeepAlive(desc)
-	runtime.KeepAlive(ops)
-	runtime.KeepAlive(anchors)
-	runtime.KeepAlive(appliedOut)
-	if rc != 0 {
-		return fmt.Errorf("aivm: %s_aivm_anchor_apply returned %d", b.kind, int(rc))
-	}
+	anchorApplyCPU(desc, ops, anchors, appliedOut)
 	return nil
 }
 
@@ -709,51 +447,52 @@ func (b *GPUBackend) EpochTransition(
 	epoch *AIVMEpochState,
 	result *AIVMTransitionResult,
 ) error {
-	if !b.IsAvailable() {
-		return ErrGPUNotAvailable
-	}
 	if desc == nil || epoch == nil || result == nil {
-		return errors.New("aivm: EpochTransition: nil desc, epoch, or result")
+		return errEpochNilInput
 	}
 	if len(attestations) == 0 {
-		return errors.New("aivm: EpochTransition: empty attestations table")
+		return errEpochEmptyTable
 	}
 
-	var modelsPtr, anchorsPtr unsafe.Pointer
-	if len(models) > 0 {
-		modelsPtr = unsafe.Pointer(&models[0])
+	if b.IsAvailable() {
+		var modelsPtr, anchorsPtr unsafe.Pointer
+		if len(models) > 0 {
+			modelsPtr = unsafe.Pointer(&models[0])
+		}
+		if len(anchors) > 0 {
+			anchorsPtr = unsafe.Pointer(&anchors[0])
+		}
+		rc := C.call_aivm_epoch(
+			b.fnEpoch,
+			unsafe.Pointer(desc),
+			unsafe.Pointer(&attestations[0]),
+			modelsPtr,
+			anchorsPtr,
+			unsafe.Pointer(epoch),
+			unsafe.Pointer(result),
+			C.uint32_t(len(attestations)),
+			C.uint32_t(len(models)),
+			C.uint32_t(len(anchors)),
+		)
+		runtime.KeepAlive(desc)
+		runtime.KeepAlive(attestations)
+		runtime.KeepAlive(models)
+		runtime.KeepAlive(anchors)
+		runtime.KeepAlive(epoch)
+		runtime.KeepAlive(result)
+		if rc == 0 {
+			return nil
+		}
 	}
-	if len(anchors) > 0 {
-		anchorsPtr = unsafe.Pointer(&anchors[0])
-	}
-	rc := C.call_aivm_epoch(
-		b.fnEpoch,
-		unsafe.Pointer(desc),
-		unsafe.Pointer(&attestations[0]),
-		modelsPtr,
-		anchorsPtr,
-		unsafe.Pointer(epoch),
-		unsafe.Pointer(result),
-		C.uint32_t(len(attestations)),
-		C.uint32_t(len(models)),
-		C.uint32_t(len(anchors)),
-	)
-	runtime.KeepAlive(desc)
-	runtime.KeepAlive(attestations)
-	runtime.KeepAlive(models)
-	runtime.KeepAlive(anchors)
-	runtime.KeepAlive(epoch)
-	runtime.KeepAlive(result)
-	if rc != 0 {
-		return fmt.Errorf("aivm: %s_aivm_epoch_transition returned %d", b.kind, int(rc))
-	}
+	epochTransitionCPU(desc, attestations, models, anchors, epoch, result)
 	return nil
 }
 
 // InferenceStep runs the deterministic int8 32→16→1 inference kernel.
-// `batchInputs` is op_count × 32 bytes of input rows; `batchOutputs` receives
-// op_count × 1 byte of output values. Determinism contract: byte-equal to
-// the CPU reference + every other backend.
+// `batchInputs` is op_count × 32 bytes of input rows; `batchOutputs`
+// receives op_count × 1 byte of output values. Tries the GPU plugin
+// first; falls through to inferenceStepCPU on missing plugin or any
+// plugin-side error. Byte-equal across CPU + every GPU backend.
 func (b *GPUBackend) InferenceStep(
 	weights *InferenceWeights,
 	ops []InferenceOp,
@@ -761,75 +500,73 @@ func (b *GPUBackend) InferenceStep(
 	batchOutputs []int8,
 	results []InferenceResult,
 ) error {
-	if !b.IsAvailable() {
-		return ErrGPUNotAvailable
-	}
 	if weights == nil {
-		return errors.New("aivm: InferenceStep: nil weights")
+		return errInferenceNilWeights
 	}
 	if len(ops) == 0 {
 		return nil // no-op
 	}
 	if len(results) != len(ops) {
-		return fmt.Errorf("aivm: InferenceStep: results length %d != ops length %d",
-			len(results), len(ops))
+		return errInferenceLenMismatchResults
 	}
 	if len(batchInputs) != len(ops)*InferenceInDim {
-		return fmt.Errorf("aivm: InferenceStep: batchInputs length %d != ops*%d (=%d)",
-			len(batchInputs), InferenceInDim, len(ops)*InferenceInDim)
+		return errInferenceLenMismatchInputs
 	}
 	if len(batchOutputs) != len(ops)*InferenceOutDim {
-		return fmt.Errorf("aivm: InferenceStep: batchOutputs length %d != ops*%d (=%d)",
-			len(batchOutputs), InferenceOutDim, len(ops)*InferenceOutDim)
+		return errInferenceLenMismatchOutputs
 	}
 
-	rc := C.call_aivm_inference(
-		b.fnInfer,
-		unsafe.Pointer(weights),
-		unsafe.Pointer(&ops[0]),
-		unsafe.Pointer(&batchInputs[0]),
-		unsafe.Pointer(&batchOutputs[0]),
-		unsafe.Pointer(&results[0]),
-		C.uint32_t(len(ops)),
-	)
-	runtime.KeepAlive(weights)
-	runtime.KeepAlive(ops)
-	runtime.KeepAlive(batchInputs)
-	runtime.KeepAlive(batchOutputs)
-	runtime.KeepAlive(results)
-	if rc != 0 {
-		return fmt.Errorf("aivm: %s_aivm_inference_step returned %d", b.kind, int(rc))
+	if b.IsAvailable() {
+		rc := C.call_aivm_inference(
+			b.fnInfer,
+			unsafe.Pointer(weights),
+			unsafe.Pointer(&ops[0]),
+			unsafe.Pointer(&batchInputs[0]),
+			unsafe.Pointer(&batchOutputs[0]),
+			unsafe.Pointer(&results[0]),
+			C.uint32_t(len(ops)),
+		)
+		runtime.KeepAlive(weights)
+		runtime.KeepAlive(ops)
+		runtime.KeepAlive(batchInputs)
+		runtime.KeepAlive(batchOutputs)
+		runtime.KeepAlive(results)
+		if rc == 0 {
+			return nil
+		}
 	}
+	inferenceStepCPU(weights, ops, batchInputs, batchOutputs, results)
 	return nil
 }
 
-// ProofVerify runs the TEE-attestation envelope check kernel.
+// ProofVerify runs the TEE-attestation envelope check kernel. Tries
+// the GPU plugin first; falls through to proofVerifyCPU on missing
+// plugin or any plugin-side error.
 func (b *GPUBackend) ProofVerify(
 	ops []ProofVerifyOp,
 	results []ProofVerifyResult,
 ) error {
-	if !b.IsAvailable() {
-		return ErrGPUNotAvailable
-	}
 	if len(ops) == 0 {
 		return nil // no-op
 	}
 	if len(results) != len(ops) {
-		return fmt.Errorf("aivm: ProofVerify: results length %d != ops length %d",
-			len(results), len(ops))
+		return errProofVerifyLenMismatch
 	}
 
-	rc := C.call_aivm_proof_verify(
-		b.fnProof,
-		unsafe.Pointer(&ops[0]),
-		unsafe.Pointer(&results[0]),
-		C.uint32_t(len(ops)),
-	)
-	runtime.KeepAlive(ops)
-	runtime.KeepAlive(results)
-	if rc != 0 {
-		return fmt.Errorf("aivm: %s_aivm_proof_verify returned %d", b.kind, int(rc))
+	if b.IsAvailable() {
+		rc := C.call_aivm_proof_verify(
+			b.fnProof,
+			unsafe.Pointer(&ops[0]),
+			unsafe.Pointer(&results[0]),
+			C.uint32_t(len(ops)),
+		)
+		runtime.KeepAlive(ops)
+		runtime.KeepAlive(results)
+		if rc == 0 {
+			return nil
+		}
 	}
+	proofVerifyCPU(ops, results)
 	return nil
 }
 
@@ -847,8 +584,9 @@ func gpuAvailable() bool {
 }
 
 // gpuTransitionApply is a one-call wrapper around EpochTransition that
-// vm.go's Accept() can opt into when ready. Returns ErrGPUNotAvailable
-// if no backend is loaded — caller falls through to the CPU Go path.
+// vm.go's Accept() can opt into. Now that EpochTransition itself falls
+// through to the CPU reference on plugin error, this never returns
+// ErrGPUNotAvailable; the caller always gets a correct answer.
 func gpuTransitionApply(
 	desc *AIVMRoundDescriptor,
 	attestations []Attestation,
@@ -857,9 +595,5 @@ func gpuTransitionApply(
 	epoch *AIVMEpochState,
 	result *AIVMTransitionResult,
 ) error {
-	b := ActiveGPUBackend()
-	if !b.IsAvailable() {
-		return ErrGPUNotAvailable
-	}
-	return b.EpochTransition(desc, attestations, models, anchors, epoch, result)
+	return ActiveGPUBackend().EpochTransition(desc, attestations, models, anchors, epoch, result)
 }
