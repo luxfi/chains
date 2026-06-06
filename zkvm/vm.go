@@ -128,7 +128,7 @@ func (vm *VM) Initialize(
 
 	// Parse configuration or use defaults
 	if len(init.Config) > 0 {
-		if _, err := Codec.Unmarshal(init.Config, &vm.config); err != nil {
+		if err := unmarshalConfig(init.Config, &vm.config); err != nil {
 			return fmt.Errorf("failed to parse config: %w", err)
 		}
 	} else {
@@ -320,7 +320,7 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 // ParseBlock parses a block from bytes
 func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (chain.Block, error) {
 	block := &Block{vm: vm}
-	if _, err := Codec.Unmarshal(blockBytes, block); err != nil {
+	if err := unmarshalBlock(blockBytes, block); err != nil {
 		return nil, err
 	}
 
