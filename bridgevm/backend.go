@@ -120,7 +120,7 @@ type Signer struct {
 	ExitEpoch        uint64
 	SignCount        uint64
 	BLSPubKey        [48]byte
-	RingtailPubKey   [32]byte
+	CoronaPubKey   [32]byte
 	MLDSAPubKey      [32]byte
 	Status           uint32
 	JailUntilEpoch   uint32
@@ -221,7 +221,7 @@ type SignerOp struct {
 	BondAmountHi    uint64
 	OptInHeight     uint64
 	BLSPubKey       [48]byte
-	RingtailPubKey  [32]byte
+	CoronaPubKey  [32]byte
 	MLDSAPubKey     [32]byte
 	Kind            uint32
 	JailUntilEpoch  uint32
