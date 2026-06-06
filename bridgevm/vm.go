@@ -484,7 +484,7 @@ func (vm *VM) GetBlock(ctx context.Context, id ids.ID) (chain.Block, error) {
 // ParseBlock implements the chain.ChainVM interface
 func (vm *VM) ParseBlock(ctx context.Context, bytes []byte) (chain.Block, error) {
 	blk := &Block{vm: vm}
-	if _, err := Codec.Unmarshal(bytes, blk); err != nil {
+	if err := unmarshalBlock(bytes, blk); err != nil {
 		return nil, err
 	}
 
@@ -636,7 +636,7 @@ func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
 // Helper methods
 
 func (vm *VM) putBlock(blk *Block) error {
-	bytes, err := Codec.Marshal(codecVersion, blk)
+	bytes, err := marshalBlock(blk)
 	if err != nil {
 		return err
 	}
@@ -651,7 +651,7 @@ func (vm *VM) getBlock(id ids.ID) (*Block, error) {
 	}
 
 	blk := &Block{vm: vm}
-	if _, err := Codec.Unmarshal(bytes, blk); err != nil {
+	if err := unmarshalBlock(bytes, blk); err != nil {
 		return nil, err
 	}
 
