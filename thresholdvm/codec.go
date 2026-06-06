@@ -4,19 +4,17 @@
 package thresholdvm
 
 import (
-	"github.com/luxfi/codec"
-	"github.com/luxfi/codec/linearcodec"
+	"github.com/luxfi/node/vms/pcodecs"
 )
 
 const codecVersion = 0
 
 // Codec is the codec for the threshold VM
-var Codec codec.Manager
+var Codec pcodecs.Manager
 
 func init() {
-	c := linearcodec.NewDefault()
+	c := pcodecs.NewLinearCodec()
 
-	// Register types
 	c.RegisterType(&Block{})
 	c.RegisterType(&Operation{})
 	c.RegisterType(&Genesis{})
@@ -29,7 +27,7 @@ func init() {
 	c.RegisterType(&ProtocolOptions{})
 	c.RegisterType(&CrossChainMPCRequest{})
 
-	Codec = codec.NewDefaultManager()
+	Codec = pcodecs.NewDefaultManager()
 	if err := Codec.RegisterCodec(codecVersion, c); err != nil {
 		panic(err)
 	}
