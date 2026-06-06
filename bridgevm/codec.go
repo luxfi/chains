@@ -5,22 +5,19 @@ package bridgevm
 
 import (
 	"errors"
-	"math"
 
-	"github.com/luxfi/codec"
-	"github.com/luxfi/codec/linearcodec"
+	"github.com/luxfi/node/vms/pcodecs"
 )
 
 const codecVersion = 0
 
-var Codec codec.Manager
+var Codec pcodecs.Manager
 
 func init() {
-	Codec = codec.NewManager(math.MaxInt)
-	lc := linearcodec.NewDefault()
+	Codec = pcodecs.NewMaxIntManager()
+	lc := pcodecs.NewLinearCodec()
 
 	err := errors.Join(
-		// Register BVM-specific types
 		lc.RegisterType(&BridgeRequest{}),
 		lc.RegisterType(&Block{}),
 		lc.RegisterType(&Genesis{}),
