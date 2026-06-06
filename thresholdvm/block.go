@@ -6,6 +6,7 @@ package thresholdvm
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"time"
 
 	"github.com/luxfi/consensus/core/choices"
@@ -84,7 +85,7 @@ func (b *Block) ChoicesStatus() choices.Status {
 
 // Bytes returns the block's serialized bytes
 func (b *Block) Bytes() []byte {
-	bytes, _ := Codec.Marshal(codecVersion, b)
+	bytes, _ := json.Marshal(b)
 	return bytes
 }
 
@@ -175,7 +176,7 @@ func (b *Block) SetStatus(status choices.Status) {
 
 // computeID computes the block's ID
 func (b *Block) computeID() ids.ID {
-	bytes, _ := Codec.Marshal(codecVersion, b)
+	bytes, _ := json.Marshal(b)
 	hash := sha256.Sum256(bytes)
 	return ids.ID(hash)
 }
