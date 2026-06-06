@@ -383,7 +383,7 @@ func (vm *VM) parseConfig(configBytes []byte) error {
 		return nil
 	}
 
-	if _, err := Codec.Unmarshal(configBytes, &vm.config); err != nil {
+	if err := json.Unmarshal(configBytes, &vm.config); err != nil {
 		return err
 	}
 
@@ -1327,7 +1327,7 @@ func (vm *VM) GetBlock(ctx context.Context, id ids.ID) (chain.Block, error) {
 // ParseBlock implements the chain.ChainVM interface
 func (vm *VM) ParseBlock(ctx context.Context, bytes []byte) (chain.Block, error) {
 	blk := &Block{vm: vm}
-	if _, err := Codec.Unmarshal(bytes, blk); err != nil {
+	if err := json.Unmarshal(bytes, blk); err != nil {
 		return nil, err
 	}
 	blk.ID_ = blk.computeID()
@@ -1439,7 +1439,7 @@ func (vm *VM) Version(ctx context.Context) (string, error) {
 func (vm *VM) CrossChainRequest(ctx context.Context, chainID ids.ID, requestID uint32, deadline time.Time, request []byte) error {
 	// Parse cross-chain MPC request
 	var req CrossChainMPCRequest
-	if _, err := Codec.Unmarshal(request, &req); err != nil {
+	if err := json.Unmarshal(request, &req); err != nil {
 		return err
 	}
 
@@ -1520,7 +1520,7 @@ func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
 // Helper methods
 
 func (vm *VM) putBlock(blk *Block) error {
-	bytes, err := Codec.Marshal(codecVersion, blk)
+	bytes, err := json.Marshal(blk)
 	if err != nil {
 		return err
 	}
@@ -1535,7 +1535,7 @@ func (vm *VM) getBlock(id ids.ID) (*Block, error) {
 	}
 
 	blk := &Block{vm: vm}
-	if _, err := Codec.Unmarshal(bytes, blk); err != nil {
+	if err := json.Unmarshal(bytes, blk); err != nil {
 		return nil, err
 	}
 
@@ -1544,7 +1544,7 @@ func (vm *VM) getBlock(id ids.ID) (*Block, error) {
 }
 
 func (vm *VM) persistKey(key *ManagedKey) error {
-	bytes, err := Codec.Marshal(codecVersion, key)
+	bytes, err := json.Marshal(key)
 	if err != nil {
 		return err
 	}
@@ -1560,7 +1560,7 @@ func (vm *VM) loadKeys() error {
 
 	for iter.Next() {
 		key := &ManagedKey{}
-		if _, err := Codec.Unmarshal(iter.Value(), key); err != nil {
+		if err := json.Unmarshal(iter.Value(), key); err != nil {
 			continue
 		}
 		vm.keys[key.KeyID] = key
