@@ -52,7 +52,7 @@ func TestVMInitialize(t *testing.T) {
 		},
 	}
 
-	genesisBytes, err := Codec.Marshal(codecVersion, genesis)
+	genesisBytes, err := marshalGenesis(genesis)
 	require.NoError(err)
 
 	// Create config
@@ -66,7 +66,7 @@ func TestVMInitialize(t *testing.T) {
 		ProofCacheSize:              1000,
 	}
 
-	configBytes, err := Codec.Marshal(codecVersion, config)
+	configBytes, err := marshalConfig(&config)
 	require.NoError(err)
 
 	// Create VM
@@ -187,14 +187,14 @@ func setupTestVM(t *testing.T) *VM {
 		Timestamp:  1607144400,
 		InitialTxs: []*Transaction{},
 	}
-	genesisBytes, _ := Codec.Marshal(codecVersion, genesis)
+	genesisBytes, _ := marshalGenesis(genesis)
 
 	config := ZConfig{
 		ProofSystem:      "groth16",
 		MaxUTXOsPerBlock: 100,
 		ProofCacheSize:   1000,
 	}
-	configBytes, _ := Codec.Marshal(codecVersion, config)
+	configBytes, _ := marshalConfig(&config)
 
 	vmImpl := &VM{}
 	toEngine := make(chan vm.Message, 1)
@@ -223,7 +223,7 @@ func setupTestVMWithPrivacy(t *testing.T) *VM {
 		Timestamp:  1607144400,
 		InitialTxs: []*Transaction{},
 	}
-	genesisBytes, _ := Codec.Marshal(codecVersion, genesis)
+	genesisBytes, _ := marshalGenesis(genesis)
 
 	config := ZConfig{
 		EnablePrivateAddresses: true,
@@ -231,7 +231,7 @@ func setupTestVMWithPrivacy(t *testing.T) *VM {
 		MaxUTXOsPerBlock:       100,
 		ProofCacheSize:         1000,
 	}
-	configBytes, _ := Codec.Marshal(codecVersion, config)
+	configBytes, _ := marshalConfig(&config)
 
 	vmImpl := &VM{}
 	toEngine := make(chan vm.Message, 1)

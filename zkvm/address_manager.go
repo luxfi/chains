@@ -235,7 +235,7 @@ func (am *AddressManager) SignTransaction(tx *Transaction, signingAddresses [][]
 // storeAddress stores an address in the database
 func (am *AddressManager) storeAddress(privAddr *PrivateAddress) error {
 	// Serialize address
-	addrBytes, err := Codec.Marshal(codecVersion, privAddr)
+	addrBytes, err := marshalPrivateAddress(privAddr)
 	if err != nil {
 		return err
 	}
