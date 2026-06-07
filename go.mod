@@ -28,7 +28,7 @@ require (
 	github.com/luxfi/threshold v1.9.7
 	github.com/luxfi/timer v1.0.2
 	github.com/luxfi/version v1.0.1
-	github.com/luxfi/vm v1.1.11
+	github.com/luxfi/vm v1.2.0
 	github.com/luxfi/warp v1.19.3
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto v0.52.0
@@ -141,8 +141,8 @@ require (
 	github.com/luxfi/pulsar v1.1.2 // indirect
 	github.com/luxfi/resource v0.0.1 // indirect
 	github.com/luxfi/rpc v1.0.2 // indirect
-	github.com/luxfi/sampler v1.0.0 // indirect
-	github.com/luxfi/staking v1.1.0 // indirect
+	github.com/luxfi/sampler v1.1.0 // indirect
+	github.com/luxfi/staking v1.5.0 // indirect
 	github.com/luxfi/tls v1.0.3 // indirect
 	github.com/luxfi/trace v0.1.4 // indirect
 	github.com/luxfi/upgrade v1.0.1-0.20260603055252-f51810805436 // indirect
