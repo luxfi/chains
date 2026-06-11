@@ -14,7 +14,7 @@ retained only for `teleportvm` (LP-6332), which is unrelated.
 3. M-Chain registers each protocol verifier:
      reg.Register(cggmp21Verifier{...})         // LaneMChainCGGMP21
      reg.Register(frostVerifier{...})           // LaneMChainFROST
-     reg.Register(ringtailGenVerifier{...})     // LaneMChainRingtailGen
+     reg.Register(coronaGenVerifier{...})     // LaneMChainCoronaGen
 4. During the LP-134 grace epoch, M-Chain wires legacy aliases:
      reg.RegisterLegacyAlias(LaneTChainSign, LaneMChainCGGMP21)
      // ... per the LP-134 deprecation table.
@@ -47,7 +47,7 @@ M-Chain block time targets **~500 ms**. This means:
 
 - A 2-round CGGMP21 / FROST ceremony finalizes in ~1 s.
 - A pre-sign + sign CGGMP21 sequence is ~1.5 s.
-- Ringtail-general (2-round) is ~1 s.
+- Corona-general (2-round) is ~1 s.
 
 GPU acceleration (LP-132) is optional; current M-Chain validators
 are CPU-only. F-Chain is where GPU lives.
@@ -58,7 +58,7 @@ are CPU-only. F-Chain is where GPU lives.
 |---|---|---|
 | LaneMChainCGGMP21 | `protocol/cggmp21.Verifier` | `protocol/cggmp21.Driver` |
 | LaneMChainFROST   | `protocol/frost.Verifier`   | `protocol/frost.Driver` |
-| LaneMChainRingtailGen | `protocol/ringtail_general.Verifier` | `protocol/ringtail_general.Driver` |
+| LaneMChainCoronaGen | `protocol/corona_general.Verifier` | `protocol/corona_general.Driver` |
 
 M-Chain **does not** own LaneFChainTFHE or LaneFChainBootstrap. The
 substrate's registry refuses to register them under OwnerMChain.

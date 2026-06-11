@@ -3,7 +3,7 @@
 The Q-chain Virtual Machine (QVM) hosts the Q lane of Lux's parallel-witness
 finality model (LP-020 Quasar). When the operator-selected witness set
 includes `WitnessQ` (policies `PolicyPQ` or `PolicyQuantum`), Q-Chain runs a
-Ringtail 2-round threshold ceremony per consensus round and emits the
+Corona 2-round threshold ceremony per consensus round and emits the
 resulting threshold signature as the round's Q-witness. Q-Chain is one of
 three parallel finality producers (P, Q, Z); adding it does not change
 finality latency, only parallel verification cost.
@@ -14,7 +14,8 @@ and a quantum stamp for individual transactions.
 ## Features
 
 ### Q-witness production (Quasar parallel-witness finality)
-- **Ringtail threshold (Module-LWE, eprint 2024/1113)**: 2-round threshold
+- **Corona threshold (Module-LWE, the two-round Ringtail construction,
+  eprint 2024/1113)**: 2-round threshold
   signing per consensus round, t = ⌊2n/3⌋ + 1 of n validators, combined
   public key rooted in `qchain_ceremony_root`.
 - **Per-validator ML-DSA-65 (FIPS 204)**: identity signatures over round
@@ -37,12 +38,12 @@ type Config struct {
     QuantumVerificationFee  uint64        // Fee for quantum signature verification
     MaxParallelTxs          int           // Maximum parallel transactions
     QuantumAlgorithmVersion uint32        // Quantum algorithm version
-    RingtailKeySize         int           // Size of Ringtail keys in bytes
+    CoronaKeySize           int           // Size of Corona keys in bytes
     QuantumStampEnabled     bool          // Enable quantum stamp validation
     QuantumStampWindow      time.Duration // Validity window for quantum stamps
     ParallelBatchSize       int           // Batch size for parallel processing
     QuantumSigCacheSize     int           // Cache size for quantum signatures
-    RingtailEnabled         bool          // Enable Ringtail key support
+    CoronaEnabled           bool          // Enable Corona key support
     MinQuantumConfirmations uint32        // Minimum confirmations for quantum stamps
 }
 ```
@@ -69,7 +70,7 @@ type Config struct {
 The QVM exposes the following RPC endpoints:
 
 - `qvm.getBlock`: Retrieve a block by ID
-- `qvm.generateRingtailKey`: Generate a new Ringtail key pair
+- `qvm.generateCoronaKey`: Generate a new Corona key pair
 - `qvm.verifyQuantumSignature`: Verify a quantum signature
 - `qvm.getPendingTransactions`: Get pending transactions
 - `qvm.getHealth`: Get VM health status
@@ -89,12 +90,12 @@ quantum-resistant signatures:
 ### Validator key material
 Two distinct categories live on Q-Chain validators:
 - **Per-validator ML-DSA-65 identity key**: `MLDSAValidatorKey` in
-  `quantum/signer.go` (kept exposed via the legacy `GenerateRingtailKey`
+  `quantum/signer.go` (kept exposed via the legacy `GenerateCoronaKey`
   RPC name). Used for individual round attestations and the Z-witness
   rollup input.
-- **Ringtail threshold share**: per-validator share of the combined
-  Ringtail key, produced by the Q-Chain DKG ceremony (rooted in
-  `qchain_ceremony_root`). Lives in `luxfi/threshold/protocols/ringtail`.
+- **Corona threshold share**: per-validator share of the combined
+  Corona key, produced by the Q-Chain DKG ceremony (rooted in
+  `qchain_ceremony_root`). Lives in `luxfi/threshold/protocols/corona`.
 
 ### Parallel Processing Safety
 - Thread-safe transaction pool with mutex protection

@@ -20,7 +20,7 @@ flowchart LR
 
   subgraph MChain["M-Chain (MPC)"]
     MV[M-Chain validator subset]
-    MProto[CGGMP21 / FROST / Ringtail-gen]
+    MProto[CGGMP21 / FROST / Corona-gen]
     MRoot[mchain_ceremony_root]
   end
 
@@ -40,7 +40,7 @@ flowchart LR
   Substrate -.imported.-> MChain
   Substrate -.imported.-> FChain
 
-  MChain -->|MChainCGGMP21 / FROST / RingtailGen lanes| Quasar
+  MChain -->|MChainCGGMP21 / FROST / CoronaGen lanes| Quasar
   FChain -->|FChainTFHE / FChainBootstrap lanes| Quasar
 
   MChain -->|bootstrap-key handoff envelope| FChain
@@ -99,7 +99,7 @@ substrate — each chain's runtime drives transitions on block ticks.
 type Share struct {
     CeremonyID    [32]byte // hash(ceremony_descriptor)
     ParticipantID uint32   // index into ParticipantSet
-    Round         uint8    // 1 or 2 for FROST/CGGMP21; up to 4 for Ringtail/TFHE
+    Round         uint8    // 1 or 2 for FROST/CGGMP21; up to 4 for Corona/TFHE
     Lane          CertLane // dispatches per-protocol verifier
     PayloadOffset uint32   // offset into ceremony's payload arena
     PayloadLen    uint32   // length of this share's payload
@@ -129,7 +129,7 @@ type LaneRegistry interface {
 
 - M-Chain's runtime calls `Register(MChainCGGMP21Verifier{})`,
   `Register(MChainFROSTVerifier{})`,
-  `Register(MChainRingtailGenVerifier{})` at boot.
+  `Register(MChainCoronaGenVerifier{})` at boot.
 - F-Chain's runtime calls `Register(FChainTFHEVerifier{})`,
   `Register(FChainBootstrapVerifier{})` at boot.
 - Each chain's registry instance is private to that chain's process.
@@ -229,7 +229,7 @@ or boot-time failure, not a silent semantic bug.
 Per LP-134 (Lux Chain Topology), the legacy T-Chain monolith is split into
 two operational chains served by this same `thresholdvm` substrate:
 
-- `thresholdvm` in **MPC mode → M-Chain** (CGGMP21, FROST, Ringtail-gen).
+- `thresholdvm` in **MPC mode → M-Chain** (CGGMP21, FROST, Corona-gen).
 - `thresholdvm` in **FHE mode → F-Chain** (TFHE keygen, encrypted EVM).
 
 The standalone `teleportvm` (LP-6332) is unrelated and retains its own
