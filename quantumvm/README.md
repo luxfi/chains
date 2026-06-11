@@ -14,7 +14,8 @@ and a quantum stamp for individual transactions.
 ## Features
 
 ### Q-witness production (Quasar parallel-witness finality)
-- **Corona threshold (Module-LWE, eprint 2024/1113)**: 2-round threshold
+- **Corona threshold (Module-LWE, the two-round Corona construction,
+  eprint 2024/1113)**: 2-round threshold
   signing per consensus round, t = ⌊2n/3⌋ + 1 of n validators, combined
   public key rooted in `qchain_ceremony_root`.
 - **Per-validator ML-DSA-65 (FIPS 204)**: identity signatures over round
@@ -37,12 +38,12 @@ type Config struct {
     QuantumVerificationFee  uint64        // Fee for quantum signature verification
     MaxParallelTxs          int           // Maximum parallel transactions
     QuantumAlgorithmVersion uint32        // Quantum algorithm version
-    CoronaKeySize         int           // Size of Corona keys in bytes
+    CoronaKeySize           int           // Size of Corona keys in bytes
     QuantumStampEnabled     bool          // Enable quantum stamp validation
     QuantumStampWindow      time.Duration // Validity window for quantum stamps
     ParallelBatchSize       int           // Batch size for parallel processing
     QuantumSigCacheSize     int           // Cache size for quantum signatures
-    CoronaEnabled         bool          // Enable Corona key support
+    CoronaEnabled           bool          // Enable Corona key support
     MinQuantumConfirmations uint32        // Minimum confirmations for quantum stamps
 }
 ```
