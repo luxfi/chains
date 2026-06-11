@@ -33,6 +33,6 @@ The luxfi/evm-side `cevmExecutor.ExecuteTransaction` is currently a stub
 
 ## PQ finality
 
-C-Chain blocks become PQ-final via P-Chain inclusion (Quasar = BLS + Ringtail
+C-Chain blocks become PQ-final via P-Chain inclusion (Quasar = BLS + Corona
 lattice). This package does not sign anything itself. See
 `~/work/lux/consensus/LLM.md`.

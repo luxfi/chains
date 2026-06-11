@@ -6,7 +6,7 @@ Per LP-134 (Lux Chain Topology), the legacy T-Chain custody monolith is
 split into two operational chains, both served by this substrate:
 
 - `thresholdvm` in **MPC mode → M-Chain** — bridge custody for external
-  wallets, threshold signing ceremonies (CGGMP21 / FROST / Ringtail-gen).
+  wallets, threshold signing ceremonies (CGGMP21 / FROST / Corona-gen).
 - `thresholdvm` in **FHE mode → F-Chain** — TFHE keygen, encrypted EVM,
   confidential compute.
 
@@ -29,7 +29,7 @@ The legacy "T-Chain" name is retained **only** for `teleportvm`
         |     M-Chain     |                     |     F-Chain     |
         |  (MPC: CGGMP21, |                     | (FHE: TFHE,     |
         |   FROST,        |                     |  bootstrap-key  |
-        |   Ringtail-gen) |  --bootstrap key--> |  gen, encrypted |
+        |   Corona-gen) |  --bootstrap key--> |  gen, encrypted |
         |                 |                     |  EVM)           |
         +-----------------+                     +-----------------+
         ceremony_root:                          ceremony_root:

@@ -48,7 +48,7 @@ both chains' binaries.
 | Participant set + Selector contract | substrate (`types/participant.go`) |
 | Cert lane registry (per-owner enforcement) | substrate (`cert/lane.go`) |
 | `certificate_subject` binding | substrate (`cert/subject.go`) |
-| CGGMP21 / FROST / Ringtail-general drivers | M-Chain (`chains/mchain/protocol/*/`) |
+| CGGMP21 / FROST / Corona-general drivers | M-Chain (`chains/mchain/protocol/*/`) |
 | TFHE bootstrap-key generation | M-Chain producer + F-Chain consumer |
 | TFHE compute kernels | F-Chain (`chains/fchain/`) |
 | Block production, gossip, p2p | each chain's VM |
