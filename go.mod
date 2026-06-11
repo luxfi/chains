@@ -10,7 +10,7 @@ require (
 	github.com/luxfi/accel v1.1.9
 	github.com/luxfi/ai v0.1.0
 	github.com/luxfi/consensus v1.25.14
-	github.com/luxfi/constants v1.5.8-0.20260603055356-93c2c2ceb9ca
+	github.com/luxfi/constants v1.5.8
 	github.com/luxfi/crypto v1.19.17
 	github.com/luxfi/database v1.19.0
 	github.com/luxfi/evm v0.19.4
@@ -20,9 +20,9 @@ require (
 	github.com/luxfi/log v1.4.1
 	github.com/luxfi/metric v1.5.8
 	github.com/luxfi/node v1.29.3
-	github.com/luxfi/oracle v0.1.1-0.20260429020431-76258cfcddf9
+	github.com/luxfi/oracle v1.0.0
 	github.com/luxfi/precompile v0.5.37
-	github.com/luxfi/relay v0.0.0-20260429020048-c629fe160d3c
+	github.com/luxfi/relay v1.0.0
 	github.com/luxfi/runtime v1.1.0
 	github.com/luxfi/sys v0.1.0
 	github.com/luxfi/threshold v1.9.7
@@ -145,7 +145,7 @@ require (
 	github.com/luxfi/staking v1.5.0 // indirect
 	github.com/luxfi/tls v1.0.3 // indirect
 	github.com/luxfi/trace v0.1.4 // indirect
-	github.com/luxfi/upgrade v1.0.1-0.20260603055252-f51810805436 // indirect
+	github.com/luxfi/upgrade v1.0.1 // indirect
 	github.com/luxfi/utils v1.1.5 // indirect
 	github.com/luxfi/utxo v0.3.7 // indirect
 	github.com/luxfi/validators v1.2.0 // indirect
