@@ -4,7 +4,7 @@
 
 ThresholdVM is a **library substrate**, not a Lux chain. It is imported by:
 
-- `chains/mchain/` — MPC ceremonies (CGGMP21, FROST, Ringtail-general)
+- `chains/mchain/` — MPC ceremonies (CGGMP21, FROST, Corona-general)
 - `chains/fchain/` — FHE compute (TFHE bootstrap, encrypted EVM)
 
 The substrate hosts the ceremony state machine, share envelope,
@@ -33,7 +33,7 @@ shared by both chains.
 - Substrate ships with Quasar 3.0 activation on **2025-12-25**.
 - LP-5013 (T-Chain) is **deprecated** by LP-134.
 - Cert-lane enums `MChainCGGMP21=5`, `MChainFROST=6`,
-  `MChainRingtailGen=7`, `FChainTFHE=8`, `FChainBootstrap=9`. Never
+  `MChainCoronaGen=7`, `FChainTFHE=8`, `FChainBootstrap=9`. Never
   reorder; appends only.
 
 ## Where to read next
