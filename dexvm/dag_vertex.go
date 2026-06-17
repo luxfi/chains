@@ -7,27 +7,32 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
+	"encoding/hex"
 	"fmt"
 
 	"github.com/luxfi/consensus/core/choices"
 	"github.com/luxfi/consensus/engine/dag/vertex"
 	"github.com/luxfi/ids"
-	"github.com/luxfi/chains/dexvm/orderbook"
+
 	"github.com/luxfi/chains/dexvm/txs"
 )
 
 var _ vertex.DAGVM = (*ChainVM)(nil)
 
-// OrderKey is the conflict key for the DEX: (base, quote, side, orderID).
-// Two vertices conflict iff their OrderKey sets intersect.
+// OrderKey is the conflict key for the proxy: (poolId, side, orderID) for relay
+// envelopes, or the consumed source-UTXO id for imports. Two vertices conflict
+// iff their OrderKey sets intersect — relays/cancels touching the same resting
+// order, or imports claiming the same exported UTXO. The proxy does NOT match,
+// so this is a transport-level conflict key, not a matching one.
 type OrderKey struct {
-	Symbol  string
-	Side    orderbook.Side
+	// Market is the 32-byte poolId (hex) for order relays, or "utxo" for the
+	// atomic-import double-spend key.
+	Market  string
+	Side    uint8
 	OrderID ids.ID
 }
 
-// DexVertex represents a DAG vertex in the DEX chain.
+// DexVertex represents a DAG vertex in the DEX proxy chain.
 type DexVertex struct {
 	id      ids.ID
 	bytes   []byte
@@ -38,6 +43,7 @@ type DexVertex struct {
 	status  choices.Status
 	rawTxs  [][]byte
 	keys    []OrderKey
+	result  *BlockResult
 	vm      *ChainVM
 }
 
@@ -53,8 +59,12 @@ func (v *DexVertex) Verify(ctx context.Context) error {
 	if v.vm == nil || v.vm.inner == nil {
 		return errVMNotInitialized
 	}
-	_, err := v.vm.inner.ProcessBlock(ctx, v.height, v.vm.inner.clock.Time(), v.rawTxs)
-	return err
+	result, err := v.vm.inner.ProcessBlock(ctx, v.height, v.vm.inner.clock.Time(), v.rawTxs)
+	if err != nil {
+		return err
+	}
+	v.result = result
+	return nil
 }
 
 func (v *DexVertex) Accept(ctx context.Context) error {
@@ -64,17 +74,19 @@ func (v *DexVertex) Accept(ctx context.Context) error {
 	v.vm.lastAcceptedID = v.id
 	v.vm.lastAcceptedHeight = v.height
 	v.vm.blocks[v.id] = &Block{
-		vm:        v.vm,
-		id:        v.id,
-		parentID:  v.parents[0],
-		height:    v.height,
-		txs:       v.rawTxs,
-		status:    StatusAccepted,
+		vm:       v.vm,
+		id:       v.id,
+		parentID: v.parents[0],
+		height:   v.height,
+		txs:      v.rawTxs,
+		status:   StatusAccepted,
 	}
-	if v.vm.inner.db != nil {
-		return v.vm.inner.db.Commit()
-	}
-	return nil
+	// Commit the proxy's state batch ATOMICALLY with the cross-chain shared-
+	// memory operations accumulated this block (the settlement leg). This is the
+	// single commit point (the platformvm acceptor.go pattern): a failed atomic
+	// apply leaves NO committed state, so a d-side fill cannot strand without
+	// its C-side settle.
+	return v.vm.inner.acceptBlock(v.result)
 }
 
 func (v *DexVertex) Reject(ctx context.Context) error {
@@ -114,29 +126,51 @@ func (v *DexVertex) ConflictsVertex(other vertex.Vertex) bool {
 	return v.Conflicts(ov)
 }
 
-// extractOrderKeys extracts conflict keys from raw transaction bytes.
+// extractOrderKeys extracts transport-level conflict keys from raw tx bytes.
+// The proxy's conflicts are: order relays/places/cancels touching the same
+// (poolId, side, orderID), and imports claiming the same exported source UTXO.
+// Parsing goes through the canonical TxParser so the key reflects the real wire
+// fields (not an ad-hoc JSON probe).
 func extractOrderKeys(rawTxs [][]byte) []OrderKey {
+	parser := &txs.TxParser{}
 	var keys []OrderKey
 	for _, raw := range rawTxs {
-		var envelope struct {
-			Type    txs.TxType `json:"type"`
-			OrderID ids.ID     `json:"orderId"`
-			Symbol  string     `json:"symbol"`
-			Side    uint8      `json:"side"`
-		}
-		if json.Unmarshal(raw, &envelope) != nil {
+		tx, err := parser.Parse(raw)
+		if err != nil {
 			continue
 		}
-		switch envelope.Type {
-		case txs.TxPlaceOrder, txs.TxCancelOrder, txs.TxCommitOrder, txs.TxRevealOrder:
-			keys = append(keys, OrderKey{
-				Symbol:  envelope.Symbol,
-				Side:    orderbook.Side(envelope.Side),
-				OrderID: envelope.OrderID,
-			})
+		switch t := tx.(type) {
+		case *txs.PlaceOrderTx:
+			keys = append(keys, OrderKey{Market: marketHex(t.PoolID), Side: t.Side})
+		case *txs.CancelOrderTx:
+			keys = append(keys, OrderKey{Market: marketHex(t.PoolID), OrderID: orderIDToKey(t.OrderID)})
+		case *txs.RelayOrderTx:
+			// Relays serialize an opaque frame; bind the conflict to the
+			// collateral ref so two relays spending the same locked collateral
+			// in one round conflict.
+			keys = append(keys, OrderKey{Market: "relay", OrderID: t.CollateralRef})
+		case *txs.ImportTx:
+			// Each imported UTXO is a single-claim conflict key (no double-import).
+			for _, in := range t.ImportedInputs {
+				keys = append(keys, OrderKey{Market: "utxo", OrderID: in.UTXOID})
+			}
 		}
 	}
 	return keys
+}
+
+// marketHex renders a 32-byte poolId as a stable hex string for the conflict
+// key (Go map keys must be comparable; a [32]byte already is, but the Market
+// field is a string shared with the "utxo"/"relay" sentinels).
+func marketHex(poolID [32]byte) string {
+	return hex.EncodeToString(poolID[:])
+}
+
+// orderIDToKey embeds a uint64 order id into an ids.ID conflict key.
+func orderIDToKey(orderID uint64) ids.ID {
+	var id ids.ID
+	binary.BigEndian.PutUint64(id[:8], orderID)
+	return id
 }
 
 func (v *DexVertex) computeID() ids.ID {

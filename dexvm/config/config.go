@@ -1,7 +1,11 @@
 // Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
-// Package config defines configuration types for the DEX VM.
+// Package config defines configuration types for the DEX VM — a STATELESS
+// ATOMIC ZAP PROXY. The proxy holds NO embedded-AMM configuration (no swap
+// fees, pools, or order sizing): matching + DEX state live ONLY on the d-chain,
+// reached over ZAP. This config covers transport (the d-chain ZAP endpoint),
+// the optional Warp attestation channel, and block cadence.
 package config
 
 import (
@@ -10,7 +14,7 @@ import (
 	"github.com/luxfi/ids"
 )
 
-// Config contains configuration parameters for the DEX VM.
+// Config contains configuration parameters for the DEX VM proxy.
 type Config struct {
 	// IndexAllowIncomplete enables indexing of incomplete blocks
 	IndexAllowIncomplete bool `json:"indexAllowIncomplete"`
@@ -19,30 +23,22 @@ type Config struct {
 	// ChecksumsEnabled enables merkle checksum verification
 	ChecksumsEnabled bool `json:"checksumsEnabled"`
 
-	// DEX-specific configuration
+	// DexZapEndpoint is the node-local, version-pinned ZAP address of the
+	// d-chain's CLOB gateway (e.g. "127.0.0.1:9100"). The proxy forwards
+	// byte-identical clob_* frames here. Empty = the relay leg is inert (the
+	// proxy still settles via atomic import/export but has no matcher to relay
+	// to). MUST be node-local + version-pinned so every validator's proxy and
+	// its single-source-of-truth d-chain are byte-identical (consensus-safety).
+	DexZapEndpoint string `json:"dexZapEndpoint"`
+	// DexZapTimeout bounds a single ZAP relay round-trip.
+	DexZapTimeout time.Duration `json:"dexZapTimeout"`
 
-	// DefaultSwapFeeBps is the default swap fee in basis points (100 = 1%)
-	DefaultSwapFeeBps uint16 `json:"defaultSwapFeeBps"`
-	// ProtocolFeeBps is the protocol fee in basis points
-	ProtocolFeeBps uint16 `json:"protocolFeeBps"`
-	// MaxSlippageBps is the maximum allowed slippage in basis points
-	MaxSlippageBps uint16 `json:"maxSlippageBps"`
-
-	// MinLiquidity is the minimum liquidity required for a pool
-	MinLiquidity uint64 `json:"minLiquidity"`
-	// MaxPoolsPerPair is the maximum number of pools allowed per token pair
-	MaxPoolsPerPair uint16 `json:"maxPoolsPerPair"`
-
-	// OrderbookConfig
-	MaxOrdersPerAccount uint32        `json:"maxOrdersPerAccount"`
-	MaxOrderSize        uint64        `json:"maxOrderSize"`
-	MinOrderSize        uint64        `json:"minOrderSize"`
-	OrderExpirationTime time.Duration `json:"orderExpirationTime"`
-
-	// Cross-chain configuration
-	WarpEnabled     bool     `json:"warpEnabled"`
-	TeleportEnabled bool     `json:"teleportEnabled"`
-	TrustedChains   []ids.ID `json:"trustedChains"`
+	// Cross-chain configuration. Warp is retained ONLY as the optional
+	// fill-attestation / fraud-proof channel — it is NOT the settlement
+	// primitive (atomic SharedMemory import/export is). TrustedChains gates
+	// which chains may submit attestations.
+	WarpEnabled   bool     `json:"warpEnabled"`
+	TrustedChains []ids.ID `json:"trustedChains"`
 
 	// Block configuration
 	BlockInterval  time.Duration `json:"blockInterval"`
@@ -50,28 +46,21 @@ type Config struct {
 	MaxTxsPerBlock uint32        `json:"maxTxsPerBlock"`
 }
 
-// DefaultConfig returns the default configuration for the DEX VM.
+// DefaultConfig returns the default configuration for the DEX VM proxy.
 func DefaultConfig() Config {
 	return Config{
 		IndexAllowIncomplete: false,
 		IndexTransactions:    true,
 		ChecksumsEnabled:     true,
 
-		DefaultSwapFeeBps: 30,  // 0.3%
-		ProtocolFeeBps:    5,   // 0.05%
-		MaxSlippageBps:    100, // 1%
+		// Empty by default: the proxy is inert on the relay leg until the venue
+		// operator points it at a d-chain gateway.
+		DexZapEndpoint: "",
+		DexZapTimeout:  5 * time.Second,
 
-		MinLiquidity:    1000,
-		MaxPoolsPerPair: 10,
-
-		MaxOrdersPerAccount: 1000,
-		MaxOrderSize:        1_000_000_000_000_000_000, // 1e18
-		MinOrderSize:        1000,
-		OrderExpirationTime: 24 * time.Hour,
-
-		WarpEnabled:     true,
-		TeleportEnabled: true,
-		TrustedChains:   nil,
+		// Attestation channel off by default; the venue enables it explicitly.
+		WarpEnabled:   false,
+		TrustedChains: nil,
 
 		BlockInterval:  1 * time.Millisecond, // 1ms blocks for HFT (ultra-low latency)
 		MaxBlockSize:   2 * 1024 * 1024,      // 2MB

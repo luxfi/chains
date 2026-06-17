@@ -118,7 +118,9 @@ func (b *Block) Verify(ctx context.Context) error {
 	return nil
 }
 
-// Accept marks the block as accepted
+// Accept marks the block as accepted and commits the proxy's state batch
+// ATOMICALLY with the cross-chain shared-memory operations accumulated during
+// Verify (the settlement leg) — the single commit point.
 func (b *Block) Accept(ctx context.Context) error {
 	b.status = StatusAccepted
 
@@ -127,14 +129,8 @@ func (b *Block) Accept(ctx context.Context) error {
 	b.vm.lastAcceptedHeight = b.height
 	b.vm.blocks[b.id] = b
 
-	// Commit database changes
-	if b.vm.inner.db != nil {
-		if err := b.vm.inner.db.Commit(); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	// Atomic commit (state batch + shared-memory import/export requests).
+	return b.vm.inner.acceptBlock(b.result)
 }
 
 // Reject marks the block as rejected
