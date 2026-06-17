@@ -5,7 +5,6 @@ go 1.26.4
 require (
 	github.com/consensys/gnark-crypto v0.20.1
 	github.com/gorilla/rpc v1.2.1
-	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/hashicorp/golang-lru v1.0.2
 	github.com/luxfi/accel v1.1.9
 	github.com/luxfi/ai v0.1.0
@@ -23,6 +22,7 @@ require (
 	github.com/luxfi/oracle v1.0.0
 	github.com/luxfi/precompile v0.5.37
 	github.com/luxfi/relay v1.0.0
+	github.com/luxfi/rpc v1.1.0
 	github.com/luxfi/runtime v1.1.0
 	github.com/luxfi/sys v0.1.0
 	github.com/luxfi/threshold v1.9.7
@@ -93,6 +93,7 @@ require (
 	github.com/google/renameio/v2 v2.0.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/mux v1.8.1 // indirect
+	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
 	github.com/grandcat/zeroconf v1.0.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
 	github.com/gtank/merlin v0.1.1 // indirect
@@ -140,7 +141,6 @@ require (
 	github.com/luxfi/proto v1.3.0 // indirect
 	github.com/luxfi/pulsar v1.1.2 // indirect
 	github.com/luxfi/resource v0.0.1 // indirect
-	github.com/luxfi/rpc v1.0.2 // indirect
 	github.com/luxfi/sampler v1.1.0 // indirect
 	github.com/luxfi/staking v1.5.0 // indirect
 	github.com/luxfi/tls v1.0.3 // indirect
