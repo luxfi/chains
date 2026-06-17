@@ -14,13 +14,11 @@ import (
 	"time"
 
 	"github.com/luxfi/consensus/engine/dag/vertex"
-	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/vms/types/fee"
-
-	"github.com/luxfi/chains/dexvm/orderbook"
 	"github.com/luxfi/vm"
+	"github.com/luxfi/vm/chain"
 )
 
 var (
@@ -384,28 +382,9 @@ func (cvm *ChainVM) SubmitTx(tx []byte) error {
 	return nil
 }
 
-// GetInnerVM returns the inner functional VM for direct access
+// GetInnerVM returns the inner proxy VM for direct access.
 func (cvm *ChainVM) GetInnerVM() *VM {
 	return cvm.inner
-}
-
-// Getter methods for DEX functionality
-
-// GetOrderbook returns an orderbook by symbol
-func (cvm *ChainVM) GetOrderbook(symbol string) (*orderbook.Orderbook, error) {
-	cvm.lock.RLock()
-	defer cvm.lock.RUnlock()
-	return cvm.inner.GetOrderbook(symbol)
-}
-
-// GetLiquidityManager returns the liquidity manager
-func (cvm *ChainVM) GetLiquidityManager() interface{} {
-	return cvm.inner.GetLiquidityManager()
-}
-
-// GetPerpetualsEngine returns the perpetuals engine
-func (cvm *ChainVM) GetPerpetualsEngine() interface{} {
-	return cvm.inner.GetPerpetualsEngine()
 }
 
 // WaitForEvent implements the chain.ChainVM interface.

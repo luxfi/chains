@@ -1,7 +1,28 @@
 // Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
-// Package state manages persistent state for the DEX VM.
+// Package state manages persistent state for the DEX VM proxy.
+//
+// PROXY STATELESSNESS INVARIANT: this holds ZERO canonical DEX state. There are
+// NO order / pool / position / tick / feeGrowth keys — matching + DEX state
+// live ONLY on the d-chain. The proxy persists exactly three things, all proper
+// to an atomic transport layer:
+//
+//  1. NONCES            — per-account replay protection for proxy txs.
+//  2. RELAY RECEIPTS    — in-flight clob_* relays bound to (blockHash, txIndex),
+//                         so a re-execution / reorg / retry maps to exactly one
+//                         d-chain match (replay-idempotency).
+//  3. CONSUMED UTXOs    — the atomic-UTXO consumption set: source-chain UTXO ids
+//                         already claimed by an Import, so the same exported
+//                         value can never be imported twice.
+//  4. COLLATERAL ESCROW — the locked-collateral ledger: per collateral ref, the
+//                         (asset, amount) an Import locked into the proxy. It is
+//                         the value-conservation witness: a settle credits the
+//                         realized proceeds and REFUNDS the unfilled remainder of
+//                         this locked amount, so value_in == value_out exactly.
+//                         This is NOT canonical DEX state — it is the transport
+//                         layer's record of value in flight, the exact analogue
+//                         of the consumed-UTXO set for the return leg.
 package state
 
 import (
@@ -15,57 +36,51 @@ import (
 )
 
 var (
-	ErrAccountNotFound     = errors.New("account not found")
-	ErrInsufficientBalance = errors.New("insufficient balance")
-	ErrStateCorrupted      = errors.New("state corrupted")
+	ErrStateCorrupted   = errors.New("state corrupted")
+	ErrUTXOAlreadySpent = errors.New("atomic UTXO already consumed")
 
-	// Database prefixes
-	prefixAccount   = []byte("account:")
-	prefixBalance   = []byte("balance:")
-	prefixOrder     = []byte("order:")
-	prefixPool      = []byte("pool:")
-	prefixPosition  = []byte("position:")
+	// ErrEscrowConsumed is returned when a collateral escrow is settled twice.
+	ErrEscrowConsumed = errors.New("collateral escrow already settled")
+
+	// Database prefixes — replay nonces, relay receipts, consumed UTXOs,
+	// collateral escrow.
 	prefixNonce     = []byte("nonce:")
-	prefixBlock     = []byte("block:")
-	prefixTx        = []byte("tx:")
+	prefixReceipt   = []byte("receipt:")
+	prefixConsumed  = []byte("consumed:")
+	prefixEscrow    = []byte("escrow:")
 	prefixLastBlock = []byte("lastBlock")
 )
 
-// Account represents a user account in the DEX.
-type Account struct {
-	Address    ids.ShortID       `json:"address"`
-	Nonce      uint64            `json:"nonce"`
-	Balances   map[ids.ID]uint64 `json:"balances"`   // token -> balance
-	OpenOrders []ids.ID          `json:"openOrders"` // list of open order IDs
-	LPTokens   map[ids.ID]uint64 `json:"lpTokens"`   // pool -> LP token balance
-	CreatedAt  int64             `json:"createdAt"`
+// Receipt records an in-flight ZAP relay: the d-chain match it triggered, keyed
+// by the consensus binding (blockHash, txIndex) so the same logical order maps
+// to exactly one match across re-execution / reorg / retry.
+type Receipt struct {
+	BlockHash ids.ID `json:"blockHash"`
+	TxIndex   uint32 `json:"txIndex"`
+	// FillsHash is the SHA-256 of the d-chain's returned fills wire bytes — the
+	// idempotency witness. A retry that re-derives the same fills is a no-op.
+	FillsHash ids.ID `json:"fillsHash"`
 }
 
-// State manages the persistent state of the DEX VM.
+// State manages the proxy's persistent state.
 type State struct {
 	mu sync.RWMutex
 	db database.Database
 
-	// Cached state
-	accounts        map[ids.ShortID]*Account
 	lastBlockID     ids.ID
 	lastBlockHeight uint64
 }
 
 // New creates a new state manager.
 func New(db database.Database) *State {
-	return &State{
-		db:       db,
-		accounts: make(map[ids.ShortID]*Account),
-	}
+	return &State{db: db}
 }
 
-// Initialize initializes state from database.
+// Initialize loads the last-accepted block pointer from the database.
 func (s *State) Initialize() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Load last block
 	lastBlockBytes, err := s.db.Get(prefixLastBlock)
 	if err != nil && !errors.Is(err, database.ErrNotFound) {
 		return fmt.Errorf("failed to load last block: %w", err)
@@ -74,228 +89,179 @@ func (s *State) Initialize() error {
 		copy(s.lastBlockID[:], lastBlockBytes[:32])
 		s.lastBlockHeight = binary.BigEndian.Uint64(lastBlockBytes[32:40])
 	}
-
 	return nil
 }
 
-// GetAccount returns an account by address.
-func (s *State) GetAccount(addr ids.ShortID) (*Account, error) {
+// ---------------------------------------------------------------------------
+// Nonces — replay protection for proxy txs.
+// ---------------------------------------------------------------------------
+
+func nonceKey(addr ids.ShortID) []byte {
+	return append(append([]byte{}, prefixNonce...), addr[:]...)
+}
+
+// GetNonce returns the current nonce for an account (0 if unseen).
+func (s *State) GetNonce(addr ids.ShortID) (uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	// Check cache first
-	if acc, ok := s.accounts[addr]; ok {
-		return acc, nil
-	}
-
-	// Load from database
-	key := append(prefixAccount, addr[:]...)
-	data, err := s.db.Get(key)
+	data, err := s.db.Get(nonceKey(addr))
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
-			return nil, ErrAccountNotFound
+			return 0, nil
 		}
-		return nil, err
+		return 0, err
 	}
-
-	acc, err := s.decodeAccount(data)
-	if err != nil {
-		return nil, err
+	if len(data) < 8 {
+		return 0, ErrStateCorrupted
 	}
-
-	return acc, nil
+	return binary.BigEndian.Uint64(data), nil
 }
 
-// GetOrCreateAccount returns an existing account or creates a new one.
-func (s *State) GetOrCreateAccount(addr ids.ShortID) *Account {
+// SetNonce persists the nonce for an account.
+func (s *State) SetNonce(addr ids.ShortID, nonce uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], nonce)
+	return s.db.Put(nonceKey(addr), buf[:])
+}
 
-	// Check cache first
-	if acc, ok := s.accounts[addr]; ok {
-		return acc
-	}
+// ---------------------------------------------------------------------------
+// Atomic-UTXO consumption set — each exported UTXO claimable exactly once.
+// ---------------------------------------------------------------------------
 
-	// Try to load from database
-	key := append(prefixAccount, addr[:]...)
-	data, err := s.db.Get(key)
+func consumedKey(utxoID ids.ID) []byte {
+	return append(append([]byte{}, prefixConsumed...), utxoID[:]...)
+}
+
+// IsConsumed reports whether an exported UTXO was already claimed by an Import.
+func (s *State) IsConsumed(utxoID ids.ID) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, err := s.db.Get(consumedKey(utxoID))
 	if err == nil {
-		acc, err := s.decodeAccount(data)
-		if err == nil {
-			s.accounts[addr] = acc
-			return acc
-		}
+		return true, nil
 	}
-
-	// Create new account
-	acc := &Account{
-		Address:    addr,
-		Nonce:      0,
-		Balances:   make(map[ids.ID]uint64),
-		OpenOrders: make([]ids.ID, 0),
-		LPTokens:   make(map[ids.ID]uint64),
+	if errors.Is(err, database.ErrNotFound) {
+		return false, nil
 	}
-	s.accounts[addr] = acc
-	return acc
+	return false, err
 }
 
-// SaveAccount saves an account to database.
-func (s *State) SaveAccount(acc *Account) error {
+// MarkConsumed records that an exported UTXO has been claimed. It refuses a
+// double-spend: a UTXO already in the set returns ErrUTXOAlreadySpent.
+func (s *State) MarkConsumed(utxoID ids.ID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	key := append(prefixAccount, acc.Address[:]...)
-	data, err := s.encodeAccount(acc)
-	if err != nil {
+	if _, err := s.db.Get(consumedKey(utxoID)); err == nil {
+		return ErrUTXOAlreadySpent
+	} else if !errors.Is(err, database.ErrNotFound) {
 		return err
 	}
+	return s.db.Put(consumedKey(utxoID), []byte{1})
+}
 
-	if err := s.db.Put(key, data); err != nil {
+// ---------------------------------------------------------------------------
+// Collateral escrow — locked-value ledger for the conservation return leg.
+// ---------------------------------------------------------------------------
+
+func escrowKey(ref ids.ID) []byte {
+	return append(append([]byte{}, prefixEscrow...), ref[:]...)
+}
+
+// PutEscrow records the (asset, amount) an Import locked under a collateral ref.
+// The stored value is asset(32)||amount(8). Recording is the import leg of the
+// conservation equation; the matching ConsumeEscrow at settle pays the refund.
+func (s *State) PutEscrow(ref ids.ID, asset ids.ID, amount uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	val := make([]byte, 40)
+	copy(val[0:32], asset[:])
+	binary.BigEndian.PutUint64(val[32:40], amount)
+	return s.db.Put(escrowKey(ref), val)
+}
+
+// GetEscrow returns the (asset, amount) locked under a collateral ref. found is
+// false when no escrow exists (e.g. a relay that was not preceded by an import
+// in this proxy — then there is nothing to refund and nothing to settle).
+func (s *State) GetEscrow(ref ids.ID) (asset ids.ID, amount uint64, found bool, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	data, gerr := s.db.Get(escrowKey(ref))
+	if gerr != nil {
+		if errors.Is(gerr, database.ErrNotFound) {
+			return ids.Empty, 0, false, nil
+		}
+		return ids.Empty, 0, false, gerr
+	}
+	if len(data) < 40 {
+		return ids.Empty, 0, false, ErrStateCorrupted
+	}
+	copy(asset[:], data[0:32])
+	amount = binary.BigEndian.Uint64(data[32:40])
+	return asset, amount, true, nil
+}
+
+// ConsumeEscrow deletes a collateral escrow once it has been settled, so the
+// same locked collateral can never be refunded twice. It refuses to consume an
+// absent escrow (ErrEscrowConsumed) — the settle path's single-claim guard,
+// mirroring MarkConsumed on the import leg.
+func (s *State) ConsumeEscrow(ref ids.ID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.Get(escrowKey(ref)); err != nil {
+		if errors.Is(err, database.ErrNotFound) {
+			return ErrEscrowConsumed
+		}
 		return err
 	}
-
-	s.accounts[acc.Address] = acc
-	return nil
+	return s.db.Delete(escrowKey(ref))
 }
 
-// GetBalance returns the balance of a token for an account.
-func (s *State) GetBalance(addr ids.ShortID, token ids.ID) (uint64, error) {
-	acc, err := s.GetAccount(addr)
+// ---------------------------------------------------------------------------
+// Relay receipts — replay-idempotency for in-flight d-chain matches.
+// ---------------------------------------------------------------------------
+
+func receiptKey(blockHash ids.ID, txIndex uint32) []byte {
+	k := append(append([]byte{}, prefixReceipt...), blockHash[:]...)
+	var idx [4]byte
+	binary.BigEndian.PutUint32(idx[:], txIndex)
+	return append(k, idx[:]...)
+}
+
+// GetReceipt returns the relay receipt bound to (blockHash, txIndex), if any.
+func (s *State) GetReceipt(blockHash ids.ID, txIndex uint32) (*Receipt, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	data, err := s.db.Get(receiptKey(blockHash, txIndex))
 	if err != nil {
-		if errors.Is(err, ErrAccountNotFound) {
-			return 0, nil
+		if errors.Is(err, database.ErrNotFound) {
+			return nil, false, nil
 		}
-		return 0, err
+		return nil, false, err
 	}
-
-	return acc.Balances[token], nil
-}
-
-// Transfer transfers tokens between accounts.
-func (s *State) Transfer(from, to ids.ShortID, token ids.ID, amount uint64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Get or create accounts
-	fromAcc := s.getOrCreateAccountLocked(from)
-	toAcc := s.getOrCreateAccountLocked(to)
-
-	// Check balance
-	if fromAcc.Balances[token] < amount {
-		return ErrInsufficientBalance
+	if len(data) < 64 {
+		return nil, false, ErrStateCorrupted
 	}
-
-	// Transfer
-	fromAcc.Balances[token] -= amount
-	toAcc.Balances[token] += amount
-
-	return nil
+	r := &Receipt{BlockHash: blockHash, TxIndex: txIndex}
+	copy(r.FillsHash[:], data[32:64])
+	return r, true, nil
 }
 
-// Credit adds tokens to an account.
-func (s *State) Credit(addr ids.ShortID, token ids.ID, amount uint64) error {
+// PutReceipt records a relay receipt. The stored value is blockHash||fillsHash
+// (the txIndex lives in the key); blockHash is redundant-but-cheap provenance.
+func (s *State) PutReceipt(r *Receipt) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	acc := s.getOrCreateAccountLocked(addr)
-	acc.Balances[token] += amount
-	return nil
+	val := make([]byte, 64)
+	copy(val[0:32], r.BlockHash[:])
+	copy(val[32:64], r.FillsHash[:])
+	return s.db.Put(receiptKey(r.BlockHash, r.TxIndex), val)
 }
 
-// Debit removes tokens from an account.
-func (s *State) Debit(addr ids.ShortID, token ids.ID, amount uint64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	acc := s.getOrCreateAccountLocked(addr)
-	if acc.Balances[token] < amount {
-		return ErrInsufficientBalance
-	}
-	acc.Balances[token] -= amount
-	return nil
-}
-
-// GetNonce returns the current nonce for an account.
-func (s *State) GetNonce(addr ids.ShortID) (uint64, error) {
-	acc, err := s.GetAccount(addr)
-	if err != nil {
-		if errors.Is(err, ErrAccountNotFound) {
-			return 0, nil
-		}
-		return 0, err
-	}
-	return acc.Nonce, nil
-}
-
-// IncrementNonce increments the nonce for an account.
-func (s *State) IncrementNonce(addr ids.ShortID) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	acc := s.getOrCreateAccountLocked(addr)
-	acc.Nonce++
-	return nil
-}
-
-// AddOpenOrder adds an order ID to an account's open orders.
-func (s *State) AddOpenOrder(addr ids.ShortID, orderID ids.ID) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	acc := s.getOrCreateAccountLocked(addr)
-	acc.OpenOrders = append(acc.OpenOrders, orderID)
-	return nil
-}
-
-// RemoveOpenOrder removes an order ID from an account's open orders.
-func (s *State) RemoveOpenOrder(addr ids.ShortID, orderID ids.ID) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	acc := s.getOrCreateAccountLocked(addr)
-	for i, id := range acc.OpenOrders {
-		if id == orderID {
-			acc.OpenOrders = append(acc.OpenOrders[:i], acc.OpenOrders[i+1:]...)
-			break
-		}
-	}
-	return nil
-}
-
-// GetLPBalance returns the LP token balance for a pool.
-func (s *State) GetLPBalance(addr ids.ShortID, poolID ids.ID) (uint64, error) {
-	acc, err := s.GetAccount(addr)
-	if err != nil {
-		if errors.Is(err, ErrAccountNotFound) {
-			return 0, nil
-		}
-		return 0, err
-	}
-	return acc.LPTokens[poolID], nil
-}
-
-// CreditLPTokens adds LP tokens to an account.
-func (s *State) CreditLPTokens(addr ids.ShortID, poolID ids.ID, amount uint64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	acc := s.getOrCreateAccountLocked(addr)
-	acc.LPTokens[poolID] += amount
-	return nil
-}
-
-// DebitLPTokens removes LP tokens from an account.
-func (s *State) DebitLPTokens(addr ids.ShortID, poolID ids.ID, amount uint64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	acc := s.getOrCreateAccountLocked(addr)
-	if acc.LPTokens[poolID] < amount {
-		return ErrInsufficientBalance
-	}
-	acc.LPTokens[poolID] -= amount
-	return nil
-}
+// ---------------------------------------------------------------------------
+// Last-accepted block pointer.
+// ---------------------------------------------------------------------------
 
 // SetLastBlock sets the last accepted block.
 func (s *State) SetLastBlock(blockID ids.ID, height uint64) error {
@@ -305,11 +271,9 @@ func (s *State) SetLastBlock(blockID ids.ID, height uint64) error {
 	data := make([]byte, 40)
 	copy(data[:32], blockID[:])
 	binary.BigEndian.PutUint64(data[32:], height)
-
 	if err := s.db.Put(prefixLastBlock, data); err != nil {
 		return err
 	}
-
 	s.lastBlockID = blockID
 	s.lastBlockHeight = height
 	return nil
@@ -322,154 +286,5 @@ func (s *State) GetLastBlock() (ids.ID, uint64) {
 	return s.lastBlockID, s.lastBlockHeight
 }
 
-// Commit commits all pending changes to the database.
-func (s *State) Commit() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	batch := s.db.NewBatch()
-
-	// Save all cached accounts
-	for _, acc := range s.accounts {
-		key := append(prefixAccount, acc.Address[:]...)
-		data, err := s.encodeAccount(acc)
-		if err != nil {
-			return err
-		}
-		if err := batch.Put(key, data); err != nil {
-			return err
-		}
-	}
-
-	return batch.Write()
-}
-
-// Close closes the state manager.
-func (s *State) Close() error {
-	return s.Commit()
-}
-
-// Helper methods
-
-func (s *State) getOrCreateAccountLocked(addr ids.ShortID) *Account {
-	if acc, ok := s.accounts[addr]; ok {
-		return acc
-	}
-
-	acc := &Account{
-		Address:    addr,
-		Nonce:      0,
-		Balances:   make(map[ids.ID]uint64),
-		OpenOrders: make([]ids.ID, 0),
-		LPTokens:   make(map[ids.ID]uint64),
-	}
-	s.accounts[addr] = acc
-	return acc
-}
-
-func (s *State) encodeAccount(acc *Account) ([]byte, error) {
-	// Simplified encoding - in production use proper codec
-	// Format: address (20) + nonce (8) + num_balances (4) + [token (32) + balance (8)]... + ...
-	size := 20 + 8 + 4 + len(acc.Balances)*40 + 4 + len(acc.OpenOrders)*32 + 4 + len(acc.LPTokens)*40
-	data := make([]byte, size)
-
-	offset := 0
-	copy(data[offset:], acc.Address[:])
-	offset += 20
-
-	binary.BigEndian.PutUint64(data[offset:], acc.Nonce)
-	offset += 8
-
-	binary.BigEndian.PutUint32(data[offset:], uint32(len(acc.Balances)))
-	offset += 4
-
-	for token, balance := range acc.Balances {
-		copy(data[offset:], token[:])
-		offset += 32
-		binary.BigEndian.PutUint64(data[offset:], balance)
-		offset += 8
-	}
-
-	binary.BigEndian.PutUint32(data[offset:], uint32(len(acc.OpenOrders)))
-	offset += 4
-
-	for _, orderID := range acc.OpenOrders {
-		copy(data[offset:], orderID[:])
-		offset += 32
-	}
-
-	binary.BigEndian.PutUint32(data[offset:], uint32(len(acc.LPTokens)))
-	offset += 4
-
-	for poolID, balance := range acc.LPTokens {
-		copy(data[offset:], poolID[:])
-		offset += 32
-		binary.BigEndian.PutUint64(data[offset:], balance)
-		offset += 8
-	}
-
-	return data[:offset], nil
-}
-
-func (s *State) decodeAccount(data []byte) (*Account, error) {
-	if len(data) < 32 {
-		return nil, ErrStateCorrupted
-	}
-
-	acc := &Account{
-		Balances:   make(map[ids.ID]uint64),
-		OpenOrders: make([]ids.ID, 0),
-		LPTokens:   make(map[ids.ID]uint64),
-	}
-
-	offset := 0
-	copy(acc.Address[:], data[offset:offset+20])
-	offset += 20
-
-	acc.Nonce = binary.BigEndian.Uint64(data[offset:])
-	offset += 8
-
-	numBalances := binary.BigEndian.Uint32(data[offset:])
-	offset += 4
-
-	for i := uint32(0); i < numBalances; i++ {
-		var token ids.ID
-		copy(token[:], data[offset:offset+32])
-		offset += 32
-		balance := binary.BigEndian.Uint64(data[offset:])
-		offset += 8
-		acc.Balances[token] = balance
-	}
-
-	if offset >= len(data) {
-		return acc, nil
-	}
-
-	numOrders := binary.BigEndian.Uint32(data[offset:])
-	offset += 4
-
-	for i := uint32(0); i < numOrders; i++ {
-		var orderID ids.ID
-		copy(orderID[:], data[offset:offset+32])
-		offset += 32
-		acc.OpenOrders = append(acc.OpenOrders, orderID)
-	}
-
-	if offset >= len(data) {
-		return acc, nil
-	}
-
-	numLPTokens := binary.BigEndian.Uint32(data[offset:])
-	offset += 4
-
-	for i := uint32(0); i < numLPTokens; i++ {
-		var poolID ids.ID
-		copy(poolID[:], data[offset:offset+32])
-		offset += 32
-		balance := binary.BigEndian.Uint64(data[offset:])
-		offset += 8
-		acc.LPTokens[poolID] = balance
-	}
-
-	return acc, nil
-}
+// Close is a no-op flush hook (the proxy writes through to the DB directly).
+func (s *State) Close() error { return nil }
