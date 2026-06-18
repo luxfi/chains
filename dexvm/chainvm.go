@@ -6,7 +6,6 @@ package dexvm
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,13 +13,11 @@ import (
 	"time"
 
 	"github.com/luxfi/consensus/engine/dag/vertex"
-	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/vms/types/fee"
-
-	"github.com/luxfi/chains/dexvm/orderbook"
 	"github.com/luxfi/vm"
+	"github.com/luxfi/vm/chain"
 )
 
 var (
@@ -221,8 +218,17 @@ func (cvm *ChainVM) Response(ctx context.Context, nodeID ids.NodeID, requestID u
 	return cvm.inner.Response(ctx, nodeID, requestID, response)
 }
 
-// BuildBlock implements the chain.ChainVM interface.
-// It builds a new block from pending transactions.
+// BuildBlock implements the chain.ChainVM interface. It builds a new block from
+// pending transactions AND, as the block PROPOSER, performs the network-wide-ONCE
+// d-chain relay (VM.BuildBlockResult -> obtainFills), carrying the confirmed fills
+// in the block bytes so every validator settles from them without relaying (RED
+// finding #9). This is the ONLY chain entry point that triggers a d-chain relay;
+// Verify and Accept never do.
+//
+// The proposer chooses the block time here (wall clock, clamped non-decreasing)
+// and carries it in the bytes — the consensus-agreement point. The block id is the
+// hash of the serialized bytes (header + txs + carried fills), so the id commits to
+// the carried fills (a peer cannot swap fills while keeping the same id).
 func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	cvm.lock.Lock()
 	defer cvm.lock.Unlock()
@@ -231,45 +237,53 @@ func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		return nil, errVMNotInitialized
 	}
 
-	// Get parent block
 	parent, ok := cvm.blocks[cvm.preferredID]
 	if !ok {
 		return nil, fmt.Errorf("preferred block not found: %s", cvm.preferredID)
 	}
 
-	// Create new block
 	newHeight := parent.height + 1
-	newTimestamp := time.Now()
-
-	// Generate block ID from height and timestamp using sha256
-	blockIDBytes := make([]byte, 16)
-	binary.BigEndian.PutUint64(blockIDBytes[0:8], newHeight)
-	binary.BigEndian.PutUint64(blockIDBytes[8:16], uint64(newTimestamp.UnixNano()))
-	hash := sha256.Sum256(blockIDBytes)
-	var newID ids.ID
-	copy(newID[:], hash[:])
-
-		block := &Block{
-			vm:        cvm,
-		id:        newID,
-		parentID:  cvm.preferredID,
-		height:    newHeight,
-		timestamp: newTimestamp,
-		txs:       cvm.pendingTxs,
-		status:    StatusUnknown,
+	// Proposer-chosen block time, clamped non-decreasing vs the last processed
+	// block so time never goes backwards on a re-proposal / clock skew. The SAME
+	// value is carried in the bytes and fed to ProcessBlock by every validator.
+	newTimestamp := cvm.inner.clock.Time()
+	if last := cvm.inner.GetLastBlockTime(); newTimestamp.Before(last) {
+		newTimestamp = last
 	}
 
-	// Clear pending transactions
-	cvm.pendingTxs = nil
+	txs := cvm.pendingTxs
 
-	// Store the block
-	cvm.blocks[newID] = block
+	// Proposer build: plan + relay-once + obtain the carried fills. obtainFills is
+	// the single d-chain relay for this block, network-wide.
+	result, err := cvm.inner.BuildBlockResult(ctx, newHeight, newTimestamp, txs)
+	if err != nil {
+		return nil, fmt.Errorf("dexvm: build block result: %w", err)
+	}
+
+	block := &Block{
+		vm:           cvm,
+		parentID:     cvm.preferredID,
+		height:       newHeight,
+		timestamp:    newTimestamp,
+		txs:          txs,
+		carriedFills: result.carriedFills,
+		fillSig:      result.fillSig,
+		result:       result,
+		status:       StatusProcessing,
+	}
+	// Block id = hash of the serialized bytes (commits to the carried fills).
+	hash := sha256.Sum256(block.Bytes())
+	copy(block.id[:], hash[:])
+
+	cvm.pendingTxs = nil
+	cvm.blocks[block.id] = block
 
 	if !cvm.log.IsZero() {
 		cvm.log.Debug("Built block",
-			"id", newID,
+			"id", block.id,
 			"height", newHeight,
 			"txCount", len(block.txs),
+			"carriedFillEntries", len(block.carriedFills),
 		)
 	}
 
@@ -384,28 +398,9 @@ func (cvm *ChainVM) SubmitTx(tx []byte) error {
 	return nil
 }
 
-// GetInnerVM returns the inner functional VM for direct access
+// GetInnerVM returns the inner proxy VM for direct access.
 func (cvm *ChainVM) GetInnerVM() *VM {
 	return cvm.inner
-}
-
-// Getter methods for DEX functionality
-
-// GetOrderbook returns an orderbook by symbol
-func (cvm *ChainVM) GetOrderbook(symbol string) (*orderbook.Orderbook, error) {
-	cvm.lock.RLock()
-	defer cvm.lock.RUnlock()
-	return cvm.inner.GetOrderbook(symbol)
-}
-
-// GetLiquidityManager returns the liquidity manager
-func (cvm *ChainVM) GetLiquidityManager() interface{} {
-	return cvm.inner.GetLiquidityManager()
-}
-
-// GetPerpetualsEngine returns the perpetuals engine
-func (cvm *ChainVM) GetPerpetualsEngine() interface{} {
-	return cvm.inner.GetPerpetualsEngine()
 }
 
 // WaitForEvent implements the chain.ChainVM interface.
