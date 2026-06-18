@@ -1,11 +1,30 @@
 // Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
-// Package txs defines transaction types for the DEX VM.
+// Package txs defines transaction types for the DEX VM — a STATELESS ATOMIC
+// ZAP PROXY. There is NO local matching, NO AMM, NO embedded order book. The
+// transaction surface is exactly the two concerns a proxy owns:
+//
+//  1. ATOMIC VALUE MOVEMENT (C-Chain <-> proxy), modeled on the platformvm
+//     Import/Export txs that move value between primary-network chains in a
+//     single atomic shared-memory commit:
+//       - TxImport  : claim value exported from C-Chain into the proxy.
+//       - TxExport  : settle proceeds (and unfilled IOC remainder) back to
+//                     C-Chain, derived ONLY from confirmed d-chain fills.
+//
+//  2. ORDER RELAY (proxy -> d-chain over ZAP), transport only:
+//       - TxRelayOrder : an opaque, byte-identical clob_* ZAP payload plus a
+//                        reference to the collateral already locked by an
+//                        Import. The matcher is the d-chain; the proxy never
+//                        matches.
+//       - TxPlaceOrder / TxCancelOrder : thin relay envelopes (a CLOB place /
+//                        cancel forwarded verbatim). They carry NO price/size
+//                        matching semantics in the proxy — the d-chain is the
+//                        single source of truth.
 package txs
 
 import (
-	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -24,46 +43,39 @@ var (
 type TxType uint8
 
 const (
-	TxPlaceOrder TxType = iota
+	// TxImport claims value exported from C-Chain into the proxy (atomic
+	// shared-memory import leg). Consumes imported UTXOs, credits local outputs.
+	TxImport TxType = iota
+	// TxExport settles proceeds back to C-Chain (atomic shared-memory export
+	// leg). Produces exported outputs derived ONLY from confirmed d-chain fills.
+	TxExport
+	// TxRelayOrder forwards an opaque clob_* ZAP payload to the d-chain matcher,
+	// bound to a locked-collateral reference. Transport only — no local match.
+	TxRelayOrder
+	// TxPlaceOrder is a thin relay envelope for a CLOB limit-order placement.
+	TxPlaceOrder
+	// TxCancelOrder is a thin relay envelope for a CLOB cancel.
 	TxCancelOrder
-	TxSwap
-	TxAddLiquidity
-	TxRemoveLiquidity
-	TxCreatePool
-	TxCrossChainSwap
-	TxCrossChainTransfer
-	TxCommitOrder // MEV protection: commit order hash
-	TxRevealOrder // MEV protection: reveal order details
 )
 
 func (t TxType) String() string {
 	switch t {
+	case TxImport:
+		return "import"
+	case TxExport:
+		return "export"
+	case TxRelayOrder:
+		return "relay_order"
 	case TxPlaceOrder:
 		return "place_order"
 	case TxCancelOrder:
 		return "cancel_order"
-	case TxSwap:
-		return "swap"
-	case TxAddLiquidity:
-		return "add_liquidity"
-	case TxRemoveLiquidity:
-		return "remove_liquidity"
-	case TxCreatePool:
-		return "create_pool"
-	case TxCrossChainSwap:
-		return "cross_chain_swap"
-	case TxCrossChainTransfer:
-		return "cross_chain_transfer"
-	case TxCommitOrder:
-		return "commit_order"
-	case TxRevealOrder:
-		return "reveal_order"
 	default:
 		return "unknown"
 	}
 }
 
-// Tx is the interface for all DEX transactions.
+// Tx is the interface for all DEX proxy transactions.
 type Tx interface {
 	// ID returns the unique identifier for this transaction.
 	ID() ids.ID
@@ -80,8 +92,14 @@ type Tx interface {
 }
 
 // BaseTx contains common fields for all transactions.
+//
+// TxID is intentionally NOT serialized (json:"-"): the transaction ID is the
+// SHA-256 checksum of the wire bytes, so embedding it in those same bytes would
+// be circular and would make the ID depend on whatever value happened to be in
+// the field at marshal time. It is always (re)derived from the wire on Parse,
+// and stamped by finalize on construction.
 type BaseTx struct {
-	TxID      ids.ID      `json:"id"`
+	TxID      ids.ID      `json:"-"`
 	TxType    TxType      `json:"type"`
 	From      ids.ShortID `json:"from"`
 	Nonce     uint64      `json:"nonce"`
@@ -98,32 +116,212 @@ func (tx *BaseTx) Sender() ids.ShortID { return tx.From }
 func (tx *BaseTx) Timestamp() int64    { return tx.CreatedAt }
 func (tx *BaseTx) Bytes() []byte       { return tx.bytes }
 
-// PlaceOrderTx represents a place order transaction.
-type PlaceOrderTx struct {
-	BaseTx
-	Symbol      string `json:"symbol"`
-	Side        uint8  `json:"side"`      // 0 = Buy, 1 = Sell
-	OrderType   uint8  `json:"orderType"` // 0 = Limit, 1 = Market, etc.
-	Price       uint64 `json:"price"`
-	Quantity    uint64 `json:"quantity"`
-	StopPrice   uint64 `json:"stopPrice"`
-	PostOnly    bool   `json:"postOnly"`
-	ReduceOnly  bool   `json:"reduceOnly"`
-	TimeInForce string `json:"timeInForce"` // GTC, IOC, FOK
-	ExpiresAt   int64  `json:"expiresAt"`
+// AtomicInput references a UTXO exported from the source chain that an Import
+// consumes via shared memory. UTXOID is the source-chain UTXO id (the
+// InputID()); Asset and Amount describe the value being claimed.
+type AtomicInput struct {
+	UTXOID ids.ID `json:"utxoId"`
+	Asset  ids.ID `json:"asset"`
+	Amount uint64 `json:"amount"`
 }
 
-// NewPlaceOrderTx creates a new place order transaction.
-func NewPlaceOrderTx(
-	from ids.ShortID,
-	nonce uint64,
-	symbol string,
-	side uint8,
-	orderType uint8,
-	price, quantity uint64,
-	timeInForce string,
-) *PlaceOrderTx {
-	return &PlaceOrderTx{
+// AtomicOutput is a value output: an Import credits these locally; an Export
+// puts these into shared memory for the destination chain to claim.
+type AtomicOutput struct {
+	Owner  ids.ShortID `json:"owner"`
+	Asset  ids.ID      `json:"asset"`
+	Amount uint64      `json:"amount"`
+}
+
+// ImportTx claims value exported from C-Chain (the SourceChain) into the proxy.
+// The atomic shared-memory import leg: the imported UTXOs are removed from
+// shared memory and their value credited to local outputs. This is the FIRST
+// leg of the conservation ordering (import -> ZAP submit -> export).
+type ImportTx struct {
+	BaseTx
+	SourceChain    ids.ID         `json:"sourceChain"`
+	ImportedInputs []AtomicInput  `json:"importedInputs"`
+	Outputs        []AtomicOutput `json:"outputs"`
+}
+
+// NewImportTx creates a new import transaction.
+func NewImportTx(from ids.ShortID, nonce uint64, sourceChain ids.ID, in []AtomicInput, out []AtomicOutput) *ImportTx {
+	tx := &ImportTx{
+		BaseTx: BaseTx{
+			TxType:    TxImport,
+			From:      from,
+			Nonce:     nonce,
+			GasPrice:  1000,
+			GasLimit:  100000,
+			CreatedAt: time.Now().UnixNano(),
+		},
+		SourceChain:    sourceChain,
+		ImportedInputs: in,
+		Outputs:        out,
+	}
+	return finalize(tx, &tx.BaseTx)
+}
+
+func (tx *ImportTx) Verify() error {
+	if tx.SourceChain == ids.Empty {
+		return errors.New("import: empty source chain")
+	}
+	if len(tx.ImportedInputs) == 0 {
+		return errors.New("import: no imported inputs")
+	}
+	var in uint64
+	for _, i := range tx.ImportedInputs {
+		if i.Amount == 0 {
+			return ErrInvalidAmount
+		}
+		in += i.Amount
+	}
+	var outAmt uint64
+	for _, o := range tx.Outputs {
+		outAmt += o.Amount
+	}
+	// Conservation: credited outputs must not exceed claimed inputs (the proxy
+	// never mints). A difference is the burned fee.
+	if outAmt > in {
+		return errors.New("import: outputs exceed imported value (would mint)")
+	}
+	return nil
+}
+
+// ExportTx settles proceeds back to C-Chain (the DestinationChain). The atomic
+// shared-memory export leg: ExportedOutputs are written into shared memory for
+// the destination chain to claim. The amounts MUST be derived ONLY from
+// confirmed d-chain fills (and any unfilled IOC remainder being refunded) — the
+// proxy never mints. This is the FINAL leg of the conservation ordering.
+type ExportTx struct {
+	BaseTx
+	DestinationChain ids.ID         `json:"destinationChain"`
+	ExportedOutputs  []AtomicOutput `json:"exportedOutputs"`
+	// FillRef binds this settlement to the d-chain relay receipt whose confirmed
+	// fills justify the exported amounts (replay-idempotency / audit).
+	FillRef ids.ID `json:"fillRef"`
+}
+
+// NewExportTx creates a new export transaction.
+func NewExportTx(from ids.ShortID, nonce uint64, destChain ids.ID, out []AtomicOutput, fillRef ids.ID) *ExportTx {
+	tx := &ExportTx{
+		BaseTx: BaseTx{
+			TxType:    TxExport,
+			From:      from,
+			Nonce:     nonce,
+			GasPrice:  1000,
+			GasLimit:  100000,
+			CreatedAt: time.Now().UnixNano(),
+		},
+		DestinationChain: destChain,
+		ExportedOutputs:  out,
+		FillRef:          fillRef,
+	}
+	return finalize(tx, &tx.BaseTx)
+}
+
+// NewSettlementExportTx builds the settlement export the VM constructs INSIDE
+// block processing (settleFromFills) — never a client-submitted tx. Because it
+// is reconstructed independently on every validator, its identity must be a
+// pure function of consensus-agreed inputs only. The wall-clock CreatedAt used
+// by the client-facing NewExportTx would make tx.ID() (and therefore any
+// shared-memory UTXO key derived from it) diverge per node, splitting the
+// atomic commit. Here CreatedAt is pinned to createdAt — the deterministic
+// settlement coordinate (the relay's UnixNano block time) supplied by the
+// caller — so the wire bytes, the TxID, and every derived export UTXO key are
+// byte-identical across validators. Nonce carries the settlement's txIndex so
+// two settlements in the same block produce distinct identities.
+func NewSettlementExportTx(from ids.ShortID, txIndex uint32, destChain ids.ID, out []AtomicOutput, fillRef ids.ID, createdAt int64) *ExportTx {
+	tx := &ExportTx{
+		BaseTx: BaseTx{
+			TxType:    TxExport,
+			From:      from,
+			Nonce:     uint64(txIndex),
+			GasPrice:  1000,
+			GasLimit:  100000,
+			CreatedAt: createdAt,
+		},
+		DestinationChain: destChain,
+		ExportedOutputs:  out,
+		FillRef:          fillRef,
+	}
+	return finalize(tx, &tx.BaseTx)
+}
+
+func (tx *ExportTx) Verify() error {
+	if tx.DestinationChain == ids.Empty {
+		return errors.New("export: empty destination chain")
+	}
+	if len(tx.ExportedOutputs) == 0 {
+		return errors.New("export: no exported outputs")
+	}
+	for _, o := range tx.ExportedOutputs {
+		if o.Amount == 0 {
+			return ErrInvalidAmount
+		}
+	}
+	return nil
+}
+
+// RelayOrderTx forwards an opaque clob_* ZAP payload to the d-chain matcher,
+// bound to a locked-collateral reference. The payload is the byte-identical
+// clob_submit/clob_place frame the d-chain's zap_server.go expects; the proxy
+// is pure transport and does not interpret it beyond routing.
+type RelayOrderTx struct {
+	BaseTx
+	// Method is the ZAP CLOB method ("clob_submit", "clob_place", "clob_cancel").
+	Method string `json:"method"`
+	// Payload is the opaque, byte-identical clob_* frame forwarded verbatim.
+	Payload []byte `json:"payload"`
+	// CollateralRef references the Import whose locked value backs this order.
+	CollateralRef ids.ID `json:"collateralRef"`
+}
+
+// NewRelayOrderTx creates a new relay-order transaction.
+func NewRelayOrderTx(from ids.ShortID, nonce uint64, method string, payload []byte, collateralRef ids.ID) *RelayOrderTx {
+	tx := &RelayOrderTx{
+		BaseTx: BaseTx{
+			TxType:    TxRelayOrder,
+			From:      from,
+			Nonce:     nonce,
+			GasPrice:  1000,
+			GasLimit:  100000,
+			CreatedAt: time.Now().UnixNano(),
+		},
+		Method:        method,
+		Payload:       payload,
+		CollateralRef: collateralRef,
+	}
+	return finalize(tx, &tx.BaseTx)
+}
+
+func (tx *RelayOrderTx) Verify() error {
+	if tx.Method == "" {
+		return errors.New("relay: empty ZAP method")
+	}
+	if len(tx.Payload) == 0 {
+		return errors.New("relay: empty payload")
+	}
+	return nil
+}
+
+// PlaceOrderTx is a thin relay envelope for a CLOB limit-order placement. It
+// carries the wire fields a clob_place frame needs but NO matching logic — the
+// VM forwards it to the d-chain and settles from the returned ack/fills.
+type PlaceOrderTx struct {
+	BaseTx
+	// PoolID is the 32-byte market identity (V4 poolId) the d-chain keys by.
+	PoolID [32]byte `json:"poolId"`
+	Side   uint8    `json:"side"` // 0 = Buy/bid, 1 = Sell/ask
+	Price  uint64   `json:"price"`
+	Size   uint64   `json:"size"`
+	// CollateralRef references the Import whose locked value backs this order.
+	CollateralRef ids.ID `json:"collateralRef"`
+}
+
+// NewPlaceOrderTx creates a new place-order relay envelope.
+func NewPlaceOrderTx(from ids.ShortID, nonce uint64, poolID [32]byte, side uint8, price, size uint64) *PlaceOrderTx {
+	tx := &PlaceOrderTx{
 		BaseTx: BaseTx{
 			TxType:    TxPlaceOrder,
 			From:      from,
@@ -132,35 +330,36 @@ func NewPlaceOrderTx(
 			GasLimit:  100000,
 			CreatedAt: time.Now().UnixNano(),
 		},
-		Symbol:      symbol,
-		Side:        side,
-		OrderType:   orderType,
-		Price:       price,
-		Quantity:    quantity,
-		TimeInForce: timeInForce,
+		PoolID: poolID,
+		Side:   side,
+		Price:  price,
+		Size:   size,
 	}
+	return finalize(tx, &tx.BaseTx)
 }
 
 func (tx *PlaceOrderTx) Verify() error {
-	if tx.Quantity == 0 {
+	if tx.Size == 0 {
 		return ErrInvalidAmount
 	}
-	if tx.OrderType == 0 && tx.Price == 0 { // Limit order needs price
+	if tx.Price == 0 {
 		return ErrInvalidPrice
 	}
 	return nil
 }
 
-// CancelOrderTx represents a cancel order transaction.
+// CancelOrderTx is a thin relay envelope for a CLOB cancel. The d-chain
+// authenticates the cancel against the resting order's maker — the proxy only
+// forwards the (market, orderID) reference.
 type CancelOrderTx struct {
 	BaseTx
-	OrderID ids.ID `json:"orderId"`
-	Symbol  string `json:"symbol"`
+	PoolID  [32]byte `json:"poolId"`
+	OrderID uint64   `json:"orderId"`
 }
 
-// NewCancelOrderTx creates a new cancel order transaction.
-func NewCancelOrderTx(from ids.ShortID, nonce uint64, orderID ids.ID, symbol string) *CancelOrderTx {
-	return &CancelOrderTx{
+// NewCancelOrderTx creates a new cancel-order relay envelope.
+func NewCancelOrderTx(from ids.ShortID, nonce uint64, poolID [32]byte, orderID uint64) *CancelOrderTx {
+	tx := &CancelOrderTx{
 		BaseTx: BaseTx{
 			TxType:    TxCancelOrder,
 			From:      from,
@@ -169,345 +368,16 @@ func NewCancelOrderTx(from ids.ShortID, nonce uint64, orderID ids.ID, symbol str
 			GasLimit:  50000,
 			CreatedAt: time.Now().UnixNano(),
 		},
+		PoolID:  poolID,
 		OrderID: orderID,
-		Symbol:  symbol,
 	}
+	return finalize(tx, &tx.BaseTx)
 }
 
 func (tx *CancelOrderTx) Verify() error {
-	if tx.OrderID == ids.Empty {
-		return errors.New("order ID cannot be empty")
+	if tx.OrderID == 0 {
+		return errors.New("cancel: order id cannot be zero")
 	}
-	return nil
-}
-
-// SwapTx represents an AMM swap transaction.
-type SwapTx struct {
-	BaseTx
-	PoolID       ids.ID `json:"poolId"`
-	TokenIn      ids.ID `json:"tokenIn"`
-	TokenOut     ids.ID `json:"tokenOut"`
-	AmountIn     uint64 `json:"amountIn"`
-	MinAmountOut uint64 `json:"minAmountOut"`
-	MaxSlippage  uint16 `json:"maxSlippage"` // In basis points
-	Deadline     int64  `json:"deadline"`
-}
-
-// NewSwapTx creates a new swap transaction.
-func NewSwapTx(
-	from ids.ShortID,
-	nonce uint64,
-	poolID ids.ID,
-	tokenIn, tokenOut ids.ID,
-	amountIn, minAmountOut uint64,
-	maxSlippage uint16,
-) *SwapTx {
-	return &SwapTx{
-		BaseTx: BaseTx{
-			TxType:    TxSwap,
-			From:      from,
-			Nonce:     nonce,
-			GasPrice:  1000,
-			GasLimit:  200000,
-			CreatedAt: time.Now().UnixNano(),
-		},
-		PoolID:       poolID,
-		TokenIn:      tokenIn,
-		TokenOut:     tokenOut,
-		AmountIn:     amountIn,
-		MinAmountOut: minAmountOut,
-		MaxSlippage:  maxSlippage,
-		Deadline:     time.Now().Add(5 * time.Minute).UnixNano(),
-	}
-}
-
-func (tx *SwapTx) Verify() error {
-	if tx.AmountIn == 0 {
-		return ErrInvalidAmount
-	}
-	if tx.TokenIn == tx.TokenOut {
-		return errors.New("cannot swap same token")
-	}
-	return nil
-}
-
-// AddLiquidityTx represents adding liquidity to a pool.
-type AddLiquidityTx struct {
-	BaseTx
-	PoolID       ids.ID `json:"poolId"`
-	Token0Amount uint64 `json:"token0Amount"`
-	Token1Amount uint64 `json:"token1Amount"`
-	MinLPTokens  uint64 `json:"minLPTokens"`
-	Deadline     int64  `json:"deadline"`
-}
-
-// NewAddLiquidityTx creates a new add liquidity transaction.
-func NewAddLiquidityTx(
-	from ids.ShortID,
-	nonce uint64,
-	poolID ids.ID,
-	token0Amount, token1Amount, minLPTokens uint64,
-) *AddLiquidityTx {
-	return &AddLiquidityTx{
-		BaseTx: BaseTx{
-			TxType:    TxAddLiquidity,
-			From:      from,
-			Nonce:     nonce,
-			GasPrice:  1000,
-			GasLimit:  250000,
-			CreatedAt: time.Now().UnixNano(),
-		},
-		PoolID:       poolID,
-		Token0Amount: token0Amount,
-		Token1Amount: token1Amount,
-		MinLPTokens:  minLPTokens,
-		Deadline:     time.Now().Add(5 * time.Minute).UnixNano(),
-	}
-}
-
-func (tx *AddLiquidityTx) Verify() error {
-	if tx.Token0Amount == 0 || tx.Token1Amount == 0 {
-		return ErrInvalidAmount
-	}
-	return nil
-}
-
-// RemoveLiquidityTx represents removing liquidity from a pool.
-type RemoveLiquidityTx struct {
-	BaseTx
-	PoolID        ids.ID `json:"poolId"`
-	LPTokenAmount uint64 `json:"lpTokenAmount"`
-	MinToken0     uint64 `json:"minToken0"`
-	MinToken1     uint64 `json:"minToken1"`
-	Deadline      int64  `json:"deadline"`
-}
-
-// NewRemoveLiquidityTx creates a new remove liquidity transaction.
-func NewRemoveLiquidityTx(
-	from ids.ShortID,
-	nonce uint64,
-	poolID ids.ID,
-	lpTokenAmount, minToken0, minToken1 uint64,
-) *RemoveLiquidityTx {
-	return &RemoveLiquidityTx{
-		BaseTx: BaseTx{
-			TxType:    TxRemoveLiquidity,
-			From:      from,
-			Nonce:     nonce,
-			GasPrice:  1000,
-			GasLimit:  250000,
-			CreatedAt: time.Now().UnixNano(),
-		},
-		PoolID:        poolID,
-		LPTokenAmount: lpTokenAmount,
-		MinToken0:     minToken0,
-		MinToken1:     minToken1,
-		Deadline:      time.Now().Add(5 * time.Minute).UnixNano(),
-	}
-}
-
-func (tx *RemoveLiquidityTx) Verify() error {
-	if tx.LPTokenAmount == 0 {
-		return ErrInvalidAmount
-	}
-	return nil
-}
-
-// CreatePoolTx represents creating a new liquidity pool.
-type CreatePoolTx struct {
-	BaseTx
-	Token0        ids.ID `json:"token0"`
-	Token1        ids.ID `json:"token1"`
-	PoolType      uint8  `json:"poolType"` // 0 = ConstantProduct, 1 = StableSwap, 2 = Concentrated
-	SwapFeeBps    uint16 `json:"swapFeeBps"`
-	InitialToken0 uint64 `json:"initialToken0"`
-	InitialToken1 uint64 `json:"initialToken1"`
-	// For concentrated liquidity
-	TickLower int32 `json:"tickLower"`
-	TickUpper int32 `json:"tickUpper"`
-}
-
-// NewCreatePoolTx creates a new create pool transaction.
-func NewCreatePoolTx(
-	from ids.ShortID,
-	nonce uint64,
-	token0, token1 ids.ID,
-	poolType uint8,
-	swapFeeBps uint16,
-	initialToken0, initialToken1 uint64,
-) *CreatePoolTx {
-	return &CreatePoolTx{
-		BaseTx: BaseTx{
-			TxType:    TxCreatePool,
-			From:      from,
-			Nonce:     nonce,
-			GasPrice:  1000,
-			GasLimit:  500000,
-			CreatedAt: time.Now().UnixNano(),
-		},
-		Token0:        token0,
-		Token1:        token1,
-		PoolType:      poolType,
-		SwapFeeBps:    swapFeeBps,
-		InitialToken0: initialToken0,
-		InitialToken1: initialToken1,
-	}
-}
-
-func (tx *CreatePoolTx) Verify() error {
-	if tx.Token0 == tx.Token1 {
-		return errors.New("cannot create pool with same token")
-	}
-	if tx.InitialToken0 == 0 || tx.InitialToken1 == 0 {
-		return ErrInvalidAmount
-	}
-	if tx.SwapFeeBps > 10000 { // Max 100%
-		return errors.New("swap fee too high")
-	}
-	return nil
-}
-
-// CrossChainSwapTx represents a cross-chain atomic swap via Warp.
-type CrossChainSwapTx struct {
-	BaseTx
-	SourceChain   ids.ID      `json:"sourceChain"`
-	DestChain     ids.ID      `json:"destChain"`
-	TokenIn       ids.ID      `json:"tokenIn"`
-	TokenOut      ids.ID      `json:"tokenOut"`
-	AmountIn      uint64      `json:"amountIn"`
-	MinAmountOut  uint64      `json:"minAmountOut"`
-	Recipient     ids.ShortID `json:"recipient"`
-	WarpMessageID ids.ID      `json:"warpMessageId"`
-	Deadline      int64       `json:"deadline"`
-}
-
-func (tx *CrossChainSwapTx) Verify() error {
-	if tx.AmountIn == 0 {
-		return ErrInvalidAmount
-	}
-	if tx.SourceChain == tx.DestChain {
-		return errors.New("source and destination chain must be different")
-	}
-	return nil
-}
-
-// CrossChainTransferTx represents a cross-chain token transfer via Warp.
-type CrossChainTransferTx struct {
-	BaseTx
-	SourceChain   ids.ID      `json:"sourceChain"`
-	DestChain     ids.ID      `json:"destChain"`
-	Token         ids.ID      `json:"token"`
-	Amount        uint64      `json:"amount"`
-	Recipient     ids.ShortID `json:"recipient"`
-	WarpMessageID ids.ID      `json:"warpMessageId"`
-}
-
-func (tx *CrossChainTransferTx) Verify() error {
-	if tx.Amount == 0 {
-		return ErrInvalidAmount
-	}
-	if tx.SourceChain == tx.DestChain {
-		return errors.New("source and destination chain must be different")
-	}
-	return nil
-}
-
-// CommitOrderTx represents a commit phase for MEV-protected order placement.
-// Users submit hash(order || salt) without revealing order details.
-type CommitOrderTx struct {
-	BaseTx
-	// CommitmentHash is SHA256(order_bytes || salt)
-	CommitmentHash ids.ID `json:"commitmentHash"`
-}
-
-// NewCommitOrderTx creates a new commit order transaction.
-func NewCommitOrderTx(from ids.ShortID, nonce uint64, commitmentHash ids.ID) *CommitOrderTx {
-	return &CommitOrderTx{
-		BaseTx: BaseTx{
-			TxType:    TxCommitOrder,
-			From:      from,
-			Nonce:     nonce,
-			GasPrice:  500, // Lower gas for commit
-			GasLimit:  30000,
-			CreatedAt: time.Now().UnixNano(),
-		},
-		CommitmentHash: commitmentHash,
-	}
-}
-
-func (tx *CommitOrderTx) Verify() error {
-	if tx.CommitmentHash == ids.Empty {
-		return errors.New("commitment hash cannot be empty")
-	}
-	return nil
-}
-
-// RevealOrderTx represents a reveal phase for MEV-protected order placement.
-// Users reveal the actual order and salt to match their commitment.
-type RevealOrderTx struct {
-	BaseTx
-	// CommitmentHash links to the original commitment
-	CommitmentHash ids.ID `json:"commitmentHash"`
-
-	// Salt is the 32-byte random salt used in commitment
-	Salt [32]byte `json:"salt"`
-
-	// Order details being revealed
-	Symbol      string `json:"symbol"`
-	Side        uint8  `json:"side"`      // 0 = Buy, 1 = Sell
-	OrderType   uint8  `json:"orderType"` // 0 = Limit, 1 = Market, etc.
-	Price       uint64 `json:"price"`
-	Quantity    uint64 `json:"quantity"`
-	StopPrice   uint64 `json:"stopPrice"`
-	PostOnly    bool   `json:"postOnly"`
-	ReduceOnly  bool   `json:"reduceOnly"`
-	TimeInForce string `json:"timeInForce"` // GTC, IOC, FOK
-	ExpiresAt   int64  `json:"expiresAt"`
-}
-
-// NewRevealOrderTx creates a new reveal order transaction.
-func NewRevealOrderTx(
-	from ids.ShortID,
-	nonce uint64,
-	commitmentHash ids.ID,
-	salt [32]byte,
-	symbol string,
-	side uint8,
-	orderType uint8,
-	price, quantity uint64,
-	timeInForce string,
-) *RevealOrderTx {
-	return &RevealOrderTx{
-		BaseTx: BaseTx{
-			TxType:    TxRevealOrder,
-			From:      from,
-			Nonce:     nonce,
-			GasPrice:  1000,
-			GasLimit:  100000,
-			CreatedAt: time.Now().UnixNano(),
-		},
-		CommitmentHash: commitmentHash,
-		Salt:           salt,
-		Symbol:         symbol,
-		Side:           side,
-		OrderType:      orderType,
-		Price:          price,
-		Quantity:       quantity,
-		TimeInForce:    timeInForce,
-	}
-}
-
-func (tx *RevealOrderTx) Verify() error {
-	if tx.CommitmentHash == ids.Empty {
-		return errors.New("commitment hash cannot be empty")
-	}
-	if tx.Quantity == 0 {
-		return ErrInvalidAmount
-	}
-	if tx.OrderType == 0 && tx.Price == 0 { // Limit order needs price
-		return ErrInvalidPrice
-	}
-	// Salt verification is done in commit-reveal matching, not here
 	return nil
 }
 
@@ -522,107 +392,93 @@ func (p *TxParser) Parse(data []byte) (Tx, error) {
 
 	txType := TxType(data[0])
 	switch txType {
+	case TxImport:
+		return parse[ImportTx](data, TxImport)
+	case TxExport:
+		return parse[ExportTx](data, TxExport)
+	case TxRelayOrder:
+		return parse[RelayOrderTx](data, TxRelayOrder)
 	case TxPlaceOrder:
-		return p.parsePlaceOrder(data)
+		return parse[PlaceOrderTx](data, TxPlaceOrder)
 	case TxCancelOrder:
-		return p.parseCancelOrder(data)
-	case TxSwap:
-		return p.parseSwap(data)
-	case TxAddLiquidity:
-		return p.parseAddLiquidity(data)
-	case TxRemoveLiquidity:
-		return p.parseRemoveLiquidity(data)
-	case TxCreatePool:
-		return p.parseCreatePool(data)
-	case TxCrossChainSwap:
-		return p.parseCrossChainSwap(data)
-	case TxCrossChainTransfer:
-		return p.parseCrossChainTransfer(data)
-	case TxCommitOrder:
-		return p.parseCommitOrder(data)
-	case TxRevealOrder:
-		return p.parseRevealOrder(data)
+		return parse[CancelOrderTx](data, TxCancelOrder)
 	default:
 		return nil, ErrInvalidTxType
 	}
 }
 
-func (p *TxParser) parsePlaceOrder(data []byte) (*PlaceOrderTx, error) {
-	// Simplified parsing - in production use proper codec
-	tx := &PlaceOrderTx{}
-	tx.TxType = TxPlaceOrder
-	tx.bytes = data
+// parse decodes the JSON body into a concrete tx, stamps its type, wire bytes,
+// and the deterministic TxID. One codec for every type — there is exactly one
+// way to read a transaction off the wire.
+func parse[T any](data []byte, txType TxType) (*T, error) {
+	tx := new(T)
+	if err := unmarshalBody(data, tx); err != nil {
+		return nil, err
+	}
+	stampBase(tx, txType, data)
 	return tx, nil
 }
 
-func (p *TxParser) parseCancelOrder(data []byte) (*CancelOrderTx, error) {
-	tx := &CancelOrderTx{}
-	tx.TxType = TxCancelOrder
-	tx.bytes = data
-	return tx, nil
+// stampBase sets the embedded BaseTx's type, wire bytes, and checksum TxID via
+// the Tx interface methods exposed on *BaseTx. It relies on every concrete tx
+// embedding BaseTx.
+func stampBase(tx any, txType TxType, data []byte) {
+	type baseHolder interface{ base() *BaseTx }
+	if h, ok := tx.(baseHolder); ok {
+		b := h.base()
+		b.TxType = txType
+		b.TxID = ids.Checksum256(data)
+		b.bytes = data
+	}
 }
 
-func (p *TxParser) parseSwap(data []byte) (*SwapTx, error) {
-	tx := &SwapTx{}
-	tx.TxType = TxSwap
-	tx.bytes = data
-	return tx, nil
+func (tx *BaseTx) base() *BaseTx { return tx }
+
+// Wire format for every transaction is a single type byte followed by the JSON
+// encoding of the concrete transaction struct:
+//
+//	[0]      = TxType
+//	[1:]     = json.Marshal(tx)
+//
+// The encoding is deterministic (Go's encoding/json emits struct fields in
+// declaration order and these types contain no maps), so the same logical
+// transaction always serializes to identical bytes and therefore the same
+// TxID. This is the single codec used by both the constructors and the parser.
+
+// Marshal serializes a concrete transaction struct into wire bytes:
+// type byte + JSON body.
+func Marshal[T any](tx *T, txType TxType) ([]byte, error) {
+	body, err := json.Marshal(tx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 1+len(body))
+	out[0] = byte(txType)
+	copy(out[1:], body)
+	return out, nil
 }
 
-func (p *TxParser) parseAddLiquidity(data []byte) (*AddLiquidityTx, error) {
-	tx := &AddLiquidityTx{}
-	tx.TxType = TxAddLiquidity
-	tx.bytes = data
-	return tx, nil
+// unmarshalBody decodes the JSON body (everything after the type byte) into the
+// supplied transaction struct. The type byte itself is validated by the caller
+// (TxParser.Parse) before dispatch.
+func unmarshalBody(data []byte, v any) error {
+	if len(data) < 1 {
+		return ErrInvalidTxType
+	}
+	return json.Unmarshal(data[1:], v)
 }
 
-func (p *TxParser) parseRemoveLiquidity(data []byte) (*RemoveLiquidityTx, error) {
-	tx := &RemoveLiquidityTx{}
-	tx.TxType = TxRemoveLiquidity
-	tx.bytes = data
-	return tx, nil
-}
-
-func (p *TxParser) parseCreatePool(data []byte) (*CreatePoolTx, error) {
-	tx := &CreatePoolTx{}
-	tx.TxType = TxCreatePool
-	tx.bytes = data
-	return tx, nil
-}
-
-func (p *TxParser) parseCrossChainSwap(data []byte) (*CrossChainSwapTx, error) {
-	tx := &CrossChainSwapTx{}
-	tx.TxType = TxCrossChainSwap
-	tx.bytes = data
-	return tx, nil
-}
-
-func (p *TxParser) parseCrossChainTransfer(data []byte) (*CrossChainTransferTx, error) {
-	tx := &CrossChainTransferTx{}
-	tx.TxType = TxCrossChainTransfer
-	tx.bytes = data
-	return tx, nil
-}
-
-func (p *TxParser) parseCommitOrder(data []byte) (*CommitOrderTx, error) {
-	tx := &CommitOrderTx{}
-	tx.TxType = TxCommitOrder
-	tx.bytes = data
-	return tx, nil
-}
-
-func (p *TxParser) parseRevealOrder(data []byte) (*RevealOrderTx, error) {
-	tx := &RevealOrderTx{}
-	tx.TxType = TxRevealOrder
-	tx.bytes = data
-	return tx, nil
-}
-
-// Helper functions for encoding
-func encodeUint64(buf []byte, v uint64) {
-	binary.BigEndian.PutUint64(buf, v)
-}
-
-func decodeUint64(buf []byte) uint64 {
-	return binary.BigEndian.Uint64(buf)
+// finalize serializes the constructed transaction and stamps its wire bytes and
+// deterministic TxID. Every New*Tx constructor calls this so a freshly built
+// transaction is immediately wire-ready and Parse-round-trippable.
+func finalize[T any](tx *T, base *BaseTx) *T {
+	wire, err := Marshal(tx, base.TxType)
+	if err != nil {
+		// JSON encoding of these plain structs cannot fail; treat as a
+		// programmer error rather than silently returning a half-built tx.
+		panic("txs: failed to marshal transaction: " + err.Error())
+	}
+	base.TxID = ids.Checksum256(wire)
+	base.bytes = wire
+	return tx
 }
