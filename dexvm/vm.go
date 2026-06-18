@@ -10,26 +10,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/big"
+	"math"
 	"net/http"
-	"sort"
 	"sync"
 	"time"
 
 	"github.com/gorilla/rpc/v2"
 	rpcjson "github.com/gorilla/rpc/v2/json"
-	"github.com/gorilla/websocket"
 	"github.com/luxfi/log"
 	"github.com/luxfi/metric"
 
 	"github.com/luxfi/accel"
 	"github.com/luxfi/chains/dexvm/api"
 	"github.com/luxfi/chains/dexvm/config"
-	"github.com/luxfi/chains/dexvm/liquidity"
-	"github.com/luxfi/chains/dexvm/mev"
 	"github.com/luxfi/chains/dexvm/network"
-	"github.com/luxfi/chains/dexvm/orderbook"
-	"github.com/luxfi/chains/dexvm/perpetuals"
+	dexstate "github.com/luxfi/chains/dexvm/state"
 	"github.com/luxfi/chains/dexvm/txs"
 	consensuscore "github.com/luxfi/consensus/core"
 	"github.com/luxfi/database"
@@ -44,110 +39,163 @@ import (
 )
 
 var (
-	errUnknownState    = errors.New("unknown state")
 	errNotBootstrapped = errors.New("VM not bootstrapped")
 	errShutdown        = errors.New("VM is shutting down")
+	// errUTXOAlreadyImported guards the atomic-import double-spend (the proxy
+	// never mints — an exported UTXO is claimable exactly once).
+	errUTXOAlreadyImported = errors.New("atomic UTXO already imported")
 
 	_ = errNotBootstrapped
 	_ = errShutdown
 )
 
-// BlockResult represents the deterministic result of processing a block.
-// All state changes are captured here for verifiability.
+// BlockResult is the deterministic result of processing a block on the proxy.
+// A STATELESS ATOMIC ZAP PROXY produces NO MatchedTrades / FundingPayments /
+// Liquidations — matching lives ONLY on the d-chain. The proxy's per-block
+// output is the cross-chain atomic operations it accumulated (committed at
+// accept) and the state root over its (tiny) replay/consumption state.
 type BlockResult struct {
-	// BlockHeight is the height of the processed block
+	// BlockHeight is the height of the processed block.
 	BlockHeight uint64
 
-	// Timestamp is when this block was processed
+	// Timestamp is when this block was processed.
 	Timestamp time.Time
 
-	// MatchedTrades from order matching in this block
-	MatchedTrades []orderbook.Trade
-
-	// FundingPayments processed in this block (if any)
-	FundingPayments []*perpetuals.FundingPayment
-
-	// Liquidations executed in this block (if any)
-	Liquidations []*perpetuals.LiquidationEvent
-
-	// StateRoot is the merkle root of state after this block
+	// StateRoot is the merkle root of the proxy's state after this block.
 	StateRoot ids.ID
+
+	// blockHash is the deterministic (height, time) binding ProcessBlock used to
+	// key relay receipts. Accept reuses it so a relay maps to exactly one
+	// (blockHash, txIndex) receipt across re-execution.
+	blockHash ids.ID
+
+	// atomic holds the cross-chain IMPORT operations accumulated during Verify
+	// (deterministic, no I/O). The EXPORT (settlement) legs are appended at
+	// accept by settleCarried, derived from the block-CARRIED fills. Applied
+	// atomically with the state batch at the single accept commit point.
+	atomic *atomicRequests
+
+	// relays is the deterministic ORDER-RELAY PLAN built during Verify. Verify is
+	// a PURE DETERMINISTIC PLANNER — it performs NO d-chain I/O at all. The plan
+	// records which txIndex is a settling submit (so settleCarried knows which
+	// carried-fills entry drives an export) and the per-relay settle context
+	// (sender, collateralRef). The actual relay (the irreversible, non-
+	// deterministic d-chain leg) is NOT executed from this plan on the
+	// verify/accept path — it is performed exactly once by the PROPOSER at build
+	// time (VM.obtainFills), and its fills are CARRIED in the block bytes.
+	relays []plannedRelay
+
+	// carriedFills are the d-chain matcher's confirmed fills carried in the block
+	// /vertex bytes (see carried_fills.go). On the PROPOSER they are produced at
+	// build by obtainFills (one relay per order, network-wide); on every other
+	// validator they are parsed from the block bytes. settleCarried settles purely
+	// from these — NO validator ever relays during Verify/Accept — so block output
+	// is a pure function of (height, carried time, tx bytes, carried fills) and
+	// every node reproduces the identical StateRoot (RED finding #9 fix).
+	carriedFills []carriedFill
+
+	// fillSig is the RESERVED d-chain fill-attestation signature carried alongside
+	// the fills (see carried_fills.go). Empty today; the trustless upgrade (d-chain
+	// signs its fills, P3Q -> starkfri verifies) populates and checks it WITHOUT a
+	// further wire-format change.
+	fillSig []byte
 }
 
-// VM implements the DEX Virtual Machine using a pure functional architecture.
-// Native decentralized exchange — Hyperliquid-class on-chain CLOB.
-// All state transitions happen deterministically within block processing:
-//   - Central Limit Order Book (CLOB) — native, not EVM-based
-//   - Perpetual futures with auto-deleveraging
-//   - Cross-chain atomic swaps via Warp messaging
-//   - 1ms block times for ultra-low latency trading
+// plannedRelay is one clob_* relay captured deterministically during Verify. It
+// binds the relay to (blockHash, txIndex) for replay-idempotency and carries
+// everything BOTH the proposer's build-time relay (obtainFills) AND every
+// validator's accept-time settle-from-carried (settleCarried) need — no tx
+// re-parse at either point.
+type plannedRelay struct {
+	// txIndex is the relay's position in the block (the receipt-binding key).
+	txIndex uint32
+	// method is the ZAP CLOB method ("clob_submit" / "clob_place" / "clob_cancel").
+	method string
+	// payload is the opaque, byte-identical clob_* frame forwarded verbatim.
+	payload []byte
+	// sender is the taker/maker address (settle owner for clob_submit).
+	sender ids.ShortID
+	// collateralRef binds a clob_submit to the Import escrow it settles against.
+	collateralRef ids.ID
+	// settle is true only for clob_submit: its returned fills drive an export.
+	// place/cancel are acks the proxy relays but does not settle.
+	settle bool
+}
+
+// VM implements the DEX proxy Virtual Machine: a STATELESS ATOMIC ZAP PROXY on
+// the Lux consensus network. It holds ZERO canonical DEX state. It does exactly
+// two orthogonal things, each its own primitive (do NOT conflate them):
 //
-// DESIGN: No background goroutines. All operations are block-driven and deterministic.
-// This ensures:
-//   - Every node produces identical state from identical inputs
-//   - No race conditions or non-deterministic behavior
-//   - Easy to test and verify
-//   - Replay-safe for auditing
+//  1. ORDER RELAY (proxy -> d-chain): forwards byte-identical clob_* frames
+//     over ZAP (RelayClient) to the single source-of-truth matcher. NOT atomic,
+//     NOT consensus — pure transport.
+//
+//  2. VALUE SETTLEMENT (C-Chain <-> proxy, atomic): moves value in/out via
+//     atomic.SharedMemory import/export (atomic.go), exactly as X/P-chains do.
+//     The ONLY primitive in the proxy that moves value across chains.
+//
+// Warp is retained ONLY as the optional fill-attestation channel (off the hot
+// path) — it is NOT the settlement primitive.
+//
+// DESIGN: No background goroutines. All operations are block-driven and
+// deterministic, so every node produces identical state from identical inputs.
 type VM struct {
 	config.Config
 
-	// Per-VM GPU acceleration session. Reserved for future batch
-	// order-matching, MSM-based commitment verification, and tensor
-	// orderbook reconstruction.
+	// Per-VM GPU acceleration session (held for API symmetry with other VMs;
+	// the proxy itself runs NO kernels — GPU lives in the d-chain's dex/pkg/lx).
 	accel *accel.VMSession
 
-	// Logger for this VM
+	// Logger for this VM.
 	log log.Logger
 
-	// Lock for thread safety (only for API access, not consensus)
+	// Lock for thread safety (API access; consensus is single-threaded).
 	lock sync.RWMutex
 
-	// Consensus context - provides chain identity and network info
+	// Consensus context — provides chain identity, network info, and the
+	// per-chain atomic.SharedMemory used by the settlement leg.
 	consensusRuntime *runtime.Runtime
 
-	// Chain identity
+	// Chain identity.
 	chainID ids.ID
 
-	// Database management
+	// Database management.
 	baseDB database.Database
 	db     *versiondb.Database
 
-	// Used to check local time
+	// state persists ONLY replay nonces, in-flight relay receipts, and the
+	// atomic-UTXO consumption set (proxy-statelessness invariant).
+	state *dexstate.State
+
+	// relay forwards clob_* frames to the d-chain ZAP gateway (order-relay leg).
+	relay *RelayClient
+
+	// Used to check local time.
 	clock mockable.Clock
 
-	// Metrics
+	// Metrics.
 	registerer metric.Registerer
 
-	// Network peers
+	// Network peers.
 	connectedPeers map[ids.NodeID]*version.Application
 
-	// Application sender for gossip
+	// Application sender for gossip.
 	appSender warp.Sender
 
-	// DEX components (all operations on these are deterministic)
-	orderbooks      map[string]*orderbook.Orderbook    // symbol -> orderbook
-	liquidityMgr    *liquidity.Manager                 // AMM liquidity pools
-	perpetualsEng   *perpetuals.Engine                 // Perpetual futures engine
-	commitmentStore *mev.CommitmentStore               // MEV protection commit-reveal
-	adlEngine       *perpetuals.AutoDeleveragingEngine // Auto-deleveraging
-
-	// Block state
+	// Block state.
 	currentBlockHeight uint64
 	lastBlockTime      time.Time
-	lastFundingTime    time.Time // Tracks when funding was last processed
 
-	// Lifecycle state
+	// Lifecycle state.
 	bootstrapped  bool
 	isInitialized bool
 	shutdown      bool
 
-	// Channel for sending messages to consensus engine
+	// Channel for sending messages to consensus engine.
 	toEngine chan<- vmcore.Message
 }
 
 // NewVMForTest creates a new VM instance for testing purposes.
-// This allows external test packages to create VM instances without
-// needing to access internal fields directly.
 func NewVMForTest(cfg config.Config, logger log.Logger) *VM {
 	return &VM{
 		Config: cfg,
@@ -155,20 +203,18 @@ func NewVMForTest(cfg config.Config, logger log.Logger) *VM {
 	}
 }
 
-// Initialize implements consensuscore.VM interface.
-// It sets up the VM with the provided context, database, and genesis data.
-func (vm *VM) Initialize(
-	ctx context.Context,
-	vmInit vmcore.Init,
-) error {
+// Initialize implements consensuscore.VM. It sets up the proxy with the
+// provided context, database, and genesis/config data.
+func (vm *VM) Initialize(ctx context.Context, vmInit vmcore.Init) error {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
 
-	// Cast Runtime
 	vm.consensusRuntime = vmInit.Runtime
-	vm.chainID = vm.consensusRuntime.ChainID
+	if vm.consensusRuntime != nil {
+		vm.chainID = vm.consensusRuntime.ChainID
+	}
 
-	// Initialize logger from Runtime
+	// Logger from runtime.
 	if vm.consensusRuntime != nil && vm.consensusRuntime.Log != nil {
 		if logger, ok := vm.consensusRuntime.Log.(log.Logger); ok && !logger.IsZero() {
 			vm.log = logger
@@ -179,247 +225,93 @@ func (vm *VM) Initialize(
 		vm.log = log.Noop()
 	}
 
-	// Setup database
+	// Database. The proxy keeps two layers: vm.db (versiondb) is the per-block
+	// state committed atomically at accept; vm.baseDB is the durable base the
+	// versiondb wraps. Relay receipts are write-ahead intents that gate an
+	// irreversible d-chain side effect, so they route through the durable base
+	// (receiptDB) and survive a crash-before-accept that db.Abort would discard.
 	vm.baseDB = vmInit.DB
 	vm.db = versiondb.New(vm.baseDB)
+	vm.state = dexstate.New(vm.db, vm.baseDB)
+	if err := vm.state.Initialize(); err != nil {
+		return fmt.Errorf("failed to initialize proxy state: %w", err)
+	}
 
-	// Setup message channel
 	vm.toEngine = vmInit.ToEngine
-
-	// Setup app sender
 	if vmInit.Sender != nil {
 		vm.appSender = vmInit.Sender
 	}
-
-	// Initialize peer tracking
 	vm.connectedPeers = make(map[ids.NodeID]*version.Application)
 
-	// Initialize DEX components
-	vm.orderbooks = make(map[string]*orderbook.Orderbook)
-	vm.liquidityMgr = liquidity.NewManager()
-	vm.perpetualsEng = perpetuals.NewEngine()
-	vm.commitmentStore = mev.NewCommitmentStore()
-	vm.adlEngine = perpetuals.NewAutoDeleveragingEngine(perpetuals.DefaultADLConfig())
-
-	// Initialize block state
 	vm.currentBlockHeight = 0
 	vm.lastBlockTime = time.Time{}
-	vm.lastFundingTime = time.Time{}
 
-	// Parse genesis if provided
+	// Parse config first (genesis may override).
+	if len(vmInit.Config) > 0 {
+		if err := vm.parseConfig(vmInit.Config); err != nil {
+			return fmt.Errorf("failed to parse config: %w", err)
+		}
+	}
 	if len(vmInit.Genesis) > 0 {
 		if err := vm.parseGenesis(vmInit.Genesis); err != nil {
 			return fmt.Errorf("failed to parse genesis: %w", err)
 		}
 	}
 
-	// Parse config if provided
-	if len(vmInit.Config) > 0 {
-		if err := vm.parseConfig(vmInit.Config); err != nil {
-			return fmt.Errorf("failed to parse config: %w", err)
-		}
-	}
+	// Wire the order-relay client to the configured d-chain endpoint. Empty
+	// endpoint => inert relay leg (ErrRelayNotConfigured on relay attempts).
+	vm.relay = NewRelayClient(vm.Config.DexZapEndpoint, vm.Config.DexZapTimeout)
 
 	vm.isInitialized = true
 	if !vm.log.IsZero() {
-		vm.log.Info("DEX VM initialized (functional mode)",
+		vm.log.Info("DEX proxy VM initialized (stateless atomic ZAP proxy)",
 			"chainID", vm.chainID,
-			"blockInterval", vm.Config.BlockInterval,
+			"dexZapEndpoint", redactEndpoint(vm.Config.DexZapEndpoint),
+			"relayConfigured", vm.relay.Configured(),
 		)
 	}
-
 	return nil
 }
 
-// Genesis represents the DEX VM genesis configuration.
+// Genesis is the proxy's genesis configuration: trusted chains for the
+// attestation channel and the d-chain ZAP endpoint. There are NO trading
+// pairs / pools / perp markets — the proxy seeds no DEX state.
 type Genesis struct {
-	// TradingPairs defines the initial trading pairs (order book markets)
-	TradingPairs []GenesisTradingPair `json:"tradingPairs"`
-
-	// LiquidityPools defines the initial AMM liquidity pools
-	LiquidityPools []GenesisPool `json:"liquidityPools"`
-
-	// PerpetualMarkets defines the initial perpetual futures markets
-	PerpetualMarkets []GenesisPerpMarket `json:"perpetualMarkets"`
-
-	// FeeConfig contains global fee configuration
-	FeeConfig GenesisFeeConfig `json:"feeConfig"`
-
-	// TrustedChains are chain IDs trusted for cross-chain operations
-	TrustedChains []string `json:"trustedChains"`
-
-	// InitialBalances are pre-funded accounts (for testing/airdrops)
-	InitialBalances []GenesisBalance `json:"initialBalances,omitempty"`
+	// DexZapEndpoint optionally overrides the d-chain ZAP gateway address.
+	DexZapEndpoint string `json:"dexZapEndpoint,omitempty"`
+	// TrustedChains are chain IDs trusted for the Warp attestation channel.
+	TrustedChains []string `json:"trustedChains,omitempty"`
 }
 
-// GenesisTradingPair defines a trading pair for the order book.
-type GenesisTradingPair struct {
-	Symbol     string `json:"symbol"`     // e.g., "LUX/USDC"
-	BaseAsset  string `json:"baseAsset"`  // Base asset ID
-	QuoteAsset string `json:"quoteAsset"` // Quote asset ID
-}
-
-// GenesisPool defines an initial liquidity pool.
-type GenesisPool struct {
-	Token0        string `json:"token0"`
-	Token1        string `json:"token1"`
-	InitialToken0 uint64 `json:"initialToken0"`
-	InitialToken1 uint64 `json:"initialToken1"`
-	PoolType      uint8  `json:"poolType"` // 0=ConstantProduct, 1=StableSwap, 2=Concentrated
-	FeeBps        uint16 `json:"feeBps"`
-}
-
-// GenesisPerpMarket defines an initial perpetual futures market.
-type GenesisPerpMarket struct {
-	Symbol            string `json:"symbol"`     // e.g., "BTC-PERP"
-	BaseAsset         string `json:"baseAsset"`  // e.g., BTC
-	QuoteAsset        string `json:"quoteAsset"` // e.g., USDC
-	MaxLeverage       uint16 `json:"maxLeverage"`
-	MaintenanceMargin uint16 `json:"maintenanceMarginBps"` // in basis points
-	InitialMargin     uint16 `json:"initialMarginBps"`     // in basis points
-	MakerFee          uint16 `json:"makerFeeBps"`
-	TakerFee          uint16 `json:"takerFeeBps"`
-}
-
-// GenesisFeeConfig contains global fee configuration.
-type GenesisFeeConfig struct {
-	DefaultSwapFeeBps uint16 `json:"defaultSwapFeeBps"`
-	ProtocolFeeBps    uint16 `json:"protocolFeeBps"`
-	MaxSlippageBps    uint16 `json:"maxSlippageBps"`
-}
-
-// GenesisBalance defines a pre-funded account balance.
-type GenesisBalance struct {
-	Address string `json:"address"` // Hex-encoded address
-	Token   string `json:"token"`   // Token ID
-	Amount  uint64 `json:"amount"`
-}
-
-// parseGenesis parses the genesis data and initializes initial state.
+// parseGenesis applies the proxy genesis (endpoint + trusted attestation chains).
 func (vm *VM) parseGenesis(genesisBytes []byte) error {
 	var genesis Genesis
 	if err := json.Unmarshal(genesisBytes, &genesis); err != nil {
 		return fmt.Errorf("failed to unmarshal genesis: %w", err)
 	}
-
-	// Initialize trading pairs (order books)
-	for _, pair := range genesis.TradingPairs {
-		ob := orderbook.New(pair.Symbol)
-		vm.orderbooks[pair.Symbol] = ob
-		if !vm.log.IsZero() {
-			vm.log.Info("Initialized trading pair", "symbol", pair.Symbol)
-		}
+	if genesis.DexZapEndpoint != "" {
+		vm.Config.DexZapEndpoint = genesis.DexZapEndpoint
 	}
-
-	// Initialize liquidity pools
-	for _, pool := range genesis.LiquidityPools {
-		token0, err := ids.FromString(pool.Token0)
-		if err != nil {
-			return fmt.Errorf("invalid token0 ID %s: %w", pool.Token0, err)
-		}
-		token1, err := ids.FromString(pool.Token1)
-		if err != nil {
-			return fmt.Errorf("invalid token1 ID %s: %w", pool.Token1, err)
-		}
-
-		_, err = vm.liquidityMgr.CreatePool(
-			token0, token1,
-			new(big.Int).SetUint64(pool.InitialToken0),
-			new(big.Int).SetUint64(pool.InitialToken1),
-			liquidity.PoolType(pool.PoolType),
-			pool.FeeBps,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to create pool %s/%s: %w", pool.Token0, pool.Token1, err)
-		}
-		if !vm.log.IsZero() {
-			vm.log.Info("Initialized liquidity pool", "token0", pool.Token0, "token1", pool.Token1)
-		}
-	}
-
-	// Initialize perpetual markets
-	for _, market := range genesis.PerpetualMarkets {
-		baseAsset, err := ids.FromString(market.BaseAsset)
-		if err != nil {
-			return fmt.Errorf("invalid base asset ID %s: %w", market.BaseAsset, err)
-		}
-		quoteAsset, err := ids.FromString(market.QuoteAsset)
-		if err != nil {
-			return fmt.Errorf("invalid quote asset ID %s: %w", market.QuoteAsset, err)
-		}
-
-		// Default initial price of 1e18 (1.0 scaled)
-		initialPrice := new(big.Int).Set(perpetuals.PrecisionFactor)
-		// Default min size of 1e15 (0.001 scaled)
-		minSize := new(big.Int).Div(perpetuals.PrecisionFactor, big.NewInt(1000))
-		// Default tick size of 1e12 (0.000001 scaled)
-		tickSize := new(big.Int).Div(perpetuals.PrecisionFactor, big.NewInt(1000000))
-
-		_, err = vm.perpetualsEng.CreateMarket(
-			market.Symbol,
-			baseAsset,
-			quoteAsset,
-			initialPrice,
-			market.MaxLeverage,
-			minSize,
-			tickSize,
-			market.MakerFee,
-			market.TakerFee,
-			market.MaintenanceMargin,
-			market.InitialMargin,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to create perp market %s: %w", market.Symbol, err)
-		}
-		if !vm.log.IsZero() {
-			vm.log.Info("Initialized perpetual market", "symbol", market.Symbol)
-		}
-	}
-
-	// Apply fee configuration
-	if genesis.FeeConfig.DefaultSwapFeeBps > 0 {
-		vm.Config.DefaultSwapFeeBps = genesis.FeeConfig.DefaultSwapFeeBps
-	}
-	if genesis.FeeConfig.ProtocolFeeBps > 0 {
-		vm.Config.ProtocolFeeBps = genesis.FeeConfig.ProtocolFeeBps
-	}
-	if genesis.FeeConfig.MaxSlippageBps > 0 {
-		vm.Config.MaxSlippageBps = genesis.FeeConfig.MaxSlippageBps
-	}
-
-	// Parse trusted chains for cross-chain operations
 	for _, chainIDStr := range genesis.TrustedChains {
 		chainID, err := ids.FromString(chainIDStr)
 		if err != nil {
 			return fmt.Errorf("invalid trusted chain ID %s: %w", chainIDStr, err)
 		}
 		vm.Config.TrustedChains = append(vm.Config.TrustedChains, chainID)
-		if !vm.log.IsZero() {
-			vm.log.Info("Added trusted chain", "chainID", chainID)
-		}
 	}
-
 	if !vm.log.IsZero() {
-		vm.log.Info("Genesis parsed successfully",
-			"tradingPairs", len(genesis.TradingPairs),
-			"pools", len(genesis.LiquidityPools),
-			"perpMarkets", len(genesis.PerpetualMarkets),
-			"trustedChains", len(genesis.TrustedChains),
-		)
+		vm.log.Info("Genesis parsed", "trustedChains", len(vm.Config.TrustedChains))
 	}
-
 	return nil
 }
 
-// parseConfig parses and applies runtime configuration.
+// parseConfig applies runtime configuration (only non-zero values, preserving
+// defaults).
 func (vm *VM) parseConfig(configBytes []byte) error {
-	// Parse config into a temporary struct to avoid overwriting defaults
 	var cfg config.Config
 	if err := json.Unmarshal(configBytes, &cfg); err != nil {
 		return fmt.Errorf("failed to unmarshal config: %w", err)
 	}
-
-	// Only apply non-zero values to preserve defaults
 	if cfg.IndexAllowIncomplete {
 		vm.Config.IndexAllowIncomplete = cfg.IndexAllowIncomplete
 	}
@@ -429,38 +321,14 @@ func (vm *VM) parseConfig(configBytes []byte) error {
 	if cfg.ChecksumsEnabled {
 		vm.Config.ChecksumsEnabled = cfg.ChecksumsEnabled
 	}
-	if cfg.DefaultSwapFeeBps > 0 {
-		vm.Config.DefaultSwapFeeBps = cfg.DefaultSwapFeeBps
+	if cfg.DexZapEndpoint != "" {
+		vm.Config.DexZapEndpoint = cfg.DexZapEndpoint
 	}
-	if cfg.ProtocolFeeBps > 0 {
-		vm.Config.ProtocolFeeBps = cfg.ProtocolFeeBps
-	}
-	if cfg.MaxSlippageBps > 0 {
-		vm.Config.MaxSlippageBps = cfg.MaxSlippageBps
-	}
-	if cfg.MinLiquidity > 0 {
-		vm.Config.MinLiquidity = cfg.MinLiquidity
-	}
-	if cfg.MaxPoolsPerPair > 0 {
-		vm.Config.MaxPoolsPerPair = cfg.MaxPoolsPerPair
-	}
-	if cfg.MaxOrdersPerAccount > 0 {
-		vm.Config.MaxOrdersPerAccount = cfg.MaxOrdersPerAccount
-	}
-	if cfg.MaxOrderSize > 0 {
-		vm.Config.MaxOrderSize = cfg.MaxOrderSize
-	}
-	if cfg.MinOrderSize > 0 {
-		vm.Config.MinOrderSize = cfg.MinOrderSize
-	}
-	if cfg.OrderExpirationTime > 0 {
-		vm.Config.OrderExpirationTime = cfg.OrderExpirationTime
+	if cfg.DexZapTimeout > 0 {
+		vm.Config.DexZapTimeout = cfg.DexZapTimeout
 	}
 	if cfg.WarpEnabled {
 		vm.Config.WarpEnabled = cfg.WarpEnabled
-	}
-	if cfg.TeleportEnabled {
-		vm.Config.TeleportEnabled = cfg.TeleportEnabled
 	}
 	if len(cfg.TrustedChains) > 0 {
 		vm.Config.TrustedChains = cfg.TrustedChains
@@ -474,21 +342,16 @@ func (vm *VM) parseConfig(configBytes []byte) error {
 	if cfg.MaxTxsPerBlock > 0 {
 		vm.Config.MaxTxsPerBlock = cfg.MaxTxsPerBlock
 	}
-
 	if !vm.log.IsZero() {
-		vm.log.Info("Config parsed successfully",
+		vm.log.Info("Config parsed",
 			"blockInterval", vm.Config.BlockInterval,
-			"maxTxsPerBlock", vm.Config.MaxTxsPerBlock,
 			"warpEnabled", vm.Config.WarpEnabled,
 		)
 	}
-
 	return nil
 }
 
-// SetState implements consensuscore.VM interface.
-// It transitions the VM between bootstrapping and normal operation states.
-// NOTE: No background goroutines are started - all operations are block-driven.
+// SetState implements consensuscore.VM. NOTE: No background goroutines.
 func (vm *VM) SetState(ctx context.Context, stateNum uint32) error {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
@@ -496,13 +359,13 @@ func (vm *VM) SetState(ctx context.Context, stateNum uint32) error {
 	switch vmcore.State(stateNum) {
 	case vmcore.Bootstrapping:
 		if !vm.log.IsZero() {
-			vm.log.Info("DEX VM entering bootstrap state")
+			vm.log.Info("DEX proxy entering bootstrap state")
 		}
 		vm.bootstrapped = false
 		return nil
 	case vmcore.Ready:
 		if !vm.log.IsZero() {
-			vm.log.Info("DEX VM entering ready state")
+			vm.log.Info("DEX proxy entering ready state")
 		}
 		vm.bootstrapped = true
 		return nil
@@ -511,16 +374,28 @@ func (vm *VM) SetState(ctx context.Context, stateNum uint32) error {
 	}
 }
 
-// ProcessBlock is the core function that processes all DEX operations deterministically.
-// This is called by the consensus engine for each new block.
-// All state changes happen here in a deterministic, reproducible manner.
+// ProcessBlock is the proxy's PURE DETERMINISTIC VERIFY: it validates the
+// block's transactions and builds a plan, performing ZERO d-chain I/O.
+// Concretely it applies the atomic IMPORT legs (consuming UTXOs into the
+// versiondb in-memory layer, accumulating RemoveRequests) and the EXPORT legs,
+// and it records every order RELAY as a plannedRelay. Matching is NEVER done
+// here — it lives only on the d-chain.
 //
-// Operations performed per block:
-//  1. Order matching for all orderbooks
-//  2. Funding rate processing (every 8 hours)
-//  3. Liquidation checks
-//  4. State commitment
-func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime time.Time, txs [][]byte) (*BlockResult, error) {
+// Why no relay here (RED finding #9): a Verified block is later decided Accept OR
+// Reject, and Reject must undo everything Verify did with a plain db.Abort(). But
+// more fundamentally, Verify runs on EVERY validator: a clob_submit issued here
+// would be relayed per-validator against a MOVING d-chain book, so each validator
+// would observe independently-timed fills => divergent settlement => divergent
+// StateRoot => the network forks. The relay is therefore performed exactly ONCE,
+// by the block PROPOSER at build (VM.obtainFills), and the confirmed fills are
+// CARRIED in the block bytes; every validator settles purely from those carried
+// fills (settleCarried at accept). Block output is thus a pure function of
+// (height, carried time, tx bytes, carried fills).
+//
+// CONSERVATION ORDERING within a block: each tx is processed in order, and an
+// import always precedes the relay/export that depends on its locked value. The
+// plan preserves that order (settleCarried settles in capture order at accept).
+func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime time.Time, blockTxs [][]byte) (*BlockResult, error) {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
 
@@ -528,1080 +403,650 @@ func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime ti
 		return nil, errShutdown
 	}
 
+	// Bind relays to (blockHash, txIndex) for replay-idempotency. The block hash
+	// here is derived from height+time deterministically (the chain layer's
+	// canonical block id is set at accept; this binding is stable per replay).
+	blockHash := deriveBlockHash(blockHeight, blockTime)
+
 	result := &BlockResult{
-		BlockHeight:     blockHeight,
-		Timestamp:       blockTime,
-		MatchedTrades:   make([]orderbook.Trade, 0),
-		FundingPayments: make([]*perpetuals.FundingPayment, 0),
-		Liquidations:    make([]*perpetuals.LiquidationEvent, 0),
+		BlockHeight: blockHeight,
+		Timestamp:   blockTime,
+		blockHash:   blockHash,
+		atomic:      newAtomicRequests(),
 	}
 
-	// 1. Process all transactions in the block
-	for _, tx := range txs {
-		if err := vm.processTx(tx, result); err != nil {
-			// Log but continue - individual tx failures don't fail the block
+	for i, txBytes := range blockTxs {
+		if err := vm.processTx(txBytes, blockHash, uint32(i), result); err != nil {
+			// Individual tx failures don't fail the block; log and continue. A
+			// failed import leaves NO committed cross-chain op for that tx
+			// (atomicity-or-reversal): executeImport/Export only accumulate on
+			// success, and a relay that fails to PLAN is simply not enqueued.
 			if !vm.log.IsZero() {
-				vm.log.Warn("Transaction failed", "error", err)
+				vm.log.Warn("Proxy transaction failed", "index", i, "error", err)
 			}
 		}
 	}
 
-	// 2. Run order matching for all active orderbooks
-	result.MatchedTrades = vm.matchAllOrders()
-
-	// 3. Check if funding should be processed (every 8 hours)
-	if vm.shouldProcessFunding(blockTime) {
-		result.FundingPayments = vm.processFunding(blockTime)
-		vm.lastFundingTime = blockTime
-	}
-
-	// 4. Check and execute liquidations
-	result.Liquidations = vm.processLiquidations()
-
-	// 5. Update block state
 	vm.currentBlockHeight = blockHeight
 	vm.lastBlockTime = blockTime
-
-	// 6. Compute state root (merkle root of all state)
-	result.StateRoot = vm.computeStateRoot()
-
-	if !vm.log.IsZero() {
-		vm.log.Debug("Block processed",
-			"height", blockHeight,
-			"trades", len(result.MatchedTrades),
-			"funding", len(result.FundingPayments),
-			"liquidations", len(result.Liquidations),
-		)
+	if err := vm.state.SetLastBlock(blockHash, blockHeight); err != nil {
+		return nil, fmt.Errorf("failed to persist last block: %w", err)
 	}
 
+	// VERIFY-time root: commits the post-verify state (imports' consumed/escrow
+	// staged in the versiondb in-memory layer) and the import legs accumulated so
+	// far. The settlement EXPORT legs and relay receipts are produced at accept;
+	// acceptBlock recomputes the root over that final state (see acceptBlock).
+	root, err := vm.computeStateRoot(blockHash, result)
+	if err != nil {
+		return nil, err
+	}
+	result.StateRoot = root
+
+	if !vm.log.IsZero() {
+		vm.log.Debug("Proxy block processed", "height", blockHeight, "txs", len(blockTxs))
+	}
 	return result, nil
 }
 
-// processTx processes a single transaction.
-func (vm *VM) processTx(txBytes []byte, result *BlockResult) error {
+// BuildBlockResult is the PROPOSER's full build of a block: it plans the block
+// (the deterministic ProcessBlock pass) and then performs the network-wide-ONCE
+// d-chain relay (obtainFills), attaching the confirmed fills to the result. The
+// caller (BuildBlock / BuildVertex) serializes result.carriedFills + result.fillSig
+// into the block/vertex bytes so every validator settles from them — the matcher
+// is hit exactly once for the whole network (RED finding #9).
+//
+// This is the ONLY method that triggers a d-chain relay. Verify (ProcessBlock) and
+// Accept (acceptBlock) never relay. A non-proposer obtains the same fills by
+// parsing the block bytes, not by calling this.
+//
+// The relay is best-effort per order: obtainFills carries a zero-fill entry for any
+// order whose relay failed, so the build always yields a valid block (the escrow is
+// refunded at settle). It returns an error only on a fault that should abort the
+// proposal entirely (e.g. the planning pass failed).
+func (vm *VM) BuildBlockResult(ctx context.Context, blockHeight uint64, blockTime time.Time, blockTxs [][]byte) (*BlockResult, error) {
+	result, err := vm.ProcessBlock(ctx, blockHeight, blockTime, blockTxs)
+	if err != nil {
+		return nil, err
+	}
+	// Relay exactly once (proposer) and carry the fills. obtainFills locks nothing
+	// in vm (it only touches the durable receiptDB + the relay socket); ProcessBlock
+	// already released vm.lock.
+	entries, err := vm.obtainFills(ctx, result.blockHash, result.relays)
+	if err != nil {
+		return nil, fmt.Errorf("build: obtain fills: %w", err)
+	}
+	result.carriedFills = entries
+	// result.fillSig stays empty: the reserved trustless-path signature is not
+	// produced by the proxy (the d-chain signs its fills in the future upgrade).
+	return result, nil
+}
+
+// processTx parses and dispatches a single proxy transaction during VERIFY. The
+// proxy handles exactly the import/export atomic legs (deterministic, staged in
+// the versiondb in-memory layer + accumulated atomic requests) and the order-
+// relay envelopes (captured as a deferred plan — NO d-chain I/O here). There is
+// NO matching dispatch.
+func (vm *VM) processTx(txBytes []byte, blockHash ids.ID, txIndex uint32, result *BlockResult) error {
 	if len(txBytes) < 1 {
 		return errors.New("empty transaction")
 	}
-
-	// Parse transaction using the TxParser
 	parser := &txs.TxParser{}
 	tx, err := parser.Parse(txBytes)
 	if err != nil {
 		return fmt.Errorf("failed to parse transaction: %w", err)
 	}
-
-	// Verify transaction
 	if err := tx.Verify(); err != nil {
 		return fmt.Errorf("transaction verification failed: %w", err)
 	}
 
-	// Dispatch based on transaction type
 	switch tx.Type() {
+	case txs.TxImport:
+		return vm.executeImport(tx.(*txs.ImportTx), result.atomic)
+	case txs.TxExport:
+		return vm.executeExport(tx.(*txs.ExportTx), result.atomic)
+	case txs.TxRelayOrder:
+		return vm.planRelayOrder(tx.(*txs.RelayOrderTx), blockHash, txIndex, result)
 	case txs.TxPlaceOrder:
-		return vm.executePlaceOrder(tx.(*txs.PlaceOrderTx), result)
+		return vm.planPlaceOrder(tx.(*txs.PlaceOrderTx), blockHash, txIndex, result)
 	case txs.TxCancelOrder:
-		return vm.executeCancelOrder(tx.(*txs.CancelOrderTx))
-	case txs.TxSwap:
-		return vm.executeSwap(tx.(*txs.SwapTx))
-	case txs.TxAddLiquidity:
-		return vm.executeAddLiquidity(tx.(*txs.AddLiquidityTx))
-	case txs.TxRemoveLiquidity:
-		return vm.executeRemoveLiquidity(tx.(*txs.RemoveLiquidityTx))
-	case txs.TxCreatePool:
-		return vm.executeCreatePool(tx.(*txs.CreatePoolTx))
-	case txs.TxCrossChainSwap:
-		return vm.executeCrossChainSwap(tx.(*txs.CrossChainSwapTx))
-	case txs.TxCrossChainTransfer:
-		return vm.executeCrossChainTransfer(tx.(*txs.CrossChainTransferTx))
-	case txs.TxCommitOrder:
-		return vm.executeCommitOrder(tx.(*txs.CommitOrderTx))
-	case txs.TxRevealOrder:
-		return vm.executeRevealOrder(tx.(*txs.RevealOrderTx), result)
+		return vm.planCancelOrder(tx.(*txs.CancelOrderTx), blockHash, txIndex, result)
 	default:
 		return fmt.Errorf("unknown transaction type: %d", tx.Type())
 	}
 }
 
-// executePlaceOrder executes a place order transaction.
-func (vm *VM) executePlaceOrder(tx *txs.PlaceOrderTx, result *BlockResult) error {
-	ob, exists := vm.orderbooks[tx.Symbol]
-	if !exists {
-		return fmt.Errorf("orderbook not found for symbol: %s", tx.Symbol)
-	}
-
-	order := &orderbook.Order{
-		ID:          tx.ID(),
-		Owner:       tx.Sender(),
-		Symbol:      tx.Symbol,
-		Side:        orderbook.Side(tx.Side),
-		Type:        orderbook.OrderType(tx.OrderType),
-		Price:       tx.Price,
-		Quantity:    tx.Quantity,
-		StopPrice:   tx.StopPrice,
-		Status:      orderbook.StatusOpen,
-		CreatedAt:   tx.Timestamp(),
-		ExpiresAt:   tx.ExpiresAt,
-		PostOnly:    tx.PostOnly,
-		ReduceOnly:  tx.ReduceOnly,
-		TimeInForce: tx.TimeInForce,
-	}
-
-	trades, err := ob.AddOrder(order)
-	if err != nil {
-		return fmt.Errorf("failed to add order: %w", err)
-	}
-
-	// Convert to orderbook.Trade slice for result
-	for _, trade := range trades {
-		result.MatchedTrades = append(result.MatchedTrades, *trade)
-	}
-
-	if !vm.log.IsZero() {
-		vm.log.Debug("Order placed",
-			"orderID", order.ID,
-			"symbol", tx.Symbol,
-			"side", order.Side,
-			"price", tx.Price,
-			"quantity", tx.Quantity,
-			"trades", len(trades),
-		)
-	}
-
-	return nil
-}
-
-// executeCancelOrder executes a cancel order transaction.
-func (vm *VM) executeCancelOrder(tx *txs.CancelOrderTx) error {
-	ob, exists := vm.orderbooks[tx.Symbol]
-	if !exists {
-		return fmt.Errorf("orderbook not found for symbol: %s", tx.Symbol)
-	}
-
-	// Verify the order belongs to the sender
-	order, err := ob.GetOrder(tx.OrderID)
-	if err != nil {
-		return err
-	}
-	if order.Owner != tx.Sender() {
-		return errors.New("cannot cancel order owned by another account")
-	}
-
-	if err := ob.CancelOrder(tx.OrderID); err != nil {
-		return fmt.Errorf("failed to cancel order: %w", err)
-	}
-
-	if !vm.log.IsZero() {
-		vm.log.Debug("Order cancelled", "orderID", tx.OrderID, "symbol", tx.Symbol)
-	}
-
-	return nil
-}
-
-// executeSwap executes an AMM swap transaction.
-func (vm *VM) executeSwap(tx *txs.SwapTx) error {
-	// Check deadline
-	if tx.Deadline > 0 && time.Now().UnixNano() > tx.Deadline {
-		return errors.New("swap deadline exceeded")
-	}
-
-	_, err := vm.liquidityMgr.Swap(
-		tx.PoolID,
-		tx.TokenIn,
-		new(big.Int).SetUint64(tx.AmountIn),
-		new(big.Int).SetUint64(tx.MinAmountOut),
-	)
-	if err != nil {
-		return fmt.Errorf("swap failed: %w", err)
-	}
-
-	if !vm.log.IsZero() {
-		vm.log.Debug("Swap executed",
-			"poolID", tx.PoolID,
-			"tokenIn", tx.TokenIn,
-			"amountIn", tx.AmountIn,
-		)
-	}
-
-	return nil
-}
-
-// executeAddLiquidity executes an add liquidity transaction.
-func (vm *VM) executeAddLiquidity(tx *txs.AddLiquidityTx) error {
-	// Check deadline
-	if tx.Deadline > 0 && time.Now().UnixNano() > tx.Deadline {
-		return errors.New("add liquidity deadline exceeded")
-	}
-
-	liquidity, err := vm.liquidityMgr.AddLiquidity(
-		tx.PoolID,
-		new(big.Int).SetUint64(tx.Token0Amount),
-		new(big.Int).SetUint64(tx.Token1Amount),
-		new(big.Int).SetUint64(tx.MinLPTokens),
-	)
-	if err != nil {
-		return fmt.Errorf("add liquidity failed: %w", err)
-	}
-
-	if !vm.log.IsZero() {
-		vm.log.Debug("Liquidity added",
-			"poolID", tx.PoolID,
-			"token0", tx.Token0Amount,
-			"token1", tx.Token1Amount,
-			"lpTokens", liquidity,
-		)
-	}
-
-	return nil
-}
-
-// executeRemoveLiquidity executes a remove liquidity transaction.
-func (vm *VM) executeRemoveLiquidity(tx *txs.RemoveLiquidityTx) error {
-	// Check deadline
-	if tx.Deadline > 0 && time.Now().UnixNano() > tx.Deadline {
-		return errors.New("remove liquidity deadline exceeded")
-	}
-
-	amount0, amount1, err := vm.liquidityMgr.RemoveLiquidity(
-		tx.PoolID,
-		new(big.Int).SetUint64(tx.LPTokenAmount),
-		new(big.Int).SetUint64(tx.MinToken0),
-		new(big.Int).SetUint64(tx.MinToken1),
-	)
-	if err != nil {
-		return fmt.Errorf("remove liquidity failed: %w", err)
-	}
-
-	if !vm.log.IsZero() {
-		vm.log.Debug("Liquidity removed",
-			"poolID", tx.PoolID,
-			"lpTokens", tx.LPTokenAmount,
-			"token0Out", amount0,
-			"token1Out", amount1,
-		)
-	}
-
-	return nil
-}
-
-// executeCreatePool executes a create pool transaction.
-func (vm *VM) executeCreatePool(tx *txs.CreatePoolTx) error {
-	pool, err := vm.liquidityMgr.CreatePool(
-		tx.Token0,
-		tx.Token1,
-		new(big.Int).SetUint64(tx.InitialToken0),
-		new(big.Int).SetUint64(tx.InitialToken1),
-		liquidity.PoolType(tx.PoolType),
-		tx.SwapFeeBps,
-	)
-	if err != nil {
-		return fmt.Errorf("create pool failed: %w", err)
-	}
-
-	if !vm.log.IsZero() {
-		vm.log.Info("Pool created",
-			"poolID", pool.ID,
-			"token0", tx.Token0,
-			"token1", tx.Token1,
-			"type", tx.PoolType,
-		)
-	}
-
-	return nil
-}
-
-// executeCrossChainSwap executes a cross-chain swap via Warp.
-func (vm *VM) executeCrossChainSwap(tx *txs.CrossChainSwapTx) error {
-	// Verify source chain is trusted
-	trusted := false
-	for _, chainID := range vm.Config.TrustedChains {
-		if chainID == tx.SourceChain {
-			trusted = true
-			break
-		}
-	}
-	if !trusted {
-		return errors.New("source chain not trusted for cross-chain swap")
-	}
-
-	// Check deadline
-	if tx.Deadline > 0 && time.Now().UnixNano() > tx.Deadline {
-		return errors.New("cross-chain swap deadline exceeded")
-	}
-
-	// The actual swap is executed when the Warp message is received
-	// Here we just validate and prepare
-	if !vm.log.IsZero() {
-		vm.log.Debug("Cross-chain swap initiated",
-			"sourceChain", tx.SourceChain,
-			"destChain", tx.DestChain,
-			"tokenIn", tx.TokenIn,
-			"amountIn", tx.AmountIn,
-		)
-	}
-
-	return nil
-}
-
-// executeCrossChainTransfer executes a cross-chain transfer via Warp.
-func (vm *VM) executeCrossChainTransfer(tx *txs.CrossChainTransferTx) error {
-	// Verify source chain is trusted
-	trusted := false
-	for _, chainID := range vm.Config.TrustedChains {
-		if chainID == tx.SourceChain {
-			trusted = true
-			break
-		}
-	}
-	if !trusted {
-		return errors.New("source chain not trusted for cross-chain transfer")
-	}
-
-	if !vm.log.IsZero() {
-		vm.log.Debug("Cross-chain transfer initiated",
-			"sourceChain", tx.SourceChain,
-			"destChain", tx.DestChain,
-			"token", tx.Token,
-			"amount", tx.Amount,
-		)
-	}
-
-	return nil
-}
-
-// executeCommitOrder executes a commit phase for MEV-protected order placement.
-func (vm *VM) executeCommitOrder(tx *txs.CommitOrderTx) error {
-	// Add commitment to the store with current block info
-	err := vm.commitmentStore.AddCommitment(
-		tx.CommitmentHash,
-		tx.Sender(),
-		vm.currentBlockHeight,
-		vm.lastBlockTime,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to store commitment: %w", err)
-	}
-
-	if !vm.log.IsZero() {
-		vm.log.Debug("Order commitment stored",
-			"hash", tx.CommitmentHash,
-			"sender", tx.Sender(),
-		)
-	}
-
-	return nil
-}
-
-// executeRevealOrder executes a reveal phase for MEV-protected order placement.
-func (vm *VM) executeRevealOrder(tx *txs.RevealOrderTx, result *BlockResult) error {
-	// Use the Reveal method which handles verification and marks as revealed
-	orderBytes := mev.SerializeOrderForCommitment(
-		tx.Symbol,
-		tx.Side,
-		tx.OrderType,
-		tx.Price,
-		tx.Quantity,
-		tx.TimeInForce,
-	)
-
-	_, err := vm.commitmentStore.Reveal(
-		tx.CommitmentHash,
-		orderBytes,
-		tx.Salt,
-		tx.Sender(),
-		vm.lastBlockTime,
-	)
-	if err != nil {
-		return fmt.Errorf("commitment reveal failed: %w", err)
-	}
-
-	// Now execute as a regular place order
-	ob, exists := vm.orderbooks[tx.Symbol]
-	if !exists {
-		return fmt.Errorf("orderbook not found for symbol: %s", tx.Symbol)
-	}
-
-	order := &orderbook.Order{
-		ID:          tx.ID(),
-		Owner:       tx.Sender(),
-		Symbol:      tx.Symbol,
-		Side:        orderbook.Side(tx.Side),
-		Type:        orderbook.OrderType(tx.OrderType),
-		Price:       tx.Price,
-		Quantity:    tx.Quantity,
-		StopPrice:   tx.StopPrice,
-		Status:      orderbook.StatusOpen,
-		CreatedAt:   tx.Timestamp(),
-		ExpiresAt:   tx.ExpiresAt,
-		PostOnly:    tx.PostOnly,
-		ReduceOnly:  tx.ReduceOnly,
-		TimeInForce: tx.TimeInForce,
-	}
-
-	trades, err := ob.AddOrder(order)
-	if err != nil {
-		return fmt.Errorf("failed to add revealed order: %w", err)
-	}
-
-	for _, trade := range trades {
-		result.MatchedTrades = append(result.MatchedTrades, *trade)
-	}
-
-	if !vm.log.IsZero() {
-		vm.log.Debug("Order revealed and placed",
-			"orderID", order.ID,
-			"symbol", tx.Symbol,
-			"trades", len(trades),
-		)
-	}
-
-	return nil
-}
-
-// matchAllOrders runs the matching engine for all orderbooks.
-// This is deterministic - same orders always produce same matches.
-func (vm *VM) matchAllOrders() []orderbook.Trade {
-	var allTrades []orderbook.Trade
-
-	for symbol, ob := range vm.orderbooks {
-		trades := ob.Match()
-		if len(trades) > 0 {
-			allTrades = append(allTrades, trades...)
-			if !vm.log.IsZero() {
-				vm.log.Debug("Matched trades", "symbol", symbol, "count", len(trades))
-			}
-		}
-	}
-
-	return allTrades
-}
-
-// shouldProcessFunding determines if funding should be processed.
-// Funding happens every 8 hours (28800 seconds).
-func (vm *VM) shouldProcessFunding(blockTime time.Time) bool {
-	if vm.lastFundingTime.IsZero() {
-		return true // First funding
-	}
-
-	fundingInterval := 8 * time.Hour
-	return blockTime.Sub(vm.lastFundingTime) >= fundingInterval
-}
-
-// processFunding processes funding payments for all perpetual markets.
-// This is deterministic based on current positions and mark prices.
-func (vm *VM) processFunding(blockTime time.Time) []*perpetuals.FundingPayment {
-	var allPayments []*perpetuals.FundingPayment
-
-	for _, m := range vm.perpetualsEng.GetAllMarkets() {
-		market, ok := m.(*perpetuals.Market)
-		if !ok {
-			continue
-		}
-		payments, err := vm.perpetualsEng.ProcessFunding(market.Symbol)
-		if err != nil {
-			if !vm.log.IsZero() {
-				vm.log.Warn("Failed to process funding", "market", market.Symbol, "error", err)
-			}
-			continue
-		}
-		allPayments = append(allPayments, payments...)
-	}
-
-	return allPayments
-}
-
-// processLiquidations checks and executes liquidations for all markets.
-// This is deterministic based on current prices and position health.
-func (vm *VM) processLiquidations() []*perpetuals.LiquidationEvent {
-	var allLiquidations []*perpetuals.LiquidationEvent
-
-	for _, m := range vm.perpetualsEng.GetAllMarkets() {
-		market, ok := m.(*perpetuals.Market)
-		if !ok {
-			continue
-		}
-		liquidations, err := vm.perpetualsEng.CheckAndLiquidate(market.Symbol)
-		if err != nil {
-			if !vm.log.IsZero() {
-				vm.log.Warn("Failed to check liquidations", "market", market.Symbol, "error", err)
-			}
-			continue
-		}
-		allLiquidations = append(allLiquidations, liquidations...)
-	}
-
-	return allLiquidations
-}
-
-// computeStateRoot computes the merkle root of all state.
-// This ensures all nodes agree on state after processing a block.
-// The merkle tree is computed over all state in deterministic order.
-func (vm *VM) computeStateRoot() ids.ID {
-	// Collect all leaf hashes in deterministic order
-	var leaves [][]byte
-
-	// 1. Hash all orderbook state (sorted by symbol)
-	orderbookLeaves := vm.computeOrderbookHashes()
-	leaves = append(leaves, orderbookLeaves...)
-
-	// 2. Hash all liquidity pool state (sorted by pool ID)
-	poolLeaves := vm.computePoolHashes()
-	leaves = append(leaves, poolLeaves...)
-
-	// 3. Hash all perpetual market state (sorted by symbol)
-	perpLeaves := vm.computePerpetualHashes()
-	leaves = append(leaves, perpLeaves...)
-
-	// 4. Add block metadata
-	metaHash := vm.computeBlockMetaHash()
-	leaves = append(leaves, metaHash)
-
-	// If no state, return empty hash
-	if len(leaves) == 0 {
-		return ids.Empty
-	}
-
-	// Compute merkle root from leaves
-	return computeMerkleRoot(leaves)
-}
-
-// computeOrderbookHashes computes hashes for all orderbook state.
-func (vm *VM) computeOrderbookHashes() [][]byte {
-	// Get sorted symbol list for deterministic ordering
-	symbols := make([]string, 0, len(vm.orderbooks))
-	for symbol := range vm.orderbooks {
-		symbols = append(symbols, symbol)
-	}
-	sort.Strings(symbols)
-
-	var hashes [][]byte
-	for _, symbol := range symbols {
-		ob := vm.orderbooks[symbol]
-
-		// Hash orderbook state: symbol + bestBid + bestAsk + spread
-		h := sha256.New()
-		h.Write([]byte(symbol))
-
-		bestBid := ob.GetBestBid()
-		bestAsk := ob.GetBestAsk()
-
-		bidBuf := make([]byte, 8)
-		binary.BigEndian.PutUint64(bidBuf, bestBid)
-		h.Write(bidBuf)
-
-		askBuf := make([]byte, 8)
-		binary.BigEndian.PutUint64(askBuf, bestAsk)
-		h.Write(askBuf)
-
-		// Add depth hash (top 10 levels each side)
-		bids, asks := ob.GetDepth(10)
-		for _, level := range bids {
-			priceBuf := make([]byte, 8)
-			binary.BigEndian.PutUint64(priceBuf, level.Price)
-			h.Write(priceBuf)
-			qtyBuf := make([]byte, 8)
-			binary.BigEndian.PutUint64(qtyBuf, level.Quantity)
-			h.Write(qtyBuf)
-		}
-		for _, level := range asks {
-			priceBuf := make([]byte, 8)
-			binary.BigEndian.PutUint64(priceBuf, level.Price)
-			h.Write(priceBuf)
-			qtyBuf := make([]byte, 8)
-			binary.BigEndian.PutUint64(qtyBuf, level.Quantity)
-			h.Write(qtyBuf)
-		}
-
-		hashes = append(hashes, h.Sum(nil))
-	}
-
-	return hashes
-}
-
-// computePoolHashes computes hashes for all liquidity pool state.
-func (vm *VM) computePoolHashes() [][]byte {
-	pools := vm.liquidityMgr.GetAllPools()
-
-	// Sort by pool ID for deterministic ordering
-	sort.Slice(pools, func(i, j int) bool {
-		return pools[i].ID.Compare(pools[j].ID) < 0
+// planRelayOrder records an opaque clob_* relay as a plannedRelay. A clob_submit's
+// confirmed fills drive an export leg, so it is flagged settle=true; place/cancel
+// framed as a RelayOrderTx are acks only (settle=false). The plan is bound to
+// (blockHash, txIndex) — the coordinate that keys both the build-time relay's
+// idempotency receipt and the deterministic settlement export identity.
+//
+// PURE PLANNER (RED #9): planning is a deterministic, side-effect-free fold over
+// the tx — it does NOT consult the receipt and does NOT relay. The plan MUST be
+// reproduced identically on every validator (the proposer at build, and every node
+// at Verify/parse) because settleCarried drives the settlement off it; gating the
+// plan on a per-validator receipt would make a validator that lacks the receipt
+// plan differently from the proposer. Relay-idempotency lives where the relay is —
+// inside obtainFills (relaySubmit/relayAck check the receipt), run once by the
+// proposer.
+func (vm *VM) planRelayOrder(tx *txs.RelayOrderTx, blockHash ids.ID, txIndex uint32, result *BlockResult) error {
+	result.relays = append(result.relays, plannedRelay{
+		txIndex:       txIndex,
+		method:        tx.Method,
+		payload:       tx.Payload,
+		sender:        tx.Sender(),
+		collateralRef: tx.CollateralRef,
+		settle:        tx.Method == ZAPMethodSubmit,
 	})
-
-	var hashes [][]byte
-	for _, pool := range pools {
-		h := sha256.New()
-
-		// Pool ID
-		h.Write(pool.ID[:])
-
-		// Token pair
-		h.Write(pool.Token0[:])
-		h.Write(pool.Token1[:])
-
-		// Reserves (as big-endian bytes)
-		h.Write(pool.Reserve0.Bytes())
-		h.Write(pool.Reserve1.Bytes())
-
-		// Total supply
-		h.Write(pool.TotalSupply.Bytes())
-
-		// Fee
-		feeBuf := make([]byte, 2)
-		binary.BigEndian.PutUint16(feeBuf, pool.FeeBps)
-		h.Write(feeBuf)
-
-		hashes = append(hashes, h.Sum(nil))
-	}
-
-	return hashes
+	return nil
 }
 
-// computePerpetualHashes computes hashes for all perpetual market state.
-func (vm *VM) computePerpetualHashes() [][]byte {
-	markets := vm.perpetualsEng.GetAllMarkets()
-
-	// Sort by symbol for deterministic ordering
-	sort.Slice(markets, func(i, j int) bool {
-		mi, ok1 := markets[i].(*perpetuals.Market)
-		mj, ok2 := markets[j].(*perpetuals.Market)
-		if !ok1 || !ok2 {
-			return false
-		}
-		return mi.Symbol < mj.Symbol
+// planPlaceOrder records a thin place-order envelope as a clob_place relay. It
+// rests a maker limit order when relayed by the proposer; the maker is settled
+// when taken (no immediate fills to settle here), so settle=false.
+//
+// Replay-idempotency (RED double-place): the relay itself is gated by the durable
+// receipt inside obtainFills and is performed exactly once by the PROPOSER. Verify
+// never relays, so re-verifying the same block (reorg, restart-before-accept,
+// normal re-verification) sends ZERO clob_place frames — one PlaceOrderTx rests
+// exactly one maker order on the d-chain, never N copies. Planning here is the pure
+// deterministic fold, not the relay.
+func (vm *VM) planPlaceOrder(tx *txs.PlaceOrderTx, blockHash ids.ID, txIndex uint32, result *BlockResult) error {
+	result.relays = append(result.relays, plannedRelay{
+		txIndex: txIndex,
+		method:  ZAPMethodPlace,
+		payload: encodeCLOBPlace(tx),
+		sender:  tx.Sender(),
 	})
+	return nil
+}
 
-	var hashes [][]byte
-	for _, m := range markets {
-		market, ok := m.(*perpetuals.Market)
-		if !ok {
+// planCancelOrder records a thin cancel envelope as a clob_cancel relay. The
+// d-chain authenticates the cancel against the resting order's maker — the proxy
+// only routes it; settle=false.
+//
+// Replay-idempotency (RED double-cancel): like place, the relay is gated by the
+// durable receipt inside obtainFills and fires once on the proposer; Verify never
+// relays, so re-verifying never re-sends clob_cancel (which on the d-chain could
+// cancel a DIFFERENT order that re-used the id, or spuriously fail an already-
+// cancelled one). One CancelOrderTx => one cancel.
+func (vm *VM) planCancelOrder(tx *txs.CancelOrderTx, blockHash ids.ID, txIndex uint32, result *BlockResult) error {
+	payload := make([]byte, 40)
+	copy(payload[0:32], tx.PoolID[:])
+	binary.BigEndian.PutUint64(payload[32:40], tx.OrderID)
+	result.relays = append(result.relays, plannedRelay{
+		txIndex: txIndex,
+		method:  ZAPMethodCancel,
+		payload: payload,
+		sender:  tx.Sender(),
+	})
+	return nil
+}
+
+// obtainFills is the PROPOSER-ONLY relay step, run at BuildBlock/BuildVertex
+// (chainvm.go / dag_vertex.go) — the single point where the proxy performs the
+// irreversible, non-deterministic d-chain I/O for a block. For each planned relay
+// it forwards the byte-identical clob_* frame to the d-chain EXACTLY ONCE and, for
+// a settling submit, decodes the confirmed fills into a carriedFill entry. The
+// returned entries are serialized into the block/vertex bytes (carried_fills.go),
+// so every validator settles from them without ever relaying — the matcher is hit
+// at most once per order, network-wide (RED finding #9).
+//
+// Idempotency: the relay is gated by the SAME durable two-phase write-ahead
+// receipt the proxy has always used, keyed by (blockHash, txIndex). A re-build of
+// the same block coordinate (proposer restart) finds the intent and skips the
+// re-relay — no double-submit to the source-of-truth matcher. (The receipt is
+// finalized with the response hash for provenance.)
+//
+// A per-relay failure (transport error, undecodable fills) is LOGGED and the
+// order is carried with NO fills (an explicit zero-fill entry for a submit), so
+// the block still validates and the taker's escrow is fully refunded at settle —
+// recoverable by a later order. obtainFills never returns a fatal error for a
+// single relay failure; it returns an error only on a programming/receipt fault.
+//
+// place/cancel return an ack the proxy records but does not settle (the resting
+// maker is settled when taken), so they produce no carriedFill entry.
+//
+// NOTE ON THE TRUST SURFACE: relaying at build means the PROPOSER reports the
+// fills the rest of the network settles from. This is the interim
+// conservation-bounded model documented in carried_fills.go: a lying proposer is
+// bounded by settleFromFills' spent>locked refusal (no mint; blast radius = one
+// taker's own escrow). The trustless path uses the reserved fill-signature field.
+func (vm *VM) obtainFills(ctx context.Context, blockHash ids.ID, relays []plannedRelay) ([]carriedFill, error) {
+	var entries []carriedFill
+	for _, r := range relays {
+		// Only a settling submit produces fills the network must carry+settle.
+		// place/cancel are relayed for their side effect (rest/cancel a maker) but
+		// carry nothing to settle.
+		if !r.settle {
+			if err := vm.relayAck(ctx, blockHash, r); err != nil && !vm.log.IsZero() {
+				vm.log.Warn("Proxy build relay (ack) failed", "txIndex", r.txIndex, "method", r.method, "error", err)
+			}
 			continue
 		}
-
-		h := sha256.New()
-
-		// Symbol
-		h.Write([]byte(market.Symbol))
-
-		// Prices
-		if market.IndexPrice != nil {
-			h.Write(market.IndexPrice.Bytes())
+		fills, err := vm.relaySubmit(ctx, blockHash, r)
+		if err != nil {
+			// Carry an explicit zero-fill entry so the validator settles a full
+			// refund rather than inferring intent; the order is recoverable later.
+			if !vm.log.IsZero() {
+				vm.log.Warn("Proxy build relay (submit) failed; carrying zero fills (escrow refunded at settle)",
+					"txIndex", r.txIndex, "error", err)
+			}
+			entries = append(entries, carriedFill{txIndex: r.txIndex, fills: nil})
+			continue
 		}
-		if market.MarkPrice != nil {
-			h.Write(market.MarkPrice.Bytes())
-		}
-		if market.LastPrice != nil {
-			h.Write(market.LastPrice.Bytes())
-		}
-
-		// Open interest
-		if market.OpenInterestLong != nil {
-			h.Write(market.OpenInterestLong.Bytes())
-		}
-		if market.OpenInterestShort != nil {
-			h.Write(market.OpenInterestShort.Bytes())
-		}
-
-		// Funding rate
-		if market.FundingRate != nil {
-			h.Write(market.FundingRate.Bytes())
-		}
-
-		hashes = append(hashes, h.Sum(nil))
+		entries = append(entries, carriedFill{txIndex: r.txIndex, fills: fills})
 	}
-
-	return hashes
+	return entries, nil
 }
 
-// computeBlockMetaHash computes hash of block metadata.
-func (vm *VM) computeBlockMetaHash() []byte {
+// relaySubmit performs one idempotent clob_submit relay and decodes its fills.
+// The two-phase durable receipt makes the irreversible d-chain leg fire AT MOST
+// ONCE across a proposer crash mid-build:
+//
+//	GetReceipt  — a witness already present (intent OR finalized) => no relay,
+//	              treat as zero-fill (the prior relay's fills are not re-derivable
+//	              from the hash; a re-built block carries nothing for this tx and
+//	              the escrow is refunded — a bounded proposer-local liveness cost,
+//	              never a consensus-safety or double-submit issue).
+//	phase 1     — RecordRelayIntent: durable intent BEFORE the relay.
+//	relay       — the irreversible d-chain leg.
+//	phase 2     — recordReceipt: finalize with the response hash (provenance).
+func (vm *VM) relaySubmit(ctx context.Context, blockHash ids.ID, r plannedRelay) ([]Fill, error) {
+	if _, found, err := vm.state.GetReceipt(blockHash, r.txIndex); err != nil {
+		return nil, fmt.Errorf("relay: receipt check: %w", err)
+	} else if found {
+		return nil, nil
+	}
+	if err := vm.state.RecordRelayIntent(blockHash, r.txIndex); err != nil {
+		return nil, fmt.Errorf("relay: record intent: %w", err)
+	}
+	resp, err := vm.relay.Relay(ctx, r.method, r.payload)
+	if err != nil {
+		return nil, fmt.Errorf("relay %s: %w", r.method, err)
+	}
+	fills, derr := DecodeFills(resp)
+	if derr != nil {
+		return nil, fmt.Errorf("relay: decode fills: %w", derr)
+	}
+	if err := vm.recordReceipt(blockHash, r.txIndex, resp); err != nil {
+		return nil, fmt.Errorf("relay: record receipt: %w", err)
+	}
+	return fills, nil
+}
+
+// relayAck performs one idempotent place/cancel relay (no fills to settle). Same
+// durable receipt discipline as relaySubmit; the ack is recorded for provenance.
+func (vm *VM) relayAck(ctx context.Context, blockHash ids.ID, r plannedRelay) error {
+	if _, found, err := vm.state.GetReceipt(blockHash, r.txIndex); err != nil {
+		return fmt.Errorf("relay: receipt check: %w", err)
+	} else if found {
+		return nil
+	}
+	if err := vm.state.RecordRelayIntent(blockHash, r.txIndex); err != nil {
+		return fmt.Errorf("relay: record intent: %w", err)
+	}
+	resp, err := vm.relay.Relay(ctx, r.method, r.payload)
+	if err != nil {
+		return fmt.Errorf("relay %s: %w", r.method, err)
+	}
+	return vm.recordReceipt(blockHash, r.txIndex, resp)
+}
+
+// settleCarried turns the block-CARRIED fills into export legs at ACCEPT. It is a
+// PURE DETERMINISTIC FUNCTION of (planned relays, carried fills, escrow state):
+// it performs NO d-chain I/O, so it runs identically on every validator and yields
+// byte-identical export UTXO keys => identical StateRoot (RED finding #9).
+//
+// For each planned settling submit it looks up the carried fills bound to that
+// txIndex and settles them via settleFromFills (unchanged: directional rounding,
+// spent>locked refused, escrow consumed once). An absent or empty carried entry
+// settles a full refund of the locked collateral — the conservation-safe default
+// when the proposer carried no fills (a failed build relay, or a non-settling
+// block). A per-settle refusal (e.g. a lying proposer's spent>locked) is LOGGED
+// and SKIPPED, leaving the escrow intact and recoverable — never fatal to the
+// block, and bounded to that one taker's collateral.
+func (vm *VM) settleCarried(result *BlockResult, ar *atomicRequests) {
+	for _, r := range result.relays {
+		if !r.settle {
+			continue
+		}
+		fills, _ := fillsForTx(result.carriedFills, r.txIndex)
+		if err := vm.settleFromFills(r.sender, r.collateralRef, fills, result.blockHash, r.txIndex, ar); err != nil {
+			if !vm.log.IsZero() {
+				vm.log.Warn("Proxy settle from carried fills failed (collateral remains escrowed)",
+					"txIndex", r.txIndex, "error", err)
+			}
+		}
+	}
+}
+
+// settleFromFills derives the taker's export output from the d-chain's
+// CONFIRMED fills (value-conservation: the credited amount comes from a real
+// fill, never a client-supplied number) and accumulates it as an export leg
+// back to C-Chain.
+//
+// VALUE CONSERVATION (RED C4): the proxy must return EVERY locked unit — as
+// proceeds or as a refund — so value_in == value_out exactly. A CLOB fill moves
+// value in one direction: the taker pays the asset it locked on import and
+// RECEIVES the opposite asset. The settle therefore exports TWO legs:
+//
+//	PROCEEDS leg — the received (opposite) asset:
+//	  - taker BUY  (side 0): receives base  = sum(size).
+//	  - taker SELL (side 1): receives quote = sum(price*size).
+//	REFUND leg — the unfilled remainder of the LOCKED asset:
+//	  - taker BUY  locked quote; spent = sum(price*size); refund = locked - spent.
+//	  - taker SELL locked base;  spent = sum(size);       refund = locked - spent.
+//
+// Crediting only the proceeds leg (the prior behavior) DESTROYED the unfilled
+// remainder on every partial/zero fill. The refund leg closes that leak: the
+// locked-collateral amount comes from the escrow recorded at import, the spent
+// amount from the confirmed fills, and refund = locked - spent is exported in
+// the SAME asset that was locked. The escrow is consumed so it cannot be
+// refunded twice. With no escrow (a relay not backed by a proxy-side import),
+// there is no locked collateral to refund — proceeds only.
+//
+// FRACTIONAL-NOTIONAL ROUNDING (RED escrow-truncation mint): fills cross the ZAP
+// wire as float64, so base = sum(size) and quote = sum(price*size) are generally
+// FRACTIONAL while on-chain value moves in integer asset units. The float->uint
+// conversion is ASYMMETRIC by purpose, to preserve "the proxy never mints"
+// (atomic.go quantToCredit/quantToCharge):
+//   - PROCEEDS (the opposite asset the taker RECEIVES) round DOWN — never credit
+//     a unit that was not realized.
+//   - SPENT (the locked asset consumed, which REDUCES the refund) round UP —
+//     never UNDERstate spend. Understating spend is exactly this bug: a BUY's
+//     spent = floor(notional) inflates refund = locked - spent, so the taker
+//     keeps the base proceeds AND a refund larger than the true unspent quote =>
+//     quote minted out of escrow.
+//
+// Totals are summed over the fills ONCE as exact floats, then rounded ONCE at the
+// asset boundary. The prior per-fill uint64(price*size) truncated DOWN on every
+// fill and summed the error: 100 fills of notional 0.99 recorded spent=0 and
+// refunded the entire lock. Aggregate ceiling gives spent=ceil(99.0)=99, so the
+// refund is capped at the true unspent value — no extraction. spent > locked is
+// still refused (minting against the proxy's own escrow).
+//
+// DETERMINISM (RED split): the export this settle constructs is reconstructed
+// independently on every validator, so its shared-memory UTXO keys MUST be a
+// pure function of consensus-agreed inputs. The settlement export is therefore
+// built via NewSettlementExportTx seeded by (blockHash, txIndex) — the SAME
+// coordinate that keys the idempotency receipt — never by wall-clock time. A
+// time.Now() in the export identity would make deriveUTXOID(tx.ID(), i) differ
+// per node and split the atomic commit on accept.
+func (vm *VM) settleFromFills(taker ids.ShortID, collateralRef ids.ID, fills []Fill, blockHash ids.ID, txIndex uint32, ar *atomicRequests) error {
+	// Resolve the locked collateral this settle must conserve. Absent escrow =>
+	// nothing locked on the proxy side; fall back to proceeds-only settlement.
+	lockedAsset, locked, haveEscrow, err := vm.state.GetEscrow(collateralRef)
+	if err != nil {
+		return fmt.Errorf("settle: escrow lookup: %w", err)
+	}
+
+	// Taker side: from the fills if any, else (zero-fill) from the locked-asset
+	// identity recorded at import so a fully-unfilled order still refunds. A single
+	// marketable submit takes exactly ONE side, so fills[0].Side governs the whole
+	// stream. Per-fill side validity (0=BUY, 1=SELL) is a WIRE property enforced at
+	// the boundary (DecodeFills); this defensive re-check covers callers that build
+	// fills directly (tests) and keeps settle self-protecting at the policy edge.
+	takerSide := uint8(0)
+	if len(fills) > 0 {
+		takerSide = fills[0].Side
+	}
+	if takerSide > 1 {
+		return fmt.Errorf("settle: invalid taker side %d", takerSide)
+	}
+
+	// Aggregate the fill totals ONCE as exact floats (base = sum(size), quote =
+	// sum(price*size)). Rounding to integer asset units happens later, in the
+	// direction proper to each leg — NOT per-fill, which would truncate DOWN on
+	// every fill and sum a directional leak (the escrow-truncation mint).
+	//
+	// SINGLE-SIDE GUARD (RED mixed-side over-credit): the proceeds/spent split
+	// below applies ONE direction (takerSide) to the WHOLE aggregate, so a fill
+	// stream that mixes sides would be credited as if every fill took takerSide —
+	// minting the opposite-side volume (a lying/MITM backend returns [BUY 10,
+	// SELL 1000] and the proxy credits base = 1010). A submit cannot legitimately
+	// fill both sides; refuse the stream rather than over-credit.
+	var baseFloat, quoteFloat float64
+	for _, f := range fills {
+		if f.Side != takerSide {
+			return fmt.Errorf("settle: mixed-side fills (fill side %d != taker side %d)", f.Side, takerSide)
+		}
+		baseFloat += f.Size
+		quoteFloat += f.Price * f.Size
+	}
+
+	// Directional rounding by purpose (atomic.go): a RECEIVED quantity rounds DOWN
+	// (never over-credit); a SPENT quantity rounds UP (never inflate the refund).
+	// BUY  receives base, spends quote. SELL receives quote, spends base.
+	var proceeds uint64 // the opposite asset the taker receives
+	var spent uint64    // the locked asset consumed (reduces the refund)
+	if takerSide == 0 { // BUY
+		if proceeds, err = quantToCredit(baseFloat); err != nil {
+			return err
+		}
+		if spent, err = quantToCharge(quoteFloat); err != nil {
+			return err
+		}
+	} else { // SELL
+		if proceeds, err = quantToCredit(quoteFloat); err != nil {
+			return err
+		}
+		if spent, err = quantToCharge(baseFloat); err != nil {
+			return err
+		}
+	}
+
+	outs := make([]txs.AtomicOutput, 0, 2)
+
+	// PROCEEDS leg — the opposite asset the taker received (ref-derived routing
+	// handle; the C-Chain side maps it to the real ERC-20).
+	if takerSide == 0 { // BUY: receives base
+		outs = append(outs, txs.AtomicOutput{Owner: taker, Asset: assetFromRef(collateralRef, 0), Amount: proceeds})
+	} else { // SELL: receives quote
+		outs = append(outs, txs.AtomicOutput{Owner: taker, Asset: assetFromRef(collateralRef, 1), Amount: proceeds})
+	}
+
+	// REFUND leg — the unfilled remainder of the locked asset.
+	if haveEscrow {
+		// A settle can never consume more than was locked; that would be the
+		// proxy minting against its own escrow. Refuse rather than underflow.
+		if spent > locked {
+			return fmt.Errorf("settle: spent %d exceeds locked collateral %d (would mint)", spent, locked)
+		}
+		if refund := locked - spent; refund > 0 {
+			outs = append(outs, txs.AtomicOutput{Owner: taker, Asset: lockedAsset, Amount: refund})
+		}
+		// Consume the escrow exactly once — the locked collateral is now fully
+		// accounted for (proceeds + refund) and must not be refundable again.
+		if err := vm.state.ConsumeEscrow(collateralRef); err != nil {
+			return fmt.Errorf("settle: consume escrow: %w", err)
+		}
+	}
+
+	outs = nonZeroOutputs(outs)
+	if len(outs) == 0 {
+		// Nothing realized and nothing locked — no value to move. (Both proceeds
+		// and refund were zero, e.g. a zero-fill with no escrow.)
+		return nil
+	}
+	// Deterministic settlement identity: seed CreatedAt from the block hash (a
+	// consensus-agreed value, NOT wall-clock) and the txIndex via Nonce. Every
+	// validator that replays this block builds byte-identical export wire bytes,
+	// so tx.ID() — and every export UTXO key derived from it — is identical
+	// network-wide. This is the fix for the time.Now() shared-memory-key split.
+	createdAt := int64(binary.BigEndian.Uint64(blockHash[:8]))
+	tx := txs.NewSettlementExportTx(taker, txIndex, vm.cChainID(), outs, collateralRef, createdAt)
+	return vm.executeExport(tx, ar)
+}
+
+// recordReceipt stores the relay receipt binding (blockHash, txIndex) to the
+// hash of the d-chain's response — the replay-idempotency witness. The response
+// is a clob_submit fills frame, or a clob_place / clob_cancel ack; the witness
+// is the same primitive either way (one relay per (blockHash, txIndex)).
+func (vm *VM) recordReceipt(blockHash ids.ID, txIndex uint32, respWire []byte) error {
+	return vm.state.PutReceipt(&dexstate.Receipt{
+		BlockHash: blockHash,
+		TxIndex:   txIndex,
+		RespHash:  ids.ID(sha256.Sum256(respWire)),
+	})
+}
+
+// acceptBlock is the proxy's SINGLE COMMIT POINT — and, by the RED #9 fix, a
+// PURE DETERMINISTIC FUNCTION of the block (it performs NO d-chain I/O; the relay
+// already happened once at the proposer's build, and the fills are carried in the
+// block bytes). It commits the C-side settlement atomically with the proxy state:
+//
+//  1. settleCarried — turn the block-CARRIED fills into export legs (settle from
+//     bytes, never from a fresh relay). Runs identically on every validator, so
+//     the export keys — and the root — are byte-identical network-wide. A node
+//     never relays here, so two validators can no longer diverge on per-call fills
+//     (the per-validator-relay fork is structurally impossible).
+//  2. CommitBatch — snapshot every versiondb write made during Verify (consumed
+//     UTXOs, escrow) AND during step 1 (escrow-consume).
+//  3. commitAtomic — apply that state batch together with the cross-chain
+//     requests (import removes from Verify + export puts from step 1) in one
+//     atomic shared-memory commit (the platformvm acceptor pattern).
+//
+// Atomicity-or-reversal: the C-side credit and the escrow-consume land in the same
+// atomic apply, so a settle never half-applies. A Rejected block reaches a plain
+// db.Abort (Reject) and commits nothing on the C-side. (The d-chain relay for a
+// rejected block happened at the proposer's build and is the documented, bounded
+// proposer-trust cost — see carried_fills.go.)
+func (vm *VM) acceptBlock(ctx context.Context, result *BlockResult) error {
+	vm.lock.Lock()
+	defer vm.lock.Unlock()
+
+	if vm.db == nil {
+		return nil
+	}
+	ar := newAtomicRequests()
+	if result != nil && result.atomic != nil {
+		ar = result.atomic
+	}
+
+	// Settle from the block-carried fills now (deterministic; NO d-chain I/O),
+	// accumulating settlement exports into ar and consuming escrow in the versiondb
+	// in-memory layer that CommitBatch is about to snapshot.
+	if result != nil {
+		vm.settleCarried(result, ar)
+	}
+
+	// FINAL root: recompute over the post-accept state — escrow consumed by the
+	// settle and the settlement EXPORT legs now present in ar (neither existed at
+	// Verify, which only staged the imports). Because settleCarried is a pure
+	// function of the carried fills, two validators processing the same block bytes
+	// reach the IDENTICAL post-accept state and ar, hence the identical root. The
+	// versiondb in-memory layer still holds these writes (CommitBatch has not run
+	// yet), so the walk sees them.
+	if result != nil {
+		root, err := vm.computeStateRoot(result.blockHash, result)
+		if err != nil {
+			return err
+		}
+		result.StateRoot = root
+	}
+	_ = ctx
+
+	// Abort clears the versiondb's in-memory layer after the batch is written by
+	// Apply/Write (the platformvm defer-Abort pattern).
+	defer vm.db.Abort()
+	batch, err := vm.db.CommitBatch()
+	if err != nil {
+		return fmt.Errorf("dexvm: commit batch: %w", err)
+	}
+	return vm.commitAtomic(ar, batch)
+}
+
+// computeStateRoot computes the block's StateRoot as a FAITHFUL commitment to
+// the proxy's mutated state — not just an identifier of the block. It folds
+// together, in fixed order:
+//
+//  1. blockHash + height — the consensus binding (kept from the original root).
+//  2. state.StateHash()  — every persisted key/value: the consumed-UTXO set,
+//     collateral escrow, replay nonces, relay receipts, last-block pointer.
+//  3. result.atomic      — the cross-chain operations this block produces (the
+//     import UTXO removes and export UTXO puts that move value across chains).
+//
+// Because (2) and (3) are the ACTUAL state and the ACTUAL settlement output,
+// two nodes that genuinely diverge — one consumed an escrow / committed an
+// import+export, a peer whose relay failed committed no cross-chain op — can no
+// longer emit an identical root: the divergent escrow/receipt key (2) or the
+// missing export leg (3) changes the digest. A matching blockHash is no longer
+// sufficient to forge a matching root, so the root-based safety check actually
+// witnesses real divergence.
+//
+// It returns an error only if the state walk fails (a corrupt/closed DB);
+// callers treat that as a block-processing failure rather than silently
+// committing an unverifiable root.
+func (vm *VM) computeStateRoot(blockHash ids.ID, result *BlockResult) (ids.ID, error) {
 	h := sha256.New()
 
-	// Block height
-	heightBuf := make([]byte, 8)
-	binary.BigEndian.PutUint64(heightBuf, vm.currentBlockHeight)
-	h.Write(heightBuf)
+	h.Write(blockHash[:])
+	var heightBuf [8]byte
+	binary.BigEndian.PutUint64(heightBuf[:], vm.currentBlockHeight)
+	h.Write(heightBuf[:])
 
-	// Last block time
-	timeBuf := make([]byte, 8)
-	binary.BigEndian.PutUint64(timeBuf, uint64(vm.lastBlockTime.UnixNano()))
-	h.Write(timeBuf)
+	// (2) Every persisted key/value (consumed-UTXO set, escrow, replay nonces,
+	// relay receipts, last-block pointer) via the state's own deterministic walk.
+	stateHash, err := vm.state.StateHash()
+	if err != nil {
+		return ids.Empty, fmt.Errorf("compute state root: %w", err)
+	}
+	h.Write(stateHash[:])
 
-	// Last funding time
-	fundingBuf := make([]byte, 8)
-	binary.BigEndian.PutUint64(fundingBuf, uint64(vm.lastFundingTime.UnixNano()))
-	h.Write(fundingBuf)
-
-	return h.Sum(nil)
+	// (3) The cross-chain operations this block produces — the import UTXO removes
+	// accumulated at Verify and the export UTXO puts appended at accept. These are
+	// the block's OTHER mutated output (alongside persisted state); a node whose
+	// relay failed accumulates no export leg, so this fold is what makes its root
+	// differ from a peer that settled. nil-safe for blocks with no atomic legs.
+	if result != nil && result.atomic != nil {
+		result.atomic.hashInto(h)
+	}
+	return ids.ID(h.Sum(nil)), nil
 }
 
-// computeMerkleRoot computes the merkle root from a list of leaf hashes.
-// Uses standard binary merkle tree construction.
-func computeMerkleRoot(leaves [][]byte) ids.ID {
-	if len(leaves) == 0 {
-		return ids.Empty
-	}
-
-	// Copy leaves to avoid modifying input
-	nodes := make([][]byte, len(leaves))
-	copy(nodes, leaves)
-
-	// Build tree bottom-up
-	for len(nodes) > 1 {
-		var nextLevel [][]byte
-
-		for i := 0; i < len(nodes); i += 2 {
-			h := sha256.New()
-			h.Write(nodes[i])
-
-			if i+1 < len(nodes) {
-				// Pair exists
-				h.Write(nodes[i+1])
-			} else {
-				// Odd node, duplicate
-				h.Write(nodes[i])
-			}
-
-			nextLevel = append(nextLevel, h.Sum(nil))
-		}
-
-		nodes = nextLevel
-	}
-
-	// Root is first (and only) node
-	var root ids.ID
-	copy(root[:], nodes[0])
-	return root
-}
-
-// Shutdown implements consensuscore.VM interface.
-// It gracefully shuts down the VM.
-// NOTE: No background tasks to wait for in functional mode.
+// Shutdown implements consensuscore.VM.
 func (vm *VM) Shutdown(ctx context.Context) error {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
 
 	if !vm.log.IsZero() {
-		vm.log.Info("Shutting down DEX VM")
+		vm.log.Info("Shutting down DEX proxy VM")
 	}
-
 	vm.shutdown = true
 
-	// Close database
+	if vm.relay != nil {
+		_ = vm.relay.Close()
+	}
 	if vm.db != nil {
 		if err := vm.db.Close(); err != nil {
 			return fmt.Errorf("failed to close database: %w", err)
 		}
 	}
-
-	if !vm.log.IsZero() {
-		vm.log.Info("DEX VM shutdown complete")
-	}
-
 	return nil
 }
 
-// Version implements consensuscore.VM interface.
+// Version implements consensuscore.VM.
 func (vm *VM) Version(ctx context.Context) (string, error) {
-	return "1.0.0", nil
+	return "2.0.0", nil
 }
 
-// CreateHandlers implements consensuscore.VM interface.
-// It creates HTTP handlers for the DEX API.
+// CreateHandlers implements consensuscore.VM. The proxy's API is a thin
+// pass-through to the relay client (no local book to query).
 func (vm *VM) CreateHandlers(ctx context.Context) (map[string]http.Handler, error) {
 	server := rpc.NewServer()
 	server.RegisterCodec(rpcjson.NewCodec(), "application/json")
 	server.RegisterCodec(rpcjson.NewCodec(), "application/json;charset=UTF-8")
 
-	// Register DEX API service
 	service := api.NewService(vm)
 	if err := server.RegisterService(service, "dex"); err != nil {
 		return nil, fmt.Errorf("failed to register DEX service: %w", err)
 	}
-
-	return map[string]http.Handler{
-		"":    server,
-		"/ws": vm.createWebSocketHandler(),
-	}, nil
+	return map[string]http.Handler{"": server}, nil
 }
 
-// WebSocket upgrader with default options
-var wsUpgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins (configure appropriately in production)
-	},
-}
-
-// WSMessage represents a WebSocket message.
-type WSMessage struct {
-	Type    string          `json:"type"`
-	Channel string          `json:"channel"`
-	Data    json.RawMessage `json:"data,omitempty"`
-}
-
-// WSSubscription represents a client subscription.
-type WSSubscription struct {
-	Channel string `json:"channel"`
-	Symbol  string `json:"symbol,omitempty"`
-}
-
-// wsClient represents a connected WebSocket client.
-type wsClient struct {
-	conn          *websocket.Conn
-	vm            *VM
-	subscriptions map[string]bool
-	send          chan []byte
-	done          chan struct{}
-}
-
-// createWebSocketHandler creates a WebSocket handler for real-time updates.
-func (vm *VM) createWebSocketHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Upgrade HTTP connection to WebSocket
-		conn, err := wsUpgrader.Upgrade(w, r, nil)
-		if err != nil {
-			if !vm.log.IsZero() {
-				vm.log.Warn("WebSocket upgrade failed", "error", err)
-			}
-			return
-		}
-
-		client := &wsClient{
-			conn:          conn,
-			vm:            vm,
-			subscriptions: make(map[string]bool),
-			send:          make(chan []byte, 256),
-			done:          make(chan struct{}),
-		}
-
-		// Start goroutines for reading and writing
-		go client.writePump()
-		go client.readPump()
-	})
-}
-
-// readPump pumps messages from the WebSocket connection to the hub.
-func (c *wsClient) readPump() {
-	defer func() {
-		close(c.done)
-		c.conn.Close()
-	}()
-
-	c.conn.SetReadLimit(65536) // 64KB max message size
-
-	for {
-		_, message, err := c.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				if !c.vm.log.IsZero() {
-					c.vm.log.Warn("WebSocket read error", "error", err)
-				}
-			}
-			return
-		}
-
-		// Parse incoming message
-		var msg WSMessage
-		if err := json.Unmarshal(message, &msg); err != nil {
-			c.sendError("Invalid JSON message")
-			continue
-		}
-
-		// Handle message based on type
-		switch msg.Type {
-		case "subscribe":
-			c.handleSubscribe(msg)
-		case "unsubscribe":
-			c.handleUnsubscribe(msg)
-		case "ping":
-			c.sendPong()
-		default:
-			c.sendError(fmt.Sprintf("Unknown message type: %s", msg.Type))
-		}
-	}
-}
-
-// writePump pumps messages from the hub to the WebSocket connection.
-func (c *wsClient) writePump() {
-	ticker := time.NewTicker(30 * time.Second) // Ping interval
-	defer func() {
-		ticker.Stop()
-		c.conn.Close()
-	}()
-
-	for {
-		select {
-		case message, ok := <-c.send:
-			if !ok {
-				// Channel closed
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-
-			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
-				return
-			}
-
-		case <-ticker.C:
-			// Send ping to keep connection alive
-			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
-			}
-
-		case <-c.done:
-			return
-		}
-	}
-}
-
-// handleSubscribe handles subscription requests.
-func (c *wsClient) handleSubscribe(msg WSMessage) {
-	var sub WSSubscription
-	if err := json.Unmarshal(msg.Data, &sub); err != nil {
-		c.sendError("Invalid subscription data")
-		return
-	}
-
-	channel := sub.Channel
-	if sub.Symbol != "" {
-		channel = fmt.Sprintf("%s:%s", sub.Channel, sub.Symbol)
-	}
-
-	c.subscriptions[channel] = true
-
-	// Send confirmation
-	c.sendJSON(WSMessage{
-		Type:    "subscribed",
-		Channel: channel,
-	})
-
-	// Send initial snapshot based on channel type
-	switch sub.Channel {
-	case "orderbook":
-		c.sendOrderbookSnapshot(sub.Symbol)
-	case "trades":
-		// No initial snapshot for trades
-	case "ticker":
-		c.sendTickerSnapshot(sub.Symbol)
-	}
-}
-
-// handleUnsubscribe handles unsubscription requests.
-func (c *wsClient) handleUnsubscribe(msg WSMessage) {
-	var sub WSSubscription
-	if err := json.Unmarshal(msg.Data, &sub); err != nil {
-		c.sendError("Invalid unsubscription data")
-		return
-	}
-
-	channel := sub.Channel
-	if sub.Symbol != "" {
-		channel = fmt.Sprintf("%s:%s", sub.Channel, sub.Symbol)
-	}
-
-	delete(c.subscriptions, channel)
-
-	c.sendJSON(WSMessage{
-		Type:    "unsubscribed",
-		Channel: channel,
-	})
-}
-
-// sendOrderbookSnapshot sends the current orderbook state.
-func (c *wsClient) sendOrderbookSnapshot(symbol string) {
-	ob, err := c.vm.GetOrderbook(symbol)
-	if err != nil {
-		c.sendError(fmt.Sprintf("Orderbook not found: %s", symbol))
-		return
-	}
-
-	bids, asks := ob.GetDepth(20)
-
-	type OrderbookSnapshot struct {
-		Symbol string                  `json:"symbol"`
-		Bids   []*orderbook.PriceLevel `json:"bids"`
-		Asks   []*orderbook.PriceLevel `json:"asks"`
-		Time   int64                   `json:"time"`
-	}
-
-	snapshot := OrderbookSnapshot{
-		Symbol: symbol,
-		Bids:   bids,
-		Asks:   asks,
-		Time:   time.Now().UnixNano(),
-	}
-
-	data, _ := json.Marshal(snapshot)
-	c.sendJSON(WSMessage{
-		Type:    "snapshot",
-		Channel: fmt.Sprintf("orderbook:%s", symbol),
-		Data:    data,
-	})
-}
-
-// sendTickerSnapshot sends the current ticker state.
-func (c *wsClient) sendTickerSnapshot(symbol string) {
-	ob, err := c.vm.GetOrderbook(symbol)
-	if err != nil {
-		c.sendError(fmt.Sprintf("Symbol not found: %s", symbol))
-		return
-	}
-
-	type Ticker struct {
-		Symbol   string `json:"symbol"`
-		BestBid  uint64 `json:"bestBid"`
-		BestAsk  uint64 `json:"bestAsk"`
-		MidPrice uint64 `json:"midPrice"`
-		Spread   uint64 `json:"spread"`
-		Time     int64  `json:"time"`
-	}
-
-	ticker := Ticker{
-		Symbol:   symbol,
-		BestBid:  ob.GetBestBid(),
-		BestAsk:  ob.GetBestAsk(),
-		MidPrice: ob.GetMidPrice(),
-		Spread:   ob.GetSpread(),
-		Time:     time.Now().UnixNano(),
-	}
-
-	data, _ := json.Marshal(ticker)
-	c.sendJSON(WSMessage{
-		Type:    "snapshot",
-		Channel: fmt.Sprintf("ticker:%s", symbol),
-		Data:    data,
-	})
-}
-
-// sendPong sends a pong response.
-func (c *wsClient) sendPong() {
-	c.sendJSON(WSMessage{Type: "pong"})
-}
-
-// sendError sends an error message.
-func (c *wsClient) sendError(errMsg string) {
-	data, _ := json.Marshal(map[string]string{"message": errMsg})
-	c.sendJSON(WSMessage{
-		Type: "error",
-		Data: data,
-	})
-}
-
-// sendJSON sends a JSON message to the client.
-func (c *wsClient) sendJSON(msg WSMessage) {
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return
-	}
-
-	select {
-	case c.send <- data:
-	default:
-		// Channel full, drop message
-	}
-}
-
-// HealthCheck implements consensuscore.VM interface.
+// HealthCheck implements consensuscore.VM.
 func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
 	vm.lock.RLock()
 	defer vm.lock.RUnlock()
@@ -1609,86 +1054,31 @@ func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
 	return chain.HealthResult{
 		Healthy: vm.isInitialized && vm.bootstrapped,
 		Details: map[string]string{
-			"bootstrapped": fmt.Sprintf("%v", vm.bootstrapped),
-			"orderbooks":   fmt.Sprintf("%d", len(vm.orderbooks)),
-			"pools":        fmt.Sprintf("%d", len(vm.liquidityMgr.GetAllPools())),
-			"perpMarkets":  fmt.Sprintf("%d", len(vm.perpetualsEng.GetAllMarkets())),
-			"blockHeight":  fmt.Sprintf("%d", vm.currentBlockHeight),
-			"mode":         "functional",
+			"bootstrapped":    fmt.Sprintf("%v", vm.bootstrapped),
+			"relayConfigured": fmt.Sprintf("%v", vm.relay.Configured()),
+			"blockHeight":     fmt.Sprintf("%d", vm.currentBlockHeight),
+			"mode":            "stateless-atomic-zap-proxy",
 		},
 	}, nil
 }
 
-// Connected implements consensuscore.VM interface.
+// Connected implements consensuscore.VM.
 func (vm *VM) Connected(ctx context.Context, nodeID ids.NodeID, v *version.Application) error {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
-
 	vm.connectedPeers[nodeID] = v
-	if !vm.log.IsZero() {
-		vm.log.Debug("Peer connected", "nodeID", nodeID, "version", v)
-	}
 	return nil
 }
 
-// Disconnected implements consensuscore.VM interface.
+// Disconnected implements consensuscore.VM.
 func (vm *VM) Disconnected(ctx context.Context, nodeID ids.NodeID) error {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
-
 	delete(vm.connectedPeers, nodeID)
-	if !vm.log.IsZero() {
-		vm.log.Debug("Peer disconnected", "nodeID", nodeID)
-	}
 	return nil
 }
 
-// GetOrderbook returns the orderbook for a symbol.
-func (vm *VM) GetOrderbook(symbol string) (*orderbook.Orderbook, error) {
-	vm.lock.RLock()
-	defer vm.lock.RUnlock()
-
-	ob, exists := vm.orderbooks[symbol]
-	if !exists {
-		return nil, fmt.Errorf("orderbook not found for symbol: %s", symbol)
-	}
-	return ob, nil
-}
-
-// GetOrCreateOrderbook returns or creates an orderbook for a symbol.
-func (vm *VM) GetOrCreateOrderbook(symbol string) *orderbook.Orderbook {
-	vm.lock.Lock()
-	defer vm.lock.Unlock()
-
-	ob, exists := vm.orderbooks[symbol]
-	if !exists {
-		ob = orderbook.New(symbol)
-		vm.orderbooks[symbol] = ob
-	}
-	return ob
-}
-
-// GetLiquidityManager returns the liquidity pool manager.
-func (vm *VM) GetLiquidityManager() *liquidity.Manager {
-	return vm.liquidityMgr
-}
-
-// GetPerpetualsEngine returns the perpetual futures engine.
-func (vm *VM) GetPerpetualsEngine() api.PerpetualsEngine {
-	return vm.perpetualsEng
-}
-
-// GetCommitmentStore returns the MEV protection commitment store.
-func (vm *VM) GetCommitmentStore() api.CommitmentStore {
-	return vm.commitmentStore
-}
-
-// GetADLEngine returns the auto-deleveraging engine.
-func (vm *VM) GetADLEngine() api.ADLEngine {
-	return vm.adlEngine
-}
-
-// IsBootstrapped returns true if the VM is fully bootstrapped.
+// IsBootstrapped reports whether the proxy is fully bootstrapped.
 func (vm *VM) IsBootstrapped() bool {
 	vm.lock.RLock()
 	defer vm.lock.RUnlock()
@@ -1709,475 +1099,186 @@ func (vm *VM) GetLastBlockTime() time.Time {
 	return vm.lastBlockTime
 }
 
-// Gossip implements consensuscore.VM interface.
-// It handles gossiped messages from peers (orders and trades).
+// Relay exposes the relay client to the API pass-through layer as the neutral
+// api.Relayer surface (the proxy's only DEX capability is transport).
+func (vm *VM) Relay() api.Relayer { return vm.relay }
+
+// Gossip implements consensuscore.VM. The proxy gossips nothing matcher-related
+// (it has no book); it only acknowledges peer messages.
 func (vm *VM) Gossip(ctx context.Context, nodeID ids.NodeID, msg []byte) error {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
-
 	if vm.shutdown {
 		return errShutdown
 	}
-
-	// Decode the network message
-	netMsg, err := network.DecodeMessage(msg)
-	if err != nil {
-		if !vm.log.IsZero() {
-			vm.log.Warn("Failed to decode gossip message", "nodeID", nodeID, "error", err)
-		}
-		return nil // Don't fail on invalid messages from peers
-	}
-
-	switch netMsg.Type {
-	case network.MsgOrderGossip:
-		return vm.handleGossipedOrder(nodeID, netMsg)
-	case network.MsgTradeGossip:
-		return vm.handleGossipedTrade(nodeID, netMsg)
-	default:
-		if !vm.log.IsZero() {
-			vm.log.Debug("Unknown gossip message type", "type", netMsg.Type, "nodeID", nodeID)
-		}
-	}
-
 	return nil
 }
 
-// handleGossipedOrder handles an order gossiped from a peer.
-func (vm *VM) handleGossipedOrder(nodeID ids.NodeID, msg *network.Message) error {
-	// Parse the order from the payload
-	parser := &txs.TxParser{}
-	tx, err := parser.Parse(msg.Payload)
-	if err != nil {
-		return nil // Ignore malformed orders
-	}
-
-	// Only handle place order transactions from gossip
-	placeOrderTx, ok := tx.(*txs.PlaceOrderTx)
-	if !ok {
-		return nil
-	}
-
-	// Verify the transaction
-	if err := placeOrderTx.Verify(); err != nil {
-		return nil // Ignore invalid orders
-	}
-
-	ob, exists := vm.orderbooks[placeOrderTx.Symbol]
-	if !exists {
-		return nil // Unknown symbol
-	}
-
-	// Create order from gossip (will be confirmed in next block)
-	order := &orderbook.Order{
-		ID:          placeOrderTx.ID(),
-		Owner:       placeOrderTx.Sender(),
-		Symbol:      placeOrderTx.Symbol,
-		Side:        orderbook.Side(placeOrderTx.Side),
-		Type:        orderbook.OrderType(placeOrderTx.OrderType),
-		Price:       placeOrderTx.Price,
-		Quantity:    placeOrderTx.Quantity,
-		StopPrice:   placeOrderTx.StopPrice,
-		Status:      orderbook.StatusOpen,
-		CreatedAt:   placeOrderTx.Timestamp(),
-		ExpiresAt:   placeOrderTx.ExpiresAt,
-		PostOnly:    placeOrderTx.PostOnly,
-		ReduceOnly:  placeOrderTx.ReduceOnly,
-		TimeInForce: placeOrderTx.TimeInForce,
-	}
-
-	// Add to orderbook (trades happen in block processing)
-	if _, err := ob.AddOrder(order); err != nil {
-		if !vm.log.IsZero() {
-			vm.log.Debug("Failed to add gossiped order", "orderID", order.ID, "error", err)
-		}
-	} else if !vm.log.IsZero() {
-		vm.log.Debug("Received gossiped order",
-			"orderID", order.ID,
-			"symbol", order.Symbol,
-			"nodeID", nodeID,
-		)
-	}
-
-	return nil
-}
-
-// handleGossipedTrade handles a trade notification gossiped from a peer.
-func (vm *VM) handleGossipedTrade(nodeID ids.NodeID, msg *network.Message) error {
-	// Trade gossip is informational only - actual trades are determined by block processing
-	// This can be used for real-time UI updates before block confirmation
-	if !vm.log.IsZero() {
-		vm.log.Debug("Received gossiped trade notification", "nodeID", nodeID)
-	}
-	return nil
-}
-
-// Request implements consensuscore.VM interface.
-// It handles direct requests from peers (e.g., orderbook sync).
-func (vm *VM) Request(
-	ctx context.Context,
-	nodeID ids.NodeID,
-	requestID uint32,
-	deadline time.Time,
-	request []byte,
-) error {
+// Request implements consensuscore.VM. The proxy serves no orderbook/pool sync
+// (it holds no such state); unknown requests are ignored.
+func (vm *VM) Request(ctx context.Context, nodeID ids.NodeID, requestID uint32, deadline time.Time, request []byte) error {
 	vm.lock.RLock()
 	defer vm.lock.RUnlock()
-
 	if vm.shutdown {
 		return errShutdown
 	}
-
-	// Check deadline
-	if time.Now().After(deadline) {
-		return errors.New("request deadline exceeded")
-	}
-
-	// Decode the network message
-	netMsg, err := network.DecodeMessage(request)
-	if err != nil {
-		if !vm.log.IsZero() {
-			vm.log.Warn("Failed to decode request", "nodeID", nodeID, "error", err)
-		}
-		return err
-	}
-
-	switch netMsg.Type {
-	case network.MsgOrderbookSync:
-		return vm.handleOrderbookSyncRequest(ctx, nodeID, requestID, netMsg)
-	case network.MsgPoolSync:
-		return vm.handlePoolSyncRequest(ctx, nodeID, requestID, netMsg)
-	default:
-		if !vm.log.IsZero() {
-			vm.log.Debug("Unknown request type", "type", netMsg.Type, "nodeID", nodeID)
-		}
-	}
-
 	return nil
 }
 
-// handleOrderbookSyncRequest handles an orderbook sync request from a peer.
-func (vm *VM) handleOrderbookSyncRequest(
-	ctx context.Context,
-	nodeID ids.NodeID,
-	requestID uint32,
-	msg *network.Message,
-) error {
-	// Extract symbol from payload (simple format: just the symbol string)
-	symbol := string(msg.Payload)
-	if symbol == "" {
-		return errors.New("missing symbol in orderbook sync request")
-	}
-
-	ob, exists := vm.orderbooks[symbol]
-	if !exists {
-		return fmt.Errorf("orderbook not found: %s", symbol)
-	}
-
-	// Get orderbook depth
-	bids, asks := ob.GetDepth(100) // Send top 100 levels
-
-	// Create response with orderbook state
-	type OrderbookSyncResponse struct {
-		Symbol    string                  `json:"symbol"`
-		Bids      []*orderbook.PriceLevel `json:"bids"`
-		Asks      []*orderbook.PriceLevel `json:"asks"`
-		BestBid   uint64                  `json:"bestBid"`
-		BestAsk   uint64                  `json:"bestAsk"`
-		Timestamp int64                   `json:"timestamp"`
-	}
-
-	response := OrderbookSyncResponse{
-		Symbol:    symbol,
-		Bids:      bids,
-		Asks:      asks,
-		BestBid:   ob.GetBestBid(),
-		BestAsk:   ob.GetBestAsk(),
-		Timestamp: time.Now().UnixNano(),
-	}
-
-	responseData, err := json.Marshal(response)
-	if err != nil {
-		return err
-	}
-
-	// Create network message for response
-	responseMsg := &network.Message{
-		Type:      network.MsgOrderbookSync,
-		RequestID: requestID,
-		ChainID:   vm.chainID,
-		Payload:   responseData,
-		Timestamp: time.Now().UnixNano(),
-	}
-
-	// Send response via appSender
-	if vm.appSender != nil {
-		// Response is sent automatically by the consensus layer
-		// Log for debugging
-		if !vm.log.IsZero() {
-			vm.log.Debug("Sent orderbook sync response",
-				"symbol", symbol,
-				"nodeID", nodeID,
-				"bids", len(bids),
-				"asks", len(asks),
-			)
-		}
-		_ = responseMsg // Response will be sent by caller
-	}
-
-	return nil
-}
-
-// handlePoolSyncRequest handles a liquidity pool sync request from a peer.
-func (vm *VM) handlePoolSyncRequest(
-	ctx context.Context,
-	nodeID ids.NodeID,
-	requestID uint32,
-	msg *network.Message,
-) error {
-	// Get all pools
-	pools := vm.liquidityMgr.GetAllPools()
-
-	// Create response with pool state
-	type PoolSyncResponse struct {
-		Pools     []*liquidity.Pool `json:"pools"`
-		Timestamp int64             `json:"timestamp"`
-	}
-
-	response := PoolSyncResponse{
-		Pools:     pools,
-		Timestamp: time.Now().UnixNano(),
-	}
-
-	responseData, err := json.Marshal(response)
-	if err != nil {
-		return err
-	}
-
-	// Log response
-	if !vm.log.IsZero() {
-		vm.log.Debug("Sent pool sync response",
-			"nodeID", nodeID,
-			"pools", len(pools),
-		)
-	}
-
-	_ = responseData // Response will be sent by caller
-	return nil
-}
-
-// RequestFailed implements consensuscore.VM interface.
+// RequestFailed implements consensuscore.VM.
 func (vm *VM) RequestFailed(ctx context.Context, nodeID ids.NodeID, requestID uint32, appErr *consensuscore.AppError) error {
-	if !vm.log.IsZero() {
-		vm.log.Warn("Request failed", "nodeID", nodeID, "requestID", requestID, "error", appErr)
-	}
 	return nil
 }
 
-// Response implements consensuscore.VM interface.
+// Response implements consensuscore.VM.
 func (vm *VM) Response(ctx context.Context, nodeID ids.NodeID, requestID uint32, response []byte) error {
-	if !vm.log.IsZero() {
-		vm.log.Debug("Received response", "nodeID", nodeID, "requestID", requestID, "size", len(response))
-	}
 	return nil
 }
 
-// CrossChainRequest implements consensuscore.VM interface.
-// It handles cross-chain requests via Warp messaging.
-func (vm *VM) CrossChainRequest(
-	ctx context.Context,
-	sourceChainID ids.ID,
-	requestID uint32,
-	deadline time.Time,
-	request []byte,
-) error {
+// CrossChainRequest implements consensuscore.VM. The proxy retains ONLY the
+// Warp attestation-ingress dispatch — it does NOT move value over Warp (the
+// atomic SharedMemory import/export leg does that). Cross-chain swap/transfer
+// value handlers were removed; an incoming Warp message is a fill attestation
+// receipt, off the settlement hot path.
+func (vm *VM) CrossChainRequest(ctx context.Context, sourceChainID ids.ID, requestID uint32, deadline time.Time, request []byte) error {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
-
 	if vm.shutdown {
 		return errShutdown
 	}
 
-	// Check deadline
-	if time.Now().After(deadline) {
-		return errors.New("cross-chain request deadline exceeded")
-	}
-
-	// Verify source chain is trusted
-	trusted := false
-	for _, chainID := range vm.Config.TrustedChains {
-		if chainID == sourceChainID {
-			trusted = true
-			break
-		}
-	}
-	if !trusted {
+	// Verify source chain is trusted for attestations.
+	if !vm.isTrustedChain(sourceChainID) {
 		if !vm.log.IsZero() {
-			vm.log.Warn("Cross-chain request from untrusted chain", "chainID", sourceChainID)
+			vm.log.Warn("Attestation from untrusted chain", "chainID", sourceChainID)
 		}
 		return errors.New("source chain not trusted")
 	}
 
-	// Decode the network message
 	netMsg, err := network.DecodeMessage(request)
 	if err != nil {
-		if !vm.log.IsZero() {
-			vm.log.Warn("Failed to decode cross-chain request", "chainID", sourceChainID, "error", err)
-		}
 		return err
 	}
 
-	if !vm.log.IsZero() {
-		vm.log.Info("Received cross-chain request",
-			"sourceChain", sourceChainID,
-			"type", netMsg.Type,
-			"requestID", requestID,
-		)
-	}
-
 	switch netMsg.Type {
-	case network.MsgCrossChainSwap:
-		return vm.handleCrossChainSwapRequest(ctx, sourceChainID, requestID, netMsg)
-	case network.MsgCrossChainTransfer:
-		return vm.handleCrossChainTransferRequest(ctx, sourceChainID, requestID, netMsg)
 	case network.MsgWarpMessage:
-		return vm.handleWarpMessage(ctx, sourceChainID, requestID, netMsg)
+		return vm.handleAttestation(ctx, sourceChainID, requestID, netMsg)
 	default:
 		if !vm.log.IsZero() {
-			vm.log.Debug("Unknown cross-chain request type", "type", netMsg.Type)
+			vm.log.Debug("Ignored non-attestation cross-chain request", "type", netMsg.Type)
 		}
 	}
-
 	return nil
 }
 
-// handleCrossChainSwapRequest handles a cross-chain swap request.
-func (vm *VM) handleCrossChainSwapRequest(
-	ctx context.Context,
-	sourceChainID ids.ID,
-	requestID uint32,
-	msg *network.Message,
-) error {
-	// Parse the cross-chain swap transaction from payload
-	parser := &txs.TxParser{}
-	tx, err := parser.Parse(msg.Payload)
-	if err != nil {
-		return fmt.Errorf("failed to parse cross-chain swap: %w", err)
-	}
-
-	swapTx, ok := tx.(*txs.CrossChainSwapTx)
-	if !ok {
-		return errors.New("invalid cross-chain swap transaction")
-	}
-
-	// Verify the swap
-	if err := swapTx.Verify(); err != nil {
-		return fmt.Errorf("cross-chain swap verification failed: %w", err)
-	}
-
-	// Check deadline
-	if swapTx.Deadline > 0 && time.Now().UnixNano() > swapTx.Deadline {
-		return errors.New("cross-chain swap deadline exceeded")
-	}
-
-	// Execute the swap on this chain
-	// Find the best pool for the token pair
-	pools := vm.liquidityMgr.GetPoolsByTokenPair(swapTx.TokenIn, swapTx.TokenOut)
-	if len(pools) == 0 {
-		return errors.New("no liquidity pool found for token pair")
-	}
-
-	// Execute swap on the first available pool
-	result, err := vm.liquidityMgr.Swap(
-		pools[0].ID,
-		swapTx.TokenIn,
-		new(big.Int).SetUint64(swapTx.AmountIn),
-		new(big.Int).SetUint64(swapTx.MinAmountOut),
-	)
-	if err != nil {
-		return fmt.Errorf("cross-chain swap execution failed: %w", err)
-	}
-
+// handleAttestation ingests a Warp fill attestation. It is RECEIPT-ONLY: it
+// records/logs the attestation for the optional fraud-proof channel and moves
+// NO value (value moves atomically via SharedMemory import/export). This is the
+// trimmed body of the former handleWarpMessage — no value-moving logic remains.
+func (vm *VM) handleAttestation(ctx context.Context, sourceChainID ids.ID, requestID uint32, msg *network.Message) error {
 	if !vm.log.IsZero() {
-		vm.log.Info("Cross-chain swap executed",
-			"sourceChain", sourceChainID,
-			"tokenIn", swapTx.TokenIn,
-			"amountIn", swapTx.AmountIn,
-			"amountOut", result.AmountOut,
-		)
-	}
-
-	return nil
-}
-
-// handleCrossChainTransferRequest handles a cross-chain transfer request.
-func (vm *VM) handleCrossChainTransferRequest(
-	ctx context.Context,
-	sourceChainID ids.ID,
-	requestID uint32,
-	msg *network.Message,
-) error {
-	// Parse the cross-chain transfer transaction from payload
-	parser := &txs.TxParser{}
-	tx, err := parser.Parse(msg.Payload)
-	if err != nil {
-		return fmt.Errorf("failed to parse cross-chain transfer: %w", err)
-	}
-
-	transferTx, ok := tx.(*txs.CrossChainTransferTx)
-	if !ok {
-		return errors.New("invalid cross-chain transfer transaction")
-	}
-
-	// Verify the transfer
-	if err := transferTx.Verify(); err != nil {
-		return fmt.Errorf("cross-chain transfer verification failed: %w", err)
-	}
-
-	// The actual transfer is completed when the Warp message is signed by validators
-	// Here we acknowledge receipt and prepare for settlement
-	if !vm.log.IsZero() {
-		vm.log.Info("Cross-chain transfer received",
-			"sourceChain", sourceChainID,
-			"token", transferTx.Token,
-			"amount", transferTx.Amount,
-			"recipient", transferTx.Recipient,
-		)
-	}
-
-	return nil
-}
-
-// handleWarpMessage handles a generic Warp message.
-func (vm *VM) handleWarpMessage(
-	ctx context.Context,
-	sourceChainID ids.ID,
-	requestID uint32,
-	msg *network.Message,
-) error {
-	// Generic Warp message handling
-	// Can be used for custom cross-chain operations
-	if !vm.log.IsZero() {
-		vm.log.Debug("Received Warp message",
+		vm.log.Debug("Received fill attestation (receipt-only)",
 			"sourceChain", sourceChainID,
 			"payloadSize", len(msg.Payload),
 		)
 	}
-
 	return nil
 }
 
-// CrossChainRequestFailed implements consensuscore.VM interface.
+// CrossChainRequestFailed implements consensuscore.VM.
 func (vm *VM) CrossChainRequestFailed(ctx context.Context, chainID ids.ID, requestID uint32, appErr *consensuscore.AppError) error {
-	if !vm.log.IsZero() {
-		vm.log.Warn("Cross-chain request failed", "chainID", chainID, "requestID", requestID, "error", appErr)
-	}
 	return nil
 }
 
-// CrossChainResponse implements consensuscore.VM interface.
+// CrossChainResponse implements consensuscore.VM.
 func (vm *VM) CrossChainResponse(ctx context.Context, chainID ids.ID, requestID uint32, response []byte) error {
-	if !vm.log.IsZero() {
-		vm.log.Debug("Received cross-chain response", "chainID", chainID, "requestID", requestID, "size", len(response))
-	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Small deterministic helpers.
+// ---------------------------------------------------------------------------
+
+// isTrustedChain reports whether chainID is in the attestation trust set.
+func (vm *VM) isTrustedChain(chainID ids.ID) bool {
+	for _, c := range vm.Config.TrustedChains {
+		if c == chainID {
+			return true
+		}
+	}
+	return false
+}
+
+// cChainID returns the C-Chain id used as the settlement destination. The proxy
+// settles to the same primary network's C-Chain (the atomic-DB peer). When the
+// runtime exposes a C-Chain alias it is used; otherwise the proxy's own chain
+// id is the harness default (single-chain test mode).
+func (vm *VM) cChainID() ids.ID {
+	if vm.consensusRuntime != nil && vm.consensusRuntime.CChainID != ids.Empty {
+		return vm.consensusRuntime.CChainID
+	}
+	return vm.chainID
+}
+
+// encodeCLOBPlace builds a byte-identical clob_place frame from a thin place
+// envelope, mirroring the d-chain gateway's expected layout (poolId[32] |
+// side[1] | price[8] | size[8] | maker[16]).
+func encodeCLOBPlace(tx *txs.PlaceOrderTx) []byte {
+	payload := make([]byte, 65)
+	copy(payload[0:32], tx.PoolID[:])
+	payload[32] = tx.Side
+	putZAPFloat(payload[33:41], float64(tx.Price))
+	putZAPFloat(payload[41:49], float64(tx.Size))
+	maker := tx.Sender()
+	copy(payload[49:65], maker[:16])
+	return payload
+}
+
+// putZAPFloat writes a ZAP float wire field (big-endian IEEE-754 float64 bits).
+func putZAPFloat(b []byte, f float64) {
+	binary.BigEndian.PutUint64(b, math.Float64bits(f))
+}
+
+// idHash is the canonical 32-byte hash used for derived ids.
+func idHash(b []byte) [32]byte { return sha256.Sum256(b) }
+
+// deriveBlockHash deterministically derives a stable per-block hash from height
+// and time. Used to bind relays to (blockHash, txIndex) for replay-idempotency.
+func deriveBlockHash(height uint64, t time.Time) ids.ID {
+	var buf [16]byte
+	binary.BigEndian.PutUint64(buf[0:8], height)
+	binary.BigEndian.PutUint64(buf[8:16], uint64(t.UnixNano()))
+	return ids.ID(sha256.Sum256(buf[:]))
+}
+
+// assetFromRef resolves the leg's asset id from the collateral reference. The
+// proxy carries the asset identity in the import's locked collateral; here we
+// derive a stable per-leg asset id (leg 0 = base, 1 = quote) so the C-Chain
+// side can map it back. This is a routing handle, not canonical state.
+func assetFromRef(ref ids.ID, leg uint8) ids.ID {
+	var buf [33]byte
+	copy(buf[0:32], ref[:])
+	buf[32] = leg
+	return ids.ID(sha256.Sum256(buf[:]))
+}
+
+// nonZeroOutputs drops zero-amount outputs (an export must carry only positive
+// value — a zero leg means that asset wasn't part of the realized proceeds).
+func nonZeroOutputs(out []txs.AtomicOutput) []txs.AtomicOutput {
+	r := out[:0]
+	for _, o := range out {
+		if o.Amount > 0 {
+			r = append(r, o)
+		}
+	}
+	return r
+}
+
+// redactEndpoint returns a log-safe form of the endpoint (host:port is fine to
+// log; empty stays empty).
+func redactEndpoint(addr string) string {
+	if addr == "" {
+		return "<inert>"
+	}
+	return addr
 }

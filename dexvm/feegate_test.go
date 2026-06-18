@@ -64,7 +64,7 @@ func TestDexVM_FeePolicy_RejectsZeroFee(t *testing.T) {
 		Nonce:    1,
 		GasPrice: 0, // <-- the bug we are closing
 		GasLimit: 0,
-	}, Symbol: "LUX/USDC", Quantity: 1, Price: 1, OrderType: 0}
+	}, PoolID: [32]byte{1}, Side: 0, Price: 1, Size: 1}
 	b, err := json.Marshal(tx)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -84,7 +84,7 @@ func TestDexVM_FeePolicy_AcceptsMinFee(t *testing.T) {
 		Nonce:    1,
 		GasPrice: 1_000,
 		GasLimit: 1_000,
-	}, Symbol: "LUX/USDC", Quantity: 1, Price: 1, OrderType: 0}
+	}, PoolID: [32]byte{1}, Side: 0, Price: 1, Size: 1}
 	b, err := json.Marshal(tx)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
