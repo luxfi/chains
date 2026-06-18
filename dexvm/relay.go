@@ -142,8 +142,15 @@ type Fill struct {
 }
 
 // DecodeFills parses a clob_submit response: count[4] then count×(price[8] +
-// size[8] + side[1]). Every numeric is range-checked so a backend that lies (or
-// a MITM on the socket) cannot inject a NaN/Inf/negative fill into settlement.
+// size[8] + side[1]). Every field is range-checked so a backend that lies (or a
+// MITM on the socket) cannot inject a structurally invalid fill into settlement:
+// price/size must be finite and strictly positive, and side MUST be a valid CLOB
+// side (0=BUY, 1=SELL). A side byte outside {0,1} is malformed wire exactly like
+// a NaN price — rejecting it here keeps a Fill value always well-formed, so no
+// downstream consumer ever sees an impossible side. (Cross-fill side CONSISTENCY
+// — "a single submit takes exactly one side" — is a settlement-policy invariant
+// enforced in settleFromFills, not a per-fill wire property; the two checks own
+// different invariants and do not overlap.)
 func DecodeFills(data []byte) ([]Fill, error) {
 	if len(data) < 4 {
 		return nil, fmt.Errorf("fills response too short: %d", len(data))
@@ -164,6 +171,9 @@ func DecodeFills(data []byte) ([]Fill, error) {
 		}
 		if !isFinitePositive(s) {
 			return nil, fmt.Errorf("fill %d: invalid size %v", i, s)
+		}
+		if side > 1 {
+			return nil, fmt.Errorf("fill %d: invalid side %d (must be 0=BUY or 1=SELL)", i, side)
 		}
 		fills = append(fills, Fill{Price: p, Size: s, Side: side})
 	}

@@ -220,6 +220,34 @@ func NewExportTx(from ids.ShortID, nonce uint64, destChain ids.ID, out []AtomicO
 	return finalize(tx, &tx.BaseTx)
 }
 
+// NewSettlementExportTx builds the settlement export the VM constructs INSIDE
+// block processing (settleFromFills) — never a client-submitted tx. Because it
+// is reconstructed independently on every validator, its identity must be a
+// pure function of consensus-agreed inputs only. The wall-clock CreatedAt used
+// by the client-facing NewExportTx would make tx.ID() (and therefore any
+// shared-memory UTXO key derived from it) diverge per node, splitting the
+// atomic commit. Here CreatedAt is pinned to createdAt — the deterministic
+// settlement coordinate (the relay's UnixNano block time) supplied by the
+// caller — so the wire bytes, the TxID, and every derived export UTXO key are
+// byte-identical across validators. Nonce carries the settlement's txIndex so
+// two settlements in the same block produce distinct identities.
+func NewSettlementExportTx(from ids.ShortID, txIndex uint32, destChain ids.ID, out []AtomicOutput, fillRef ids.ID, createdAt int64) *ExportTx {
+	tx := &ExportTx{
+		BaseTx: BaseTx{
+			TxType:    TxExport,
+			From:      from,
+			Nonce:     uint64(txIndex),
+			GasPrice:  1000,
+			GasLimit:  100000,
+			CreatedAt: createdAt,
+		},
+		DestinationChain: destChain,
+		ExportedOutputs:  out,
+		FillRef:          fillRef,
+	}
+	return finalize(tx, &tx.BaseTx)
+}
+
 func (tx *ExportTx) Verify() error {
 	if tx.DestinationChain == ids.Empty {
 		return errors.New("export: empty destination chain")
