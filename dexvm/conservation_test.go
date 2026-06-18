@@ -41,9 +41,16 @@ import (
 type fakeMatcherConn struct {
 	fills    []Fill
 	received [][]byte
+	// failNext makes the next Call return a transport error, simulating a
+	// d-chain relay failure for the atomicity-on-failed-settle proof.
+	failNext bool
 }
 
 func (f *fakeMatcherConn) Call(_ context.Context, method string, payload []byte) ([]byte, error) {
+	if f.failNext {
+		f.failNext = false
+		return nil, context.DeadlineExceeded
+	}
 	f.received = append(f.received, append([]byte(nil), payload...))
 	switch method {
 	case ZAPMethodSubmit:
@@ -140,6 +147,26 @@ func newConservationHarness(t *testing.T, fills []Fill) *conservationHarness {
 // Test helpers.
 // ---------------------------------------------------------------------------
 
+// proposeAndAccept models the production PROPOSER flow for a single node (RED #9):
+// build the block (BuildBlockResult performs the network-wide-ONCE d-chain relay
+// via obtainFills and carries the confirmed fills) and then accept it (settle
+// purely from those carried fills). This is the only path that triggers a relay;
+// Verify/Accept never do. Direct-call tests use it wherever they previously relied
+// on acceptBlock relaying — the relay LOCATION moved from accept to build, the
+// conservation invariants are unchanged.
+func proposeAndAccept(t *testing.T, vm *VM, height uint64, blockTime time.Time, txBytes [][]byte) *BlockResult {
+	t.Helper()
+	ctx := context.Background()
+	result, err := vm.BuildBlockResult(ctx, height, blockTime, txBytes)
+	if err != nil {
+		t.Fatalf("BuildBlockResult: %v", err)
+	}
+	if err := vm.acceptBlock(ctx, result); err != nil {
+		t.Fatalf("acceptBlock: %v", err)
+	}
+	return result
+}
+
 // newImportTxBytes builds a wire-ready ImportTx claiming one source UTXO.
 func newImportTxBytes(t *testing.T, from ids.ShortID, sourceChain, utxoID, asset ids.ID, amount uint64) []byte {
 	t.Helper()
@@ -228,7 +255,6 @@ func TestEndToEndAtomicValueConservation(t *testing.T) {
 	// single fill of 1000 base @ price 1 so base=1000, quote=1000 (integer-exact).
 	fills := []Fill{{Price: 1, Size: 1000, Side: 0}}
 	h := newConservationHarness(t, fills)
-	ctx := context.Background()
 
 	taker := ids.GenerateTestShortID()
 	h.exportTaker = taker
@@ -260,22 +286,20 @@ func TestEndToEndAtomicValueConservation(t *testing.T) {
 	importTx := newImportTxBytes(t, taker, h.cChain, srcUTXOID, assetID, 1000)
 	relayTx := newRelayTxBytes(t, taker, collateralRef, clobSubmitPayload(assetID, 1000))
 
-	result, err := h.vm.ProcessBlock(ctx, 1, time.Unix(1, 0), [][]byte{importTx, relayTx})
-	if err != nil {
-		t.Fatalf("ProcessBlock: %v", err)
-	}
+	// --- Steps 3+4: propose (relay ONCE at build, carry fills) + accept (settle). ---
+	// This is the production proposer flow. The relay happens exactly once here for
+	// the whole network and the fills are carried in the block bytes; Verify and
+	// Accept never relay (that purity is pinned by TestRED_VerifyDoesNotRelay and
+	// TestRED_PerValidatorRelay_SplitsConsensus). Verifying the block bytes does not
+	// re-consume the import — BuildBlockResult runs the single Verify pass.
+	_ = proposeAndAccept(t, h.vm, 1, time.Unix(1, 0), [][]byte{importTx, relayTx})
 
-	// Assert the proxy forwarded a byte-identical clob_submit frame (66 bytes).
+	// The proposer forwarded exactly one byte-identical clob_submit frame at build.
 	if len(h.matcher.received) != 1 {
-		t.Fatalf("matcher received %d frames, want 1 (one clob_submit)", len(h.matcher.received))
+		t.Fatalf("matcher received %d frames after propose+accept, want 1 (one clob_submit at build)", len(h.matcher.received))
 	}
 	if got := len(h.matcher.received[0]); got != 66 {
 		t.Fatalf("relayed clob_submit frame = %d bytes, want 66", got)
-	}
-
-	// --- Step 4 commit: accept the block (atomic settle). ---
-	if err := h.vm.acceptBlock(result); err != nil {
-		t.Fatalf("acceptBlock: %v", err)
 	}
 
 	// --- Step 5: assert GLOBAL ALL-OR-NOTHING CONSERVATION. ---

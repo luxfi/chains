@@ -5,7 +5,7 @@
 //
 // PROXY STATELESSNESS INVARIANT: this holds ZERO canonical DEX state. There are
 // NO order / pool / position / tick / feeGrowth keys — matching + DEX state
-// live ONLY on the d-chain. The proxy persists exactly three things, all proper
+// live ONLY on the d-chain. The proxy persists exactly four things, all proper
 // to an atomic transport layer:
 //
 //  1. NONCES            — per-account replay protection for proxy txs.
@@ -26,6 +26,8 @@
 package state
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -51,15 +53,17 @@ var (
 	prefixLastBlock = []byte("lastBlock")
 )
 
-// Receipt records an in-flight ZAP relay: the d-chain match it triggered, keyed
-// by the consensus binding (blockHash, txIndex) so the same logical order maps
-// to exactly one match across re-execution / reorg / retry.
+// Receipt records an in-flight ZAP relay: the d-chain operation it triggered,
+// keyed by the consensus binding (blockHash, txIndex) so the same logical order
+// (submit, place, or cancel) maps to exactly one relay across re-execution /
+// reorg / retry.
 type Receipt struct {
 	BlockHash ids.ID `json:"blockHash"`
 	TxIndex   uint32 `json:"txIndex"`
-	// FillsHash is the SHA-256 of the d-chain's returned fills wire bytes — the
-	// idempotency witness. A retry that re-derives the same fills is a no-op.
-	FillsHash ids.ID `json:"fillsHash"`
+	// RespHash is the SHA-256 of the d-chain's response wire bytes (clob_submit
+	// fills, or a clob_place / clob_cancel ack) — the idempotency witness. A
+	// retry that finds this receipt is a no-op; it never re-relays.
+	RespHash ids.ID `json:"respHash"`
 }
 
 // State manages the proxy's persistent state.
@@ -67,13 +71,30 @@ type State struct {
 	mu sync.RWMutex
 	db database.Database
 
+	// receiptDB is the DURABLE base layer for relay receipts ONLY — the
+	// underlying disk DB, NOT the versiondb in-memory layer that `db` wraps. A
+	// receipt is a WRITE-AHEAD INTENT that gates an irreversible external side
+	// effect (the d-chain relay), so it must be durable the instant it is written
+	// — BEFORE the relay fires and INDEPENDENT of the consensus commit/abort
+	// timing. Every other key (nonce/escrow/consumed/lastBlock) is ordinary block
+	// state and commits with the block at accept via `db`; db.Abort discards that
+	// in-memory layer on a crash-before-accept, which is correct for block state
+	// but would be fatal for the relay witness (it would re-fire the relay on
+	// re-Verify). Routing receipts to receiptDB decomplects the witness's
+	// durability from the block-commit lifecycle.
+	receiptDB database.Database
+
 	lastBlockID     ids.ID
 	lastBlockHeight uint64
 }
 
-// New creates a new state manager.
-func New(db database.Database) *State {
-	return &State{db: db}
+// New creates a new state manager. db is the per-block state layer (a versiondb
+// committed atomically at accept); receiptDB is the DURABLE base DB the relay
+// write-ahead receipts are written through to, so an idempotency witness
+// survives a crash between Verify and Accept (db.Abort discards db's in-memory
+// layer; receiptDB is untouched). Pass the same base DB the versiondb wraps.
+func New(db, receiptDB database.Database) *State {
+	return &State{db: db, receiptDB: receiptDB}
 }
 
 // Initialize loads the last-accepted block pointer from the database.
@@ -220,6 +241,19 @@ func (s *State) ConsumeEscrow(ref ids.ID) error {
 
 // ---------------------------------------------------------------------------
 // Relay receipts — replay-idempotency for in-flight d-chain matches.
+//
+// Receipts are the proxy's WRITE-AHEAD INTENT LOG over the d-chain relay and so
+// live in the DURABLE receiptDB, never the versiondb `db` (which is aborted on a
+// crash-before-accept). The lifecycle is two-phase, both phases durable:
+//
+//  1. RecordRelayIntent(blockHash, txIndex) — written BEFORE the relay fires.
+//     Its mere presence is the double-submit guard: a crash/restart between
+//     Verify and Accept leaves this witness on disk, so re-Verify sees the
+//     receipt and skips the relay. RespHash is zero at this point.
+//  2. PutReceipt(r) — written AFTER the relay returns, finalizing the witness
+//     with the response hash (provenance for the optional fraud-proof channel).
+//
+// Phase 1 alone fully closes the double-spend window; phase 2 is provenance.
 // ---------------------------------------------------------------------------
 
 func receiptKey(blockHash ids.ID, txIndex uint32) []byte {
@@ -229,11 +263,13 @@ func receiptKey(blockHash ids.ID, txIndex uint32) []byte {
 	return append(k, idx[:]...)
 }
 
-// GetReceipt returns the relay receipt bound to (blockHash, txIndex), if any.
+// GetReceipt returns the relay receipt bound to (blockHash, txIndex), if any. It
+// reads the DURABLE receiptDB so a write-ahead intent recorded before a crash is
+// seen on the post-restart re-Verify — the heart of the double-submit guard.
 func (s *State) GetReceipt(blockHash ids.ID, txIndex uint32) (*Receipt, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	data, err := s.db.Get(receiptKey(blockHash, txIndex))
+	data, err := s.receiptDB.Get(receiptKey(blockHash, txIndex))
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
 			return nil, false, nil
@@ -244,19 +280,38 @@ func (s *State) GetReceipt(blockHash ids.ID, txIndex uint32) (*Receipt, bool, er
 		return nil, false, ErrStateCorrupted
 	}
 	r := &Receipt{BlockHash: blockHash, TxIndex: txIndex}
-	copy(r.FillsHash[:], data[32:64])
+	copy(r.RespHash[:], data[32:64])
 	return r, true, nil
 }
 
-// PutReceipt records a relay receipt. The stored value is blockHash||fillsHash
-// (the txIndex lives in the key); blockHash is redundant-but-cheap provenance.
+// RecordRelayIntent durably records the write-ahead intent to relay
+// (blockHash, txIndex) — phase 1 — BEFORE the relay fires. After this returns,
+// a crash that aborts the versiondb cannot erase the witness, so re-Verify finds
+// it (GetReceipt) and refuses to re-submit. RespHash is left zero until the
+// relay returns and PutReceipt finalizes it. Writing through receiptDB.Put makes
+// the witness durable immediately (not deferred to the block commit).
+func (s *State) RecordRelayIntent(blockHash ids.ID, txIndex uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	val := make([]byte, 64)
+	copy(val[0:32], blockHash[:])
+	// val[32:64] (RespHash) stays zero: the intent is recorded; the response is
+	// not known yet. Presence — not content — is the idempotency guard.
+	return s.receiptDB.Put(receiptKey(blockHash, txIndex), val)
+}
+
+// PutReceipt finalizes a relay receipt — phase 2 — after the relay returns,
+// stamping the response hash onto the already-durable intent. The stored value
+// is blockHash||respHash (the txIndex lives in the key); blockHash is
+// redundant-but-cheap provenance. Written to the DURABLE receiptDB so it shares
+// one home with the intent it upgrades.
 func (s *State) PutReceipt(r *Receipt) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	val := make([]byte, 64)
 	copy(val[0:32], r.BlockHash[:])
-	copy(val[32:64], r.FillsHash[:])
-	return s.db.Put(receiptKey(r.BlockHash, r.TxIndex), val)
+	copy(val[32:64], r.RespHash[:])
+	return s.receiptDB.Put(receiptKey(r.BlockHash, r.TxIndex), val)
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +339,67 @@ func (s *State) GetLastBlock() (ids.ID, uint64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.lastBlockID, s.lastBlockHeight
+}
+
+// ---------------------------------------------------------------------------
+// State commitment — a faithful hash of EVERY persisted key/value.
+// ---------------------------------------------------------------------------
+
+// StateHash returns a deterministic SHA-256 commitment over the proxy's CONSENSUS
+// state: every consumed-UTXO marker, collateral escrow, replay nonce, and the
+// last-block pointer. It is the value the block's StateRoot binds, so two nodes
+// whose consensus state actually diverges (a different consumed set, a settled-
+// vs-unsettled escrow) ALWAYS produce different roots — divergence can never hide
+// behind a matching block hash.
+//
+// RELAY RECEIPTS ARE DELIBERATELY EXCLUDED (RED finding #9). Under the carried-
+// fills model the d-chain relay is performed exactly ONCE, by the block PROPOSER,
+// at build (VM.obtainFills); the proposer writes a relay receipt as proposer-LOCAL
+// idempotency bookkeeping, but a VALIDATOR that merely parses the block bytes never
+// relays and so never writes that receipt. Folding receipts into the StateRoot
+// would therefore make the proposer's root diverge from every validator's for the
+// IDENTICAL block — reintroducing a fork. The receipt is liveness bookkeeping, not
+// consensus state, and must not be committed here. (It remains durable in
+// receiptDB and is still GetReceipt-able to gate a proposer rebuild.)
+//
+// The walk reads the versiondb `db` (which merges this block's staged in-memory
+// writes over the durable base and drops deleted keys, e.g. a consumed escrow is
+// absent), skipping the receipt prefix. Keys come out in lexicographic order, so
+// the digest is order-independent of write history and identical across nodes.
+// Every entry is folded length-prefixed (len(key)||key||len(value)||value) so no
+// two distinct keyspaces collide by concatenation. The state is tiny by the
+// proxy-statelessness invariant, so the walk per block is cheap.
+func (s *State) StateHash() (ids.ID, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	h := sha256.New()
+	var lenBuf [8]byte
+	fold := func(key, val []byte) {
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(key)))
+		h.Write(lenBuf[:])
+		h.Write(key)
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(val)))
+		h.Write(lenBuf[:])
+		h.Write(val)
+	}
+
+	// Consensus state from the versiondb, EXCLUDING relay receipts (proposer-local
+	// bookkeeping; see the doc above — folding them forks proposer vs validator).
+	dbIt := s.db.NewIterator()
+	defer dbIt.Release()
+	for dbIt.Next() {
+		key := dbIt.Key()
+		if bytes.HasPrefix(key, prefixReceipt) {
+			continue
+		}
+		fold(key, dbIt.Value())
+	}
+	if err := dbIt.Error(); err != nil {
+		return ids.Empty, fmt.Errorf("state hash: iterate db: %w", err)
+	}
+
+	return ids.ID(h.Sum(nil)), nil
 }
 
 // Close is a no-op flush hook (the proxy writes through to the DB directly).

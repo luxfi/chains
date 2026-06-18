@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"time"
 
 	"github.com/luxfi/consensus/core/choices"
 	"github.com/luxfi/consensus/engine/dag/vertex"
@@ -34,35 +35,59 @@ type OrderKey struct {
 
 // DexVertex represents a DAG vertex in the DEX proxy chain.
 type DexVertex struct {
-	id      ids.ID
-	bytes   []byte
-	height  uint64
-	epoch   uint32
-	parents []ids.ID
-	txIDs   []ids.ID
-	status  choices.Status
-	rawTxs  [][]byte
-	keys    []OrderKey
-	result  *BlockResult
-	vm      *ChainVM
+	id     ids.ID
+	bytes  []byte
+	height uint64
+	epoch  uint32
+	// timestamp is the proposer-chosen block time, carried in the serialized
+	// vertex bytes and committed by computeID. Verify MUST use this value (NOT
+	// the local wall clock) so every validator processing the same vertex feeds
+	// the IDENTICAL time into deriveBlockHash -> receipt keys + computeStateRoot,
+	// yielding the same StateRoot. This mirrors the linear Block.timestamp path
+	// (block.go); injecting clock.Time() here forked StateRoot across validators.
+	timestamp time.Time
+	parents   []ids.ID
+	txIDs     []ids.ID
+	status    choices.Status
+	rawTxs    [][]byte
+	keys      []OrderKey
+	// carriedFills are the proposer's confirmed d-chain fills, obtained once at
+	// BuildVertex and serialized into the vertex bytes; every validator settles
+	// from them without relaying (RED finding #9). fillSig is the reserved
+	// trustless-path attestation (empty today). Carrying these CHANGES THE VERTEX
+	// WIRE FORMAT — a network-upgrade-gated, lockstep validator change.
+	carriedFills []carriedFill
+	fillSig      []byte
+	result       *BlockResult
+	vm           *ChainVM
 }
 
-func (v *DexVertex) ID() ids.ID          { return v.id }
-func (v *DexVertex) Bytes() []byte        { return v.bytes }
-func (v *DexVertex) Height() uint64       { return v.height }
-func (v *DexVertex) Epoch() uint32        { return v.epoch }
-func (v *DexVertex) Parents() []ids.ID    { return v.parents }
-func (v *DexVertex) Txs() []ids.ID        { return v.txIDs }
+func (v *DexVertex) ID() ids.ID             { return v.id }
+func (v *DexVertex) Bytes() []byte          { return v.bytes }
+func (v *DexVertex) Height() uint64         { return v.height }
+func (v *DexVertex) Epoch() uint32          { return v.epoch }
+func (v *DexVertex) Timestamp() time.Time   { return v.timestamp }
+func (v *DexVertex) Parents() []ids.ID      { return v.parents }
+func (v *DexVertex) Txs() []ids.ID          { return v.txIDs }
 func (v *DexVertex) Status() choices.Status { return v.status }
 
 func (v *DexVertex) Verify(ctx context.Context) error {
 	if v.vm == nil || v.vm.inner == nil {
 		return errVMNotInitialized
 	}
-	result, err := v.vm.inner.ProcessBlock(ctx, v.height, v.vm.inner.clock.Time(), v.rawTxs)
+	// Use the proposer-carried timestamp, NOT v.vm.inner.clock.Time(): the wall
+	// clock differs per validator and flows through deriveBlockHash into receipt
+	// keys + computeStateRoot, which would fork the StateRoot for the same
+	// vertex. The carried time is consensus-agreed (committed by computeID).
+	result, err := v.vm.inner.ProcessBlock(ctx, v.height, v.timestamp, v.rawTxs)
 	if err != nil {
 		return err
 	}
+	// Attach the carried fills (RED #9): settleCarried at accept settles purely
+	// from these + the deterministic relay plan. Verify performs NO d-chain I/O on
+	// any node — the proposer relayed once at BuildVertex.
+	result.carriedFills = v.carriedFills
+	result.fillSig = v.fillSig
 	v.result = result
 	return nil
 }
@@ -74,19 +99,21 @@ func (v *DexVertex) Accept(ctx context.Context) error {
 	v.vm.lastAcceptedID = v.id
 	v.vm.lastAcceptedHeight = v.height
 	v.vm.blocks[v.id] = &Block{
-		vm:       v.vm,
-		id:       v.id,
-		parentID: v.parents[0],
-		height:   v.height,
-		txs:      v.rawTxs,
-		status:   StatusAccepted,
+		vm:        v.vm,
+		id:        v.id,
+		parentID:  v.parents[0],
+		height:    v.height,
+		timestamp: v.timestamp,
+		txs:       v.rawTxs,
+		status:    StatusAccepted,
 	}
-	// Commit the proxy's state batch ATOMICALLY with the cross-chain shared-
-	// memory operations accumulated this block (the settlement leg). This is the
-	// single commit point (the platformvm acceptor.go pattern): a failed atomic
-	// apply leaves NO committed state, so a d-side fill cannot strand without
-	// its C-side settle.
-	return v.vm.inner.acceptBlock(v.result)
+	// Run the deferred relay plan (the irreversible d-chain leg) and commit the
+	// proxy's state batch ATOMICALLY with the cross-chain shared-memory operations
+	// (the settlement leg). This is the single commit point (the platformvm
+	// acceptor.go pattern): the relay never fires during Verify, so a Rejected
+	// vertex never strands a d-chain match; a failed atomic apply leaves NO
+	// committed state, so a d-side fill cannot strand without its C-side settle.
+	return v.vm.inner.acceptBlock(ctx, v.result)
 }
 
 func (v *DexVertex) Reject(ctx context.Context) error {
@@ -177,6 +204,10 @@ func (v *DexVertex) computeID() ids.ID {
 	h := sha256.New()
 	binary.Write(h, binary.BigEndian, v.height)
 	binary.Write(h, binary.BigEndian, v.epoch)
+	// Commit to the proposer-chosen timestamp so the vertex id binds the exact
+	// time fed into ProcessBlock (a tampered timestamp yields a different id, and
+	// two proposals with the same txs but different times don't collide).
+	binary.Write(h, binary.BigEndian, v.timestamp.UnixNano())
 	for _, p := range v.parents {
 		h.Write(p[:])
 	}
@@ -184,6 +215,11 @@ func (v *DexVertex) computeID() ids.ID {
 		txHash := sha256.Sum256(raw)
 		h.Write(txHash[:])
 	}
+	// Commit to the carried fills (RED #9) so the vertex id binds the settlement
+	// data every validator consumes — a peer cannot swap the proposer's fills (or
+	// the reserved signature) while keeping the same id. The canonical encoding is
+	// the same one serialized into the vertex bytes.
+	h.Write(encodeCarriedFills(v.carriedFills, v.fillSig))
 	return ids.ID(h.Sum(nil))
 }
 
@@ -237,15 +273,38 @@ func (cvm *ChainVM) BuildVertex(ctx context.Context) (vertex.Vertex, error) {
 	}
 
 	parentID := cvm.lastAcceptedID
+	// The proposer chooses the block time here (wall clock), then carries it in
+	// the serialized bytes so every validator's Verify uses the IDENTICAL value
+	// — the consensus-agreement point, exactly like the linear BuildBlock. Clamp
+	// to be non-decreasing vs the last processed block so block time never goes
+	// backwards on a re-proposal/clock skew.
+	ts := cvm.inner.clock.Time()
+	if last := cvm.inner.GetLastBlockTime(); ts.Before(last) {
+		ts = last
+	}
+	height := cvm.lastAcceptedHeight + 1
+
+	// Proposer build: plan + relay-once + obtain the carried fills. obtainFills is
+	// the single d-chain relay for this vertex, network-wide (RED #9); every
+	// validator settles from the carried fills below without relaying.
+	result, err := cvm.inner.BuildBlockResult(ctx, height, ts, batch)
+	if err != nil {
+		return nil, fmt.Errorf("dexvm: build vertex result: %w", err)
+	}
+
 	v := &DexVertex{
-		height:  cvm.lastAcceptedHeight + 1,
-		epoch:   0,
-		parents: []ids.ID{parentID},
-		txIDs:   txIDs,
-		rawTxs:  batch,
-		keys:    batchKeys,
-		status:  choices.Processing,
-		vm:      cvm,
+		height:       height,
+		epoch:        0,
+		timestamp:    ts,
+		parents:      []ids.ID{parentID},
+		txIDs:        txIDs,
+		rawTxs:       batch,
+		keys:         batchKeys,
+		carriedFills: result.carriedFills,
+		fillSig:      result.fillSig,
+		result:       result,
+		status:       choices.Processing,
+		vm:           cvm,
 	}
 	v.id = v.computeID()
 	v.bytes = serializeDexVertex(v)
@@ -270,6 +329,10 @@ func serializeDexVertex(v *DexVertex) []byte {
 	buf = append(buf, b8...)
 	binary.BigEndian.PutUint32(b4, v.epoch)
 	buf = append(buf, b4...)
+	// Proposer-chosen block time (UnixNano) — every validator parses this exact
+	// value and feeds it to ProcessBlock, keeping StateRoot deterministic.
+	binary.BigEndian.PutUint64(b8, uint64(v.timestamp.UnixNano()))
+	buf = append(buf, b8...)
 	binary.BigEndian.PutUint32(b4, uint32(len(v.parents)))
 	buf = append(buf, b4...)
 	for _, p := range v.parents {
@@ -282,11 +345,16 @@ func serializeDexVertex(v *DexVertex) []byte {
 		buf = append(buf, b4...)
 		buf = append(buf, raw...)
 	}
+	// Carried-fills section (RED #9): the proposer's confirmed fills + reserved
+	// signature, every validator settles from these. Same encoding as the linear
+	// block. NETWORK-UPGRADE-GATED, LOCKSTEP vertex wire-format change.
+	buf = append(buf, encodeCarriedFills(v.carriedFills, v.fillSig)...)
 	return buf
 }
 
 func deserializeDexVertex(data []byte, cvm *ChainVM) (*DexVertex, error) {
-	if len(data) < 16 {
+	// Minimum: height(8) + epoch(4) + timestamp(8) + parentCount(4).
+	if len(data) < 24 {
 		return nil, fmt.Errorf("dex vertex data too short: %d", len(data))
 	}
 	pos := 0
@@ -294,6 +362,8 @@ func deserializeDexVertex(data []byte, cvm *ChainVM) (*DexVertex, error) {
 	pos += 8
 	epoch := binary.BigEndian.Uint32(data[pos:])
 	pos += 4
+	timestamp := time.Unix(0, int64(binary.BigEndian.Uint64(data[pos:])))
+	pos += 8
 	pc := binary.BigEndian.Uint32(data[pos:])
 	pos += 4
 	parents := make([]ids.ID, pc)
@@ -328,16 +398,28 @@ func deserializeDexVertex(data []byte, cvm *ChainVM) (*DexVertex, error) {
 		pos += int(tl)
 	}
 
+	// Carried-fills section (RED #9): must be exactly consumed to end-of-vertex.
+	entries, sig, consumed, ferr := decodeCarriedFills(data[pos:])
+	if ferr != nil {
+		return nil, errInvalidBlock
+	}
+	if pos+consumed != len(data) {
+		return nil, errInvalidBlock
+	}
+
 	v := &DexVertex{
-		height:  height,
-		epoch:   epoch,
-		parents: parents,
-		txIDs:   txIDs,
-		rawTxs:  rawTxs,
-		keys:    extractOrderKeys(rawTxs),
-		status:  choices.Unknown,
-		vm:      cvm,
-		bytes:   data,
+		height:       height,
+		epoch:        epoch,
+		timestamp:    timestamp,
+		parents:      parents,
+		txIDs:        txIDs,
+		rawTxs:       rawTxs,
+		keys:         extractOrderKeys(rawTxs),
+		carriedFills: entries,
+		fillSig:      sig,
+		status:       choices.Unknown,
+		vm:           cvm,
+		bytes:        data,
 	}
 	v.id = v.computeID()
 	return v, nil
