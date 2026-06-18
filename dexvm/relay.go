@@ -24,6 +24,30 @@ const (
 	ZAPMethodPlace        = "clob_place"
 	ZAPMethodCancel       = "clob_cancel"
 	ZAPMethodSubmit       = "clob_submit"
+
+	// Custody methods — the funds-in / funds-out rail between the atomic
+	// shared-memory leg and the D-Chain balance ledger (where the money lives in
+	// the order book). FROZEN, byte-identical with the d-chain gateway
+	// (github.com/luxfi/dex/pkg/zapwire Method{Deposit,Withdraw,OpenMarket}).
+	//   - clob_deposit : credit an account's available D-Chain balance from value
+	//     this proxy atomically IMPORTED (so the book can draw from it).
+	//   - clob_withdraw: debit an account's realized D-Chain balance; the returned
+	//     realized amount is what this proxy atomically EXPORTS back out.
+	//   - clob_open_market: bind a market's (base,quote) asset handles.
+	ZAPMethodDeposit    = "clob_deposit"
+	ZAPMethodWithdraw   = "clob_withdraw"
+	ZAPMethodOpenMarket = "clob_open_market"
+)
+
+// Custody wire sizes (FROZEN, == github.com/luxfi/dex/pkg/zapwire). The proxy
+// re-defines them since it cannot import the cgo-tagged d-chain package; a
+// parity test pins byte-equality.
+const (
+	// DepositReqSize / WithdrawReqSize: user[16] + asset[8] + amount[8].
+	DepositReqSize  = 16 + 8 + 8 // 32
+	WithdrawReqSize = 16 + 8 + 8 // 32
+	// BalanceRespSize: status[1] + realizedAmount[8].
+	BalanceRespSize = 1 + 8
 )
 
 // FillWireSize is one fill in a clob_submit response: price[8]+size[8]+side[1].
