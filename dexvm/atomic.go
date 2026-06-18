@@ -6,7 +6,9 @@ package dexvm
 import (
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"math"
+	"sort"
 
 	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
@@ -55,6 +57,58 @@ func (a *atomicRequests) forChain(chainID ids.ID) *atomic.Requests {
 	return r
 }
 
+// hashInto folds a deterministic commitment of the accumulated cross-chain
+// operations into h. The atomic requests are the block's OTHER mutated output
+// (alongside the persisted state) — the import UTXO removes and the export UTXO
+// puts that move value across chains. Binding them into the StateRoot is what
+// makes a block whose settlement legs differ (one node exported a settle, a peer
+// whose relay failed exported nothing) produce a different root, even when its
+// state keys and block hash match.
+//
+// Determinism: the per-chain map is walked in sorted chainID order (Go map
+// iteration is randomized). Within a chain the RemoveRequests and PutRequests
+// keep their accumulation order — that order is itself deterministic (txs are
+// processed in block order). Every variable-length field is length-prefixed so
+// no two distinct request sets can collide by concatenation.
+func (a *atomicRequests) hashInto(h hash.Hash) {
+	chainIDs := make([]ids.ID, 0, len(a.reqs))
+	for id := range a.reqs {
+		chainIDs = append(chainIDs, id)
+	}
+	sort.Slice(chainIDs, func(i, j int) bool { return chainIDs[i].Compare(chainIDs[j]) < 0 })
+
+	var lenBuf [8]byte
+	writeChunk := func(b []byte) {
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(b)))
+		h.Write(lenBuf[:])
+		h.Write(b)
+	}
+
+	for _, id := range chainIDs {
+		req := a.reqs[id]
+		idCopy := id
+		h.Write(idCopy[:])
+
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(req.RemoveRequests)))
+		h.Write(lenBuf[:])
+		for _, rm := range req.RemoveRequests {
+			writeChunk(rm)
+		}
+
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(req.PutRequests)))
+		h.Write(lenBuf[:])
+		for _, e := range req.PutRequests {
+			writeChunk(e.Key)
+			writeChunk(e.Value)
+			binary.BigEndian.PutUint64(lenBuf[:], uint64(len(e.Traits)))
+			h.Write(lenBuf[:])
+			for _, tr := range e.Traits {
+				writeChunk(tr)
+			}
+		}
+	}
+}
+
 // executeImport applies an ImportTx: it claims value exported from the source
 // chain by consuming its UTXOs from shared memory. The consumed-UTXO set
 // guarantees each exported UTXO is claimable exactly once (no double-import).
@@ -90,6 +144,24 @@ func (vm *VM) executeImport(tx *txs.ImportTx, ar *atomicRequests) error {
 	// state batch at accept (sm.Apply), exactly as platformvm does.
 	req := ar.forChain(tx.SourceChain)
 	req.RemoveRequests = append(req.RemoveRequests, utxoIDs...)
+
+	// Record the locked collateral so the settle leg can refund whatever the
+	// d-chain does NOT fill (value conservation: value_in == proceeds + refund).
+	// Keyed by the import's collateral ref — its first imported UTXO id, the same
+	// id a relay binds to via RelayOrderTx.CollateralRef. The locked amount is
+	// the credited output total; its asset is the locked asset. An import with no
+	// credited outputs (pure fee burn) locks nothing to refund.
+	if len(tx.Outputs) > 0 {
+		ref := tx.ImportedInputs[0].UTXOID
+		lockedAsset := tx.Outputs[0].Asset
+		var locked uint64
+		for _, o := range tx.Outputs {
+			locked += o.Amount
+		}
+		if err := vm.state.PutEscrow(ref, lockedAsset, locked); err != nil {
+			return fmt.Errorf("import: record escrow: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -201,3 +273,91 @@ func float64FromBits(b []byte) float64 {
 func isFinitePositive(f float64) bool {
 	return !math.IsNaN(f) && !math.IsInf(f, 0) && f > 0
 }
+
+// ---------------------------------------------------------------------------
+// Conservation-safe float->integer rounding for settlement.
+//
+// Fills cross the ZAP wire as float64 (price, size); on-chain value moves in
+// integer asset units (uint64). Converting a fractional notional to an integer
+// MUST round in the direction that protects the conservation invariant — the
+// proxy NEVER mints — so the rounding is asymmetric BY PURPOSE:
+//
+//   - quantToCredit (FLOOR): a quantity the taker RECEIVES (proceeds) or that
+//     REDUCES what we owe back. Round DOWN so the proxy never credits a unit it
+//     did not truly realize. Worst case the taker is under-credited by <1 unit;
+//     that sub-unit is conserved on the d-chain side (the maker's leg), never
+//     fabricated out of the proxy.
+//   - quantToCharge (CEIL): a quantity the taker SPENDS against locked escrow
+//     (so refund = locked - spent). Round UP so spent is never UNDERstated.
+//     Understating spent is exactly the escrow-truncation mint (RED): it inflates
+//     the refund, letting the taker walk away with proceeds PLUS more refund than
+//     the unspent remainder. Ceiling spent caps refund at the true unspent value.
+//
+// Both take an EXACT float aggregate (summed over fills once, not per-fill
+// truncated — per-fill truncation accumulates a directional leak) and apply the
+// rounding ONCE at the asset boundary. A small relative epsilon absorbs IEEE-754
+// representation error so an aggregate that is mathematically integral (e.g.
+// 1.5*3 + 2.5*3 == 12, but may evaluate to 12 ± 1e-13) snaps to that integer
+// instead of spuriously rounding to 11 or 13. epsilon is deterministic (a fixed
+// constant over deterministic float inputs) so every validator rounds identically.
+
+// settlementRoundEpsilon is the relative tolerance for snapping a float aggregate
+// to a neighboring integer before directional rounding. ~1e-9 dwarfs the ~1e-13
+// double-rounding error of summing realistic fill streams yet is far below one
+// asset unit, so it never moves a genuinely fractional notional across an integer.
+const settlementRoundEpsilon = 1e-9
+
+// nearestIntWithin returns (n, true) when f is within a relative epsilon of the
+// integer n, else (0, false). Used to snap a mathematically-integral aggregate
+// back to its integer before floor/ceil.
+func nearestIntWithin(f float64) (float64, bool) {
+	r := math.Round(f)
+	tol := settlementRoundEpsilon * math.Max(1, math.Abs(f))
+	if math.Abs(f-r) <= tol {
+		return r, true
+	}
+	return 0, false
+}
+
+// quantToCredit converts a proceeds aggregate to integer asset units, rounding
+// DOWN (never credit more than realized). Non-finite or negative input, or a
+// result exceeding uint64, is refused — the proxy must not settle a value it
+// cannot represent exactly.
+func quantToCredit(f float64) (uint64, error) {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+		return 0, fmt.Errorf("settle: non-finite proceeds %v", f)
+	}
+	if r, ok := nearestIntWithin(f); ok {
+		f = r
+	} else {
+		f = math.Floor(f)
+	}
+	if f > maxSettlementUnit {
+		return 0, fmt.Errorf("settle: proceeds %v exceeds uint64", f)
+	}
+	return uint64(f), nil
+}
+
+// quantToCharge converts a spent aggregate to integer asset units, rounding UP
+// (never charge less than consumed, so the refund is never inflated). Same
+// finiteness / range guards as quantToCredit.
+func quantToCharge(f float64) (uint64, error) {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+		return 0, fmt.Errorf("settle: non-finite notional %v", f)
+	}
+	if r, ok := nearestIntWithin(f); ok {
+		f = r
+	} else {
+		f = math.Ceil(f)
+	}
+	if f > maxSettlementUnit {
+		return 0, fmt.Errorf("settle: notional %v exceeds uint64", f)
+	}
+	return uint64(f), nil
+}
+
+// maxSettlementUnit is the largest float64 that converts to uint64 without
+// overflow on rounding. 2^64 is not exactly representable; the largest float64
+// strictly below it is 2^64 - 2048. Using <= against this constant keeps the
+// uint64() conversion in-range and deterministic.
+const maxSettlementUnit = float64(1<<64 - 2048)

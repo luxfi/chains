@@ -64,10 +64,62 @@ type BlockResult struct {
 	// StateRoot is the merkle root of the proxy's state after this block.
 	StateRoot ids.ID
 
-	// atomic holds the cross-chain operations accumulated this block, applied
-	// atomically with the state batch at accept (settlement leg). Unexported:
-	// it is plumbed from ProcessBlock to the accept commit, not a public field.
+	// blockHash is the deterministic (height, time) binding ProcessBlock used to
+	// key relay receipts. Accept reuses it so a relay maps to exactly one
+	// (blockHash, txIndex) receipt across re-execution.
+	blockHash ids.ID
+
+	// atomic holds the cross-chain IMPORT operations accumulated during Verify
+	// (deterministic, no I/O). The EXPORT (settlement) legs are appended at
+	// accept by settleCarried, derived from the block-CARRIED fills. Applied
+	// atomically with the state batch at the single accept commit point.
 	atomic *atomicRequests
+
+	// relays is the deterministic ORDER-RELAY PLAN built during Verify. Verify is
+	// a PURE DETERMINISTIC PLANNER — it performs NO d-chain I/O at all. The plan
+	// records which txIndex is a settling submit (so settleCarried knows which
+	// carried-fills entry drives an export) and the per-relay settle context
+	// (sender, collateralRef). The actual relay (the irreversible, non-
+	// deterministic d-chain leg) is NOT executed from this plan on the
+	// verify/accept path — it is performed exactly once by the PROPOSER at build
+	// time (VM.obtainFills), and its fills are CARRIED in the block bytes.
+	relays []plannedRelay
+
+	// carriedFills are the d-chain matcher's confirmed fills carried in the block
+	// /vertex bytes (see carried_fills.go). On the PROPOSER they are produced at
+	// build by obtainFills (one relay per order, network-wide); on every other
+	// validator they are parsed from the block bytes. settleCarried settles purely
+	// from these — NO validator ever relays during Verify/Accept — so block output
+	// is a pure function of (height, carried time, tx bytes, carried fills) and
+	// every node reproduces the identical StateRoot (RED finding #9 fix).
+	carriedFills []carriedFill
+
+	// fillSig is the RESERVED d-chain fill-attestation signature carried alongside
+	// the fills (see carried_fills.go). Empty today; the trustless upgrade (d-chain
+	// signs its fills, P3Q -> starkfri verifies) populates and checks it WITHOUT a
+	// further wire-format change.
+	fillSig []byte
+}
+
+// plannedRelay is one clob_* relay captured deterministically during Verify. It
+// binds the relay to (blockHash, txIndex) for replay-idempotency and carries
+// everything BOTH the proposer's build-time relay (obtainFills) AND every
+// validator's accept-time settle-from-carried (settleCarried) need — no tx
+// re-parse at either point.
+type plannedRelay struct {
+	// txIndex is the relay's position in the block (the receipt-binding key).
+	txIndex uint32
+	// method is the ZAP CLOB method ("clob_submit" / "clob_place" / "clob_cancel").
+	method string
+	// payload is the opaque, byte-identical clob_* frame forwarded verbatim.
+	payload []byte
+	// sender is the taker/maker address (settle owner for clob_submit).
+	sender ids.ShortID
+	// collateralRef binds a clob_submit to the Import escrow it settles against.
+	collateralRef ids.ID
+	// settle is true only for clob_submit: its returned fills drive an export.
+	// place/cancel are acks the proxy relays but does not settle.
+	settle bool
 }
 
 // VM implements the DEX proxy Virtual Machine: a STATELESS ATOMIC ZAP PROXY on
@@ -173,10 +225,14 @@ func (vm *VM) Initialize(ctx context.Context, vmInit vmcore.Init) error {
 		vm.log = log.Noop()
 	}
 
-	// Database.
+	// Database. The proxy keeps two layers: vm.db (versiondb) is the per-block
+	// state committed atomically at accept; vm.baseDB is the durable base the
+	// versiondb wraps. Relay receipts are write-ahead intents that gate an
+	// irreversible d-chain side effect, so they route through the durable base
+	// (receiptDB) and survive a crash-before-accept that db.Abort would discard.
 	vm.baseDB = vmInit.DB
 	vm.db = versiondb.New(vm.baseDB)
-	vm.state = dexstate.New(vm.db)
+	vm.state = dexstate.New(vm.db, vm.baseDB)
 	if err := vm.state.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize proxy state: %w", err)
 	}
@@ -318,13 +374,27 @@ func (vm *VM) SetState(ctx context.Context, stateNum uint32) error {
 	}
 }
 
-// ProcessBlock processes the proxy's per-block transactions deterministically.
-// It does NO matching: it applies atomic import/export legs and relays orders
-// to the d-chain, accumulating cross-chain operations into the BlockResult to
-// be committed atomically with state at accept time.
+// ProcessBlock is the proxy's PURE DETERMINISTIC VERIFY: it validates the
+// block's transactions and builds a plan, performing ZERO d-chain I/O.
+// Concretely it applies the atomic IMPORT legs (consuming UTXOs into the
+// versiondb in-memory layer, accumulating RemoveRequests) and the EXPORT legs,
+// and it records every order RELAY as a plannedRelay. Matching is NEVER done
+// here — it lives only on the d-chain.
+//
+// Why no relay here (RED finding #9): a Verified block is later decided Accept OR
+// Reject, and Reject must undo everything Verify did with a plain db.Abort(). But
+// more fundamentally, Verify runs on EVERY validator: a clob_submit issued here
+// would be relayed per-validator against a MOVING d-chain book, so each validator
+// would observe independently-timed fills => divergent settlement => divergent
+// StateRoot => the network forks. The relay is therefore performed exactly ONCE,
+// by the block PROPOSER at build (VM.obtainFills), and the confirmed fills are
+// CARRIED in the block bytes; every validator settles purely from those carried
+// fills (settleCarried at accept). Block output is thus a pure function of
+// (height, carried time, tx bytes, carried fills).
 //
 // CONSERVATION ORDERING within a block: each tx is processed in order, and an
-// import always precedes the relay/export that depends on its locked value.
+// import always precedes the relay/export that depends on its locked value. The
+// plan preserves that order (settleCarried settles in capture order at accept).
 func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime time.Time, blockTxs [][]byte) (*BlockResult, error) {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
@@ -333,23 +403,24 @@ func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime ti
 		return nil, errShutdown
 	}
 
-	result := &BlockResult{
-		BlockHeight: blockHeight,
-		Timestamp:   blockTime,
-		atomic:      newAtomicRequests(),
-	}
-
 	// Bind relays to (blockHash, txIndex) for replay-idempotency. The block hash
 	// here is derived from height+time deterministically (the chain layer's
 	// canonical block id is set at accept; this binding is stable per replay).
 	blockHash := deriveBlockHash(blockHeight, blockTime)
 
+	result := &BlockResult{
+		BlockHeight: blockHeight,
+		Timestamp:   blockTime,
+		blockHash:   blockHash,
+		atomic:      newAtomicRequests(),
+	}
+
 	for i, txBytes := range blockTxs {
-		if err := vm.processTx(ctx, txBytes, blockHash, uint32(i), result); err != nil {
+		if err := vm.processTx(txBytes, blockHash, uint32(i), result); err != nil {
 			// Individual tx failures don't fail the block; log and continue. A
-			// failed settle leaves NO committed cross-chain op for that tx
+			// failed import leaves NO committed cross-chain op for that tx
 			// (atomicity-or-reversal): executeImport/Export only accumulate on
-			// success.
+			// success, and a relay that fails to PLAN is simply not enqueued.
 			if !vm.log.IsZero() {
 				vm.log.Warn("Proxy transaction failed", "index", i, "error", err)
 			}
@@ -362,7 +433,15 @@ func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime ti
 		return nil, fmt.Errorf("failed to persist last block: %w", err)
 	}
 
-	result.StateRoot = vm.computeStateRoot(blockHash)
+	// VERIFY-time root: commits the post-verify state (imports' consumed/escrow
+	// staged in the versiondb in-memory layer) and the import legs accumulated so
+	// far. The settlement EXPORT legs and relay receipts are produced at accept;
+	// acceptBlock recomputes the root over that final state (see acceptBlock).
+	root, err := vm.computeStateRoot(blockHash, result)
+	if err != nil {
+		return nil, err
+	}
+	result.StateRoot = root
 
 	if !vm.log.IsZero() {
 		vm.log.Debug("Proxy block processed", "height", blockHeight, "txs", len(blockTxs))
@@ -370,10 +449,45 @@ func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime ti
 	return result, nil
 }
 
-// processTx parses and dispatches a single proxy transaction. The proxy handles
-// exactly the import/export atomic legs and the order-relay envelopes — there
-// is NO matching dispatch.
-func (vm *VM) processTx(ctx context.Context, txBytes []byte, blockHash ids.ID, txIndex uint32, result *BlockResult) error {
+// BuildBlockResult is the PROPOSER's full build of a block: it plans the block
+// (the deterministic ProcessBlock pass) and then performs the network-wide-ONCE
+// d-chain relay (obtainFills), attaching the confirmed fills to the result. The
+// caller (BuildBlock / BuildVertex) serializes result.carriedFills + result.fillSig
+// into the block/vertex bytes so every validator settles from them — the matcher
+// is hit exactly once for the whole network (RED finding #9).
+//
+// This is the ONLY method that triggers a d-chain relay. Verify (ProcessBlock) and
+// Accept (acceptBlock) never relay. A non-proposer obtains the same fills by
+// parsing the block bytes, not by calling this.
+//
+// The relay is best-effort per order: obtainFills carries a zero-fill entry for any
+// order whose relay failed, so the build always yields a valid block (the escrow is
+// refunded at settle). It returns an error only on a fault that should abort the
+// proposal entirely (e.g. the planning pass failed).
+func (vm *VM) BuildBlockResult(ctx context.Context, blockHeight uint64, blockTime time.Time, blockTxs [][]byte) (*BlockResult, error) {
+	result, err := vm.ProcessBlock(ctx, blockHeight, blockTime, blockTxs)
+	if err != nil {
+		return nil, err
+	}
+	// Relay exactly once (proposer) and carry the fills. obtainFills locks nothing
+	// in vm (it only touches the durable receiptDB + the relay socket); ProcessBlock
+	// already released vm.lock.
+	entries, err := vm.obtainFills(ctx, result.blockHash, result.relays)
+	if err != nil {
+		return nil, fmt.Errorf("build: obtain fills: %w", err)
+	}
+	result.carriedFills = entries
+	// result.fillSig stays empty: the reserved trustless-path signature is not
+	// produced by the proxy (the d-chain signs its fills in the future upgrade).
+	return result, nil
+}
+
+// processTx parses and dispatches a single proxy transaction during VERIFY. The
+// proxy handles exactly the import/export atomic legs (deterministic, staged in
+// the versiondb in-memory layer + accumulated atomic requests) and the order-
+// relay envelopes (captured as a deferred plan — NO d-chain I/O here). There is
+// NO matching dispatch.
+func (vm *VM) processTx(txBytes []byte, blockHash ids.ID, txIndex uint32, result *BlockResult) error {
 	if len(txBytes) < 1 {
 		return errors.New("empty transaction")
 	}
@@ -392,72 +506,220 @@ func (vm *VM) processTx(ctx context.Context, txBytes []byte, blockHash ids.ID, t
 	case txs.TxExport:
 		return vm.executeExport(tx.(*txs.ExportTx), result.atomic)
 	case txs.TxRelayOrder:
-		return vm.executeRelayOrder(ctx, tx.(*txs.RelayOrderTx), blockHash, txIndex, result)
+		return vm.planRelayOrder(tx.(*txs.RelayOrderTx), blockHash, txIndex, result)
 	case txs.TxPlaceOrder:
-		return vm.executePlaceOrder(ctx, tx.(*txs.PlaceOrderTx), blockHash, txIndex, result)
+		return vm.planPlaceOrder(tx.(*txs.PlaceOrderTx), blockHash, txIndex, result)
 	case txs.TxCancelOrder:
-		return vm.executeCancelOrder(ctx, tx.(*txs.CancelOrderTx))
+		return vm.planCancelOrder(tx.(*txs.CancelOrderTx), blockHash, txIndex, result)
 	default:
 		return fmt.Errorf("unknown transaction type: %d", tx.Type())
 	}
 }
 
-// executeRelayOrder forwards an opaque clob_* frame to the d-chain and settles
-// the export leg from the CONFIRMED FILLS the matcher returns — never from a
-// client-supplied amount. The relay is bound to (blockHash, txIndex) so a
-// re-execution/reorg/retry maps to exactly one d-chain match (replay-idempotency).
-func (vm *VM) executeRelayOrder(ctx context.Context, tx *txs.RelayOrderTx, blockHash ids.ID, txIndex uint32, result *BlockResult) error {
-	// Replay-idempotency: if this (blockHash, txIndex) already produced a
-	// receipt, the relay was already applied — do not re-submit (would double).
-	if _, found, err := vm.state.GetReceipt(blockHash, txIndex); err != nil {
+// planRelayOrder records an opaque clob_* relay as a plannedRelay. A clob_submit's
+// confirmed fills drive an export leg, so it is flagged settle=true; place/cancel
+// framed as a RelayOrderTx are acks only (settle=false). The plan is bound to
+// (blockHash, txIndex) — the coordinate that keys both the build-time relay's
+// idempotency receipt and the deterministic settlement export identity.
+//
+// PURE PLANNER (RED #9): planning is a deterministic, side-effect-free fold over
+// the tx — it does NOT consult the receipt and does NOT relay. The plan MUST be
+// reproduced identically on every validator (the proposer at build, and every node
+// at Verify/parse) because settleCarried drives the settlement off it; gating the
+// plan on a per-validator receipt would make a validator that lacks the receipt
+// plan differently from the proposer. Relay-idempotency lives where the relay is —
+// inside obtainFills (relaySubmit/relayAck check the receipt), run once by the
+// proposer.
+func (vm *VM) planRelayOrder(tx *txs.RelayOrderTx, blockHash ids.ID, txIndex uint32, result *BlockResult) error {
+	result.relays = append(result.relays, plannedRelay{
+		txIndex:       txIndex,
+		method:        tx.Method,
+		payload:       tx.Payload,
+		sender:        tx.Sender(),
+		collateralRef: tx.CollateralRef,
+		settle:        tx.Method == ZAPMethodSubmit,
+	})
+	return nil
+}
+
+// planPlaceOrder records a thin place-order envelope as a clob_place relay. It
+// rests a maker limit order when relayed by the proposer; the maker is settled
+// when taken (no immediate fills to settle here), so settle=false.
+//
+// Replay-idempotency (RED double-place): the relay itself is gated by the durable
+// receipt inside obtainFills and is performed exactly once by the PROPOSER. Verify
+// never relays, so re-verifying the same block (reorg, restart-before-accept,
+// normal re-verification) sends ZERO clob_place frames — one PlaceOrderTx rests
+// exactly one maker order on the d-chain, never N copies. Planning here is the pure
+// deterministic fold, not the relay.
+func (vm *VM) planPlaceOrder(tx *txs.PlaceOrderTx, blockHash ids.ID, txIndex uint32, result *BlockResult) error {
+	result.relays = append(result.relays, plannedRelay{
+		txIndex: txIndex,
+		method:  ZAPMethodPlace,
+		payload: encodeCLOBPlace(tx),
+		sender:  tx.Sender(),
+	})
+	return nil
+}
+
+// planCancelOrder records a thin cancel envelope as a clob_cancel relay. The
+// d-chain authenticates the cancel against the resting order's maker — the proxy
+// only routes it; settle=false.
+//
+// Replay-idempotency (RED double-cancel): like place, the relay is gated by the
+// durable receipt inside obtainFills and fires once on the proposer; Verify never
+// relays, so re-verifying never re-sends clob_cancel (which on the d-chain could
+// cancel a DIFFERENT order that re-used the id, or spuriously fail an already-
+// cancelled one). One CancelOrderTx => one cancel.
+func (vm *VM) planCancelOrder(tx *txs.CancelOrderTx, blockHash ids.ID, txIndex uint32, result *BlockResult) error {
+	payload := make([]byte, 40)
+	copy(payload[0:32], tx.PoolID[:])
+	binary.BigEndian.PutUint64(payload[32:40], tx.OrderID)
+	result.relays = append(result.relays, plannedRelay{
+		txIndex: txIndex,
+		method:  ZAPMethodCancel,
+		payload: payload,
+		sender:  tx.Sender(),
+	})
+	return nil
+}
+
+// obtainFills is the PROPOSER-ONLY relay step, run at BuildBlock/BuildVertex
+// (chainvm.go / dag_vertex.go) — the single point where the proxy performs the
+// irreversible, non-deterministic d-chain I/O for a block. For each planned relay
+// it forwards the byte-identical clob_* frame to the d-chain EXACTLY ONCE and, for
+// a settling submit, decodes the confirmed fills into a carriedFill entry. The
+// returned entries are serialized into the block/vertex bytes (carried_fills.go),
+// so every validator settles from them without ever relaying — the matcher is hit
+// at most once per order, network-wide (RED finding #9).
+//
+// Idempotency: the relay is gated by the SAME durable two-phase write-ahead
+// receipt the proxy has always used, keyed by (blockHash, txIndex). A re-build of
+// the same block coordinate (proposer restart) finds the intent and skips the
+// re-relay — no double-submit to the source-of-truth matcher. (The receipt is
+// finalized with the response hash for provenance.)
+//
+// A per-relay failure (transport error, undecodable fills) is LOGGED and the
+// order is carried with NO fills (an explicit zero-fill entry for a submit), so
+// the block still validates and the taker's escrow is fully refunded at settle —
+// recoverable by a later order. obtainFills never returns a fatal error for a
+// single relay failure; it returns an error only on a programming/receipt fault.
+//
+// place/cancel return an ack the proxy records but does not settle (the resting
+// maker is settled when taken), so they produce no carriedFill entry.
+//
+// NOTE ON THE TRUST SURFACE: relaying at build means the PROPOSER reports the
+// fills the rest of the network settles from. This is the interim
+// conservation-bounded model documented in carried_fills.go: a lying proposer is
+// bounded by settleFromFills' spent>locked refusal (no mint; blast radius = one
+// taker's own escrow). The trustless path uses the reserved fill-signature field.
+func (vm *VM) obtainFills(ctx context.Context, blockHash ids.ID, relays []plannedRelay) ([]carriedFill, error) {
+	var entries []carriedFill
+	for _, r := range relays {
+		// Only a settling submit produces fills the network must carry+settle.
+		// place/cancel are relayed for their side effect (rest/cancel a maker) but
+		// carry nothing to settle.
+		if !r.settle {
+			if err := vm.relayAck(ctx, blockHash, r); err != nil && !vm.log.IsZero() {
+				vm.log.Warn("Proxy build relay (ack) failed", "txIndex", r.txIndex, "method", r.method, "error", err)
+			}
+			continue
+		}
+		fills, err := vm.relaySubmit(ctx, blockHash, r)
+		if err != nil {
+			// Carry an explicit zero-fill entry so the validator settles a full
+			// refund rather than inferring intent; the order is recoverable later.
+			if !vm.log.IsZero() {
+				vm.log.Warn("Proxy build relay (submit) failed; carrying zero fills (escrow refunded at settle)",
+					"txIndex", r.txIndex, "error", err)
+			}
+			entries = append(entries, carriedFill{txIndex: r.txIndex, fills: nil})
+			continue
+		}
+		entries = append(entries, carriedFill{txIndex: r.txIndex, fills: fills})
+	}
+	return entries, nil
+}
+
+// relaySubmit performs one idempotent clob_submit relay and decodes its fills.
+// The two-phase durable receipt makes the irreversible d-chain leg fire AT MOST
+// ONCE across a proposer crash mid-build:
+//
+//	GetReceipt  — a witness already present (intent OR finalized) => no relay,
+//	              treat as zero-fill (the prior relay's fills are not re-derivable
+//	              from the hash; a re-built block carries nothing for this tx and
+//	              the escrow is refunded — a bounded proposer-local liveness cost,
+//	              never a consensus-safety or double-submit issue).
+//	phase 1     — RecordRelayIntent: durable intent BEFORE the relay.
+//	relay       — the irreversible d-chain leg.
+//	phase 2     — recordReceipt: finalize with the response hash (provenance).
+func (vm *VM) relaySubmit(ctx context.Context, blockHash ids.ID, r plannedRelay) ([]Fill, error) {
+	if _, found, err := vm.state.GetReceipt(blockHash, r.txIndex); err != nil {
+		return nil, fmt.Errorf("relay: receipt check: %w", err)
+	} else if found {
+		return nil, nil
+	}
+	if err := vm.state.RecordRelayIntent(blockHash, r.txIndex); err != nil {
+		return nil, fmt.Errorf("relay: record intent: %w", err)
+	}
+	resp, err := vm.relay.Relay(ctx, r.method, r.payload)
+	if err != nil {
+		return nil, fmt.Errorf("relay %s: %w", r.method, err)
+	}
+	fills, derr := DecodeFills(resp)
+	if derr != nil {
+		return nil, fmt.Errorf("relay: decode fills: %w", derr)
+	}
+	if err := vm.recordReceipt(blockHash, r.txIndex, resp); err != nil {
+		return nil, fmt.Errorf("relay: record receipt: %w", err)
+	}
+	return fills, nil
+}
+
+// relayAck performs one idempotent place/cancel relay (no fills to settle). Same
+// durable receipt discipline as relaySubmit; the ack is recorded for provenance.
+func (vm *VM) relayAck(ctx context.Context, blockHash ids.ID, r plannedRelay) error {
+	if _, found, err := vm.state.GetReceipt(blockHash, r.txIndex); err != nil {
 		return fmt.Errorf("relay: receipt check: %w", err)
 	} else if found {
 		return nil
 	}
-
-	resp, err := vm.relay.Relay(ctx, tx.Method, tx.Payload)
+	if err := vm.state.RecordRelayIntent(blockHash, r.txIndex); err != nil {
+		return fmt.Errorf("relay: record intent: %w", err)
+	}
+	resp, err := vm.relay.Relay(ctx, r.method, r.payload)
 	if err != nil {
-		return fmt.Errorf("relay: %w", err)
+		return fmt.Errorf("relay %s: %w", r.method, err)
 	}
-
-	// Only clob_submit returns settleable fills; place/cancel return an ack the
-	// proxy records but does not settle (the resting maker is settled when taken).
-	if tx.Method == ZAPMethodSubmit {
-		fills, derr := DecodeFills(resp)
-		if derr != nil {
-			return fmt.Errorf("relay: decode fills: %w", derr)
-		}
-		if err := vm.settleFromFills(tx.Sender(), tx.CollateralRef, fills, result.atomic); err != nil {
-			return fmt.Errorf("relay: settle: %w", err)
-		}
-		if err := vm.recordReceipt(blockHash, txIndex, resp); err != nil {
-			return fmt.Errorf("relay: record receipt: %w", err)
-		}
-	}
-	return nil
+	return vm.recordReceipt(blockHash, r.txIndex, resp)
 }
 
-// executePlaceOrder forwards a thin place-order envelope to the d-chain. It
-// rests a maker limit order; the maker is settled when taken (no immediate
-// fills to settle here). The proxy forwards a byte-identical clob_place frame.
-func (vm *VM) executePlaceOrder(ctx context.Context, tx *txs.PlaceOrderTx, blockHash ids.ID, txIndex uint32, result *BlockResult) error {
-	payload := encodeCLOBPlace(tx)
-	if _, err := vm.relay.Relay(ctx, ZAPMethodPlace, payload); err != nil {
-		return fmt.Errorf("place: %w", err)
+// settleCarried turns the block-CARRIED fills into export legs at ACCEPT. It is a
+// PURE DETERMINISTIC FUNCTION of (planned relays, carried fills, escrow state):
+// it performs NO d-chain I/O, so it runs identically on every validator and yields
+// byte-identical export UTXO keys => identical StateRoot (RED finding #9).
+//
+// For each planned settling submit it looks up the carried fills bound to that
+// txIndex and settles them via settleFromFills (unchanged: directional rounding,
+// spent>locked refused, escrow consumed once). An absent or empty carried entry
+// settles a full refund of the locked collateral — the conservation-safe default
+// when the proposer carried no fills (a failed build relay, or a non-settling
+// block). A per-settle refusal (e.g. a lying proposer's spent>locked) is LOGGED
+// and SKIPPED, leaving the escrow intact and recoverable — never fatal to the
+// block, and bounded to that one taker's collateral.
+func (vm *VM) settleCarried(result *BlockResult, ar *atomicRequests) {
+	for _, r := range result.relays {
+		if !r.settle {
+			continue
+		}
+		fills, _ := fillsForTx(result.carriedFills, r.txIndex)
+		if err := vm.settleFromFills(r.sender, r.collateralRef, fills, result.blockHash, r.txIndex, ar); err != nil {
+			if !vm.log.IsZero() {
+				vm.log.Warn("Proxy settle from carried fills failed (collateral remains escrowed)",
+					"txIndex", r.txIndex, "error", err)
+			}
+		}
 	}
-	return nil
-}
-
-// executeCancelOrder forwards a thin cancel envelope. The d-chain authenticates
-// the cancel against the resting order's maker — the proxy only routes it.
-func (vm *VM) executeCancelOrder(ctx context.Context, tx *txs.CancelOrderTx) error {
-	payload := make([]byte, 40)
-	copy(payload[0:32], tx.PoolID[:])
-	binary.BigEndian.PutUint64(payload[32:40], tx.OrderID)
-	if _, err := vm.relay.Relay(ctx, ZAPMethodCancel, payload); err != nil {
-		return fmt.Errorf("cancel: %w", err)
-	}
-	return nil
 }
 
 // settleFromFills derives the taker's export output from the d-chain's
@@ -465,70 +727,196 @@ func (vm *VM) executeCancelOrder(ctx context.Context, tx *txs.CancelOrderTx) err
 // fill, never a client-supplied number) and accumulates it as an export leg
 // back to C-Chain.
 //
-// VALUE CONSERVATION (RED C4): a CLOB fill moves value in ONE direction — the
-// taker pays the asset it locked on the import leg and RECEIVES the opposite
-// asset. So the export credits ONLY the received leg, never both:
-//   - taker BUY  (side 0): pays quote (already locked on import), receives base
-//     = sum(size).
-//   - taker SELL (side 1): pays base (already locked on import), receives quote
-//     = sum(price*size).
-// Crediting both legs would mint value; this single-leg credit conserves it —
-// total out (received) <= total in (locked collateral), the difference being the
-// unfilled IOC remainder (refunded as the same asset that was locked).
+// VALUE CONSERVATION (RED C4): the proxy must return EVERY locked unit — as
+// proceeds or as a refund — so value_in == value_out exactly. A CLOB fill moves
+// value in one direction: the taker pays the asset it locked on import and
+// RECEIVES the opposite asset. The settle therefore exports TWO legs:
 //
-// Every total is an integer-exact sum over positive-finite fills (DecodeFills
-// guarantees positivity). The proxy never mints.
-func (vm *VM) settleFromFills(taker ids.ShortID, collateralRef ids.ID, fills []Fill, ar *atomicRequests) error {
-	if len(fills) == 0 {
-		return nil // nothing filled; collateral refunded via the IOC-remainder path
-	}
-	takerSide := fills[0].Side
-	var base, quote uint64
-	for _, f := range fills {
-		b := uint64(f.Size)
-		q := uint64(f.Price * f.Size)
-		// Overflow guard — a conserving fill stream cannot exceed uint64 totals
-		// for any real market; refuse rather than wrap.
-		if base+b < base || quote+q < quote {
-			return errors.New("settle: notional overflow")
-		}
-		base += b
-		quote += q
+//	PROCEEDS leg — the received (opposite) asset:
+//	  - taker BUY  (side 0): receives base  = sum(size).
+//	  - taker SELL (side 1): receives quote = sum(price*size).
+//	REFUND leg — the unfilled remainder of the LOCKED asset:
+//	  - taker BUY  locked quote; spent = sum(price*size); refund = locked - spent.
+//	  - taker SELL locked base;  spent = sum(size);       refund = locked - spent.
+//
+// Crediting only the proceeds leg (the prior behavior) DESTROYED the unfilled
+// remainder on every partial/zero fill. The refund leg closes that leak: the
+// locked-collateral amount comes from the escrow recorded at import, the spent
+// amount from the confirmed fills, and refund = locked - spent is exported in
+// the SAME asset that was locked. The escrow is consumed so it cannot be
+// refunded twice. With no escrow (a relay not backed by a proxy-side import),
+// there is no locked collateral to refund — proceeds only.
+//
+// FRACTIONAL-NOTIONAL ROUNDING (RED escrow-truncation mint): fills cross the ZAP
+// wire as float64, so base = sum(size) and quote = sum(price*size) are generally
+// FRACTIONAL while on-chain value moves in integer asset units. The float->uint
+// conversion is ASYMMETRIC by purpose, to preserve "the proxy never mints"
+// (atomic.go quantToCredit/quantToCharge):
+//   - PROCEEDS (the opposite asset the taker RECEIVES) round DOWN — never credit
+//     a unit that was not realized.
+//   - SPENT (the locked asset consumed, which REDUCES the refund) round UP —
+//     never UNDERstate spend. Understating spend is exactly this bug: a BUY's
+//     spent = floor(notional) inflates refund = locked - spent, so the taker
+//     keeps the base proceeds AND a refund larger than the true unspent quote =>
+//     quote minted out of escrow.
+//
+// Totals are summed over the fills ONCE as exact floats, then rounded ONCE at the
+// asset boundary. The prior per-fill uint64(price*size) truncated DOWN on every
+// fill and summed the error: 100 fills of notional 0.99 recorded spent=0 and
+// refunded the entire lock. Aggregate ceiling gives spent=ceil(99.0)=99, so the
+// refund is capped at the true unspent value — no extraction. spent > locked is
+// still refused (minting against the proxy's own escrow).
+//
+// DETERMINISM (RED split): the export this settle constructs is reconstructed
+// independently on every validator, so its shared-memory UTXO keys MUST be a
+// pure function of consensus-agreed inputs. The settlement export is therefore
+// built via NewSettlementExportTx seeded by (blockHash, txIndex) — the SAME
+// coordinate that keys the idempotency receipt — never by wall-clock time. A
+// time.Now() in the export identity would make deriveUTXOID(tx.ID(), i) differ
+// per node and split the atomic commit on accept.
+func (vm *VM) settleFromFills(taker ids.ShortID, collateralRef ids.ID, fills []Fill, blockHash ids.ID, txIndex uint32, ar *atomicRequests) error {
+	// Resolve the locked collateral this settle must conserve. Absent escrow =>
+	// nothing locked on the proxy side; fall back to proceeds-only settlement.
+	lockedAsset, locked, haveEscrow, err := vm.state.GetEscrow(collateralRef)
+	if err != nil {
+		return fmt.Errorf("settle: escrow lookup: %w", err)
 	}
 
-	// Credit ONLY the asset the taker received (single-leg conservation). The
-	// received-asset id is derived from the collateral ref's opposite leg so the
-	// C-Chain side maps it to the real ERC-20. CollateralRef binds the settlement
-	// to the import that locked the value (audit + replay-idempotency).
-	var received txs.AtomicOutput
-	if takerSide == 0 { // BUY: receives base
-		received = txs.AtomicOutput{Owner: taker, Asset: assetFromRef(collateralRef, 0), Amount: base}
-	} else { // SELL: receives quote
-		received = txs.AtomicOutput{Owner: taker, Asset: assetFromRef(collateralRef, 1), Amount: quote}
+	// Taker side: from the fills if any, else (zero-fill) from the locked-asset
+	// identity recorded at import so a fully-unfilled order still refunds. A single
+	// marketable submit takes exactly ONE side, so fills[0].Side governs the whole
+	// stream. Per-fill side validity (0=BUY, 1=SELL) is a WIRE property enforced at
+	// the boundary (DecodeFills); this defensive re-check covers callers that build
+	// fills directly (tests) and keeps settle self-protecting at the policy edge.
+	takerSide := uint8(0)
+	if len(fills) > 0 {
+		takerSide = fills[0].Side
 	}
-	tx := txs.NewExportTx(taker, 0, vm.cChainID(), nonZeroOutputs([]txs.AtomicOutput{received}), collateralRef)
+	if takerSide > 1 {
+		return fmt.Errorf("settle: invalid taker side %d", takerSide)
+	}
+
+	// Aggregate the fill totals ONCE as exact floats (base = sum(size), quote =
+	// sum(price*size)). Rounding to integer asset units happens later, in the
+	// direction proper to each leg — NOT per-fill, which would truncate DOWN on
+	// every fill and sum a directional leak (the escrow-truncation mint).
+	//
+	// SINGLE-SIDE GUARD (RED mixed-side over-credit): the proceeds/spent split
+	// below applies ONE direction (takerSide) to the WHOLE aggregate, so a fill
+	// stream that mixes sides would be credited as if every fill took takerSide —
+	// minting the opposite-side volume (a lying/MITM backend returns [BUY 10,
+	// SELL 1000] and the proxy credits base = 1010). A submit cannot legitimately
+	// fill both sides; refuse the stream rather than over-credit.
+	var baseFloat, quoteFloat float64
+	for _, f := range fills {
+		if f.Side != takerSide {
+			return fmt.Errorf("settle: mixed-side fills (fill side %d != taker side %d)", f.Side, takerSide)
+		}
+		baseFloat += f.Size
+		quoteFloat += f.Price * f.Size
+	}
+
+	// Directional rounding by purpose (atomic.go): a RECEIVED quantity rounds DOWN
+	// (never over-credit); a SPENT quantity rounds UP (never inflate the refund).
+	// BUY  receives base, spends quote. SELL receives quote, spends base.
+	var proceeds uint64 // the opposite asset the taker receives
+	var spent uint64    // the locked asset consumed (reduces the refund)
+	if takerSide == 0 { // BUY
+		if proceeds, err = quantToCredit(baseFloat); err != nil {
+			return err
+		}
+		if spent, err = quantToCharge(quoteFloat); err != nil {
+			return err
+		}
+	} else { // SELL
+		if proceeds, err = quantToCredit(quoteFloat); err != nil {
+			return err
+		}
+		if spent, err = quantToCharge(baseFloat); err != nil {
+			return err
+		}
+	}
+
+	outs := make([]txs.AtomicOutput, 0, 2)
+
+	// PROCEEDS leg — the opposite asset the taker received (ref-derived routing
+	// handle; the C-Chain side maps it to the real ERC-20).
+	if takerSide == 0 { // BUY: receives base
+		outs = append(outs, txs.AtomicOutput{Owner: taker, Asset: assetFromRef(collateralRef, 0), Amount: proceeds})
+	} else { // SELL: receives quote
+		outs = append(outs, txs.AtomicOutput{Owner: taker, Asset: assetFromRef(collateralRef, 1), Amount: proceeds})
+	}
+
+	// REFUND leg — the unfilled remainder of the locked asset.
+	if haveEscrow {
+		// A settle can never consume more than was locked; that would be the
+		// proxy minting against its own escrow. Refuse rather than underflow.
+		if spent > locked {
+			return fmt.Errorf("settle: spent %d exceeds locked collateral %d (would mint)", spent, locked)
+		}
+		if refund := locked - spent; refund > 0 {
+			outs = append(outs, txs.AtomicOutput{Owner: taker, Asset: lockedAsset, Amount: refund})
+		}
+		// Consume the escrow exactly once — the locked collateral is now fully
+		// accounted for (proceeds + refund) and must not be refundable again.
+		if err := vm.state.ConsumeEscrow(collateralRef); err != nil {
+			return fmt.Errorf("settle: consume escrow: %w", err)
+		}
+	}
+
+	outs = nonZeroOutputs(outs)
+	if len(outs) == 0 {
+		// Nothing realized and nothing locked — no value to move. (Both proceeds
+		// and refund were zero, e.g. a zero-fill with no escrow.)
+		return nil
+	}
+	// Deterministic settlement identity: seed CreatedAt from the block hash (a
+	// consensus-agreed value, NOT wall-clock) and the txIndex via Nonce. Every
+	// validator that replays this block builds byte-identical export wire bytes,
+	// so tx.ID() — and every export UTXO key derived from it — is identical
+	// network-wide. This is the fix for the time.Now() shared-memory-key split.
+	createdAt := int64(binary.BigEndian.Uint64(blockHash[:8]))
+	tx := txs.NewSettlementExportTx(taker, txIndex, vm.cChainID(), outs, collateralRef, createdAt)
 	return vm.executeExport(tx, ar)
 }
 
 // recordReceipt stores the relay receipt binding (blockHash, txIndex) to the
-// fills hash — the replay-idempotency witness.
-func (vm *VM) recordReceipt(blockHash ids.ID, txIndex uint32, fillsWire []byte) error {
+// hash of the d-chain's response — the replay-idempotency witness. The response
+// is a clob_submit fills frame, or a clob_place / clob_cancel ack; the witness
+// is the same primitive either way (one relay per (blockHash, txIndex)).
+func (vm *VM) recordReceipt(blockHash ids.ID, txIndex uint32, respWire []byte) error {
 	return vm.state.PutReceipt(&dexstate.Receipt{
 		BlockHash: blockHash,
 		TxIndex:   txIndex,
-		FillsHash: ids.ID(sha256.Sum256(fillsWire)),
+		RespHash:  ids.ID(sha256.Sum256(respWire)),
 	})
 }
 
-// acceptBlock commits a verified block: it writes the proxy's state batch
-// ATOMICALLY with the cross-chain shared-memory operations accumulated during
-// ProcessBlock. This is the single commit point, modeled byte-for-byte on the
-// platformvm acceptor (defer Abort -> CommitBatch -> sm.Apply(reqs, batch)).
+// acceptBlock is the proxy's SINGLE COMMIT POINT — and, by the RED #9 fix, a
+// PURE DETERMINISTIC FUNCTION of the block (it performs NO d-chain I/O; the relay
+// already happened once at the proposer's build, and the fills are carried in the
+// block bytes). It commits the C-side settlement atomically with the proxy state:
 //
-// Atomicity-or-reversal: sm.Apply writes the state batch and the shared-memory
-// requests in one atomic DB commit, so a failed settle leaves NO committed
-// state and a d-side fill can never strand without its C-side credit.
-func (vm *VM) acceptBlock(result *BlockResult) error {
+//  1. settleCarried — turn the block-CARRIED fills into export legs (settle from
+//     bytes, never from a fresh relay). Runs identically on every validator, so
+//     the export keys — and the root — are byte-identical network-wide. A node
+//     never relays here, so two validators can no longer diverge on per-call fills
+//     (the per-validator-relay fork is structurally impossible).
+//  2. CommitBatch — snapshot every versiondb write made during Verify (consumed
+//     UTXOs, escrow) AND during step 1 (escrow-consume).
+//  3. commitAtomic — apply that state batch together with the cross-chain
+//     requests (import removes from Verify + export puts from step 1) in one
+//     atomic shared-memory commit (the platformvm acceptor pattern).
+//
+// Atomicity-or-reversal: the C-side credit and the escrow-consume land in the same
+// atomic apply, so a settle never half-applies. A Rejected block reaches a plain
+// db.Abort (Reject) and commits nothing on the C-side. (The d-chain relay for a
+// rejected block happened at the proposer's build and is the documented, bounded
+// proposer-trust cost — see carried_fills.go.)
+func (vm *VM) acceptBlock(ctx context.Context, result *BlockResult) error {
+	vm.lock.Lock()
+	defer vm.lock.Unlock()
+
 	if vm.db == nil {
 		return nil
 	}
@@ -536,6 +924,29 @@ func (vm *VM) acceptBlock(result *BlockResult) error {
 	if result != nil && result.atomic != nil {
 		ar = result.atomic
 	}
+
+	// Settle from the block-carried fills now (deterministic; NO d-chain I/O),
+	// accumulating settlement exports into ar and consuming escrow in the versiondb
+	// in-memory layer that CommitBatch is about to snapshot.
+	if result != nil {
+		vm.settleCarried(result, ar)
+	}
+
+	// FINAL root: recompute over the post-accept state — escrow consumed by the
+	// settle and the settlement EXPORT legs now present in ar (neither existed at
+	// Verify, which only staged the imports). Because settleCarried is a pure
+	// function of the carried fills, two validators processing the same block bytes
+	// reach the IDENTICAL post-accept state and ar, hence the identical root. The
+	// versiondb in-memory layer still holds these writes (CommitBatch has not run
+	// yet), so the walk sees them.
+	if result != nil {
+		root, err := vm.computeStateRoot(result.blockHash, result)
+		if err != nil {
+			return err
+		}
+		result.StateRoot = root
+	}
+	_ = ctx
 
 	// Abort clears the versiondb's in-memory layer after the batch is written by
 	// Apply/Write (the platformvm defer-Abort pattern).
@@ -547,17 +958,52 @@ func (vm *VM) acceptBlock(result *BlockResult) error {
 	return vm.commitAtomic(ar, batch)
 }
 
-// computeStateRoot computes a merkle root over the proxy's deterministic state.
-// The proxy holds tiny state (replay nonces, receipts, consumed UTXOs); the
-// root binds the last block hash + height so replaying the same block yields
-// the same root on every node.
-func (vm *VM) computeStateRoot(blockHash ids.ID) ids.ID {
+// computeStateRoot computes the block's StateRoot as a FAITHFUL commitment to
+// the proxy's mutated state — not just an identifier of the block. It folds
+// together, in fixed order:
+//
+//  1. blockHash + height — the consensus binding (kept from the original root).
+//  2. state.StateHash()  — every persisted key/value: the consumed-UTXO set,
+//     collateral escrow, replay nonces, relay receipts, last-block pointer.
+//  3. result.atomic      — the cross-chain operations this block produces (the
+//     import UTXO removes and export UTXO puts that move value across chains).
+//
+// Because (2) and (3) are the ACTUAL state and the ACTUAL settlement output,
+// two nodes that genuinely diverge — one consumed an escrow / committed an
+// import+export, a peer whose relay failed committed no cross-chain op — can no
+// longer emit an identical root: the divergent escrow/receipt key (2) or the
+// missing export leg (3) changes the digest. A matching blockHash is no longer
+// sufficient to forge a matching root, so the root-based safety check actually
+// witnesses real divergence.
+//
+// It returns an error only if the state walk fails (a corrupt/closed DB);
+// callers treat that as a block-processing failure rather than silently
+// committing an unverifiable root.
+func (vm *VM) computeStateRoot(blockHash ids.ID, result *BlockResult) (ids.ID, error) {
 	h := sha256.New()
+
 	h.Write(blockHash[:])
 	var heightBuf [8]byte
 	binary.BigEndian.PutUint64(heightBuf[:], vm.currentBlockHeight)
 	h.Write(heightBuf[:])
-	return ids.ID(h.Sum(nil))
+
+	// (2) Every persisted key/value (consumed-UTXO set, escrow, replay nonces,
+	// relay receipts, last-block pointer) via the state's own deterministic walk.
+	stateHash, err := vm.state.StateHash()
+	if err != nil {
+		return ids.Empty, fmt.Errorf("compute state root: %w", err)
+	}
+	h.Write(stateHash[:])
+
+	// (3) The cross-chain operations this block produces — the import UTXO removes
+	// accumulated at Verify and the export UTXO puts appended at accept. These are
+	// the block's OTHER mutated output (alongside persisted state); a node whose
+	// relay failed accumulates no export leg, so this fold is what makes its root
+	// differ from a peer that settled. nil-safe for blocks with no atomic legs.
+	if result != nil && result.atomic != nil {
+		result.atomic.hashInto(h)
+	}
+	return ids.ID(h.Sum(nil)), nil
 }
 
 // Shutdown implements consensuscore.VM.
