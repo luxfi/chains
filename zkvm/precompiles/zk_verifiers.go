@@ -44,6 +44,10 @@ var (
 	errProofInvalid        = errors.New("proof verification failed")
 	errNotImplemented      = errors.New("verifier not yet available")
 	errVerifierUnavailable = errors.New("strict-PQ STARK verifier binding not registered (build with -tags starkfri_p3q); failing closed")
+	// errClassicalForbiddenStrictPQ is returned by the cross-chain router
+	// when a strict-PQ chain attempts to route a classical (Groth16/PLONK)
+	// verification. On a strict-PQ chain only the STARK/FRI path is allowed.
+	errClassicalForbiddenStrictPQ = errors.New("strict-PQ chain: classical Groth16/PLONK verification forbidden, use STARK/FRI (0x82)")
 )
 
 // result bytes returned by precompiles
@@ -442,25 +446,38 @@ func verifyGroth16(proof *groth16Proof, vk *groth16VK, witness []fr.Element) err
 	return nil
 }
 
-// verifyPLONK verifies a PLONK proof. Uses KZG commitment verification
-// with bn254 pairings. The proof structure follows the standard PLONK protocol
-// with linearization optimization.
-//
-// Proof format: 7 G1 commitments (7*64=448 bytes) + opening evaluations
-// VK format: KZG SRS G2 point (128 bytes) + circuit commitments
-func verifyPLONK(vkBytes, proofBytes, inputBytes []byte) error {
-	// PLONK verification requires:
-	// 1. Parse VK: SRS G2, selector commitments, permutation commitments
-	// 2. Parse proof: wire commitments, quotient, opening proof, shifted opening
-	// 3. Compute challenges via Fiat-Shamir transcript
-	// 4. Verify KZG opening proofs via pairing check
+// errPLONKVerifierIncomplete is returned by verifyPLONK because the full
+// PLONK verification equation (linearization-polynomial reconstruction +
+// Fiat-Shamir challenge derivation + public-input binding) is not
+// implemented here. It FAILS CLOSED rather than universal-accept: a
+// previous version computed a self-cancelling pairing e(W, srsG2)·e(-W, g2)
+// (always 1), discarded the result, ignored the public inputs, and
+// returned nil (valid) for ANY >=544-byte blob — a total verification
+// bypass (Red H4). PLONK is a classical (quantum-breakable) system that is
+// gated off on strict-PQ Lux chains (it is not registered there — see
+// RegisterZKPrecompiles), so failing-closed here is the safe posture: the
+// PLONKVerifier precompile now NEVER accepts a proof until a real,
+// public-input-bound PLONK verifier is wired in.
+var errPLONKVerifierIncomplete = errors.New(
+	"plonk: full verifier not implemented — failing closed (no universal-accept); " +
+		"PLONK is gated off strict-PQ chains, use the STARK/FRI verifier (0x82)")
 
+// verifyPLONK fails closed. It performs structural parsing (lengths +
+// on-curve / subgroup checks, which are cheap and let callers distinguish
+// a malformed proof from a non-verifying one) and then returns
+// errPLONKVerifierIncomplete WITHOUT ever returning nil — there is no
+// path through this function that accepts a proof.
+//
+// Proof format: 7 G1 commitments (7*64=448 bytes) + opening evaluations.
+// VK format: KZG SRS G2 point (128 bytes) + circuit commitments.
+func verifyPLONK(vkBytes, proofBytes, inputBytes []byte) error {
 	// Minimum: 7 G1 points (448 bytes) + 3 scalars (96 bytes) = 544 bytes
 	if len(proofBytes) < 544 {
 		return errInputTooShort
 	}
 
-	// Parse the 7 G1 commitments from proof
+	// Structural parse: 7 G1 commitments must be well-formed on-curve
+	// prime-order points.
 	var commitments [7]bn254.G1Affine
 	for i := range commitments {
 		off := i * 64
@@ -472,14 +489,7 @@ func verifyPLONK(vkBytes, proofBytes, inputBytes []byte) error {
 		}
 	}
 
-	// Parse opening evaluations (3 field elements at offset 448)
-	var evals [3]fr.Element
-	for i := range evals {
-		off := 448 + i*32
-		evals[i].SetBytes(proofBytes[off : off+32])
-	}
-
-	// VK must contain at least the SRS G2 point (128 bytes)
+	// VK must contain at least the SRS G2 point (128 bytes), well-formed.
 	if len(vkBytes) < 128 {
 		return errInputTooShort
 	}
@@ -491,26 +501,9 @@ func verifyPLONK(vkBytes, proofBytes, inputBytes []byte) error {
 		return fmt.Errorf("SRS G2: %w", errSubgroupCheck)
 	}
 
-	// KZG batch opening check: e(W, [x]_2) == e([f(z)] - [v]*[1], [1]_2)
-	// Using commitments[5] as opening proof W and commitments[6] as shifted opening
-	_, _, _, g2 := bn254.Generators()
-
-	var negW bn254.G1Affine
-	negW.Neg(&commitments[5])
-
-	ok, err := bn254.PairingCheck(
-		[]bn254.G1Affine{commitments[5], negW},
-		[]bn254.G2Affine{srsG2, g2},
-	)
-	if err != nil {
-		return errPairingFailed
-	}
-	// The actual PLONK verification is more involved — this pairing check
-	// validates the KZG opening structure. Full linearization polynomial
-	// construction and Fiat-Shamir challenge derivation require the complete
-	// circuit description from the VK, which is verified above structurally.
-	_ = ok
 	_ = inputBytes
 
-	return nil
+	// Structure is well-formed, but the full PLONK check is not
+	// implemented. Fail closed — NEVER return nil for an unverified proof.
+	return errPLONKVerifierIncomplete
 }
