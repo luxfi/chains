@@ -341,17 +341,26 @@ func (pv *ProofVerifier) verifyPublicInputs(tx *Transaction) error {
 }
 
 // loadVerifyingKeys loads verifying keys for different circuit types.
-// After loading, checks whether keys are all zeros (dummy). If so,
-// sets dummyKeys=true which causes VerifyProof to reject all proofs.
+// Real (non-dummy) keys come from ZConfig.VerifyingKeys when supplied;
+// otherwise all-zero dummy keys are installed (proof verification
+// disabled, fail-closed). After loading, checks whether keys are all
+// zeros (dummy). If so, sets dummyKeys=true which causes VerifyProof to
+// reject all proofs.
 func (pv *ProofVerifier) loadVerifyingKeys() error {
-	// Transfer circuit verifying key
-	pv.verifyingKeys[string(TransactionTypeTransfer)] = make([]byte, 1024)
-
-	// Shield circuit verifying key
-	pv.verifyingKeys[string(TransactionTypeShield)] = make([]byte, 1024)
-
-	// Unshield circuit verifying key
-	pv.verifyingKeys[string(TransactionTypeUnshield)] = make([]byte, 1024)
+	// Install a key per circuit type. If the config supplies a real key
+	// for that circuit, use it (copied so the verifier owns its bytes);
+	// otherwise install an all-zero dummy key.
+	for _, ct := range []TransactionType{
+		TransactionTypeTransfer,
+		TransactionTypeShield,
+		TransactionTypeUnshield,
+	} {
+		if vk, ok := pv.config.VerifyingKeys[string(ct)]; ok && len(vk) > 0 {
+			pv.verifyingKeys[string(ct)] = append([]byte(nil), vk...)
+			continue
+		}
+		pv.verifyingKeys[string(ct)] = make([]byte, 1024)
+	}
 
 	// Detect dummy (all-zero) verifying keys
 	pv.dummyKeys = true
