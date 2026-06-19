@@ -116,11 +116,35 @@ func (a *atomicRequests) hashInto(h hash.Hash) {
 //
 // Mirrors platformvm standard_tx_executor.go:285 ImportTx — Consume the source
 // UTXOs via a shared-memory RemoveRequest keyed by the source chain.
+//
+// ASSET BIND (the native-aliasing fix): an import credits the ledger with the
+// asset of the UTXO it ACTUALLY consumes, never an asset it merely declares. The
+// consumed UTXO's recorded value (owner|asset|amount, written by the export side
+// via encodeExportedOutput) is read back from shared memory and is authoritative:
+// the declared input asset/amount MUST equal the recorded asset/amount, every
+// consumed UTXO must be the SAME asset, and every credited output must name that
+// asset. Composed with ImportTx.Verify (output.Asset == input.Asset), the credit
+// is provably the consumed asset — so a bogus-token UTXO cannot be imported as
+// native value. (When the runtime has no shared memory — single-chain test mode —
+// there is no real cross-chain UTXO to read or alias; the structural Verify bind
+// still holds.)
 func (vm *VM) executeImport(tx *txs.ImportTx, ar *atomicRequests) error {
 	if err := tx.Verify(); err != nil {
 		return fmt.Errorf("import verify: %w", err)
 	}
 
+	sm := vm.sharedMemory()
+	var (
+		importedAsset ids.ID
+		importedOwner ids.ShortID
+		haveAsset     bool
+	)
+	// PASS 1 — VALIDATE every input + output with NO state mutation. The import is
+	// atomic: a rejection on ANY input/output bind must leave the consumed-set
+	// UNTOUCHED, so MarkConsumed is deferred to pass 2 below. (A bind failure after
+	// MarkConsumed would burn the UTXO on a rejected import, blocking the rightful
+	// owner's later claim — the all-or-nothing discipline the conservation invariant
+	// requires.)
 	utxoIDs := make([][]byte, 0, len(tx.ImportedInputs))
 	for _, in := range tx.ImportedInputs {
 		// Double-spend guard: a UTXO already consumed by a prior import cannot
@@ -133,11 +157,71 @@ func (vm *VM) executeImport(tx *txs.ImportTx, ar *atomicRequests) error {
 		if consumed {
 			return fmt.Errorf("import: %w: %s", errUTXOAlreadyImported, in.UTXOID)
 		}
-		if err := vm.state.MarkConsumed(in.UTXOID); err != nil {
-			return fmt.Errorf("import: mark consumed: %w", err)
+		// Bind the declared input to the UTXO the chain ACTUALLY holds. The remove
+		// has not been applied yet (it commits at accept), so the recorded value is
+		// still readable here. A UTXO that does not exist in shared memory errors —
+		// the proxy never credits an unbacked input.
+		if sm != nil {
+			id := in.UTXOID
+			vals, gerr := sm.Get(tx.SourceChain, [][]byte{id[:]})
+			if gerr != nil {
+				return fmt.Errorf("import: read source UTXO %s: %w", in.UTXOID, gerr)
+			}
+			recOwner, recAsset, recAmount, ok := decodeExportedOutput(vals[0])
+			if !ok {
+				return fmt.Errorf("import: UTXO %s: %w", in.UTXOID, errImportUTXOValueMalformed)
+			}
+			if in.Asset != recAsset {
+				return fmt.Errorf("import: UTXO %s: %w (declared %s, recorded %s)", in.UTXOID, errImportAssetMismatch, in.Asset, recAsset)
+			}
+			if in.Amount != recAmount {
+				return fmt.Errorf("import: UTXO %s: %w (declared %d, recorded %d)", in.UTXOID, errImportAmountMismatch, in.Amount, recAmount)
+			}
+			if !haveAsset {
+				importedAsset = recAsset
+				importedOwner = recOwner
+				haveAsset = true
+			} else {
+				if importedAsset != recAsset {
+					return fmt.Errorf("import: %w", errImportMixedAssets)
+				}
+				// Every consumed UTXO must share ONE recorded owner: a deposit credits
+				// one (owner,asset) ledger row, and mixing owners would let one UTXO's
+				// owner authorize spending another's value.
+				if importedOwner != recOwner {
+					return fmt.Errorf("import: %w (UTXO %s owner %s != %s)", errImportWrongOwner, in.UTXOID, recOwner, importedOwner)
+				}
+			}
 		}
 		id := in.UTXOID
 		utxoIDs = append(utxoIDs, id[:])
+	}
+
+	// Every credited output must be denominated in the asset actually consumed AND
+	// owned by the consumed UTXO's recorded owner — the authoritative half of the
+	// native-aliasing bind (asset axis; the structural output==input half is also
+	// pinned in ImportTx.Verify) and the owner-aliasing bind (owner axis; an attacker
+	// must not consume a victim's exported UTXO and credit it to their own account).
+	// Skipped only when no shared memory was read (single-chain test mode), where
+	// Verify's structural bind already holds (and there is no real cross-chain UTXO
+	// to alias).
+	if haveAsset {
+		for _, o := range tx.Outputs {
+			if o.Asset != importedAsset {
+				return fmt.Errorf("import: %w (output %s, consumed %s)", errImportOutputAsset, o.Asset, importedAsset)
+			}
+			if o.Owner != importedOwner {
+				return fmt.Errorf("import: %w (output owner %s, consumed %s)", errImportWrongOwner, o.Owner, importedOwner)
+			}
+		}
+	}
+
+	// PASS 2 — COMMIT: all binds passed, so mark every consumed UTXO now (the import
+	// is accepted as a whole). After this point the import cannot fail.
+	for _, in := range tx.ImportedInputs {
+		if err := vm.state.MarkConsumed(in.UTXOID); err != nil {
+			return fmt.Errorf("import: mark consumed: %w", err)
+		}
 	}
 
 	// Accumulate the atomic remove against the source chain. Applied with the
@@ -252,14 +336,37 @@ func deriveUTXOID(txID ids.ID, index uint32) ids.ID {
 	return ids.ID(idHash(buf[:]))
 }
 
+// exportedOutputSize is the fixed shared-memory UTXO value width: owner(20) |
+// asset(32) | amount(8).
+const exportedOutputSize = 20 + 32 + 8
+
 // encodeExportedOutput serializes an AtomicOutput as the shared-memory value:
 // owner(20) | asset(32) | amount(8). Fixed-width, deterministic.
 func encodeExportedOutput(out txs.AtomicOutput) []byte {
-	v := make([]byte, 20+32+8)
+	v := make([]byte, exportedOutputSize)
 	copy(v[0:20], out.Owner[:])
 	copy(v[20:52], out.Asset[:])
 	binary.BigEndian.PutUint64(v[52:60], out.Amount)
 	return v
+}
+
+// decodeExportedOutput is the inverse of encodeExportedOutput: it reads back the
+// (owner, asset, amount) a consumed source UTXO RECORDED in shared memory.
+// executeImport uses this to bind the credited asset AND owner to the value the
+// chain actually holds for that UTXO — not the asset/owner the importing tx merely
+// declares — so a bogus-token UTXO can never be imported as native value (the
+// native-aliasing fix) and a victim's exported UTXO can never be credited to an
+// attacker's account (the owner-aliasing fix). ok=false for any value that is not
+// exactly the canonical width, so a corrupt/garbage record is never reinterpreted
+// into a credit.
+func decodeExportedOutput(v []byte) (owner ids.ShortID, asset ids.ID, amount uint64, ok bool) {
+	if len(v) != exportedOutputSize {
+		return ids.ShortEmpty, ids.Empty, 0, false
+	}
+	copy(owner[:], v[0:20])
+	copy(asset[:], v[20:52])
+	amount = binary.BigEndian.Uint64(v[52:60])
+	return owner, asset, amount, true
 }
 
 // float64FromBits reads a big-endian IEEE-754 float64 (the ZAP fill wire codec,

@@ -21,6 +21,7 @@ package dexvm
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"testing"
 
 	"github.com/luxfi/database/memdb"
@@ -43,16 +44,18 @@ import (
 // the real d-chain enforces — sum of balances is conserved across deposit ->
 // trade -> withdraw — so the proxy rail can be proven against a faithful stand-in.
 type ledgerMatcher struct {
-	bal      map[string]uint64 // key = user16 || asset8
+	bal      map[string]uint64 // key = user16 || asset32 (FULL injective id)
 	received [][]byte
 }
 
 func newLedgerMatcher() *ledgerMatcher { return &ledgerMatcher{bal: map[string]uint64{}} }
 
-func ledgerKey(user []byte, asset uint64) string {
-	var a [8]byte
-	binary.BigEndian.PutUint64(a[:], asset)
-	return string(user) + string(a[:])
+// ledgerKey keys the fake D-Chain balance ledger by user[16] || asset[32], the
+// FULL injective cross-chain asset id (native == ids.Empty) — byte-faithful to the
+// real d-chain balance:<user:8><asset:32> keyspace (the asset is keyed at full
+// width so two assets sharing a leading prefix never collide).
+func ledgerKey(user []byte, asset ids.ID) string {
+	return string(user) + string(asset[:])
 }
 
 func (m *ledgerMatcher) Call(_ context.Context, method string, payload []byte) ([]byte, error) {
@@ -60,14 +63,16 @@ func (m *ledgerMatcher) Call(_ context.Context, method string, payload []byte) (
 	switch method {
 	case ZAPMethodDeposit:
 		user := payload[0:16]
-		asset := binary.BigEndian.Uint64(payload[16:24])
-		amount := binary.BigEndian.Uint64(payload[24:32])
+		var asset ids.ID
+		copy(asset[:], payload[16:custodyAmountOff])
+		amount := binary.BigEndian.Uint64(payload[custodyAmountOff:custodyRefOff])
 		m.bal[ledgerKey(user, asset)] += amount
 		return balResp(0, amount), nil // credited exactly
 	case ZAPMethodWithdraw:
 		user := payload[0:16]
-		asset := binary.BigEndian.Uint64(payload[16:24])
-		want := binary.BigEndian.Uint64(payload[24:32])
+		var asset ids.ID
+		copy(asset[:], payload[16:custodyAmountOff])
+		want := binary.BigEndian.Uint64(payload[custodyAmountOff:custodyRefOff])
 		k := ledgerKey(user, asset)
 		realized := want
 		if realized > m.bal[k] {
@@ -93,7 +98,7 @@ func (m *ledgerMatcher) Close() error { return nil }
 // settleFills does. Used by the test to model the cross between the deposit and
 // withdraw legs (the proxy does not trade; the D-Chain does). buyer/seller are
 // the 16-byte frame-form user identities (frameUser).
-func (m *ledgerMatcher) trade(buyer, seller []byte, baseAsset, quoteAsset, base, quote uint64) {
+func (m *ledgerMatcher) trade(buyer, seller []byte, baseAsset, quoteAsset ids.ID, base, quote uint64) {
 	m.bal[ledgerKey(buyer, quoteAsset)] -= quote
 	m.bal[ledgerKey(seller, quoteAsset)] += quote
 	m.bal[ledgerKey(seller, baseAsset)] -= base
@@ -223,23 +228,32 @@ func TestCustodyRailFullCycleConserves(t *testing.T) {
 	}
 
 	// The D-Chain ledger now holds the deposited value.
-	if got := h.ledger.bal[ledgerKey(frameUser(maker), assetHandle(lux))]; got != 100 {
+	if got := h.ledger.bal[ledgerKey(frameUser(maker), lux)]; got != 100 {
 		t.Fatalf("maker LUX in ledger = %d, want 100", got)
 	}
-	if got := h.ledger.bal[ledgerKey(frameUser(taker), assetHandle(lusd))]; got != 1000 {
+	if got := h.ledger.bal[ledgerKey(frameUser(taker), lusd)]; got != 1000 {
 		t.Fatalf("taker LUSD in ledger = %d, want 1000", got)
 	}
 
 	// --- TRADE inside the D-Chain: taker buys 10 LUX @ 5 = 50 LUSD. ---
 	// (The proxy does not trade; the D-Chain matcher does. We model the accepted
 	// block's settleFills moving balances.)
-	h.ledger.trade(frameUser(taker), frameUser(maker), assetHandle(lux), assetHandle(lusd), 10, 50)
+	h.ledger.trade(frameUser(taker), frameUser(maker), lux, lusd, 10, 50)
 
 	// Ledger after trade: maker 90 LUX + 50 LUSD ; taker 10 LUX + 950 LUSD.
 	assertLedger(t, h, maker, lux, 90)
 	assertLedger(t, h, maker, lusd, 50)
 	assertLedger(t, h, taker, lux, 10)
 	assertLedger(t, h, taker, lusd, 950)
+
+	// OWNERSHIP (proxy-boundary mirror of the dchain invariant): every account
+	// holding ledger value must be an EXPLICIT PARTY — the depositor (deposit), the
+	// maker or taker (trade), or the withdrawer (withdraw). No THIRD account ever
+	// holds value. This is the proxy-rail analog of pkg/dchain's ownership harness:
+	// conservation alone (sum unchanged) would not catch value mis-credited to a
+	// non-party (a colliding handle), so we assert the ledger's account set is
+	// exactly the explicit parties. Here both parties are maker+taker.
+	assertOnlyParties(t, h.ledger, frameUser(maker), frameUser(taker))
 
 	// --- WITHDRAW: every account pulls its full realized balance, atomically. ---
 	arW := newAtomicRequests()
@@ -341,14 +355,126 @@ func TestCustodyDepositCreditsExactImport(t *testing.T) {
 	if err := h.vm.executeDeposit(ctx, imp, ar); err != nil {
 		t.Fatalf("deposit: %v", err)
 	}
-	if got := h.ledger.bal[ledgerKey(frameUser(owner), assetHandle(asset))]; got != 777 {
+	if got := h.ledger.bal[ledgerKey(frameUser(owner), asset)]; got != 777 {
 		t.Fatalf("ledger credited %d, want exactly 777", got)
 	}
 }
 
 func assertLedger(t *testing.T, h *custodyHarness, owner ids.ShortID, asset ids.ID, want uint64) {
 	t.Helper()
-	if got := h.ledger.bal[ledgerKey(frameUser(owner), assetHandle(asset))]; got != want {
+	if got := h.ledger.bal[ledgerKey(frameUser(owner), asset)]; got != want {
 		t.Fatalf("ledger owner=%x asset=%x = %d, want %d", owner[:4], asset[:4], got, want)
+	}
+}
+
+// assertOnlyParties is the proxy-boundary OWNERSHIP gate: every account holding a
+// non-zero ledger balance must be one of the supplied EXPLICIT PARTIES (the
+// 16-byte frame-form user identities). A non-zero balance for any other account is
+// value credited to a NON-party — the theft a conservation sum cannot see. The
+// ledger key is user[16]||asset[32], so the account is the leading 16 bytes.
+func assertOnlyParties(t *testing.T, m *ledgerMatcher, parties ...[]byte) {
+	t.Helper()
+	allowed := map[string]struct{}{}
+	for _, p := range parties {
+		allowed[string(p)] = struct{}{}
+	}
+	for k, v := range m.bal {
+		if v == 0 {
+			continue
+		}
+		if len(k) < 16 {
+			t.Fatalf("ledger key too short: %x", []byte(k))
+		}
+		user := k[:16]
+		if _, ok := allowed[user]; !ok {
+			t.Fatalf("OWNERSHIP VIOLATED: account %x holds %d in the ledger but is NOT an explicit party (deposit/trade/withdraw) — value credited to a non-party", []byte(user), v)
+		}
+	}
+}
+
+// TestCustodyWithdraw_DuplicateFillRefRejected pins R2: the proxy WITHDRAW rail
+// consumes the settlement fillRef exactly once, so a duplicate fillRef cannot
+// double-export (a drain) even if the D-Chain ledger still holds a withdrawable
+// balance. This is the proxy-local second line of defense, independent of the
+// D-Chain seen: clamp, and correct regardless of how the proxy BuildBlock rail is
+// later wired. A DIFFERENT fillRef still works (consume-once is per-ref, not a
+// global block).
+func TestCustodyWithdraw_DuplicateFillRefRejected(t *testing.T) {
+	h := newCustodyHarness(t)
+	ctx := context.Background()
+	owner := ids.GenerateTestShortID()
+	asset := ids.GenerateTestID()
+
+	// Fund + deposit 200, so the ledger retains a balance AFTER the first withdraw —
+	// without consume-once, a duplicate-fillRef second withdraw WOULD double-export.
+	u := h.fundCChain(t, owner, asset, 200)
+	arD := newAtomicRequests()
+	imp := txs.NewImportTx(owner, 0, h.cChain,
+		[]txs.AtomicInput{{UTXOID: u, Asset: asset, Amount: 200}},
+		[]txs.AtomicOutput{{Owner: owner, Asset: asset, Amount: 200}})
+	if err := h.vm.executeDeposit(ctx, imp, arD); err != nil {
+		t.Fatalf("deposit: %v", err)
+	}
+	if err := h.vm.commitAtomic(arD, nil); err != nil {
+		t.Fatalf("commit deposit: %v", err)
+	}
+	assertLedger(t, h, owner, asset, 200)
+
+	fillRef := ids.GenerateTestID()
+
+	// Withdraw #1 with fillRef: realized 100, exports 100, consumes the fillRef.
+	ar1 := newAtomicRequests()
+	r1, err := h.vm.executeWithdraw(ctx, owner, asset, 100, h.cChain, fillRef, 0, 1, ar1)
+	if err != nil {
+		t.Fatalf("withdraw #1: %v", err)
+	}
+	if r1 != 100 {
+		t.Fatalf("withdraw #1 realized = %d, want 100", r1)
+	}
+	if err := h.vm.commitAtomic(ar1, nil); err != nil {
+		t.Fatalf("commit withdraw #1: %v", err)
+	}
+	assertLedger(t, h, owner, asset, 100) // 100 still withdrawable
+	if got := h.exportedTo(t, owner); got != 100 {
+		t.Fatalf("exported after #1 = %d, want 100", got)
+	}
+
+	// Withdraw #2 with the SAME fillRef: rejected by consume-once BEFORE the relay,
+	// so it neither debits the ledger again nor exports a second time.
+	ar2 := newAtomicRequests()
+	r2, err := h.vm.executeWithdraw(ctx, owner, asset, 100, h.cChain, fillRef, 1, 1, ar2)
+	if !errors.Is(err, errFillRefAlreadyExported) {
+		t.Fatalf("duplicate-fillRef withdraw err = %v, want errFillRefAlreadyExported", err)
+	}
+	if r2 != 0 {
+		t.Fatalf("duplicate-fillRef withdraw realized = %d, want 0", r2)
+	}
+	if !ar2.empty() {
+		t.Fatal("duplicate-fillRef withdraw accumulated an export — double-export not prevented")
+	}
+	if err := h.vm.commitAtomic(ar2, nil); err != nil {
+		t.Fatalf("commit (empty) withdraw #2: %v", err)
+	}
+	// No double export, and the ledger was NOT re-debited (the duplicate never relayed).
+	assertLedger(t, h, owner, asset, 100)
+	if got := h.exportedTo(t, owner); got != 100 {
+		t.Fatalf("exported after rejected duplicate = %d, want 100 (no double-export)", got)
+	}
+
+	// A DISTINCT fillRef still works: consume-once is per-ref, not a global block.
+	ar3 := newAtomicRequests()
+	r3, err := h.vm.executeWithdraw(ctx, owner, asset, 100, h.cChain, ids.GenerateTestID(), 2, 1, ar3)
+	if err != nil {
+		t.Fatalf("withdraw #3 (distinct fillRef): %v", err)
+	}
+	if r3 != 100 {
+		t.Fatalf("withdraw #3 realized = %d, want 100", r3)
+	}
+	if err := h.vm.commitAtomic(ar3, nil); err != nil {
+		t.Fatalf("commit withdraw #3: %v", err)
+	}
+	assertLedger(t, h, owner, asset, 0)
+	if got := h.exportedTo(t, owner); got != 200 {
+		t.Fatalf("exported after #3 = %d, want 200 (100 + 100, distinct refs)", got)
 	}
 }

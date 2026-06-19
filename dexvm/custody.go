@@ -50,15 +50,6 @@ import (
 // returns nothing to carry (idempotent credit), withdraw returns the realized
 // amount to carry into the export leg.
 
-// assetHandle folds a 32-byte cross-chain asset id to the 8-byte asset handle the
-// D-Chain ledger keys balances by (big-endian over the leading 8 bytes). The same
-// fold MUST be used wherever a balance is credited/debited for an asset, so the
-// deposit and withdraw of one asset agree on its handle. (The D-Chain side keys
-// balance:<user:8><asset:8>; this is the proxy's view of that 8-byte handle.)
-func assetHandle(asset ids.ID) uint64 {
-	return binary.BigEndian.Uint64(asset[:8])
-}
-
 // userHandle renders a 20-byte account address to the 16-byte user identity the
 // frozen CLOB frames carry (the leading 16 bytes of the address, the same width
 // zapwire.UserSize uses). The D-Chain folds this 16-byte user to its 8-byte
@@ -68,24 +59,33 @@ func userHandle(addr ids.ShortID) string {
 	return string(addr[:])
 }
 
-// encodeDepositFrame builds the FROZEN clob_deposit payload: user[16] + asset[8]
-// + amount[8]. Byte-identical with github.com/luxfi/dex/pkg/zapwire.EncodeDeposit
-// (the proxy cannot import the cgo-tagged d-chain package; a parity test pins it).
-func encodeDepositFrame(user string, asset, amount uint64) []byte {
+// encodeDepositFrame builds the FROZEN clob_deposit payload: user[16] + asset[32]
+// + amount[8] + ref[32]. Byte-identical with
+// github.com/luxfi/dex/pkg/zapwire.EncodeDeposit (the proxy cannot import the
+// cgo-tagged d-chain package; the hardcoded-canonical sizes move in lockstep).
+// asset is the FULL 32-byte injective cross-chain id (native == ids.Empty), keyed
+// at full width on the D-Chain ledger so distinct assets never collide. ref is the
+// originating-tx idempotency reference (this rail uses the consumed import's tx id)
+// the D-Chain folds into its seen: dedup key.
+func encodeDepositFrame(user string, asset ids.ID, amount uint64, ref ids.ID) []byte {
 	out := make([]byte, DepositReqSize)
 	copy(out[0:16], padUser(user))
-	binary.BigEndian.PutUint64(out[16:24], asset)
-	binary.BigEndian.PutUint64(out[24:32], amount)
+	copy(out[16:custodyAmountOff], asset[:])
+	binary.BigEndian.PutUint64(out[custodyAmountOff:custodyRefOff], amount)
+	copy(out[custodyRefOff:custodyRefOff+RefSize], ref[:])
 	return out
 }
 
 // encodeWithdrawFrame builds the FROZEN clob_withdraw payload: user[16] +
-// asset[8] + amount[8].
-func encodeWithdrawFrame(user string, asset, amount uint64) []byte {
+// asset[32] + amount[8] + ref[32]. asset is the FULL 32-byte injective cross-chain
+// id (native == ids.Empty). ref is the originating-tx idempotency reference (this
+// rail uses the settlement fillRef) the D-Chain folds into its seen: key.
+func encodeWithdrawFrame(user string, asset ids.ID, amount uint64, ref ids.ID) []byte {
 	out := make([]byte, WithdrawReqSize)
 	copy(out[0:16], padUser(user))
-	binary.BigEndian.PutUint64(out[16:24], asset)
-	binary.BigEndian.PutUint64(out[24:32], amount)
+	copy(out[16:custodyAmountOff], asset[:])
+	binary.BigEndian.PutUint64(out[custodyAmountOff:custodyRefOff], amount)
+	copy(out[custodyRefOff:custodyRefOff+RefSize], ref[:])
 	return out
 }
 
@@ -132,14 +132,21 @@ func (vm *VM) executeDeposit(ctx context.Context, tx *txs.ImportTx, ar *atomicRe
 		return nil
 	}
 	owner := tx.Outputs[0].Owner
-	asset := assetHandle(tx.Outputs[0].Asset)
+	// The FULL 32-byte cross-chain asset id (native == ids.Empty) — keyed at full
+	// width on the D-Chain ledger so distinct imported assets never collide.
+	asset := tx.Outputs[0].Asset
 	var amount uint64
 	for _, o := range tx.Outputs {
 		// All outputs of a single deposit are the same (owner, asset) — sum the
 		// imported value into one ledger credit.
 		amount += o.Amount
 	}
-	frame := encodeDepositFrame(userHandle(owner), asset, amount)
+	// The ref is the import tx's own id — the cross-chain identity of THIS deposit,
+	// consumed exactly once on the atomic leg. Threading it into the clob_deposit
+	// frame makes a genuinely-distinct import distinct on the D-Chain seen: index
+	// (so a second genuine deposit credits separately, matching its own atomic
+	// import); a true retry of the same import (same id) dedups exactly once.
+	frame := encodeDepositFrame(userHandle(owner), asset, amount, tx.ID())
 	resp, err := vm.relay.Relay(ctx, ZAPMethodDeposit, frame)
 	if err != nil {
 		return fmt.Errorf("dexvm custody: deposit relay: %w", err)
@@ -166,13 +173,36 @@ func (vm *VM) executeDeposit(ctx context.Context, tx *txs.ImportTx, ar *atomicRe
 //
 // owner is the account (its address); asset is the cross-chain asset id; want is
 // the requested withdrawal (the ledger clamps it to available). destChain is
-// where the value is exported (C-Chain). fillRef binds the export for audit. The
-// returned realized amount is what was exported (0 => nothing available, no export
+// where the value is exported (C-Chain). fillRef binds the export for audit AND is
+// now the clob_withdraw idempotency ref the D-Chain folds into its seen: key, so
+// it MUST be UNIQUE per genuine withdraw: two distinct withdraws sharing a fillRef
+// would collide on the D-Chain seen: index and the second would replay the first
+// realized amount against an already-exported balance (a proxy-rail double export).
+// Every current caller passes a unique id (tests: ids.GenerateTestID; the future
+// BuildBlock carry-result plan must derive a per-withdraw-unique ref, e.g. the
+// settlement/UTXO id). The returned realized amount is what was exported (0 =>
+// nothing available, no export
 // built). The relay is the irreversible leg (proposer-once + carry the realized
 // amount in production).
 func (vm *VM) executeWithdraw(ctx context.Context, owner ids.ShortID, asset ids.ID, want uint64, destChain, fillRef ids.ID, txIndex uint32, createdAt int64, ar *atomicRequests) (uint64, error) {
-	handle := assetHandle(asset)
-	frame := encodeWithdrawFrame(userHandle(owner), handle, want)
+	// Consume-once on the settlement fillRef (R2), checked BEFORE the irreversible
+	// relay so a duplicate withdraw fails fast without re-debiting the D-Chain or
+	// double-exporting. Mirrors executeImport's IsConsumed/MarkConsumed on the
+	// import UTXO id, using the SAME state consumed-set. The MarkConsumed is deferred
+	// to after a successful relay with a positive realized amount (below), so a relay
+	// FAILURE or a zero-realized withdraw never burns the ref — a legitimate retry of
+	// a failed withdraw still works, while a genuine duplicate is rejected here.
+	if consumed, cerr := vm.state.IsConsumed(fillRef); cerr != nil {
+		return 0, fmt.Errorf("dexvm custody: withdraw consumed check: %w", cerr)
+	} else if consumed {
+		return 0, fmt.Errorf("dexvm custody: withdraw: %w: %s", errFillRefAlreadyExported, fillRef)
+	}
+	// The ref is the settlement fillRef — the unique reference that already binds
+	// this withdraw's export for audit. Threading it into the clob_withdraw frame
+	// makes a genuinely-distinct withdraw distinct on the D-Chain seen: index, so a
+	// second genuine withdraw re-clamps to CURRENT available rather than replaying
+	// the first realized amount against an already-exported balance (the drain).
+	frame := encodeWithdrawFrame(userHandle(owner), asset, want, fillRef)
 	resp, err := vm.relay.Relay(ctx, ZAPMethodWithdraw, frame)
 	if err != nil {
 		return 0, fmt.Errorf("dexvm custody: withdraw relay: %w", err)
@@ -188,6 +218,12 @@ func (vm *VM) executeWithdraw(ctx context.Context, owner ids.ShortID, asset ids.
 		// The ledger released MORE than requested — impossible for a clamped
 		// withdraw and a mint risk. Refuse rather than export the excess.
 		return 0, fmt.Errorf("dexvm custody: withdraw realized %d exceeds requested %d (mint risk)", realized, want)
+	}
+	// Commit the fillRef to the consume-once set NOW that a real export will follow
+	// (relay succeeded, realized>0). A second withdraw with this fillRef is refused
+	// at the IsConsumed gate above before it can double-export (R2).
+	if cerr := vm.state.MarkConsumed(fillRef); cerr != nil {
+		return 0, fmt.Errorf("dexvm custody: withdraw mark consumed: %w", cerr)
 	}
 	// Atomic export of EXACTLY the realized amount in the withdrawn asset.
 	out := []txs.AtomicOutput{{Owner: owner, Asset: asset, Amount: realized}}
