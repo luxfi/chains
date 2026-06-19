@@ -40,12 +40,42 @@ const (
 )
 
 // Custody wire sizes (FROZEN, == github.com/luxfi/dex/pkg/zapwire). The proxy
-// re-defines them since it cannot import the cgo-tagged d-chain package; a
-// parity test pins byte-equality.
+// re-defines them since it cannot import the cgo-tagged d-chain package; the
+// hardcoded-canonical values move in lockstep with zapwire (same three-homes
+// pattern the order frames use).
+//
+// ASSET IDENTITY IS THE FULL 32-BYTE INJECTIVE ID (AssetIDSize), NOT a truncated
+// handle. Keying a value-bearing custody ledger by a truncated id is unsound: a
+// truncation maps distinct assets to the same key, so two cross-chain assets whose
+// ids share a leading 8-byte prefix would collide on the D-Chain balance ledger
+// (and a worthless asset folding to the native-LUX key 0 could mint a native claim
+// that drains the native vault). The id is therefore carried at FULL width and the
+// D-Chain keys balance:/locked: by this same 32-byte id, so the proxy's atomic
+// import (a cross-chain ids.ID, native == ids.Empty == all-zero) names the SAME
+// ledger key the EVM precompile rail and the d-chain gateway use.
+//
+// Deposit/Withdraw carry the 32-byte idempotency ref (RefSize) at the tail —
+// user[16]+asset[32]+amount[8]+ref[32] = 88. The ref is the originating-tx identity
+// the D-Chain folds into its content-addressed seen: dedup key (the vault-drain
+// fix). On THIS atomic rail the ref is the consumed import's tx id (deposit) or the
+// settlement fillRef (withdraw) — each cross-chain custody op's unique reference,
+// so two genuinely distinct ops are distinct on the D-Chain seen: index. The four
+// FROZEN order frames (ensure/place/cancel/submit) are byte-unchanged.
 const (
-	// DepositReqSize / WithdrawReqSize: user[16] + asset[8] + amount[8].
-	DepositReqSize  = 16 + 8 + 8 // 32
-	WithdrawReqSize = 16 + 8 + 8 // 32
+	// AssetIDSize: FULL injective asset-id width (NOT a truncated handle). Keys the
+	// d-chain balance:/locked: ledger; native cross-chain asset == ids.Empty.
+	AssetIDSize = 32
+	// RefSize: idempotency reference width (originating-tx id).
+	RefSize = 32
+	// DepositReqSize / WithdrawReqSize: user[16] + asset[32] + amount[8] + ref[32].
+	DepositReqSize  = 16 + AssetIDSize + 8 + RefSize // 88
+	WithdrawReqSize = 16 + AssetIDSize + 8 + RefSize // 88
+	// custodyAmountOff: amount[8] offset within a deposit/withdraw body
+	// (after user[16]+asset[32]).
+	custodyAmountOff = 16 + AssetIDSize // 48
+	// custodyRefOff: ref[32] tail offset within a deposit/withdraw body
+	// (after user[16]+asset[32]+amount[8]).
+	custodyRefOff = 16 + AssetIDSize + 8 // 56
 	// BalanceRespSize: status[1] + realizedAmount[8].
 	BalanceRespSize = 1 + 8
 )
