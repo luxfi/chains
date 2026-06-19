@@ -169,15 +169,29 @@ func (tx *ImportTx) Verify() error {
 	if len(tx.ImportedInputs) == 0 {
 		return errors.New("import: no imported inputs")
 	}
+	// All consumed inputs name ONE asset (a deposit credits one (owner,asset) ledger
+	// row). The asset of the first input is the import's asset; every other input
+	// and every credited output must match it. This is the STRUCTURAL half of the
+	// native-aliasing bind (the AUTHORITATIVE half — input asset == the consumed
+	// UTXO's RECORDED asset — is enforced in executeImport against shared memory):
+	// together they pin output.Asset == input.Asset == recordedAsset, so an import
+	// can never credit an asset it does not actually consume.
+	importAsset := tx.ImportedInputs[0].Asset
 	var in uint64
 	for _, i := range tx.ImportedInputs {
 		if i.Amount == 0 {
 			return ErrInvalidAmount
 		}
+		if i.Asset != importAsset {
+			return errors.New("import: inputs span multiple assets")
+		}
 		in += i.Amount
 	}
 	var outAmt uint64
 	for _, o := range tx.Outputs {
+		if o.Asset != importAsset {
+			return errors.New("import: output asset != imported input asset (would re-denominate)")
+		}
 		outAmt += o.Amount
 	}
 	// Conservation: credited outputs must not exceed claimed inputs (the proxy

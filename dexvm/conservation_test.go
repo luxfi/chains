@@ -351,6 +351,20 @@ func TestImportRefusesDoubleSpend(t *testing.T) {
 	assetID := ids.GenerateTestID()
 	utxoID := deriveUTXOID(ids.GenerateTestID(), 0)
 
+	// Seed the source UTXO into shared memory (the realistic precondition): the
+	// import binds its declared asset/amount to this RECORDED value, so the UTXO
+	// must exist and match. (The asset-bind fix means an import of a non-existent
+	// UTXO is rejected as unbacked — exercised by the custody asset-bind tests.)
+	if err := h.cChainSM.Apply(map[ids.ID]*atomic.Requests{
+		h.proxyChain: {PutRequests: []*atomic.Element{{
+			Key:    utxoID[:],
+			Value:  encodeExportedOutput(txs.AtomicOutput{Owner: taker, Asset: assetID, Amount: 500}),
+			Traits: [][]byte{taker[:]},
+		}}},
+	}); err != nil {
+		t.Fatalf("seed source UTXO: %v", err)
+	}
+
 	ar := newAtomicRequests()
 	tx := mustParseImport(t, newImportTxBytes(t, taker, h.cChain, utxoID, assetID, 500))
 
