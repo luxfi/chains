@@ -6,12 +6,14 @@ package precompiles
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"math/big"
 	"testing"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 	"github.com/luxfi/ids"
+	"github.com/luxfi/precompile/starkfri"
 )
 
 func TestGroth16VerifierGas(t *testing.T) {
@@ -106,8 +108,8 @@ func TestGroth16VerifierValidProof(t *testing.T) {
 	proofC.ScalarMultiplication(&pubLC, &gammaInvDeltaBI)
 	proofC.Neg(&proofC)
 
-	proofA := vkAlpha  // alpha * g1
-	proofB := vkBeta   // beta * g2
+	proofA := vkAlpha // alpha * g1
+	proofB := vkBeta  // beta * g2
 
 	// Verify the pairing equation holds (sanity check before serializing)
 	{
@@ -187,11 +189,99 @@ func TestPLONKVerifierGas(t *testing.T) {
 	}
 }
 
-func TestSTARKVerifierNotImplemented(t *testing.T) {
+// buildSTARKInput serialises [proof_len(4)][proof][pub_len(4)][pub] in
+// the wire format the STARKVerifier precompile expects.
+func buildSTARKInput(proof, pub []byte) []byte {
+	out := make([]byte, 0, 4+len(proof)+4+len(pub))
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], uint32(len(proof)))
+	out = append(out, l[:]...)
+	out = append(out, proof...)
+	binary.BigEndian.PutUint32(l[:], uint32(len(pub)))
+	out = append(out, l[:]...)
+	out = append(out, pub...)
+	return out
+}
+
+// TestSTARKVerifierFailsClosedWhenUnbound proves the Z-Chain STARK
+// rollup verifier delegates to precompile/starkfri and FAILS CLOSED
+// when no verifier binding is registered (the CGO_ENABLED=0 / no
+// starkfri_p3q build). A structurally well-formed P3Q1 proof must NOT
+// be accepted in the unbound configuration — there is no forgery
+// oracle. This is the post-quantum-safe posture: absent the FRI
+// verifier, the precompile refuses rather than rubber-stamps.
+func TestSTARKVerifierFailsClosedWhenUnbound(t *testing.T) {
+	starkfri.RegisterVerifier(nil) // ensure no binding
 	v := &STARKVerifier{}
-	_, err := v.Run([]byte{0x00})
-	if err != errNotImplemented {
-		t.Fatalf("expected errNotImplemented, got: %v", err)
+
+	proof := append([]byte(starkfri.MagicHeader), []byte("strict-PQ-FRI-Goldilocks-payload")...)
+	pub := []byte{0x01, 0x02, 0x03, 0x04}
+	res, err := v.Run(buildSTARKInput(proof, pub))
+
+	if !errors.Is(err, errVerifierUnavailable) {
+		t.Fatalf("expected errVerifierUnavailable (fail-closed), got: %v", err)
+	}
+	if len(res) != 1 || res[0] != 0x00 {
+		t.Fatalf("unbound STARK verifier must return 0x00 (invalid), got: %x", res)
+	}
+}
+
+// TestSTARKVerifierDelegatesToStarkFRI proves the verifier-side switch:
+// the Z-Chain rollup STARK path routes through starkfri.Verify (NOT the
+// pairing-based Groth16 path). We register a fake FRI verifier and
+// assert (a) it is invoked with the proof/pub bytes the precompile
+// parsed, (b) an accept yields 0x01, (c) a reject yields 0x00, and
+// (d) a proof without the "P3Q1" magic is rejected by starkfri's
+// structural pre-filter BEFORE the verifier callback runs.
+func TestSTARKVerifierDelegatesToStarkFRI(t *testing.T) {
+	defer starkfri.RegisterVerifier(nil)
+	v := &STARKVerifier{}
+
+	proof := append([]byte(starkfri.MagicHeader), []byte("trace-root|fri-root|queries")...)
+	pub := []byte{0xaa, 0xbb, 0xcc}
+
+	// (a)+(b): accept path, capture what starkfri.Verify received.
+	var sawProof, sawPub []byte
+	starkfri.RegisterVerifier(func(_ byte, p, pi []byte) (bool, error) {
+		sawProof = append([]byte(nil), p...)
+		sawPub = append([]byte(nil), pi...)
+		return true, nil
+	})
+	res, err := v.Run(buildSTARKInput(proof, pub))
+	if err != nil {
+		t.Fatalf("accept path returned error: %v", err)
+	}
+	if len(res) != 1 || res[0] != 0x01 {
+		t.Fatalf("accept path must return 0x01 (valid), got: %x", res)
+	}
+	if string(sawProof) != string(proof) {
+		t.Fatalf("starkfri verifier saw wrong proof bytes: %x != %x", sawProof, proof)
+	}
+	if string(sawPub) != string(pub) {
+		t.Fatalf("starkfri verifier saw wrong public-input bytes: %x != %x", sawPub, pub)
+	}
+
+	// (c): reject path.
+	starkfri.RegisterVerifier(func(byte, []byte, []byte) (bool, error) { return false, nil })
+	res, err = v.Run(buildSTARKInput(proof, pub))
+	if err != nil {
+		t.Fatalf("reject path must not surface an execution error, got: %v", err)
+	}
+	if len(res) != 1 || res[0] != 0x00 {
+		t.Fatalf("reject path must return 0x00 (invalid), got: %x", res)
+	}
+
+	// (d): bad-magic proof is rejected by starkfri's structural filter
+	// before the callback runs (the callback would say true otherwise).
+	called := false
+	starkfri.RegisterVerifier(func(byte, []byte, []byte) (bool, error) { called = true; return true, nil })
+	badProof := append([]byte("BAD!"), []byte("not-a-p3q1-proof")...)
+	res, _ = v.Run(buildSTARKInput(badProof, pub))
+	if len(res) != 1 || res[0] != 0x00 {
+		t.Fatalf("bad-magic proof must return 0x00 (invalid), got: %x", res)
+	}
+	if called {
+		t.Fatal("starkfri callback must not run on a proof missing the P3Q1 magic header")
 	}
 }
 
@@ -291,7 +381,9 @@ func TestCrossChainVerifierRejectsTooShort(t *testing.T) {
 
 func TestCrossChainVerifierRejectsStubs(t *testing.T) {
 	v := &CrossChainZKVerifier{ZChainID: ids.ID{}}
-	for _, vtype := range []byte{VerifierTypeSTARK, VerifierTypeHalo2, VerifierTypeNova} {
+	// STARK is no longer a stub — it routes to the strict-PQ STARK
+	// verifier on Z-Chain. Only Halo2/Nova remain unimplemented.
+	for _, vtype := range []byte{VerifierTypeHalo2, VerifierTypeNova} {
 		result, err := v.Run([]byte{vtype, 0x00})
 		if err != errNotImplemented {
 			t.Fatalf("type 0x%02x: expected errNotImplemented, got %v", vtype, err)
@@ -299,6 +391,33 @@ func TestCrossChainVerifierRejectsStubs(t *testing.T) {
 		if result[0] != 0x00 {
 			t.Fatalf("type 0x%02x: expected 0x00 result", vtype)
 		}
+	}
+}
+
+// TestCrossChainVerifierRoutesSTARK proves the cross-chain router now
+// forwards strict-PQ STARK rollup proofs to the Z-Chain STARKVerifier
+// (target address STARKVerifierAddr), instead of rejecting them as
+// not-implemented. The quantum-safe rollup path is reachable from any
+// EVM chain via Warp.
+func TestCrossChainVerifierRoutesSTARK(t *testing.T) {
+	var zID ids.ID
+	rand.Read(zID[:])
+	v := &CrossChainZKVerifier{ZChainID: zID}
+
+	proofData := []byte("p3q-stark-proof-bytes")
+	msg, err := v.Run(append([]byte{VerifierTypeSTARK}, proofData...))
+	if err != nil {
+		t.Fatalf("STARK routing returned error: %v", err)
+	}
+	_, gotAddr, gotPayload, err := DecodeWarpPayload(msg)
+	if err != nil {
+		t.Fatalf("decode warp payload: %v", err)
+	}
+	if gotAddr != STARKVerifierAddr {
+		t.Fatalf("STARK must route to STARKVerifierAddr 0x%02x, got 0x%02x", STARKVerifierAddr, gotAddr)
+	}
+	if string(gotPayload) != string(proofData) {
+		t.Fatalf("STARK routed payload mismatch: %x != %x", gotPayload, proofData)
 	}
 }
 

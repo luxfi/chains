@@ -75,9 +75,11 @@ func (v *CrossChainZKVerifier) Run(input []byte) ([]byte, error) {
 
 	// Validate verifier type
 	switch verifierType {
-	case VerifierTypeGroth16, VerifierTypePLONK:
-		// supported — route to Z-Chain
-	case VerifierTypeSTARK, VerifierTypeHalo2, VerifierTypeNova:
+	case VerifierTypeGroth16, VerifierTypePLONK, VerifierTypeSTARK:
+		// supported — route to Z-Chain. STARK is the strict-PQ
+		// (quantum-safe) rollup-proof path; Groth16/PLONK are the
+		// classical pairing-based paths kept for non-strict-PQ chains.
+	case VerifierTypeHalo2, VerifierTypeNova:
 		return resultInvalid, errNotImplemented
 	default:
 		return resultInvalid, fmt.Errorf("unknown verifier type: 0x%02x", verifierType)
@@ -91,6 +93,8 @@ func (v *CrossChainZKVerifier) Run(input []byte) ([]byte, error) {
 		targetAddr = Groth16VerifierAddr
 	case VerifierTypePLONK:
 		targetAddr = PLONKVerifierAddr
+	case VerifierTypeSTARK:
+		targetAddr = STARKVerifierAddr
 	}
 
 	msg := encodeWarpPayload(v.ZChainID, targetAddr, proofData)
