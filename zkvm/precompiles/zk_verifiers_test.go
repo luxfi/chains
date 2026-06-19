@@ -189,6 +189,82 @@ func TestPLONKVerifierGas(t *testing.T) {
 	}
 }
 
+// buildPLONKInput serialises [vk_len(4)][vk][proof_len(4)][proof][num_inputs(4)][inputs]
+// in the wire format the PLONKVerifier precompile expects.
+func buildPLONKInput(vk, proof []byte, numInputs uint32, inputs []byte) []byte {
+	out := make([]byte, 0, 4+len(vk)+4+len(proof)+4+len(inputs))
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], uint32(len(vk)))
+	out = append(out, l[:]...)
+	out = append(out, vk...)
+	binary.BigEndian.PutUint32(l[:], uint32(len(proof)))
+	out = append(out, l[:]...)
+	out = append(out, proof...)
+	binary.BigEndian.PutUint32(l[:], numInputs)
+	out = append(out, l[:]...)
+	out = append(out, inputs...)
+	return out
+}
+
+// TestPLONKVerifierNeverUniversalAccepts is the H4 regression test. The
+// previous verifyPLONK computed a self-cancelling pairing, discarded the
+// result, ignored the public inputs, and returned VALID (0x01) for ANY
+// >=544-byte blob. We construct a well-formed-but-arbitrary proof+VK
+// (7 valid G1 commitments + 3 scalars + a valid SRS G2) — exactly the
+// shape the old bypass rubber-stamped — and assert the precompile does
+// NOT return 0x01. It must fail closed (0x00).
+func TestPLONKVerifierNeverUniversalAccepts(t *testing.T) {
+	_, _, g1, g2 := bn254.Generators()
+
+	// Proof: 7 G1 commitments (use the generator — a valid prime-order
+	// point) + 3 scalar evals (32 bytes each) = 448 + 96 = 544 bytes.
+	g1m := g1.Marshal() // 64 bytes uncompressed
+	proof := make([]byte, 0, 544)
+	for i := 0; i < 7; i++ {
+		proof = append(proof, g1m...)
+	}
+	proof = append(proof, make([]byte, 96)...) // 3 zero scalars
+
+	// VK: SRS G2 = generator (valid prime-order G2 point), 128 bytes.
+	vk := g2.Marshal()
+
+	input := buildPLONKInput(vk, proof, 1, make([]byte, 32))
+
+	v := &PLONKVerifier{}
+	res, err := v.Run(input)
+	// The precompile treats an invalid proof as 0x00 with nil error
+	// (invalid proof is not an execution error). The load-bearing
+	// assertion: it must NOT be 0x01 (valid).
+	if err == nil && len(res) == 1 && res[0] == 0x01 {
+		t.Fatal("PLONKVerifier UNIVERSAL-ACCEPTED an arbitrary well-formed proof (H4 bypass)")
+	}
+	if len(res) != 1 || res[0] != 0x00 {
+		t.Fatalf("PLONKVerifier must fail closed (0x00) for an unverified proof, got res=%x err=%v", res, err)
+	}
+}
+
+// TestVerifyPLONKFailsClosed asserts the internal verifyPLONK never
+// returns nil (valid) — it either reports a structural error or
+// errPLONKVerifierIncomplete, but NEVER accepts.
+func TestVerifyPLONKFailsClosed(t *testing.T) {
+	_, _, g1, g2 := bn254.Generators()
+	g1m := g1.Marshal()
+	proof := make([]byte, 0, 544)
+	for i := 0; i < 7; i++ {
+		proof = append(proof, g1m...)
+	}
+	proof = append(proof, make([]byte, 96)...)
+	vk := g2.Marshal()
+
+	if err := verifyPLONK(vk, proof, make([]byte, 32)); err == nil {
+		t.Fatal("verifyPLONK returned nil (valid) — must fail closed, never universal-accept")
+	} else if !errors.Is(err, errPLONKVerifierIncomplete) {
+		// A well-formed proof should reach the incomplete-verifier guard,
+		// not bail early on a structural error.
+		t.Fatalf("verifyPLONK: expected errPLONKVerifierIncomplete for a well-formed blob, got %v", err)
+	}
+}
+
 // buildSTARKInput serialises [proof_len(4)][proof][pub_len(4)][pub] in
 // the wire format the STARKVerifier precompile expects.
 func buildSTARKInput(proof, pub []byte) []byte {
@@ -301,9 +377,12 @@ func TestNovaVerifierNotImplemented(t *testing.T) {
 	}
 }
 
+// TestRegistryRegistersAll confirms a NON-strict chain registers every
+// verifier, including the classical Groth16/PLONK kept as an optional
+// building block.
 func TestRegistryRegistersAll(t *testing.T) {
 	reg := NewMapRegistry()
-	RegisterZKPrecompiles(reg)
+	RegisterZKPrecompiles(reg, false /* strictPQ */)
 
 	addrs := []byte{
 		Groth16VerifierAddr,
@@ -321,6 +400,55 @@ func TestRegistryRegistersAll(t *testing.T) {
 	// Non-existent address
 	if _, err := reg.Get(0xFF); err == nil {
 		t.Fatal("expected error for unregistered address")
+	}
+}
+
+// TestRegistryStrictPQOmitsClassical is the H2 gating test: on a strict-PQ
+// chain the classical Groth16 (0x80) and PLONK (0x81) verifiers are NOT
+// registered (calls fail closed by absence), while the post-quantum STARK
+// (0x82) verifier and the always-fail-closed Halo2/Nova stubs ARE.
+func TestRegistryStrictPQOmitsClassical(t *testing.T) {
+	reg := NewMapRegistry()
+	RegisterZKPrecompiles(reg, true /* strictPQ */)
+
+	// Classical verifiers MUST be absent on a strict-PQ chain.
+	for _, addr := range []byte{Groth16VerifierAddr, PLONKVerifierAddr} {
+		if _, err := reg.Get(addr); err == nil {
+			t.Fatalf("classical precompile 0x%02x MUST NOT be registered on a strict-PQ chain", addr)
+		}
+	}
+
+	// Post-quantum STARK and the fail-closed stubs MUST be present.
+	for _, addr := range []byte{STARKVerifierAddr, Halo2VerifierAddr, NovaVerifierAddr} {
+		if _, err := reg.Get(addr); err != nil {
+			t.Fatalf("precompile 0x%02x must be registered on a strict-PQ chain: %v", addr, err)
+		}
+	}
+}
+
+// TestCrossChainVerifierStrictPQRefusesClassical is the H2 cross-chain
+// gating test: a strict-PQ router refuses to route Groth16/PLONK proofs
+// to Z-Chain, but still routes the quantum-safe STARK path.
+func TestCrossChainVerifierStrictPQRefusesClassical(t *testing.T) {
+	v := &CrossChainZKVerifier{ZChainID: ids.ID{}, StrictPQ: true}
+
+	for _, vtype := range []byte{VerifierTypeGroth16, VerifierTypePLONK} {
+		res, err := v.Run([]byte{vtype, 0x00, 0x01, 0x02})
+		if !errors.Is(err, errClassicalForbiddenStrictPQ) {
+			t.Fatalf("type 0x%02x: expected errClassicalForbiddenStrictPQ, got %v", vtype, err)
+		}
+		if len(res) != 1 || res[0] != 0x00 {
+			t.Fatalf("type 0x%02x: expected 0x00 result, got %x", vtype, res)
+		}
+	}
+
+	// STARK still routes under strict-PQ.
+	msg, err := v.Run(append([]byte{VerifierTypeSTARK}, []byte("p3q-proof")...))
+	if err != nil {
+		t.Fatalf("strict-PQ router must still route STARK, got: %v", err)
+	}
+	if _, gotAddr, _, derr := DecodeWarpPayload(msg); derr != nil || gotAddr != STARKVerifierAddr {
+		t.Fatalf("strict-PQ STARK route: addr=0x%02x err=%v", gotAddr, derr)
 	}
 }
 
