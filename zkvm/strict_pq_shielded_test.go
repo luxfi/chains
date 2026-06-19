@@ -81,52 +81,60 @@ func TestStrictPQ_RefusesClassicalShieldedProofs(t *testing.T) {
 // ProofVerifier on a strict-PQ chain with REAL (non-dummy) bn254
 // verifying keys is an error — the explicit fail-closed gate, not the
 // implicit dummy-key detector.
+//
+// This drives the PRODUCTION path: NewProofVerifier -> loadVerifyingKeys
+// with a real (non-zero) key supplied via ZConfig.VerifyingKeys. The
+// guard must fire inside the real loadVerifyingKeys, so a future refactor
+// that drops it from the real function is caught here (the previous
+// version asserted a test-local mirror and would NOT have caught that).
 func TestStrictPQ_RealBN254VKLoadErrors(t *testing.T) {
-	// loadVerifyingKeys installs dummy (all-zero) keys; simulate a real
-	// VK load by post-loading non-zero key bytes and re-running the gate
-	// logic via a fresh verifier whose keys we then make non-dummy.
-	//
-	// We exercise the construction-time guard directly: build a verifier
-	// with dummy keys (succeeds), then assert that flipping a key to
-	// non-dummy and re-detecting would be refused. The production guard
-	// lives in loadVerifyingKeys; here we assert the invariant it enforces.
-	pv := strictPQVerifier(t)
-	if !pv.dummyKeys {
-		t.Fatal("precondition: strict-PQ verifier should start with dummy keys")
-	}
+	realVK := make([]byte, 1024)
+	realVK[0] = 0x01 // non-zero ⇒ a real (non-dummy) bn254 verifying key
 
-	// Now prove the guard: a strict-PQ verifier whose keys are real must
-	// be rejected. We re-run loadVerifyingKeys after injecting a non-zero
-	// key to simulate a real-VK deployment config.
-	pv.verifyingKeys[string(TransactionTypeTransfer)][0] = 0x01 // make non-dummy
-	// Re-detect dummy + re-apply the strict-PQ guard exactly as
-	// loadVerifyingKeys does.
-	err := reapplyStrictPQVKGuard(pv)
+	_, err := NewProofVerifier(ZConfig{
+		ProofSystem:    "stark",
+		ProofCacheSize: 100,
+		StrictPQ:       true,
+		VerifyingKeys: map[string][]byte{
+			string(TransactionTypeTransfer): realVK,
+		},
+	}, log.NoLog{})
 	if !errors.Is(err, errStrictPQRealVKForbidden) {
-		t.Fatalf("strict-PQ chain must error on real bn254 VK, got: %v", err)
+		t.Fatalf("strict-PQ chain must error on real bn254 VK loaded by the production loadVerifyingKeys, got: %v", err)
 	}
 }
 
-// reapplyStrictPQVKGuard re-runs the dummy-detection + strict-PQ VK guard
-// from loadVerifyingKeys against the verifier's current keys. It mirrors
-// the production guard so the test asserts the exact invariant.
-func reapplyStrictPQVKGuard(pv *ProofVerifier) error {
-	pv.dummyKeys = true
-	for _, vk := range pv.verifyingKeys {
-		for _, b := range vk {
-			if b != 0 {
-				pv.dummyKeys = false
-				break
-			}
-		}
-		if !pv.dummyKeys {
-			break
-		}
+// TestStrictPQ_DummyVKConstructs confirms the converse: a strict-PQ
+// verifier with NO supplied keys (all-zero dummy) constructs cleanly —
+// the guard fires only on a REAL key, not on the dummy default. (Proof
+// verification is then disabled / fail-closed via dummyKeys.)
+func TestStrictPQ_DummyVKConstructs(t *testing.T) {
+	pv := strictPQVerifier(t)
+	if !pv.dummyKeys {
+		t.Fatal("strict-PQ verifier with no supplied keys must start with dummy keys")
 	}
-	if pv.config.StrictPQ && !pv.dummyKeys {
-		return errStrictPQRealVKForbidden
+}
+
+// TestNonStrict_RealVKConstructs confirms a NON-strict chain accepts a
+// real bn254 VK (the guard is strict-PQ only): the classical path stays
+// available off the strict-PQ profile.
+func TestNonStrict_RealVKConstructs(t *testing.T) {
+	realVK := make([]byte, 1024)
+	realVK[0] = 0x01
+	pv, err := NewProofVerifier(ZConfig{
+		ProofSystem:    "groth16",
+		ProofCacheSize: 100,
+		StrictPQ:       false,
+		VerifyingKeys: map[string][]byte{
+			string(TransactionTypeTransfer): realVK,
+		},
+	}, log.NoLog{})
+	if err != nil {
+		t.Fatalf("non-strict chain must accept a real bn254 VK, got: %v", err)
 	}
-	return nil
+	if pv.dummyKeys {
+		t.Fatal("non-strict verifier with a supplied real key must NOT be dummy")
+	}
 }
 
 // TestStrictPQ_STARKIsOnlyAcceptedSystem proves that under strict-PQ the
