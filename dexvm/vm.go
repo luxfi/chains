@@ -44,6 +44,45 @@ var (
 	// errUTXOAlreadyImported guards the atomic-import double-spend (the proxy
 	// never mints — an exported UTXO is claimable exactly once).
 	errUTXOAlreadyImported = errors.New("atomic UTXO already imported")
+	// errFillRefAlreadyExported guards the WITHDRAW rail's double-export (R2). The
+	// settlement fillRef is unique per genuine withdraw; consuming it exactly once
+	// (mirroring the import UTXO consume-once, same state consumed-set) stops a
+	// duplicate fillRef from exporting twice (a drain) regardless of how the proxy
+	// BuildBlock rail is later wired. Note: the swap-settle export (settleFromFills)
+	// is NOT gated this way — it is bounded by the escrow ledger and intentionally
+	// reuses the collateral ref across partial settles.
+	errFillRefAlreadyExported = errors.New("settlement fillRef already exported")
+
+	// errImportAssetMismatch guards the native-aliasing import (CRITICAL): an
+	// import must credit the asset of the UTXO it ACTUALLY consumes, not an asset
+	// it merely declares. The consumed UTXO's recorded asset (read back from shared
+	// memory — the export side wrote owner|asset|amount) is authoritative; a tx
+	// whose declared input asset disagrees is rejected, so a bogus-token UTXO can
+	// never be imported as native (or any other) value.
+	errImportAssetMismatch = errors.New("import: declared input asset != consumed UTXO asset")
+	// errImportAmountMismatch guards an import that declares more (or less) than the
+	// consumed UTXO actually holds — the same authoritative bind on the amount axis.
+	errImportAmountMismatch = errors.New("import: declared input amount != consumed UTXO amount")
+	// errImportMixedAssets rejects an import that consumes UTXOs of DIFFERENT assets:
+	// a deposit credits one (owner,asset) ledger row, so every consumed UTXO must be
+	// the same asset.
+	errImportMixedAssets = errors.New("import: consumed UTXOs span multiple assets")
+	// errImportOutputAsset rejects an import whose credited output names a different
+	// asset than the consumed UTXO — the credit must be denominated in the imported
+	// asset (the native-aliasing fix's structural half, also enforced in Verify).
+	errImportOutputAsset = errors.New("import: output asset != consumed UTXO asset")
+	// errImportUTXOValueMalformed rejects a shared-memory UTXO value that is not the
+	// canonical owner(20)|asset(32)|amount(8) image — a corrupt record must never be
+	// silently reinterpreted into a credit.
+	errImportUTXOValueMalformed = errors.New("import: source UTXO value malformed")
+	// errImportWrongOwner guards the OWNER axis of the import bind (the cross-chain
+	// analog of the settlement-identity collision): an import must credit the account
+	// AUTHORIZED by the consumed UTXO's recorded owner, not an owner the importing tx
+	// freely chooses. The consumed UTXO's recorded owner (written by the export side
+	// via encodeExportedOutput) is authoritative; every consumed UTXO must share that
+	// owner and every credited output must name it — so an attacker cannot consume a
+	// victim's exported UTXO and credit it to their own account.
+	errImportWrongOwner = errors.New("import: credited owner != consumed UTXO owner")
 
 	_ = errNotBootstrapped
 	_ = errShutdown

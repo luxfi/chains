@@ -38,8 +38,16 @@ const (
 //  4. Result is returned via Warp response
 //
 // Gas: base 100K (includes Warp relay overhead).
+//
+// StrictPQ, when set, makes this router refuse the classical
+// (quantum-breakable) verifier types Groth16 and PLONK: on a strict-PQ
+// chain only the post-quantum STARK/FRI path (VerifierTypeSTARK) may be
+// routed. This mirrors the registration-time gate in
+// RegisterZKPrecompiles — a strict-PQ chain wires this router with
+// StrictPQ=true so it cannot relay a classical proof to Z-Chain.
 type CrossChainZKVerifier struct {
 	ZChainID ids.ID
+	StrictPQ bool
 }
 
 func (v *CrossChainZKVerifier) RequiredGas(input []byte) uint64 {
@@ -73,11 +81,19 @@ func (v *CrossChainZKVerifier) Run(input []byte) ([]byte, error) {
 	verifierType := input[0]
 	proofData := input[1:]
 
+	// Strict-PQ chains refuse the classical pairing-based paths: only the
+	// quantum-safe STARK/FRI rollup path may be routed.
+	if v.StrictPQ && (verifierType == VerifierTypeGroth16 || verifierType == VerifierTypePLONK) {
+		return resultInvalid, errClassicalForbiddenStrictPQ
+	}
+
 	// Validate verifier type
 	switch verifierType {
-	case VerifierTypeGroth16, VerifierTypePLONK:
-		// supported — route to Z-Chain
-	case VerifierTypeSTARK, VerifierTypeHalo2, VerifierTypeNova:
+	case VerifierTypeGroth16, VerifierTypePLONK, VerifierTypeSTARK:
+		// supported — route to Z-Chain. STARK is the strict-PQ
+		// (quantum-safe) rollup-proof path; Groth16/PLONK are the
+		// classical pairing-based paths kept for non-strict-PQ chains.
+	case VerifierTypeHalo2, VerifierTypeNova:
 		return resultInvalid, errNotImplemented
 	default:
 		return resultInvalid, fmt.Errorf("unknown verifier type: 0x%02x", verifierType)
@@ -91,6 +107,8 @@ func (v *CrossChainZKVerifier) Run(input []byte) ([]byte, error) {
 		targetAddr = Groth16VerifierAddr
 	case VerifierTypePLONK:
 		targetAddr = PLONKVerifierAddr
+	case VerifierTypeSTARK:
+		targetAddr = STARKVerifierAddr
 	}
 
 	msg := encodeWarpPayload(v.ZChainID, targetAddr, proofData)

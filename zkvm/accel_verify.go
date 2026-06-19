@@ -136,7 +136,18 @@ func batchVerifyProofsGPU(pv *ProofVerifier, txs []*Transaction) []error {
 			continue
 		}
 
-		// Only batch Groth16 — other types verified individually
+		// Strict-PQ gate (Red H1). The GPU batch path deserializes and
+		// verifies Groth16 INLINE below, bypassing VerifyTransactionProof,
+		// so the strict-PQ refusal MUST be applied here too — otherwise a
+		// strict-PQ chain could verify a classical proof via the batch path.
+		if err := pv.refuseClassicalUnderStrictPQ(tx.Proof.ProofType); err != nil {
+			results[i] = err
+			continue
+		}
+
+		// Only batch Groth16 — other types (incl. "stark") verified
+		// individually through VerifyTransactionProof, which routes STARK
+		// to the strict-PQ starkfri verifier.
 		if tx.Proof.ProofType != "groth16" {
 			results[i] = pv.VerifyTransactionProof(tx)
 			continue
