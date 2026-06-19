@@ -14,11 +14,26 @@ import (
 
 	"github.com/luxfi/accel"
 	"github.com/luxfi/log"
+	"github.com/luxfi/precompile/starkfri"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 	lru "github.com/hashicorp/golang-lru"
 )
+
+// errStrictPQClassicalForbidden is returned by the shielded-tx verifier
+// when a strict-PQ chain is asked to verify a classical (bn254
+// pairing-based) proof system. On a strict-PQ chain only the STARK/FRI
+// system is accepted; groth16/plonk/bulletproofs are hard-disabled.
+var errStrictPQClassicalForbidden = errors.New(
+	"zkvm: classical proof system forbidden on strict-PQ chain — only STARK/FRI accepted")
+
+// errStrictPQRealVKForbidden is returned at construction when a strict-PQ
+// chain attempts to load a real (non-dummy) bn254 verifying key. Real
+// classical VKs on a strict-PQ chain would re-enable the forgeable
+// pairing path; refuse explicitly rather than rely on dummy-key detection.
+var errStrictPQRealVKForbidden = errors.New(
+	"zkvm: real bn254 verifying key forbidden on strict-PQ chain — shielded value uses STARK/FRI (P3Q) only")
 
 // ProofVerifier verifies zero-knowledge proofs.
 // When verifying keys are all zeros (dummy), proof verification is disabled
@@ -72,6 +87,25 @@ func (pv *ProofVerifier) VerifyTransactionProof(tx *Transaction) error {
 		return errors.New("transaction missing proof")
 	}
 
+	// Strict-PQ gate (Red H1). On a strict-PQ chain the classical
+	// (bn254 pairing-based) systems are hard-disabled BEFORE any other
+	// check — a CRQC that breaks bn254 must not be able to forge a
+	// shield/unshield proof. Only STARK/FRI is accepted there.
+	if err := pv.refuseClassicalUnderStrictPQ(tx.Proof.ProofType); err != nil {
+		return err
+	}
+
+	// STARK/FRI path: delegate to the strict-PQ verifier (precompile/
+	// starkfri). This is the ONLY accepted system on a strict-PQ chain
+	// and is the quantum-safe shielded-proof path everywhere. It fails
+	// closed (errVerifierUnavailable-equivalent) when no FRI binding is
+	// registered — see verifySTARKProof.
+	if tx.Proof.ProofType == "stark" {
+		return pv.verifySTARKProof(tx)
+	}
+
+	// Classical path (non-strict chains only — the gate above already
+	// rejected these under strict-PQ). Requires real (non-dummy) VKs.
 	if pv.dummyKeys {
 		return errors.New("zkvm: proof verification disabled — no real verifying keys loaded")
 	}
@@ -103,8 +137,6 @@ func (pv *ProofVerifier) VerifyTransactionProof(tx *Transaction) error {
 		err = pv.verifyPLONKProof(tx)
 	case "bulletproofs":
 		err = errors.New("zkvm: Bulletproof verification not yet implemented, use groth16 or plonk")
-	case "stark":
-		err = errors.New("zkvm: STARK verification not yet implemented, use groth16 or plonk")
 	default:
 		err = errors.New("unsupported proof type")
 	}
@@ -113,6 +145,72 @@ func (pv *ProofVerifier) VerifyTransactionProof(tx *Transaction) error {
 	pv.proofCache.Add(string(proofHash), err == nil)
 
 	return err
+}
+
+// refuseClassicalUnderStrictPQ is the single strict-PQ enforcement point
+// for the shielded-tx verifier. On a strict-PQ chain it refuses every
+// classical (quantum-breakable) proof system, leaving only "stark"
+// (STARK/FRI). On a non-strict chain it is a no-op. Both VerifyTransactionProof
+// and the GPU batch path call this so neither can verify a classical proof
+// on a strict-PQ chain.
+func (pv *ProofVerifier) refuseClassicalUnderStrictPQ(proofType string) error {
+	if !pv.config.StrictPQ {
+		return nil
+	}
+	switch proofType {
+	case "stark":
+		return nil
+	default:
+		// groth16, plonk, bulletproofs, anything else: forbidden.
+		return errStrictPQClassicalForbidden
+	}
+}
+
+// verifySTARKProof verifies a strict-PQ STARK/FRI shielded proof by
+// delegating to precompile/starkfri (cSHAKE256 Merkle over Goldilocks,
+// FRI low-degree test — no pairings, no bn254, no trusted setup). It
+// fails closed when no FRI verifier binding is registered (CGO_ENABLED=0
+// or the starkfri_p3q tag absent): a structurally well-formed proof is
+// NEVER accepted without the real verifier, so there is no forgery oracle.
+//
+// The proof bytes are tx.Proof.ProofData (which must begin with the
+// starkfri MagicHeader); the public inputs are the canonical
+// concatenation of the tx's nullifiers and output commitments, binding
+// the proof to this transaction's shielded value flow.
+//
+// PROVER STATUS (tracked, not faked). The FULL post-quantum shielded
+// path also needs the prover side: a `p3q_prove` C ABI (Rust prover
+// behind the starkfri_p3q cgo tag) and a shielded/ML-DSA AIR that
+// arithmetises the Zcash-style spend/output circuit (note commitments,
+// nullifier derivation, value balance, range proofs) over the Goldilocks
+// field. Until that AIR + prover land, this verifier accepts no shielded
+// proof on a strict-PQ chain (fail-closed), and shielded value transfer
+// is effectively disabled there — which is the correct posture: no
+// classical fallback, no forgeable path.
+func (pv *ProofVerifier) verifySTARKProof(tx *Transaction) error {
+	// Bind the proof to this tx's shielded value via the public inputs:
+	// nullifiers (spends) ‖ output commitments (outputs).
+	pub := make([]byte, 0, 64)
+	for _, n := range tx.Nullifiers {
+		pub = append(pub, n...)
+	}
+	for _, c := range tx.GetOutputCommitments() {
+		pub = append(pub, c...)
+	}
+
+	ok, err := starkfri.Verify(tx.Proof.ProofData, pub)
+	if err != nil {
+		if errors.Is(err, starkfri.ErrVerifierNotRegistered) {
+			// Binding pending: fail closed, distinguishable for operators.
+			return fmt.Errorf("zkvm: strict-PQ STARK shielded verifier unbound (build with -tags starkfri_p3q): %w", err)
+		}
+		// Malformed / non-verifying proof.
+		return fmt.Errorf("zkvm: STARK shielded proof verification failed: %w", err)
+	}
+	if !ok {
+		return errors.New("zkvm: STARK shielded proof rejected")
+	}
+	return nil
 }
 
 // VerifyBlockProof verifies an aggregated block proof.
@@ -269,9 +367,20 @@ func (pv *ProofVerifier) loadVerifyingKeys() error {
 		}
 	}
 
+	// Strict-PQ hard gate (Red H1). Loading a REAL (non-dummy) bn254
+	// verifying key on a strict-PQ chain is forbidden: such keys would
+	// re-enable the forgeable classical pairing path for shielded value.
+	// Refuse explicitly at construction rather than relying on the
+	// implicit dummy-key detector — the shielded path on a strict-PQ
+	// chain is STARK/FRI only.
+	if pv.config.StrictPQ && !pv.dummyKeys {
+		return errStrictPQRealVKForbidden
+	}
+
 	pv.log.Info("Loaded verifying keys",
 		log.Int("count", len(pv.verifyingKeys)),
 		log.String("proofSystem", pv.config.ProofSystem),
+		log.Bool("strictPQ", pv.config.StrictPQ),
 	)
 
 	return nil

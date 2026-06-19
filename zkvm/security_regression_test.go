@@ -98,13 +98,18 @@ func TestRegressionH01_Groth16SubgroupCheck(t *testing.T) {
 	}
 }
 
-// TestRegressionH02_STARKDisabled verifies that STARK proofs return an explicit
-// error rather than false-positive structural validation.
-// Finding H-02: STARK verify only checked commitment lengths and FRI layer
-// presence without verifying the FRI protocol or constraint composition.
-func TestRegressionH02_STARKDisabled(t *testing.T) {
+// TestRegressionH02_STARKFailsClosed verifies that STARK proofs are now
+// routed to the strict-PQ starkfri verifier and FAIL CLOSED — never a
+// false-positive structural validation.
+// Finding H-02: STARK verify previously only checked commitment lengths
+// and FRI layer presence without verifying the FRI protocol. The Z-Chain
+// rollup rewire (this branch) deletes that structural check and delegates
+// to precompile/starkfri, which rejects a proof lacking the "P3Q1" magic
+// header BEFORE any verifier callback. A zero-filled proof must reject.
+func TestRegressionH02_STARKFailsClosed(t *testing.T) {
 	verifier := newTestProofVerifier(t)
-	// Force non-dummy keys so the proof type switch is reached
+	// Force non-dummy keys so the classical guard does not short-circuit
+	// (irrelevant for the STARK path, which routes before the dummy gate).
 	verifier.dummyKeys = false
 
 	tx := &Transaction{
@@ -118,7 +123,7 @@ func TestRegressionH02_STARKDisabled(t *testing.T) {
 		},
 		Proof: &ZKProof{
 			ProofType:    "stark",
-			ProofData:    make([]byte, 1024),
+			ProofData:    make([]byte, 1024), // zero bytes: no P3Q1 magic header
 			PublicInputs: [][]byte{make([]byte, 32), make([]byte, 32)},
 		},
 	}
@@ -126,10 +131,10 @@ func TestRegressionH02_STARKDisabled(t *testing.T) {
 
 	err := verifier.VerifyTransactionProof(tx)
 	if err == nil {
-		t.Fatal("STARK proof must return error -- H-02 regression")
+		t.Fatal("STARK proof must return error (fail-closed) -- H-02 regression")
 	}
-	if !strings.Contains(err.Error(), "not yet implemented") {
-		t.Errorf("expected 'not yet implemented' in error, got: %v", err)
+	if !strings.Contains(err.Error(), "STARK") {
+		t.Errorf("expected STARK verification failure, got: %v", err)
 	}
 }
 

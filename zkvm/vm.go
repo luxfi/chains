@@ -11,13 +11,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/consensus/engine/dag/vertex"
 	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/runtime"
 	vmcore "github.com/luxfi/vm"
+	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/warp"
 
 	"github.com/luxfi/node/version"
@@ -48,6 +48,16 @@ type ZConfig struct {
 	CircuitType      string `serialize:"true" json:"circuitType"` // transfer, mint, burn
 	VerifyingKeyPath string `serialize:"true" json:"verifyingKeyPath"`
 	TrustedSetupPath string `serialize:"true" json:"trustedSetupPath"`
+
+	// StrictPQ HARD-DISABLES the classical (bn254 pairing-based) shielded
+	// proof systems on this chain. When true, the shielded-tx ProofVerifier
+	// REFUSES groth16/plonk/bulletproofs and accepts ONLY the post-quantum
+	// STARK/FRI system (delegated to precompile/starkfri, which fails
+	// closed until the prover binding exists). Loading a real (non-dummy)
+	// bn254 verifying key on a strict-PQ chain is an ERROR. This is the
+	// Lux primary-network posture: a CRQC that breaks bn254 cannot forge a
+	// shield/unshield proof to mint or steal shielded value.
+	StrictPQ bool `serialize:"true" json:"strictPQ"`
 
 	// FHE configuration
 	EnableFHE     bool   `serialize:"true" json:"enableFHE"`
