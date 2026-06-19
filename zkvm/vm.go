@@ -11,13 +11,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/luxfi/vm/chain"
+	"github.com/luxfi/chains/zkvm/precompiles"
 	"github.com/luxfi/consensus/engine/dag/vertex"
 	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/runtime"
 	vmcore "github.com/luxfi/vm"
+	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/warp"
 
 	"github.com/luxfi/node/version"
@@ -49,6 +50,24 @@ type ZConfig struct {
 	VerifyingKeyPath string `serialize:"true" json:"verifyingKeyPath"`
 	TrustedSetupPath string `serialize:"true" json:"trustedSetupPath"`
 
+	// VerifyingKeys supplies real (non-dummy) verifying keys per circuit
+	// type (keyed by the TransactionType string), in-memory at genesis.
+	// When empty, loadVerifyingKeys installs all-zero dummy keys (proof
+	// verification disabled, fail-closed). On a strict-PQ chain, supplying
+	// a real bn254 verifying key here is REFUSED at construction
+	// (errStrictPQRealVKForbidden) — shielded value uses STARK/FRI only.
+	VerifyingKeys map[string][]byte `serialize:"true" json:"verifyingKeys"`
+
+	// StrictPQ HARD-DISABLES the classical (bn254 pairing-based) shielded
+	// proof systems on this chain. When true, the shielded-tx ProofVerifier
+	// REFUSES groth16/plonk/bulletproofs and accepts ONLY the post-quantum
+	// STARK/FRI system (delegated to precompile/starkfri, which fails
+	// closed until the prover binding exists). Loading a real (non-dummy)
+	// bn254 verifying key on a strict-PQ chain is an ERROR. This is the
+	// Lux primary-network posture: a CRQC that breaks bn254 cannot forge a
+	// shield/unshield proof to mint or steal shielded value.
+	StrictPQ bool `serialize:"true" json:"strictPQ"`
+
 	// FHE configuration
 	EnableFHE     bool   `serialize:"true" json:"enableFHE"`
 	FHEScheme     string `serialize:"true" json:"fheScheme"`     // BFV, CKKS, etc.
@@ -75,6 +94,15 @@ type VM struct {
 	proofVerifier  *ProofVerifier
 	fheProcessor   *FHEProcessor
 	addressManager *AddressManager
+
+	// zkPrecompiles holds the Z-Chain ZK verifier precompiles. It is
+	// populated in Initialize by precompiles.RegisterZKPrecompiles, with
+	// strictPQ taken from config.StrictPQ — the SAME single field that
+	// gates the shielded-proof verifier. One profile bit, both switches:
+	// on a strict-PQ chain the classical Groth16/PLONK verifiers (0x80/
+	// 0x81) are NOT registered (fail-closed by absence) AND the shielded
+	// proof verifier refuses classical systems.
+	zkPrecompiles *precompiles.MapRegistry
 
 	// Block management
 	genesisBlock   *Block
@@ -132,12 +160,19 @@ func (vm *VM) Initialize(
 			return fmt.Errorf("failed to parse config: %w", err)
 		}
 	} else {
-		// Use default config
+		// Use default config. The Z-Chain is DEFINITIVELY strict-PQ (it is
+		// the shielded-settlement chain pinned to the canonical Lux
+		// strict-PQ security profile), so the default — used when genesis
+		// carries no explicit ZConfig — pins StrictPQ=true and the only
+		// accepted shielded system, STARK/FRI ("stark"). A non-strict
+		// permissive deployment MUST set StrictPQ=false explicitly in
+		// genesis; it is never the default for this chain.
 		vm.config = ZConfig{
 			EnableConfidentialTransfers: true,
 			EnablePrivateAddresses:      true,
-			ProofSystem:                 "groth16",
+			ProofSystem:                 "stark",
 			CircuitType:                 "transfer",
+			StrictPQ:                    true,
 			EnableFHE:                   false,
 			MaxUTXOsPerBlock:            100,
 			ProofCacheSize:              1000,
@@ -179,6 +214,17 @@ func (vm *VM) Initialize(
 	if !proofVerifier.VerifyingKeysLoaded() {
 		vm.log.Warn("Z-Chain running without real ZK verifying keys — proof verification disabled")
 	}
+
+	// Register the Z-Chain ZK verifier precompiles, deriving strictPQ from
+	// the SAME config.StrictPQ field that gates the proof verifier above.
+	// One profile bit drives both switches: a strict-PQ Z-Chain omits the
+	// classical Groth16 (0x80) / PLONK (0x81) verifiers (fail-closed by
+	// absence) so only the post-quantum STARK/FRI verifier (0x82) exists.
+	vm.zkPrecompiles = precompiles.NewMapRegistry()
+	precompiles.RegisterZKPrecompiles(vm.zkPrecompiles, vm.config.StrictPQ)
+	vm.log.Info("Registered Z-Chain ZK precompiles",
+		log.Bool("strictPQ", vm.config.StrictPQ),
+	)
 
 	// Initialize FHE processor if enabled
 	if vm.config.EnableFHE {
@@ -257,6 +303,16 @@ func (vm *VM) Initialize(
 
 	return nil
 }
+
+// ZKPrecompiles returns the registered Z-Chain ZK verifier precompiles.
+// On a strict-PQ chain the classical Groth16 (0x80) / PLONK (0x81)
+// addresses resolve to "no precompile" (fail-closed by absence).
+func (vm *VM) ZKPrecompiles() *precompiles.MapRegistry { return vm.zkPrecompiles }
+
+// StrictPQ reports whether this Z-Chain instance is on the strict-PQ
+// security profile. It is the single bit that gates both the shielded-
+// proof verifier and the classical-precompile registration.
+func (vm *VM) StrictPQ() bool { return vm.config.StrictPQ }
 
 // BuildBlock builds a new block
 func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
