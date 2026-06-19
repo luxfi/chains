@@ -11,6 +11,8 @@ import (
 
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
+
+	"github.com/luxfi/precompile/starkfri"
 )
 
 // Precompile addresses for Z-Chain ZK verifiers.
@@ -35,12 +37,13 @@ const (
 )
 
 var (
-	errInputTooShort   = errors.New("input too short")
-	errInvalidPoint    = errors.New("invalid elliptic curve point")
-	errSubgroupCheck   = errors.New("point not in correct subgroup")
-	errPairingFailed   = errors.New("pairing computation failed")
-	errProofInvalid    = errors.New("proof verification failed")
-	errNotImplemented  = errors.New("verifier not yet available")
+	errInputTooShort       = errors.New("input too short")
+	errInvalidPoint        = errors.New("invalid elliptic curve point")
+	errSubgroupCheck       = errors.New("point not in correct subgroup")
+	errPairingFailed       = errors.New("pairing computation failed")
+	errProofInvalid        = errors.New("proof verification failed")
+	errNotImplemented      = errors.New("verifier not yet available")
+	errVerifierUnavailable = errors.New("strict-PQ STARK verifier binding not registered (build with -tags starkfri_p3q); failing closed")
 )
 
 // result bytes returned by precompiles
@@ -198,10 +201,34 @@ func (v *PLONKVerifier) Run(input []byte) ([]byte, error) {
 	return resultValid, nil
 }
 
-// --- STARK Verifier (stub) ---
+// --- STARK Verifier (strict-PQ STARK / FRI via P3Q) ---
 
-// STARKVerifier will verify STARK proofs. Currently returns an error
-// indicating the verifier is not yet available.
+// STARKVerifier verifies post-quantum STARK / FRI proofs on Z-Chain by
+// delegating to the strict-PQ STARK verifier in precompile/starkfri
+// (a Plonky3 fork: cSHAKE256 Merkle commitments over the Goldilocks
+// 64-bit prime field, FRI low-degree test — NO KZG, NO pairings, NO
+// trusted setup). This is the quantum-safe replacement for the
+// pairing-based Groth16Verifier on the Z-Chain MLDSA-rollup path: a
+// quantum adversary that breaks bn254 cannot forge a STARK/FRI proof,
+// whose soundness rests only on the collision resistance of cSHAKE256
+// and the Reed–Solomon proximity gap (no algebraic-group assumption).
+//
+// Input format:
+//
+//	proof_len  (4 bytes, big-endian)
+//	proof      (proof_len bytes) — must begin with MagicHeader "P3Q1"
+//	pub_len    (4 bytes, big-endian)
+//	inputs     (pub_len bytes) — serialized public inputs
+//
+// Output: 0x01 if valid, 0x00 if invalid.
+//
+// Verifier binding. The actual FRI verifier runs out-of-band (Rust,
+// behind the `starkfri_p3q` cgo build tag) and self-registers via
+// starkfri.RegisterVerifier. When no verifier is bound (CGO_ENABLED=0
+// or the tag is absent) starkfri.Verify returns ErrVerifierNotRegistered
+// and this precompile FAILS CLOSED — it returns errVerifierUnavailable
+// and NEVER accepts an unverified proof. There is no forgery oracle in
+// the unbound configuration.
 type STARKVerifier struct{}
 
 func (v *STARKVerifier) RequiredGas(input []byte) uint64 {
@@ -209,7 +236,41 @@ func (v *STARKVerifier) RequiredGas(input []byte) uint64 {
 }
 
 func (v *STARKVerifier) Run(input []byte) ([]byte, error) {
-	return resultInvalid, errNotImplemented
+	// Parse [proof_len(4)][proof][pub_len(4)][pub].
+	if len(input) < 8 {
+		return resultInvalid, errInputTooShort
+	}
+	proofLen := binary.BigEndian.Uint32(input[:4])
+	off := uint32(4)
+	if uint32(len(input)) < off+proofLen+4 {
+		return resultInvalid, errInputTooShort
+	}
+	proof := input[off : off+proofLen]
+	off += proofLen
+
+	pubLen := binary.BigEndian.Uint32(input[off : off+4])
+	off += 4
+	if uint32(len(input)) < off+pubLen {
+		return resultInvalid, errInputTooShort
+	}
+	pub := input[off : off+pubLen]
+
+	ok, err := starkfri.Verify(proof, pub)
+	if err != nil {
+		// ErrVerifierNotRegistered (no cgo binding) or an FFI/decode
+		// failure. Either way the proof is NOT verified: fail closed.
+		// We distinguish "binding pending" from a malformed proof so an
+		// operator can tell a deployment-config gap from a bad proof,
+		// but in neither case do we return resultValid.
+		if errors.Is(err, starkfri.ErrVerifierNotRegistered) {
+			return resultInvalid, errVerifierUnavailable
+		}
+		return resultInvalid, nil // malformed / non-verifying proof is not an execution error
+	}
+	if !ok {
+		return resultInvalid, nil
+	}
+	return resultValid, nil
 }
 
 // --- Halo2 Verifier (stub) ---
