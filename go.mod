@@ -12,7 +12,7 @@ require (
 	github.com/luxfi/constants v1.5.8
 	github.com/luxfi/crypto v1.19.17
 	github.com/luxfi/database v1.19.0
-	github.com/luxfi/evm v1.99.28
+	github.com/luxfi/evm v1.99.29
 	github.com/luxfi/geth v1.17.11
 	github.com/luxfi/ids v1.2.15
 	github.com/luxfi/lattice/v7 v7.1.4
@@ -20,7 +20,7 @@ require (
 	github.com/luxfi/metric v1.5.8
 	github.com/luxfi/node v1.29.3
 	github.com/luxfi/oracle v1.0.0
-	github.com/luxfi/precompile v0.5.47
+	github.com/luxfi/precompile v0.5.49
 	github.com/luxfi/relay v1.0.0
 	github.com/luxfi/rpc v1.1.0
 	github.com/luxfi/runtime v1.1.1
