@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/luxfi/crypto/threshold"
+	_ "github.com/luxfi/crypto/threshold/bls" // bridgevm runs as a standalone plugin process; blank-import to run the bls init() that registers the BLS threshold scheme
 	"github.com/luxfi/log"
 )
 
