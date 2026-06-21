@@ -42,10 +42,10 @@ func TestNativeLP_CommitImportsFundsDPosition(t *testing.T) {
 	token := ids.GenerateTestID() // the LP's committed asset (e.g. currency0)
 	const principal = 1000
 
-	// The precompile's SubmitPositionCommit wrote a C->D commit object (owner|asset|
-	// amount) into shared memory; model it with fundCChain (proven byte-identical to
-	// the precompile wire in TestNativeSeam_WireMatchesPrecompile).
-	commitUTXO := h.fundCChain(t, lp, token, principal)
+	// The precompile's SubmitPositionCommit wrote a railLP C->D commit object (rail|
+	// owner|asset|amount) into shared memory; model it with fundCChainRail (proven
+	// byte-identical to the precompile wire in TestNativeSeam_WireMatchesPrecompile).
+	commitUTXO := h.fundCChainRail(t, txs.RailLP, lp, token, principal)
 
 	// REAL executeDeposit: atomic import (consume-once) + credit the D-Chain ledger
 	// with exactly the committed value — the LP's position collateral is now funded on
@@ -53,7 +53,7 @@ func TestNativeLP_CommitImportsFundsDPosition(t *testing.T) {
 	arDep := newAtomicRequests()
 	commitTx := txs.NewImportTx(lp, 0, h.cChain,
 		[]txs.AtomicInput{{UTXOID: commitUTXO, Asset: token, Amount: principal}},
-		[]txs.AtomicOutput{{Owner: lp, Asset: token, Amount: principal}})
+		[]txs.AtomicOutput{{Rail: txs.RailLP, Owner: lp, Asset: token, Amount: principal}})
 	if err := h.vm.executeDeposit(ctx, commitTx, arDep); err != nil {
 		t.Fatalf("executeDeposit of DL01 commit object: %v", err)
 	}
@@ -93,11 +93,11 @@ func TestNativeLP_CollectExportsPrincipalPlusFees(t *testing.T) {
 
 	// Fund + commit the principal (the C->D leg), then model the CLOB crediting the
 	// maker `fees` more from taker flow (the ledger now owes the LP principal+fees).
-	commitUTXO := h.fundCChain(t, lp, token, principal)
+	commitUTXO := h.fundCChainRail(t, txs.RailLP, lp, token, principal)
 	arDep := newAtomicRequests()
 	commitTx := txs.NewImportTx(lp, 0, h.cChain,
 		[]txs.AtomicInput{{UTXOID: commitUTXO, Asset: token, Amount: principal}},
-		[]txs.AtomicOutput{{Owner: lp, Asset: token, Amount: principal}})
+		[]txs.AtomicOutput{{Rail: txs.RailLP, Owner: lp, Asset: token, Amount: principal}})
 	if err := h.vm.executeDeposit(ctx, commitTx, arDep); err != nil {
 		t.Fatalf("commit deposit: %v", err)
 	}
@@ -121,9 +121,9 @@ func TestNativeLP_CollectExportsPrincipalPlusFees(t *testing.T) {
 	if !ok || len(req.PutRequests) != 1 {
 		t.Fatalf("collect export must produce exactly one D->C object")
 	}
-	o, a, amt, decOK := decodeExportedOutput(req.PutRequests[0].Value)
-	if !decOK || o != lp || a != token || amt != withdrawable {
-		t.Fatalf("D->C collect object mismatch: ok=%v owner=%v asset=%v amount=%d", decOK, o, a, amt)
+	r, o, a, amt, decOK := decodeExportedOutput(req.PutRequests[0].Value)
+	if !decOK || r != txs.RailLP || o != lp || a != token || amt != withdrawable {
+		t.Fatalf("D->C collect object mismatch: ok=%v rail=%d owner=%v asset=%v amount=%d", decOK, r, o, a, amt)
 	}
 	// The ledger was fully drained for this asset (principal+fees withdrawn).
 	if got := h.ledger.bal[ledgerKey(frameUser(lp), token)]; got != 0 {
@@ -146,11 +146,11 @@ func TestNativeLP_CommitCollectRoundTripConserves(t *testing.T) {
 	const fees = 120
 
 	// --- C->D commit (position funded). ---
-	commitUTXO := h.fundCChain(t, lp, token, principal)
+	commitUTXO := h.fundCChainRail(t, txs.RailLP, lp, token, principal)
 	arDep := newAtomicRequests()
 	commitTx := txs.NewImportTx(lp, 0, h.cChain,
 		[]txs.AtomicInput{{UTXOID: commitUTXO, Asset: token, Amount: principal}},
-		[]txs.AtomicOutput{{Owner: lp, Asset: token, Amount: principal}})
+		[]txs.AtomicOutput{{Rail: txs.RailLP, Owner: lp, Asset: token, Amount: principal}})
 	if err := h.vm.executeDeposit(ctx, commitTx, arDep); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
@@ -173,8 +173,8 @@ func TestNativeLP_CommitCollectRoundTripConserves(t *testing.T) {
 	if realized != principal+fees {
 		t.Fatalf("round-trip realized %d != committed+fees %d", realized, principal+fees)
 	}
-	o, a, amt, ok := decodeExportedOutput(arWd.reqs[h.cChain].PutRequests[0].Value)
-	if !ok || o != lp || a != token || amt != principal+fees {
-		t.Fatalf("round-trip D->C object mismatch: ok=%v owner=%v asset=%v amount=%d", ok, o, a, amt)
+	r, o, a, amt, ok := decodeExportedOutput(arWd.reqs[h.cChain].PutRequests[0].Value)
+	if !ok || r != txs.RailLP || o != lp || a != token || amt != principal+fees {
+		t.Fatalf("round-trip D->C object mismatch: ok=%v rail=%d owner=%v asset=%v amount=%d", ok, r, o, a, amt)
 	}
 }

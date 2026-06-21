@@ -254,8 +254,8 @@ func creditedTo(t *testing.T, cChainSM atomic.SharedMemory, proxyChain ids.ID, o
 	}
 	var credited uint64
 	for _, v := range vals {
-		if len(v) >= 60 {
-			credited += binary.BigEndian.Uint64(v[52:60])
+		if len(v) >= exportedOutputSize {
+			credited += binary.BigEndian.Uint64(v[53:61])
 		}
 	}
 	return credited
@@ -336,7 +336,7 @@ func TestRED_FractionalFill_NeverMints(t *testing.T) {
 			}
 			var a ids.ID
 			copy(a[:], e.Value[20:52])
-			amt := binary.BigEndian.Uint64(e.Value[52:60])
+			amt := binary.BigEndian.Uint64(e.Value[53:61])
 			if a == lockedAsset {
 				refund += amt
 			} else {
@@ -371,7 +371,7 @@ func TestRED_FractionalFill_NeverMints(t *testing.T) {
 // ~18.44 tokens at 18 decimals, so a single 19-token fill, cast naively, would be
 // summed into the exported amount as a plausible ~18.44-token value — value minted
 // out of thin air, and (because the export amount is a fixed 8-byte uint64 with no
-// widening downstream — atomic.go encodeExportedOutput PutUint64(v[52:60])) there
+// widening downstream — atomic.go encodeExportedOutput PutUint64(v[53:61])) there
 // is nothing downstream to catch it.
 //
 // The closed behavior: settlement aggregates fills as exact float64 ONCE, then
@@ -399,8 +399,8 @@ func TestRED_OverflowFill_SaturatesUint64(t *testing.T) {
 		var total uint64
 		for _, reqs := range ar.reqs {
 			for _, e := range reqs.PutRequests {
-				if len(e.Value) >= 60 {
-					total += binary.BigEndian.Uint64(e.Value[52:60])
+				if len(e.Value) >= exportedOutputSize {
+					total += binary.BigEndian.Uint64(e.Value[53:61])
 				}
 			}
 		}
@@ -548,8 +548,8 @@ func TestRED_MixedSideFills_OverCredits(t *testing.T) {
 	var credited uint64
 	for _, reqs := range ar.reqs {
 		for _, e := range reqs.PutRequests {
-			if len(e.Value) >= 60 {
-				credited += binary.BigEndian.Uint64(e.Value[52:60])
+			if len(e.Value) >= exportedOutputSize {
+				credited += binary.BigEndian.Uint64(e.Value[53:61])
 			}
 		}
 	}
@@ -700,7 +700,7 @@ func TestRED_EscrowTruncation_OverRefunds(t *testing.T) {
 			}
 			var a ids.ID
 			copy(a[:], e.Value[20:52])
-			amt := binary.BigEndian.Uint64(e.Value[52:60])
+			amt := binary.BigEndian.Uint64(e.Value[53:61])
 			if a == lockedAsset {
 				refund += amt
 			} else {

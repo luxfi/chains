@@ -160,12 +160,20 @@ func newCustodyHarness(t *testing.T) *custodyHarness {
 	return &custodyHarness{vm: v, cChainSM: cChainSM, proxyChain: proxyChain, cChain: cChain, ledger: ledger}
 }
 
-// fundCChain exports `amount` of `asset` owned by `owner` into shared memory (the
-// proxy can claim it on an import), returning the source UTXO id.
+// fundCChain exports `amount` of `asset` owned by `owner` into shared memory on the
+// SWAP rail (the proxy can claim it on an import), returning the source UTXO id.
 func (h *custodyHarness) fundCChain(t *testing.T, owner ids.ShortID, asset ids.ID, amount uint64) ids.ID {
+	return h.fundCChainRail(t, txs.RailSwap, owner, asset, amount)
+}
+
+// fundCChainRail is fundCChain parametrized by the object's RAIL — the lane the C->D
+// object travels (RailSwap for a swap intent, RailLP for an LP commit). The import
+// binds the credited outputs' rail to this recorded rail, so the importing tx's
+// outputs must carry the SAME rail.
+func (h *custodyHarness) fundCChainRail(t *testing.T, rail txs.Rail, owner ids.ShortID, asset ids.ID, amount uint64) ids.ID {
 	t.Helper()
 	srcUTXOID := deriveUTXOID(ids.GenerateTestID(), 0)
-	val := encodeExportedOutput(txs.AtomicOutput{Owner: owner, Asset: asset, Amount: amount})
+	val := encodeExportedOutput(txs.AtomicOutput{Rail: rail, Owner: owner, Asset: asset, Amount: amount})
 	if err := h.cChainSM.Apply(map[ids.ID]*atomic.Requests{
 		h.proxyChain: {PutRequests: []*atomic.Element{{Key: srcUTXOID[:], Value: val, Traits: [][]byte{owner[:]}}}},
 	}); err != nil {
@@ -183,8 +191,8 @@ func (h *custodyHarness) exportedTo(t *testing.T, owner ids.ShortID) uint64 {
 	}
 	var total uint64
 	for _, v := range vals {
-		if len(v) >= 60 {
-			total += binary.BigEndian.Uint64(v[52:60])
+		if len(v) >= exportedOutputSize {
+			total += binary.BigEndian.Uint64(v[53:61])
 		}
 	}
 	return total

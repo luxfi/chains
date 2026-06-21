@@ -212,8 +212,8 @@ func exportedTotal(t *testing.T, h *conservationHarness) uint64 {
 	t.Helper()
 	var total uint64
 	for _, v := range indexedByTaker(t, h) {
-		if len(v) >= 60 {
-			total += binary.BigEndian.Uint64(v[52:60])
+		if len(v) >= exportedOutputSize {
+			total += binary.BigEndian.Uint64(v[53:61])
 		}
 	}
 	return total
