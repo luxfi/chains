@@ -67,6 +67,13 @@ var (
 	// a deposit credits one (owner,asset) ledger row, so every consumed UTXO must be
 	// the same asset.
 	errImportMixedAssets = errors.New("import: consumed UTXOs span multiple assets")
+	// errImportMixedRails guards the RAIL (lane) axis of the import bind: an import
+	// funds a SINGLE lane (swap or LP), so every consumed UTXO and every credited
+	// output must share the consumed UTXO's recorded rail. Mixing lanes would let a
+	// swap-fill object and an LP-collect object be claimed in one credit — the
+	// cross-rail consume H1 closes. The recorded rail (written by the export side via
+	// encodeExportedOutput) is authoritative.
+	errImportMixedRails = errors.New("import: consumed/credited rails mismatch (cross-rail consume)")
 	// errImportOutputAsset rejects an import whose credited output names a different
 	// asset than the consumed UTXO — the credit must be denominated in the imported
 	// asset (the native-aliasing fix's structural half, also enforced in Verify).

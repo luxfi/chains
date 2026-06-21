@@ -127,8 +127,8 @@ func exportedToTaker(t *testing.T, cChainSM dexatomic.SharedMemory, proxyChain i
 	}
 	var total uint64
 	for _, v := range vals {
-		if len(v) >= 60 {
-			total += binary.BigEndian.Uint64(v[52:60])
+		if len(v) >= exportedOutputSize {
+			total += binary.BigEndian.Uint64(v[53:61])
 		}
 	}
 	return total

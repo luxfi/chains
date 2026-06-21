@@ -137,6 +137,7 @@ func (vm *VM) executeImport(tx *txs.ImportTx, ar *atomicRequests) error {
 	var (
 		importedAsset ids.ID
 		importedOwner ids.ShortID
+		importedRail  txs.Rail
 		haveAsset     bool
 	)
 	// PASS 1 — VALIDATE every input + output with NO state mutation. The import is
@@ -167,7 +168,7 @@ func (vm *VM) executeImport(tx *txs.ImportTx, ar *atomicRequests) error {
 			if gerr != nil {
 				return fmt.Errorf("import: read source UTXO %s: %w", in.UTXOID, gerr)
 			}
-			recOwner, recAsset, recAmount, ok := decodeExportedOutput(vals[0])
+			recRail, recOwner, recAsset, recAmount, ok := decodeExportedOutput(vals[0])
 			if !ok {
 				return fmt.Errorf("import: UTXO %s: %w", in.UTXOID, errImportUTXOValueMalformed)
 			}
@@ -180,6 +181,7 @@ func (vm *VM) executeImport(tx *txs.ImportTx, ar *atomicRequests) error {
 			if !haveAsset {
 				importedAsset = recAsset
 				importedOwner = recOwner
+				importedRail = recRail
 				haveAsset = true
 			} else {
 				if importedAsset != recAsset {
@@ -190,6 +192,12 @@ func (vm *VM) executeImport(tx *txs.ImportTx, ar *atomicRequests) error {
 				// owner authorize spending another's value.
 				if importedOwner != recOwner {
 					return fmt.Errorf("import: %w (UTXO %s owner %s != %s)", errImportWrongOwner, in.UTXOID, recOwner, importedOwner)
+				}
+				// Every consumed UTXO must share ONE recorded rail (lane): an import
+				// funds a single lane, and mixing lanes would let a swap object and an LP
+				// object be claimed in one credit (the cross-rail consume H1 closes).
+				if importedRail != recRail {
+					return fmt.Errorf("import: %w (UTXO %s rail %d != %d)", errImportMixedRails, in.UTXOID, recRail, importedRail)
 				}
 			}
 		}
@@ -212,6 +220,14 @@ func (vm *VM) executeImport(tx *txs.ImportTx, ar *atomicRequests) error {
 			}
 			if o.Owner != importedOwner {
 				return fmt.Errorf("import: %w (output owner %s, consumed %s)", errImportWrongOwner, o.Owner, importedOwner)
+			}
+			// Authoritative rail bind: every credited output must be on the SAME lane
+			// the consumed UTXO recorded — so an import cannot re-lane value (credit a
+			// swap object onto the LP lane or vice-versa). Composed with Verify's
+			// structural output-rail-uniformity, the credit is provably the consumed
+			// object's rail (the H1 fix, owner/asset/rail all pinned to the record).
+			if o.Rail != importedRail {
+				return fmt.Errorf("import: %w (output rail %d, consumed %d)", errImportMixedRails, o.Rail, importedRail)
 			}
 		}
 	}
@@ -336,37 +352,42 @@ func deriveUTXOID(txID ids.ID, index uint32) ids.ID {
 	return ids.ID(idHash(buf[:]))
 }
 
-// exportedOutputSize is the fixed shared-memory UTXO value width: owner(20) |
-// asset(32) | amount(8).
-const exportedOutputSize = 20 + 32 + 8
+// exportedOutputSize is the fixed shared-memory UTXO value width: rail(1) |
+// owner(20) | asset(32) | amount(8). IDENTICAL to the precompile's
+// exportedOutputSize9999 — the rail byte (the H1 lane tag) leads the object.
+const exportedOutputSize = 1 + 20 + 32 + 8
 
 // encodeExportedOutput serializes an AtomicOutput as the shared-memory value:
-// owner(20) | asset(32) | amount(8). Fixed-width, deterministic.
+// rail(1) | owner(20) | asset(32) | amount(8). Fixed-width, deterministic. The rail
+// byte is the lane the value travels (RailSwap / RailLP), bound by the precompile's
+// matching consume path on the C side.
 func encodeExportedOutput(out txs.AtomicOutput) []byte {
 	v := make([]byte, exportedOutputSize)
-	copy(v[0:20], out.Owner[:])
-	copy(v[20:52], out.Asset[:])
-	binary.BigEndian.PutUint64(v[52:60], out.Amount)
+	v[0] = byte(out.Rail)
+	copy(v[1:21], out.Owner[:])
+	copy(v[21:53], out.Asset[:])
+	binary.BigEndian.PutUint64(v[53:61], out.Amount)
 	return v
 }
 
 // decodeExportedOutput is the inverse of encodeExportedOutput: it reads back the
-// (owner, asset, amount) a consumed source UTXO RECORDED in shared memory.
-// executeImport uses this to bind the credited asset AND owner to the value the
-// chain actually holds for that UTXO — not the asset/owner the importing tx merely
-// declares — so a bogus-token UTXO can never be imported as native value (the
-// native-aliasing fix) and a victim's exported UTXO can never be credited to an
-// attacker's account (the owner-aliasing fix). ok=false for any value that is not
-// exactly the canonical width, so a corrupt/garbage record is never reinterpreted
-// into a credit.
-func decodeExportedOutput(v []byte) (owner ids.ShortID, asset ids.ID, amount uint64, ok bool) {
+// (rail, owner, asset, amount) a consumed source UTXO RECORDED in shared memory.
+// executeImport uses this to bind the credited rail, asset AND owner to the value the
+// chain actually holds for that UTXO — not what the importing tx merely declares — so
+// a bogus-token UTXO can never be imported as native value (the native-aliasing fix),
+// a victim's exported UTXO can never be credited to an attacker's account (the
+// owner-aliasing fix), and a cross-rail object can never fund the wrong lane (the H1
+// rail fix). ok=false for any value that is not exactly the canonical width, so a
+// corrupt/garbage record is never reinterpreted into a credit.
+func decodeExportedOutput(v []byte) (rail txs.Rail, owner ids.ShortID, asset ids.ID, amount uint64, ok bool) {
 	if len(v) != exportedOutputSize {
-		return ids.ShortEmpty, ids.Empty, 0, false
+		return 0, ids.ShortEmpty, ids.Empty, 0, false
 	}
-	copy(owner[:], v[0:20])
-	copy(asset[:], v[20:52])
-	amount = binary.BigEndian.Uint64(v[52:60])
-	return owner, asset, amount, true
+	rail = txs.Rail(v[0])
+	copy(owner[:], v[1:21])
+	copy(asset[:], v[21:53])
+	amount = binary.BigEndian.Uint64(v[53:61])
+	return rail, owner, asset, amount, true
 }
 
 // float64FromBits reads a big-endian IEEE-754 float64 (the ZAP fill wire codec,

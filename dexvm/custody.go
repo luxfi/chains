@@ -225,8 +225,11 @@ func (vm *VM) executeWithdraw(ctx context.Context, owner ids.ShortID, asset ids.
 	if cerr := vm.state.MarkConsumed(fillRef); cerr != nil {
 		return 0, fmt.Errorf("dexvm custody: withdraw mark consumed: %w", cerr)
 	}
-	// Atomic export of EXACTLY the realized amount in the withdrawn asset.
-	out := []txs.AtomicOutput{{Owner: owner, Asset: asset, Amount: realized}}
+	// Atomic export of EXACTLY the realized amount in the withdrawn asset, on the LP
+	// lane (RailLP) — so the precompile's ImportPositionCollect is the ONLY C-side path
+	// that can claim it (a swap-settlement consume of this object is rejected). This is
+	// the D side of the H1 rail bind for the LP collect/withdraw leg.
+	out := []txs.AtomicOutput{{Rail: txs.RailLP, Owner: owner, Asset: asset, Amount: realized}}
 	exportTx := txs.NewSettlementExportTx(owner, txIndex, destChain, out, fillRef, createdAt)
 	if err := vm.executeExport(exportTx, ar); err != nil {
 		return 0, fmt.Errorf("dexvm custody: withdraw export: %w", err)
