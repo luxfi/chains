@@ -29,15 +29,16 @@ import (
 // object -> C imports+credits, with one wire format on both ends.
 
 // encodeAtomicObjectC replicates precompile/dex.encodeAtomicObject byte-for-byte:
-// owner(20) | asset(32) | amount(8). (The chains repo cannot import the precompile
-// — it is a leaf library, and importing it would invert the dependency — so the
-// 60-byte contract is replicated here and asserted byte-identical to the VM's own
-// encodeExportedOutput below.)
-func encodeAtomicObjectC(owner ids.ShortID, asset ids.ID, amount uint64) []byte {
-	v := make([]byte, 20+32+8)
-	copy(v[0:20], owner[:])
-	copy(v[20:52], asset[:])
-	binary.BigEndian.PutUint64(v[52:60], amount)
+// rail(1) | owner(20) | asset(32) | amount(8). (The chains repo cannot import the
+// precompile — it is a leaf library, and importing it would invert the dependency —
+// so the 61-byte contract is replicated here and asserted byte-identical to the VM's
+// own encodeExportedOutput below.)
+func encodeAtomicObjectC(rail txs.Rail, owner ids.ShortID, asset ids.ID, amount uint64) []byte {
+	v := make([]byte, 1+20+32+8)
+	v[0] = byte(rail)
+	copy(v[1:21], owner[:])
+	copy(v[21:53], asset[:])
+	binary.BigEndian.PutUint64(v[53:61], amount)
 	return v
 }
 
@@ -50,24 +51,28 @@ func TestNativeSeam_WireMatchesPrecompile(t *testing.T) {
 	asset := ids.GenerateTestID()
 	const amount = 123456789
 
-	fromVM := encodeExportedOutput(txs.AtomicOutput{Owner: owner, Asset: asset, Amount: amount})
-	fromPrecompile := encodeAtomicObjectC(owner, asset, amount)
+	// Assert byte-identity on BOTH rails — the rail byte (object[0]) must round-trip
+	// identically through the VM's encode and the precompile-replicated encode.
+	for _, rail := range []txs.Rail{txs.RailSwap, txs.RailLP} {
+		fromVM := encodeExportedOutput(txs.AtomicOutput{Rail: rail, Owner: owner, Asset: asset, Amount: amount})
+		fromPrecompile := encodeAtomicObjectC(rail, owner, asset, amount)
 
-	if len(fromVM) != exportedOutputSize {
-		t.Fatalf("VM object width %d != canonical %d", len(fromVM), exportedOutputSize)
-	}
-	if len(fromPrecompile) != exportedOutputSize {
-		t.Fatalf("precompile object width %d != canonical %d", len(fromPrecompile), exportedOutputSize)
-	}
-	for i := range fromVM {
-		if fromVM[i] != fromPrecompile[i] {
-			t.Fatalf("wire drift at byte %d: VM=%02x precompile=%02x", i, fromVM[i], fromPrecompile[i])
+		if len(fromVM) != exportedOutputSize {
+			t.Fatalf("VM object width %d != canonical %d", len(fromVM), exportedOutputSize)
 		}
-	}
-	// And the VM decodes the precompile-shaped object to the same (owner, asset, amount).
-	o, a, amt, ok := decodeExportedOutput(fromPrecompile)
-	if !ok || o != owner || a != asset || amt != amount {
-		t.Fatalf("VM decode of precompile object mismatch: ok=%v owner=%v asset=%v amt=%d", ok, o, a, amt)
+		if len(fromPrecompile) != exportedOutputSize {
+			t.Fatalf("precompile object width %d != canonical %d", len(fromPrecompile), exportedOutputSize)
+		}
+		for i := range fromVM {
+			if fromVM[i] != fromPrecompile[i] {
+				t.Fatalf("rail %d wire drift at byte %d: VM=%02x precompile=%02x", rail, i, fromVM[i], fromPrecompile[i])
+			}
+		}
+		// And the VM decodes the precompile-shaped object to the same (rail, owner, asset, amount).
+		r, o, a, amt, ok := decodeExportedOutput(fromPrecompile)
+		if !ok || r != rail || o != owner || a != asset || amt != amount {
+			t.Fatalf("VM decode of precompile object mismatch: ok=%v rail=%d owner=%v asset=%v amt=%d", ok, r, o, a, amt)
+		}
 	}
 }
 
@@ -132,20 +137,21 @@ func TestNativeSeam_DtoC_ExportDecodesAsPrecompileObject(t *testing.T) {
 	}
 	obj := req.PutRequests[0].Value
 
-	// The precompile decodes this object (owner|asset|amount) and binds the credit to
-	// it. Replicate the precompile's decode (decodeAtomicObject) and assert it reads
-	// the exact recorded value — i.e. the precompile would credit `owner` exactly
-	// `amount` of `token`.
+	// The precompile decodes this object (rail|owner|asset|amount) and binds the credit
+	// to it. Replicate the precompile's decode (decodeAtomicObject) at the canonical
+	// offsets and assert it reads the exact recorded value — i.e. the precompile would
+	// credit `owner` exactly `amount` of `token` on the swap rail (a fill export).
 	if len(obj) != exportedOutputSize {
 		t.Fatalf("D->C object width %d != canonical %d", len(obj), exportedOutputSize)
 	}
+	pRail := txs.Rail(obj[0])
 	var pOwner ids.ShortID
-	copy(pOwner[:], obj[0:20])
+	copy(pOwner[:], obj[1:21])
 	var pAsset ids.ID
-	copy(pAsset[:], obj[20:52])
-	pAmount := binary.BigEndian.Uint64(obj[52:60])
-	if pOwner != owner || pAsset != token || pAmount != amount {
-		t.Fatalf("precompile decode of D->C object mismatch: owner=%v asset=%v amount=%d", pOwner, pAsset, pAmount)
+	copy(pAsset[:], obj[21:53])
+	pAmount := binary.BigEndian.Uint64(obj[53:61])
+	if pRail != txs.RailSwap || pOwner != owner || pAsset != token || pAmount != amount {
+		t.Fatalf("precompile decode of D->C object mismatch: rail=%d owner=%v asset=%v amount=%d", pRail, pOwner, pAsset, pAmount)
 	}
 
 	// The export Trait is the owner address (so the precompile / destination indexes
@@ -192,9 +198,9 @@ func TestNativeSeam_FullRoundTrip(t *testing.T) {
 	// taker's 100 tokenIn was consumed on C (import Remove) and 90 tokenOut returns
 	// (export Put) — value moves only via these atomic objects, never minted.
 	obj := arOut.reqs[h.cChain].PutRequests[0].Value
-	o, a, amt, ok := decodeExportedOutput(obj)
-	if !ok || o != taker || a != tokenOut || amt != 90 {
-		t.Fatalf("round-trip D->C object mismatch: ok=%v owner=%v asset=%v amt=%d", ok, o, a, amt)
+	r, o, a, amt, ok := decodeExportedOutput(obj)
+	if !ok || r != txs.RailSwap || o != taker || a != tokenOut || amt != 90 {
+		t.Fatalf("round-trip D->C object mismatch: ok=%v rail=%d owner=%v asset=%v amt=%d", ok, r, o, a, amt)
 	}
 	if len(arIn.reqs[h.cChain].RemoveRequests) != 1 {
 		t.Fatalf("round-trip: C->D object must be consumed exactly once")

@@ -8,19 +8,19 @@
 //  1. ATOMIC VALUE MOVEMENT (C-Chain <-> proxy), modeled on the platformvm
 //     Import/Export txs that move value between primary-network chains in a
 //     single atomic shared-memory commit:
-//       - TxImport  : claim value exported from C-Chain into the proxy.
-//       - TxExport  : settle proceeds (and unfilled IOC remainder) back to
-//                     C-Chain, derived ONLY from confirmed d-chain fills.
+//     - TxImport  : claim value exported from C-Chain into the proxy.
+//     - TxExport  : settle proceeds (and unfilled IOC remainder) back to
+//     C-Chain, derived ONLY from confirmed d-chain fills.
 //
 //  2. ORDER RELAY (proxy -> d-chain over ZAP), transport only:
-//       - TxRelayOrder : an opaque, byte-identical clob_* ZAP payload plus a
-//                        reference to the collateral already locked by an
-//                        Import. The matcher is the d-chain; the proxy never
-//                        matches.
-//       - TxPlaceOrder / TxCancelOrder : thin relay envelopes (a CLOB place /
-//                        cancel forwarded verbatim). They carry NO price/size
-//                        matching semantics in the proxy — the d-chain is the
-//                        single source of truth.
+//     - TxRelayOrder : an opaque, byte-identical clob_* ZAP payload plus a
+//     reference to the collateral already locked by an
+//     Import. The matcher is the d-chain; the proxy never
+//     matches.
+//     - TxPlaceOrder / TxCancelOrder : thin relay envelopes (a CLOB place /
+//     cancel forwarded verbatim). They carry NO price/size
+//     matching semantics in the proxy — the d-chain is the
+//     single source of truth.
 package txs
 
 import (
@@ -125,9 +125,34 @@ type AtomicInput struct {
 	Amount uint64 `json:"amount"`
 }
 
+// Rail is the cross-chain object's lane discriminator — the FIRST wire byte of the
+// shared-memory object (atomic.go encodeExportedOutput). It is the H1-closing tag the
+// precompile (precompile/dex/native_wire.go Rail) binds on the C side: a swap-fill
+// object is RailSwap, an LP-collect object is RailLP, and each C-side consume path
+// accepts ONLY its own rail (so a cross-rail consume can never reach the wrong pot).
+// The proxy stamps it on every exported output and binds it on every import, so the
+// rail round-trips through the atomic core unchanged.
+type Rail uint8
+
+const (
+	// RailSwap is the swap-fill / refund lane — the ZERO value, so an output whose rail
+	// is unstated (the proxy's settleFromFills fill/refund exports, every legacy
+	// custody/conservation path) defaults to the swap rail. The precompile's
+	// ImportSettlement consumes ONLY this rail.
+	RailSwap Rail = 0
+	// RailLP is the LP position-commit / collect lane — a non-zero tag the proxy's
+	// executeWithdraw stamps for an LP collect/withdraw. The precompile's
+	// ImportPositionCollect consumes ONLY this rail.
+	RailLP Rail = 1
+)
+
 // AtomicOutput is a value output: an Import credits these locally; an Export
-// puts these into shared memory for the destination chain to claim.
+// puts these into shared memory for the destination chain to claim. Rail is the lane
+// the value travels (RailSwap default / RailLP), bound byte-for-byte into the
+// shared-memory object so the precompile's matching consume path is the only one that
+// can claim it.
 type AtomicOutput struct {
+	Rail   Rail        `json:"rail,omitempty"`
 	Owner  ids.ShortID `json:"owner"`
 	Asset  ids.ID      `json:"asset"`
 	Amount uint64      `json:"amount"`
@@ -188,9 +213,20 @@ func (tx *ImportTx) Verify() error {
 		in += i.Amount
 	}
 	var outAmt uint64
+	// All credited outputs share ONE rail (the lane the funding object travels). This
+	// is the STRUCTURAL half of the rail bind; the AUTHORITATIVE half (output rail ==
+	// the consumed UTXO's RECORDED rail) is enforced in executeImport against shared
+	// memory, exactly as for the asset axis.
+	var importRail Rail
+	if len(tx.Outputs) > 0 {
+		importRail = tx.Outputs[0].Rail
+	}
 	for _, o := range tx.Outputs {
 		if o.Asset != importAsset {
 			return errors.New("import: output asset != imported input asset (would re-denominate)")
+		}
+		if o.Rail != importRail {
+			return errors.New("import: outputs span multiple rails")
 		}
 		outAmt += o.Amount
 	}
@@ -269,9 +305,16 @@ func (tx *ExportTx) Verify() error {
 	if len(tx.ExportedOutputs) == 0 {
 		return errors.New("export: no exported outputs")
 	}
+	// All exported outputs share ONE rail — a single export leg settles on one lane
+	// (the precompile's matching consume path claims them). The fill/refund legs of a
+	// swap settle on RailSwap; an LP withdraw exports on RailLP.
+	exportRail := tx.ExportedOutputs[0].Rail
 	for _, o := range tx.ExportedOutputs {
 		if o.Amount == 0 {
 			return ErrInvalidAmount
+		}
+		if o.Rail != exportRail {
+			return errors.New("export: outputs span multiple rails")
 		}
 	}
 	return nil
