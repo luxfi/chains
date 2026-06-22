@@ -168,7 +168,7 @@ func (vm *VM) executeImport(tx *txs.ImportTx, ar *atomicRequests) error {
 			if gerr != nil {
 				return fmt.Errorf("import: read source UTXO %s: %w", in.UTXOID, gerr)
 			}
-			recRail, recOwner, recAsset, recAmount, ok := decodeExportedOutput(vals[0])
+			recRail, recOwner, recAsset, recAmount, _, ok := decodeExportedOutput(vals[0])
 			if !ok {
 				return fmt.Errorf("import: UTXO %s: %w", in.UTXOID, errImportUTXOValueMalformed)
 			}
@@ -367,41 +367,50 @@ func deriveUTXOID(txID ids.ID, index uint32) ids.ID {
 }
 
 // exportedOutputSize is the fixed shared-memory UTXO value width: rail(1) |
-// owner(20) | asset(32) | amount(8). IDENTICAL to the precompile's
-// exportedOutputSize9999 — the rail byte (the H1 lane tag) leads the object.
-const exportedOutputSize = 1 + 20 + 32 + 8
+// owner(20) | asset(32) | amount(8) | spent(8). IDENTICAL to the precompile's
+// exportedOutputSize9999 — the rail byte (the H1 lane tag) leads the object and the
+// trailing spent(8) carries the matched INPUT amount on a swap proceeds leg (0 on every
+// other leg) so the C-side ImportSettlement can enforce the taker's recorded slippage
+// limit independently of the keeper (the taker-authenticated MEV floor). Both repos
+// extend this width in lockstep; native_seam_parity_test pins it.
+const exportedOutputSize = 1 + 20 + 32 + 8 + 8
 
 // encodeExportedOutput serializes an AtomicOutput as the shared-memory value:
-// rail(1) | owner(20) | asset(32) | amount(8). Fixed-width, deterministic. The rail
-// byte is the lane the value travels (RailSwap / RailLP), bound by the precompile's
-// matching consume path on the C side.
+// rail(1) | owner(20) | asset(32) | amount(8) | spent(8). Fixed-width, deterministic.
+// The rail byte is the lane the value travels (RailSwap / RailLP), bound by the
+// precompile's matching consume path on the C side; spent is the matched input that
+// produced a proceeds output (0 elsewhere), the price-binding witness the proceeds floor
+// checks.
 func encodeExportedOutput(out txs.AtomicOutput) []byte {
 	v := make([]byte, exportedOutputSize)
 	v[0] = byte(out.Rail)
 	copy(v[1:21], out.Owner[:])
 	copy(v[21:53], out.Asset[:])
 	binary.BigEndian.PutUint64(v[53:61], out.Amount)
+	binary.BigEndian.PutUint64(v[61:69], out.Spent)
 	return v
 }
 
 // decodeExportedOutput is the inverse of encodeExportedOutput: it reads back the
-// (rail, owner, asset, amount) a consumed source UTXO RECORDED in shared memory.
+// (rail, owner, asset, amount, spent) a consumed source UTXO RECORDED in shared memory.
 // executeImport uses this to bind the credited rail, asset AND owner to the value the
 // chain actually holds for that UTXO — not what the importing tx merely declares — so
 // a bogus-token UTXO can never be imported as native value (the native-aliasing fix),
 // a victim's exported UTXO can never be credited to an attacker's account (the
 // owner-aliasing fix), and a cross-rail object can never fund the wrong lane (the H1
-// rail fix). ok=false for any value that is not exactly the canonical width, so a
-// corrupt/garbage record is never reinterpreted into a credit.
-func decodeExportedOutput(v []byte) (rail txs.Rail, owner ids.ShortID, asset ids.ID, amount uint64, ok bool) {
+// rail fix). spent is meaningful only on a swap proceeds leg (the MEV floor witness);
+// import ignores it. ok=false for any value that is not exactly the canonical width, so
+// a corrupt/garbage record is never reinterpreted into a credit.
+func decodeExportedOutput(v []byte) (rail txs.Rail, owner ids.ShortID, asset ids.ID, amount, spent uint64, ok bool) {
 	if len(v) != exportedOutputSize {
-		return 0, ids.ShortEmpty, ids.Empty, 0, false
+		return 0, ids.ShortEmpty, ids.Empty, 0, 0, false
 	}
 	rail = txs.Rail(v[0])
 	copy(owner[:], v[1:21])
 	copy(asset[:], v[21:53])
 	amount = binary.BigEndian.Uint64(v[53:61])
-	return rail, owner, asset, amount, true
+	spent = binary.BigEndian.Uint64(v[61:69])
+	return rail, owner, asset, amount, spent, true
 }
 
 // float64FromBits reads a big-endian IEEE-754 float64 (the ZAP fill wire codec,
