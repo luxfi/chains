@@ -6,6 +6,7 @@ require (
 	github.com/consensys/gnark-crypto v0.20.1
 	github.com/gorilla/rpc v1.2.1
 	github.com/hashicorp/golang-lru v1.0.2
+	github.com/holiman/uint256 v1.3.2
 	github.com/luxfi/accel v1.2.4
 	github.com/luxfi/ai v0.1.0
 	github.com/luxfi/consensus v1.25.18
@@ -28,7 +29,7 @@ require (
 	github.com/luxfi/threshold v1.9.9
 	github.com/luxfi/timer v1.0.2
 	github.com/luxfi/version v1.0.1
-	github.com/luxfi/vm v1.2.3
+	github.com/luxfi/vm v1.2.5
 	github.com/luxfi/warp v1.19.5
 	github.com/stretchr/testify v1.11.1
 	github.com/zeebo/blake3 v0.2.4
@@ -121,7 +122,6 @@ require (
 	github.com/hashicorp/go-bexpr v0.1.16 // indirect
 	github.com/holiman/billy v0.0.0-20250707135307-f2f9b9aae7db // indirect
 	github.com/holiman/bloomfilter/v2 v2.0.3 // indirect
-	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/huin/goupnp v1.3.0 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
@@ -131,7 +131,7 @@ require (
 	github.com/kr/text v0.2.0 // indirect
 	github.com/luxfi/address v1.0.1 // indirect
 	github.com/luxfi/age v1.5.0 // indirect
-	github.com/luxfi/api v1.0.14 // indirect
+	github.com/luxfi/api v1.0.15 // indirect
 	github.com/luxfi/atomic v1.0.0 // indirect
 	github.com/luxfi/cache v1.2.1 // indirect
 	github.com/luxfi/codec v1.1.5 // indirect
