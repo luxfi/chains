@@ -72,6 +72,30 @@ func (vm *VM) QuorumEngine() (*Engine, QuorumState, QuorumLedger) {
 	return vm.quorum, vm.qstate, vm.qledger
 }
 
+// FundLedger seeds opening native balances onto the VM's committed-state ledger.
+// This is the genesis/deposit seam: the host L1 credits A-Chain accounts (a
+// requester that will fund an inference escrow, an operator that will bond) at
+// chain birth or via a verified cross-chain deposit, BEFORE any task or
+// registration can pull from them. It mutates the same MemLedger that
+// importPending/Settle move value within and that commitEngine/abortEngine
+// gate on Accept/Reject, so funded balances participate in the conservation
+// invariant exactly like deposited value. Guarded by vm.mu. Fail-closed: a
+// credit overflow aborts with no partial seeding.
+func (vm *VM) FundLedger(opening map[common.Address]*uint256.Int) error {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+	l, ok := vm.qledger.(*MemLedger)
+	if !ok {
+		return ErrLedgerNotFundable
+	}
+	for a, v := range opening {
+		if err := l.Credit(a, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // EnqueueCommittedIntent buffers a C-Chain intent that the boundary transport
 // has delivered with a committedness proof. It does NOT create a task — that
 // happens only under consensus in BuildBlock/Verify via importPending. Safe to
