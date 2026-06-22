@@ -12,6 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/rpc/v2"
+	rpcjson "github.com/gorilla/rpc/v2/json"
+	"github.com/luxfi/chains/dexvm/api"
 	"github.com/luxfi/consensus/engine/dag/vertex"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
@@ -179,9 +182,29 @@ func (cvm *ChainVM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
 	return mux, nil
 }
 
-// CreateHandlers implements the interface expected by chain manager for HTTP registration
-func (cvm *ChainVM) CreateHandlers(ctx context.Context) (map[string]http.Handler, error) {
-	return cvm.inner.CreateHandlers(ctx)
+// CreateHandlers implements the interface expected by the chain manager for HTTP
+// registration. This is the NODE path (the rpcchainvm harness serves the ChainVM),
+// so unlike the inner VM's read-only CreateHandlers it wires the tx-submission
+// surface: the dex service is built against an api.TxSubmitter (the ChainVM, which
+// owns the pending pool + the engine channel) so dex.submitTx reaches the mempool.
+// The inner VM's CreateHandlers stays read-only (Ping/Status/Relay) for the
+// standalone/test path that has no pending pool.
+//
+// This is the seam the C<->D keeper drives: ImportTx + settling RelayOrderTx are
+// submitted here; the proposer relays once and settles the D->C proceeds, which the
+// C-side Phase-B ImportSettlement consumes to emit DEXFill.
+func (cvm *ChainVM) CreateHandlers(_ context.Context) (map[string]http.Handler, error) {
+	server := rpc.NewServer()
+	server.RegisterCodec(rpcjson.NewCodec(), "application/json")
+	server.RegisterCodec(rpcjson.NewCodec(), "application/json;charset=UTF-8")
+
+	// Build the service against the inner VM (IsBootstrapped/Relay) PLUS the
+	// ChainVM as the tx submitter (SubmitTx -> pendingTxs + engine notify).
+	service := api.NewServiceWithSubmitter(cvm.inner, cvm)
+	if err := server.RegisterService(service, "dex"); err != nil {
+		return nil, fmt.Errorf("failed to register DEX service: %w", err)
+	}
+	return map[string]http.Handler{"": server}, nil
 }
 
 // HealthCheck implements the VM interface
