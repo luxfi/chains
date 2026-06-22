@@ -178,9 +178,22 @@ func newImportTxBytes(t *testing.T, from ids.ShortID, sourceChain, utxoID, asset
 }
 
 // newRelayTxBytes builds a wire-ready RelayOrderTx carrying a clob_submit frame.
+// It declares NO output asset (ids.Empty) — sufficient for tests that assert only
+// conservation TOTALS (which sum every exported asset). A test that asserts the
+// proceeds ASSET (the HIGH-1 happy path) uses newSettlingRelayTxBytes.
 func newRelayTxBytes(t *testing.T, from ids.ShortID, collateralRef ids.ID, payload []byte) []byte {
 	t.Helper()
 	return txs.NewRelayOrderTx(from, 0, ZAPMethodSubmit, payload, collateralRef).Bytes()
+}
+
+// newSettlingRelayTxBytes builds a wire-ready settling clob_submit RelayOrderTx
+// carrying the REAL output-asset id (the HIGH-1 fix: the proceeds leg is exported
+// under THIS id, the same one the C-side ImportSettlement requires) and the taker's
+// slippage price limit (0 = none). This is the canonical settling-relay the keeper
+// builds once it has resolved the market's output side.
+func newSettlingRelayTxBytes(t *testing.T, from ids.ShortID, collateralRef, assetOut ids.ID, payload []byte, priceLimit uint64, limitIsUpper bool) []byte {
+	t.Helper()
+	return txs.NewSettlingRelayOrderTx(from, 0, payload, collateralRef, assetOut, priceLimit, limitIsUpper).Bytes()
 }
 
 // mustParseImport parses wire bytes back into a typed ImportTx.

@@ -323,7 +323,7 @@ func TestRED_FractionalFill_NeverMints(t *testing.T) {
 	}
 
 	ar := newAtomicRequests()
-	if err := cvm.inner.settleFromFills(taker, collateralRef, fills, ids.GenerateTestID(), 0, ar); err != nil {
+	if err := cvm.inner.settleFromFills(taker, collateralRef, fills, ids.GenerateTestID(), 0, false, ids.GenerateTestID(), 0, ar); err != nil {
 		t.Fatalf("settleFromFills: %v", err)
 	}
 
@@ -418,7 +418,7 @@ func TestRED_OverflowFill_SaturatesUint64(t *testing.T) {
 		taker := ids.GenerateTestShortID()
 		// No escrow: isolate the proceeds cast (refund leg absent).
 		ar := newAtomicRequests()
-		err := cvm.inner.settleFromFills(taker, ids.GenerateTestID(), fills, ids.GenerateTestID(), 0, ar)
+		err := cvm.inner.settleFromFills(taker, ids.GenerateTestID(), fills, ids.GenerateTestID(), 0, false, ids.GenerateTestID(), 0, ar)
 		credited := auditCredited(ar)
 		t.Logf("proceeds overflow: settle err=%v  exported=%d (naive cast would saturate to %d)", err, credited, ^uint64(0))
 
@@ -450,7 +450,7 @@ func TestRED_OverflowFill_SaturatesUint64(t *testing.T) {
 		}
 
 		ar := newAtomicRequests()
-		err := cvm.inner.settleFromFills(taker, collateralRef, fills, ids.GenerateTestID(), 0, ar)
+		err := cvm.inner.settleFromFills(taker, collateralRef, fills, ids.GenerateTestID(), 0, false, ids.GenerateTestID(), 0, ar)
 		credited := auditCredited(ar)
 		t.Logf("notional overflow: settle err=%v  exported=%d (a saturated/floored spent would inflate the refund)", err, credited)
 
@@ -545,7 +545,7 @@ func TestRED_MixedSideFills_OverCredits(t *testing.T) {
 
 	taker := ids.GenerateTestShortID()
 	ar := newAtomicRequests()
-	err := cvm.inner.settleFromFills(taker, ids.GenerateTestID(), fills, ids.GenerateTestID(), 0, ar)
+	err := cvm.inner.settleFromFills(taker, ids.GenerateTestID(), fills, ids.GenerateTestID(), 0, false, ids.GenerateTestID(), 0, ar)
 
 	var credited uint64
 	for _, reqs := range ar.reqs {
@@ -689,7 +689,7 @@ func TestRED_EscrowTruncation_OverRefunds(t *testing.T) {
 	}
 
 	ar := newAtomicRequests()
-	if err := cvm.inner.settleFromFills(taker, collateralRef, fills, ids.GenerateTestID(), 0, ar); err != nil {
+	if err := cvm.inner.settleFromFills(taker, collateralRef, fills, ids.GenerateTestID(), 0, false, ids.GenerateTestID(), 0, ar); err != nil {
 		t.Fatalf("settleFromFills: %v", err)
 	}
 
@@ -776,6 +776,10 @@ func TestRED_SettlementExportKeyDeterminism(t *testing.T) {
 	taker := ids.GenerateTestShortID()
 	collateralRef := ids.GenerateTestID()
 	lockedAsset := ids.GenerateTestID()
+	// Fixed (NOT random) output asset: the proceeds leg now exports under it, so it is
+	// part of the export-key preimage; it MUST be identical across the two modeled
+	// validators or the keys would diverge for a reason other than the wall clock.
+	tokenOut := ids.GenerateTestID()
 	const locked uint64 = 1000
 
 	settleOn := func(label string) [][]byte {
@@ -787,7 +791,7 @@ func TestRED_SettlementExportKeyDeterminism(t *testing.T) {
 			t.Fatalf("%s: seed escrow: %v", label, err)
 		}
 		ar := newAtomicRequests()
-		if err := cvm.inner.settleFromFills(taker, collateralRef, fills, blockHash, txIndex, ar); err != nil {
+		if err := cvm.inner.settleFromFills(taker, collateralRef, fills, tokenOut, 0, false, blockHash, txIndex, ar); err != nil {
 			t.Fatalf("%s: settleFromFills: %v", label, err)
 		}
 		return exportKeys(ar)
@@ -830,16 +834,19 @@ func TestRED_SettlementExportKeyIndependentOfWallClock(t *testing.T) {
 	const txIndex = uint32(0)
 	taker := ids.GenerateTestShortID()
 	collateralRef := ids.GenerateTestID()
+	// Fixed output asset: it is part of the export-key preimage, so the two runs must
+	// use the same value or the keys would differ for a reason other than the clock.
+	tokenOut := ids.GenerateTestID()
 
 	cvm, _, _, _, _ := newCountingHarness(t, fills)
 
 	ar1 := newAtomicRequests()
-	if err := cvm.inner.settleFromFills(taker, collateralRef, fills, blockHash, txIndex, ar1); err != nil {
+	if err := cvm.inner.settleFromFills(taker, collateralRef, fills, tokenOut, 0, false, blockHash, txIndex, ar1); err != nil {
 		t.Fatalf("settle #1: %v", err)
 	}
 	time.Sleep(2 * time.Millisecond)
 	ar2 := newAtomicRequests()
-	if err := cvm.inner.settleFromFills(taker, collateralRef, fills, blockHash, txIndex, ar2); err != nil {
+	if err := cvm.inner.settleFromFills(taker, collateralRef, fills, tokenOut, 0, false, blockHash, txIndex, ar2); err != nil {
 		t.Fatalf("settle #2: %v", err)
 	}
 

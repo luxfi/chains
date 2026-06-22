@@ -40,6 +40,32 @@ type Config struct {
 	WarpEnabled   bool     `json:"warpEnabled"`
 	TrustedChains []ids.ID `json:"trustedChains"`
 
+	// FillAttestationPubKey is the venue's (d-chain matcher's) Ed25519 PUBLIC key. When
+	// set (non-empty, 32 bytes) it ENABLES fill-attestation enforcement: every validator
+	// verifies the carried-fills signature against this key over the canonical
+	// (blockHash, entries) message BEFORE settling, so a malicious/MITM proposer cannot
+	// settle FABRICATED fills (the single-proposer trust gap). A block whose carried fills
+	// lack a valid attestation is settled as a FULL REFUND (fail-secure). Empty = no
+	// enforcement (single-trusted-operator / dev) — the documented interim model. This is
+	// the canonical setting for an UNTRUSTED validator set (default-on once set).
+	//
+	// CONSENSUS-SAFETY: this value participates in the deterministic settle decision
+	// (whether a block's carried fills are trusted), so it MUST be IDENTICAL on every
+	// validator — exactly like DexZapEndpoint must be node-local + version-pinned. If
+	// validators disagreed on this key, they would reach different trust decisions for the
+	// same block and the network would FORK on the settlement path. Distribute it as a
+	// network-upgrade-pinned constant (the same lockstep discipline as the carried-fills
+	// wire format), never per-node ad hoc.
+	FillAttestationPubKey []byte `json:"fillAttestationPubKey,omitempty"`
+
+	// FillAttestationSeed is the venue's Ed25519 SIGNING seed (32 bytes), set ONLY on a
+	// node that is co-located with the venue and therefore authoritative to ATTEST the
+	// fills it relayed (the single-operator deployment). When set, the proposer signs the
+	// carried fills at build so the block carries a valid attestation. It is a SECRET and
+	// MUST come from KMS, never a plaintext manifest. Empty on a pure validator (it only
+	// VERIFIES, using FillAttestationPubKey).
+	FillAttestationSeed []byte `json:"-"`
+
 	// Block configuration
 	BlockInterval  time.Duration `json:"blockInterval"`
 	MaxBlockSize   uint64        `json:"maxBlockSize"`
