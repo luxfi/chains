@@ -49,13 +49,20 @@ type Config struct {
 	// enforcement (single-trusted-operator / dev) — the documented interim model. This is
 	// the canonical setting for an UNTRUSTED validator set (default-on once set).
 	//
-	// CONSENSUS-SAFETY: this value participates in the deterministic settle decision
-	// (whether a block's carried fills are trusted), so it MUST be IDENTICAL on every
-	// validator — exactly like DexZapEndpoint must be node-local + version-pinned. If
-	// validators disagreed on this key, they would reach different trust decisions for the
-	// same block and the network would FORK on the settlement path. Distribute it as a
-	// network-upgrade-pinned constant (the same lockstep discipline as the carried-fills
-	// wire format), never per-node ad hoc.
+	// CONSENSUS-SAFETY (STRICTER than DexZapEndpoint): this value participates in the
+	// DETERMINISTIC settle decision — verifyFillAttestation gates trustCarried, which
+	// decides whether a block's carried fills are consumed into escrow + export legs, which
+	// feeds computeStateRoot. So it is recomputed inside the consensus state-transition and
+	// MUST be a SINGLE network-pinned constant, IDENTICAL on every validator. This is a
+	// STRONGER invariant than DexZapEndpoint's: DexZapEndpoint is a node-local TRANSPORT
+	// address used only at the proposer's build (obtainFills) and is NOT recomputed in the
+	// deterministic settle path, so two validators may legitimately point at distinct local
+	// gateways. FillAttestationPubKey may NOT vary: if validators disagreed on it they would
+	// reach different trust decisions for the same block and FORK the StateRoot. It is
+	// therefore pinned in GENESIS (vm.go Genesis.FillAttestationPubKey, assigned ONLY in
+	// parseGenesis) and is DELIBERATELY absent from parseConfig — runtime per-node config
+	// cannot set it. Distribute it as a network-upgrade-pinned constant (the same lockstep
+	// discipline as the carried-fills wire format), never per-node ad hoc.
 	FillAttestationPubKey []byte `json:"fillAttestationPubKey,omitempty"`
 
 	// FillAttestationSeed is the venue's Ed25519 SIGNING seed (32 bytes), set ONLY on a
