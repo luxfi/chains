@@ -190,7 +190,7 @@ func TestRED_Escrow_DirectSettleRejectsForeignSender(t *testing.T) {
 
 	// A foreign sender (not the escrow owner) attempts to settle => refused.
 	ar := newAtomicRequests()
-	err := cvm.inner.settleFromFills(foreign, ref, nil, ids.GenerateTestID(), 0, ar)
+	err := cvm.inner.settleFromFills(foreign, ref, nil, ids.Empty, 0, false, ids.GenerateTestID(), 0, ar)
 	if err != errSettleUnauthorized {
 		t.Fatalf("a settle by a non-owner sender MUST return errSettleUnauthorized, got: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestRED_Escrow_DirectSettleRejectsForeignSender(t *testing.T) {
 
 	// The rightful owner then settles successfully (zero fills => full refund).
 	ar2 := newAtomicRequests()
-	if err := cvm.inner.settleFromFills(owner, ref, nil, ids.GenerateTestID(), 1, ar2); err != nil {
+	if err := cvm.inner.settleFromFills(owner, ref, nil, ids.Empty, 0, false, ids.GenerateTestID(), 1, ar2); err != nil {
 		t.Fatalf("the rightful owner's settle must succeed, got: %v", err)
 	}
 	var refundToOwner uint64

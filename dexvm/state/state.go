@@ -198,6 +198,13 @@ func escrowKey(ref ids.ID) []byte {
 // who may settle and where the proceeds/refund go from THIS recorded owner, never
 // from the unauthenticated relay tx sender, so an attacker naming a victim's
 // collateral ref can neither settle it nor redirect its value.
+//
+// The escrow records ONLY the LOCKED (refundable) asset — assetIn. The OUTPUT asset
+// the proceeds leg is exported under (the HIGH-1 fix) is NOT stored here: it is not
+// known at import time (the import precedes the matching relay), and it is the OPPOSITE
+// side of the market this order trades on. It is carried with the settling relay and
+// passed to settleFromFills, where the proceeds leg is exported under the REAL
+// assetID(currency_out) the C-side ImportSettlement requires.
 const escrowValueSize = 20 + 32 + 8
 
 // PutEscrow records the (owner, asset, amount) an Import locked under a collateral

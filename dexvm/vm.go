@@ -27,6 +27,7 @@ import (
 	dexstate "github.com/luxfi/chains/dexvm/state"
 	"github.com/luxfi/chains/dexvm/txs"
 	consensuscore "github.com/luxfi/consensus/core"
+	"github.com/luxfi/crypto/ed25519"
 	"github.com/luxfi/database"
 	"github.com/luxfi/database/versiondb"
 	"github.com/luxfi/ids"
@@ -175,6 +176,18 @@ type plannedRelay struct {
 	// settle is true only for clob_submit: its returned fills drive an export.
 	// place/cancel are acks the proxy relays but does not settle.
 	settle bool
+	// assetOut is the REAL injective output-asset id a settling clob_submit credits
+	// (the HIGH-1 fix): the PROCEEDS leg is exported under THIS id — the same
+	// assetID(currency_out) the C-side ImportSettlement requires — never a SHA256
+	// routing handle. Carried verbatim from RelayOrderTx.AssetOut; ids.Empty (native
+	// LUX) is a valid value, so settleFromFills must distinguish "swap output is native"
+	// from "no output declared" via the settle flag, not an empty check.
+	assetOut ids.ID
+	// priceLimit / limitIsUpper carry the taker's worst-acceptable CLOB price (the V4
+	// SqrtPriceLimitX96 mapped to the quote-per-base float64 domain). settleFromFills
+	// refuses a carried fill worse than the limit (bounded sandwich/MEV). 0 = no limit.
+	priceLimit   uint64
+	limitIsUpper bool
 }
 
 // VM implements the DEX proxy Virtual Machine: a STATELESS ATOMIC ZAP PROXY on
@@ -224,6 +237,13 @@ type VM struct {
 
 	// relay forwards clob_* frames to the d-chain ZAP gateway (order-relay leg).
 	relay *RelayClient
+
+	// fillSigningKey is the venue's Ed25519 signing key, derived ONCE from
+	// Config.FillAttestationSeed when this node is co-located with the venue (it is then
+	// authoritative to attest the fills it relayed). nil on a pure validator (verify-only)
+	// and on a node with no seed configured. Cached so the per-block build allocates none.
+	fillSigningKey ed25519.PrivateKey
+	fillSignerInit sync.Once
 
 	// Used to check local time.
 	clock mockable.Clock
@@ -504,6 +524,30 @@ func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime ti
 	return result, nil
 }
 
+// fillSigner returns the venue's Ed25519 signing key (derived ONCE from
+// Config.FillAttestationSeed), or nil when this node holds no seed (a pure validator or
+// a node not co-located with the venue). It is the proposer-side half of the fill
+// attestation: only a node authoritative to attest the fills it relayed signs them. A
+// malformed seed yields nil (no attestation produced — the block then carries an empty
+// sig and is refunded at settle if enforcement is on, never silently trusted).
+func (vm *VM) fillSigner() ed25519.PrivateKey {
+	vm.fillSignerInit.Do(func() {
+		seed := vm.Config.FillAttestationSeed
+		if len(seed) != ed25519.SeedSize {
+			return
+		}
+		key, err := ed25519.NewKeyFromSeed(seed)
+		if err != nil {
+			if !vm.log.IsZero() {
+				vm.log.Warn("Invalid fill-attestation seed; proposer will not attest fills", "error", err)
+			}
+			return
+		}
+		vm.fillSigningKey = key
+	})
+	return vm.fillSigningKey
+}
+
 // BuildBlockResult is the PROPOSER's full build of a block: it plans the block
 // (the deterministic ProcessBlock pass) and then performs the network-wide-ONCE
 // d-chain relay (obtainFills), attaching the confirmed fills to the result. The
@@ -532,8 +576,17 @@ func (vm *VM) BuildBlockResult(ctx context.Context, blockHeight uint64, blockTim
 		return nil, fmt.Errorf("build: obtain fills: %w", err)
 	}
 	result.carriedFills = entries
-	// result.fillSig stays empty: the reserved trustless-path signature is not
-	// produced by the proxy (the d-chain signs its fills in the future upgrade).
+	// FILL ATTESTATION (MEDIUM single-proposer fix). When this node is co-located with
+	// the venue (a FillAttestationSeed is configured), it is authoritative to ATTEST the
+	// fills it just relayed: sign the canonical (blockHash, entries) message so every
+	// validator can verify the carried fills came from the venue, not a lying proposer.
+	// On a pure validator (no seed) the signature stays empty and the venue's own signer
+	// supplies it out of band; a block reaching settle without a valid attestation is
+	// refunded when enforcement is on. The reserved fillSig slot carries it with NO wire
+	// change.
+	if signer := vm.fillSigner(); signer != nil {
+		result.fillSig = signFillAttestation(signer, result.blockHash, entries)
+	}
 	return result, nil
 }
 
@@ -593,6 +646,13 @@ func (vm *VM) planRelayOrder(tx *txs.RelayOrderTx, blockHash ids.ID, txIndex uin
 		sender:        tx.Sender(),
 		collateralRef: tx.CollateralRef,
 		settle:        tx.Method == ZAPMethodSubmit,
+		// HIGH-1: the real output-asset id the proceeds leg is exported under, and the
+		// taker's slippage limit, both carried verbatim from the (signature-bound) relay
+		// so settleCarried -> settleFromFills needs no tx re-parse. Meaningful only for a
+		// settling clob_submit; place/cancel leave them zero.
+		assetOut:     tx.AssetOut,
+		priceLimit:   tx.PriceLimit,
+		limitIsUpper: tx.LimitIsUpper,
 	})
 	return nil
 }
@@ -763,12 +823,34 @@ func (vm *VM) relayAck(ctx context.Context, blockHash ids.ID, r plannedRelay) er
 // and SKIPPED, leaving the escrow intact and recoverable — never fatal to the
 // block, and bounded to that one taker's collateral.
 func (vm *VM) settleCarried(result *BlockResult, ar *atomicRequests) {
+	// FILL-ATTESTATION GATE (MEDIUM single-proposer fix). When enforcement is on (a venue
+	// attestation pubkey is configured), the carried fills MUST be signed by the venue
+	// over the canonical (blockHash, entries) message. If the signature is missing/invalid
+	// — i.e. a malicious or MITM proposer carried FABRICATED fills — we DISTRUST every
+	// carried fill in this block and settle each submit as a zero-fill FULL REFUND
+	// (fail-secure: the taker's locked collateral returns to C, no fabricated proceeds
+	// ever move). This is a deterministic function of the carried bytes, so every
+	// validator reaches the identical decision and the StateRoot stays consensus-safe.
+	pubKey := vm.Config.FillAttestationPubKey
+	trustCarried := true
+	if err := verifyFillAttestation(pubKey, result.fillSig, result.blockHash, result.carriedFills); err != nil {
+		trustCarried = false
+		if !vm.log.IsZero() {
+			vm.log.Warn("Carried fills failed attestation; refunding all settles in this block (fabricated-fill guard)",
+				"error", err, "entries", len(result.carriedFills))
+		}
+	}
 	for _, r := range result.relays {
 		if !r.settle {
 			continue
 		}
-		fills, _ := fillsForTx(result.carriedFills, r.txIndex)
-		if err := vm.settleFromFills(r.sender, r.collateralRef, fills, result.blockHash, r.txIndex, ar); err != nil {
+		var fills []Fill
+		if trustCarried {
+			fills, _ = fillsForTx(result.carriedFills, r.txIndex)
+		}
+		// trustCarried==false => fills stays nil => settleFromFills refunds the full locked
+		// collateral (the conservation-safe default for an unattested/forged block).
+		if err := vm.settleFromFills(r.sender, r.collateralRef, fills, r.assetOut, r.priceLimit, r.limitIsUpper, result.blockHash, r.txIndex, ar); err != nil {
 			if !vm.log.IsZero() {
 				vm.log.Warn("Proxy settle from carried fills failed (collateral remains escrowed)",
 					"txIndex", r.txIndex, "error", err)
@@ -829,7 +911,14 @@ func (vm *VM) settleCarried(result *BlockResult, ar *atomicRequests) {
 // coordinate that keys the idempotency receipt — never by wall-clock time. A
 // time.Now() in the export identity would make deriveUTXOID(tx.ID(), i) differ
 // per node and split the atomic commit on accept.
-func (vm *VM) settleFromFills(relaySender ids.ShortID, collateralRef ids.ID, fills []Fill, blockHash ids.ID, txIndex uint32, ar *atomicRequests) error {
+// settleFromFills exports the taker's proceeds + refund from the d-chain's CONFIRMED
+// fills. outAsset is the REAL injective output-asset id the proceeds leg is exported
+// under (the HIGH-1 fix — the same assetID(currency_out) the C-side ImportSettlement
+// requires); it is carried with the settling relay (RelayOrderTx.AssetOut, signature-
+// bound). priceLimit/limitIsUpper are the taker's worst-acceptable CLOB price (0 = no
+// limit): a carried fill worse than the limit is refused so a sandwich/MEV price move
+// cannot fill the taker beyond their floor.
+func (vm *VM) settleFromFills(relaySender ids.ShortID, collateralRef ids.ID, fills []Fill, outAsset ids.ID, priceLimit uint64, limitIsUpper bool, blockHash ids.ID, txIndex uint32, ar *atomicRequests) error {
 	// Resolve the locked collateral this settle must conserve. Absent escrow =>
 	// nothing locked on the proxy side; fall back to proceeds-only settlement.
 	//
@@ -883,10 +972,33 @@ func (vm *VM) settleFromFills(relaySender ids.ShortID, collateralRef ids.ID, fil
 	// minting the opposite-side volume (a lying/MITM backend returns [BUY 10,
 	// SELL 1000] and the proxy credits base = 1010). A submit cannot legitimately
 	// fill both sides; refuse the stream rather than over-credit.
+	//
+	// SLIPPAGE-LIMIT GUARD (MEDIUM — bounded sandwich/MEV): the taker carried a
+	// worst-acceptable CLOB price (priceLimit, derived from their V4 SqrtPriceLimitX96).
+	// A fill WORSE than that limit is refused before any value moves — so an adversary
+	// who sandwiches the order and moves the price beyond the taker's floor produces
+	// fills the proxy will not settle; the escrow stays intact and is reclaimable. The
+	// limit composes per-fill (it is a price bound, not a min-total-out), so each fill is
+	// checked independently. limitIsUpper governs the direction: an exact-input BUY caps
+	// the price ABOVE the limit (never pay more than `limit` quote per base); a SELL
+	// floors it BELOW (never receive less than `limit`). priceLimit==0 means no limit
+	// (the V4 sentinel min/max sqrt price, preserved as "unbounded").
+	var limit float64
+	if priceLimit != 0 {
+		limit = math.Float64frombits(priceLimit)
+	}
 	var baseFloat, quoteFloat float64
 	for _, f := range fills {
 		if f.Side != takerSide {
 			return fmt.Errorf("settle: mixed-side fills (fill side %d != taker side %d)", f.Side, takerSide)
+		}
+		if limit > 0 {
+			if limitIsUpper && f.Price > limit {
+				return fmt.Errorf("settle: fill price %g exceeds slippage limit %g (sandwich/MEV guard)", f.Price, limit)
+			}
+			if !limitIsUpper && f.Price < limit {
+				return fmt.Errorf("settle: fill price %g below slippage limit %g (sandwich/MEV guard)", f.Price, limit)
+			}
 		}
 		baseFloat += f.Size
 		quoteFloat += f.Price * f.Size
@@ -915,12 +1027,23 @@ func (vm *VM) settleFromFills(relaySender ids.ShortID, collateralRef ids.ID, fil
 
 	outs := make([]txs.AtomicOutput, 0, 2)
 
-	// PROCEEDS leg — the opposite asset the taker received (ref-derived routing
-	// handle; the C-Chain side maps it to the real ERC-20).
-	if takerSide == 0 { // BUY: receives base
-		outs = append(outs, txs.AtomicOutput{Owner: taker, Asset: assetFromRef(collateralRef, 0), Amount: proceeds})
-	} else { // SELL: receives quote
-		outs = append(outs, txs.AtomicOutput{Owner: taker, Asset: assetFromRef(collateralRef, 1), Amount: proceeds})
+	// PROCEEDS leg — the opposite asset the taker received, exported under the REAL
+	// injective output-asset id (HIGH-1 fix). This is the same assetID(currency_out) the
+	// C-side ImportSettlement equality-binds (recAsset == claim.Asset, the id that keys
+	// seamReserve[assetOut]); previously the proxy exported a SHA256(ref||leg) routing
+	// handle that NEVER matched, so the taker's swap output was permanently unclaimable.
+	//
+	// The output asset of a swap MUST differ from the locked (input) asset — a same-asset
+	// "swap" would collide the proceeds and refund legs into one asset and is never a real
+	// fill. When proceeds are realized, an outAsset equal to the locked asset (or, with an
+	// escrow, a missing declaration that coincides with the locked asset) is a malformed
+	// settle: refuse rather than export an ambiguous credit. (No-proceeds zero-fills skip
+	// this — they only refund the locked asset.)
+	if proceeds > 0 {
+		if haveEscrow && outAsset == lockedAsset {
+			return fmt.Errorf("settle: output asset equals locked asset %s (not a cross-asset swap)", lockedAsset)
+		}
+		outs = append(outs, txs.AtomicOutput{Owner: taker, Asset: outAsset, Amount: proceeds})
 	}
 
 	// REFUND leg — the unfilled remainder of the locked asset.
@@ -1324,17 +1447,6 @@ func deriveBlockHash(height uint64, t time.Time) ids.ID {
 	var buf [16]byte
 	binary.BigEndian.PutUint64(buf[0:8], height)
 	binary.BigEndian.PutUint64(buf[8:16], uint64(t.UnixNano()))
-	return ids.ID(sha256.Sum256(buf[:]))
-}
-
-// assetFromRef resolves the leg's asset id from the collateral reference. The
-// proxy carries the asset identity in the import's locked collateral; here we
-// derive a stable per-leg asset id (leg 0 = base, 1 = quote) so the C-Chain
-// side can map it back. This is a routing handle, not canonical state.
-func assetFromRef(ref ids.ID, leg uint8) ids.ID {
-	var buf [33]byte
-	copy(buf[0:32], ref[:])
-	buf[32] = leg
 	return ids.ID(sha256.Sum256(buf[:]))
 }
 

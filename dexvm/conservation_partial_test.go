@@ -228,9 +228,10 @@ func TestSettleConsumesEscrowOnce(t *testing.T) {
 		t.Fatalf("PutEscrow: %v", err)
 	}
 
-	// First settle with zero fills => full 1000 refund + escrow consumed.
+	// First settle with zero fills => full 1000 refund + escrow consumed. No proceeds
+	// leg (zero fills), so the output asset / price limit are irrelevant here.
 	ar := newAtomicRequests()
-	if err := h.vm.settleFromFills(taker, ref, nil, ids.GenerateTestID(), 0, ar); err != nil {
+	if err := h.vm.settleFromFills(taker, ref, nil, ids.Empty, 0, false, ids.GenerateTestID(), 0, ar); err != nil {
 		t.Fatalf("first settle: %v", err)
 	}
 	if _, _, _, found, _ := h.vm.state.GetEscrow(ref); found {
@@ -239,7 +240,7 @@ func TestSettleConsumesEscrowOnce(t *testing.T) {
 
 	// Second settle against the now-consumed ref must refund nothing (no escrow).
 	ar2 := newAtomicRequests()
-	if err := h.vm.settleFromFills(taker, ref, nil, ids.GenerateTestID(), 1, ar2); err != nil {
+	if err := h.vm.settleFromFills(taker, ref, nil, ids.Empty, 0, false, ids.GenerateTestID(), 1, ar2); err != nil {
 		t.Fatalf("second settle: %v", err)
 	}
 	if !ar2.empty() {
