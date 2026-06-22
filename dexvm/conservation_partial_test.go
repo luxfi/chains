@@ -222,8 +222,9 @@ func TestSettleConsumesEscrowOnce(t *testing.T) {
 	lockedAsset := ids.GenerateTestID()
 	ref := deriveUTXOID(ids.GenerateTestID(), 0)
 
-	// Record an escrow of 1000 directly (the import leg's effect).
-	if err := h.vm.state.PutEscrow(ref, lockedAsset, 1000); err != nil {
+	// Record an escrow of 1000 directly (the import leg's effect). The escrow owner
+	// is the taker — the authenticated owner who alone may settle it (CRITICAL bind).
+	if err := h.vm.state.PutEscrow(ref, taker, lockedAsset, 1000); err != nil {
 		t.Fatalf("PutEscrow: %v", err)
 	}
 
@@ -232,7 +233,7 @@ func TestSettleConsumesEscrowOnce(t *testing.T) {
 	if err := h.vm.settleFromFills(taker, ref, nil, ids.GenerateTestID(), 0, ar); err != nil {
 		t.Fatalf("first settle: %v", err)
 	}
-	if _, _, found, _ := h.vm.state.GetEscrow(ref); found {
+	if _, _, _, found, _ := h.vm.state.GetEscrow(ref); found {
 		t.Fatal("escrow still present after settle — not consumed")
 	}
 
@@ -290,7 +291,7 @@ func TestFailedRelayCommitsNothing(t *testing.T) {
 	}
 	// The escrow is consumed exactly once by the refunding settle (it cannot be
 	// refunded again).
-	_, _, found, _ := h.vm.state.GetEscrow(srcUTXOID)
+	_, _, _, found, _ := h.vm.state.GetEscrow(srcUTXOID)
 	if found {
 		t.Fatalf("escrow after refund must be consumed exactly once, but it is still present")
 	}

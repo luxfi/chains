@@ -91,6 +91,15 @@ var (
 	// victim's exported UTXO and credit it to their own account.
 	errImportWrongOwner = errors.New("import: credited owner != consumed UTXO owner")
 
+	// errSettleUnauthorized guards the CRITICAL escrow-theft seam: a settle is
+	// authorized ONLY by the escrow's recorded owner (the authenticated owner of the
+	// consumed C->D object, persisted at import). A relay tx whose sender is not that
+	// owner cannot settle the collateral — and the proceeds/refund are exported to the
+	// recorded owner regardless, never to the tx sender. Before this bind, an
+	// unauthenticated RelayOrderTx naming a victim's collateral ref settled to the
+	// attacker out of the shared seam reserve (cross-depositor theft).
+	errSettleUnauthorized = errors.New("settle: relay sender is not the escrow owner (unauthorized settle)")
+
 	_ = errNotBootstrapped
 	_ = errShutdown
 )
@@ -820,12 +829,33 @@ func (vm *VM) settleCarried(result *BlockResult, ar *atomicRequests) {
 // coordinate that keys the idempotency receipt — never by wall-clock time. A
 // time.Now() in the export identity would make deriveUTXOID(tx.ID(), i) differ
 // per node and split the atomic commit on accept.
-func (vm *VM) settleFromFills(taker ids.ShortID, collateralRef ids.ID, fills []Fill, blockHash ids.ID, txIndex uint32, ar *atomicRequests) error {
+func (vm *VM) settleFromFills(relaySender ids.ShortID, collateralRef ids.ID, fills []Fill, blockHash ids.ID, txIndex uint32, ar *atomicRequests) error {
 	// Resolve the locked collateral this settle must conserve. Absent escrow =>
 	// nothing locked on the proxy side; fall back to proceeds-only settlement.
-	lockedAsset, locked, haveEscrow, err := vm.state.GetEscrow(collateralRef)
+	//
+	// escrowOwner is the AUTHENTICATED owner recorded at import (the consumed C->D
+	// object's owner). It — not relaySender (the unauthenticated relay tx sender) — is
+	// the authority to settle this collateral AND the sole payout target. This is the
+	// CRITICAL escrow-theft close: a relay naming a victim's collateral ref settles to
+	// the victim (or is refused), never to the attacker.
+	escrowOwner, lockedAsset, locked, haveEscrow, err := vm.state.GetEscrow(collateralRef)
 	if err != nil {
 		return fmt.Errorf("settle: escrow lookup: %w", err)
+	}
+
+	// AUTHORITY BIND (CRITICAL): when collateral is escrowed, ONLY its recorded owner
+	// may settle it. A relay whose sender is not the escrow owner is refused before any
+	// value moves — the escrow is left intact for the rightful owner's settle. With no
+	// escrow there is nothing locked to protect (proceeds-only; no shared pot is drawn).
+	taker := relaySender
+	if haveEscrow {
+		if relaySender != escrowOwner {
+			return errSettleUnauthorized
+		}
+		// The payout target is ALWAYS the recorded owner (== relaySender here, post-check)
+		// — proceeds and refund legs are exported to escrowOwner, never to a freely-chosen
+		// tx sender, so even a future caller-spoofing path cannot redirect value.
+		taker = escrowOwner
 	}
 
 	// Taker side: from the fills if any, else (zero-fill) from the locked-asset
