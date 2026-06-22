@@ -105,6 +105,22 @@ func (l *MemLedger) GetBalance(a common.Address) *uint256.Int {
 	return uint256.NewInt(0)
 }
 
+// Credit mints `amount` into `a`'s balance. This is the genesis/bootstrap seam
+// for native value (the L1's own state credits an A-Chain account at chain birth
+// or via a cross-chain deposit before any task/registration can pull from it).
+// It is the symmetric counterpart of GetBalance/Pull/Pay and the only way the VM
+// seeds opening balances onto a ledger that was constructed empty. Fail-closed on
+// overflow; no state change on error.
+func (l *MemLedger) Credit(a common.Address, amount *uint256.Int) error {
+	cur := l.GetBalance(a)
+	nv := new(uint256.Int)
+	if _, overflow := nv.AddOverflow(cur, amount); overflow {
+		return ErrCreditOverflow
+	}
+	l.bal[a] = nv
+	return nil
+}
+
 // Pull debits `from` by amount and credits EscrowAccount. Fail-closed on
 // insufficient balance or overflow; no state change on error.
 func (l *MemLedger) Pull(from common.Address, amount *uint256.Int) error {
