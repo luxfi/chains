@@ -338,11 +338,33 @@ type RelayOrderTx struct {
 	Payload []byte `json:"payload"`
 	// CollateralRef references the Import whose locked value backs this order.
 	CollateralRef ids.ID `json:"collateralRef"`
+	// AssetOut is the REAL injective output-asset id the taker receives for a settling
+	// clob_submit — the OPPOSITE side of the market this order trades on, the same
+	// assetID(currency_out) the C-side ImportSettlement requires (recAsset==claim.Asset,
+	// the id that keys seamReserve[assetOut]). The HIGH-1 fix: settleFromFills exports
+	// the PROCEEDS leg under THIS id, NOT a SHA256(ref||leg) routing handle (which never
+	// matched, so a swap's output was permanently unclaimable). It is keeper-asserted and
+	// signature-bound (JSON-covered by SigningBytes); a wrong value can only break the
+	// taker's OWN liveness — ImportSettlement equality-rejects a mismatched asset (no
+	// theft, no mint), the same bounded surface as the carried-fills proposer-trust model.
+	// PriceLimit is the worst-acceptable CLOB price (quote-per-base, float64-bits) for a
+	// settling clob_submit, derived from the V4 SqrtPriceLimitX96. settleFromFills refuses
+	// any carried fill WORSE than this (BUY: price above the limit; SELL: price below it),
+	// enforcing the taker's slippage floor against a sandwich/MEV move. Zero = no limit.
+	// LimitIsUpper records the direction the limit bounds (true: reject price ABOVE the
+	// limit, the BUY/exact-input ceiling; false: reject price BELOW it, the SELL floor).
+	// Empty/zero for place/cancel (non-settling) relays.
+	AssetOut    ids.ID  `json:"assetOut,omitempty"`
+	PriceLimit  uint64  `json:"priceLimit,omitempty"`
+	LimitIsUpper bool   `json:"limitIsUpper,omitempty"`
 }
 
 // NewRelayOrderTx creates a new relay-order transaction (UNSIGNED). From carries no
 // settle authority (the escrow owner does), so an unsigned relay is admissible; a
-// client that wants authenticated From provenance calls Sign afterwards.
+// client that wants authenticated From provenance calls Sign afterwards. assetOut is
+// the real output-asset id a settling clob_submit credits (the HIGH-1 fix); it is
+// ids.Empty for non-settling place/cancel relays. priceLimit/limitIsUpper carry the
+// taker's slippage floor (0 = none).
 func NewRelayOrderTx(from ids.ShortID, nonce uint64, method string, payload []byte, collateralRef ids.ID) *RelayOrderTx {
 	tx := &RelayOrderTx{
 		BaseTx: BaseTx{
@@ -357,6 +379,19 @@ func NewRelayOrderTx(from ids.ShortID, nonce uint64, method string, payload []by
 		Payload:       payload,
 		CollateralRef: collateralRef,
 	}
+	return finalize(tx, &tx.BaseTx)
+}
+
+// NewSettlingRelayOrderTx builds a settling clob_submit relay carrying the output-asset
+// id + slippage limit the proxy settles against. The keeper (which knows the market)
+// populates assetOut (the opposite side of the market) and the price limit derived from
+// the taker's V4 SqrtPriceLimitX96. This is the canonical constructor for the settling
+// rail; non-settling relays use NewRelayOrderTx (assetOut empty).
+func NewSettlingRelayOrderTx(from ids.ShortID, nonce uint64, payload []byte, collateralRef, assetOut ids.ID, priceLimit uint64, limitIsUpper bool) *RelayOrderTx {
+	tx := NewRelayOrderTx(from, nonce, "clob_submit", payload, collateralRef)
+	tx.AssetOut = assetOut
+	tx.PriceLimit = priceLimit
+	tx.LimitIsUpper = limitIsUpper
 	return finalize(tx, &tx.BaseTx)
 }
 
