@@ -21,6 +21,18 @@ package aivm
 
 import "github.com/luxfi/geth/common"
 
+// TaskForIntent returns the A-Chain task id that a committed C-Chain intent
+// created (zero hash if the intent never created a task). The task id is the
+// engine-internal id derived at createTask (computeTaskID over the requester's
+// nonce + height), distinct from the C-side intent id; this mapping is the only
+// way an external caller (the C boundary, an RPC client, this package's drivers)
+// resolves "the intent I committed" to "the task that answers it" for the
+// lifecycle calls (SelectOperators / Commit / Reveal / Settle / GetTask) that key
+// on the task id. Pure read.
+func (e *Engine) TaskForIntent(st QuorumState, intentID common.Hash) common.Hash {
+	return st.GetState(slotHash(nsIntentTask, intentID))
+}
+
 // ExportReceipt returns the settled receipt for the given C-chain intent id and
 // a proof of its inclusion under the current receipt_root. Errors if the intent
 // has no settled receipt. The returned (receipt, proof, root) triple is exactly
