@@ -13,13 +13,20 @@ import (
 )
 
 // stubVM implements api.VM for the SubmitTx tests. bootstrapped toggles the
-// IsBootstrapped gate; the relay is never exercised by SubmitTx.
+// IsBootstrapped gate; the relay is never exercised by SubmitTx. settle* configure
+// the GetSettlement response.
 type stubVM struct {
 	bootstrapped bool
+	settleFound  bool
+	settleOut    ids.ID
+	settleAmount uint64
 }
 
 func (s *stubVM) IsBootstrapped() bool { return s.bootstrapped }
 func (s *stubVM) Relay() Relayer       { return stubRelayer{} }
+func (s *stubVM) GetSettlement(ids.ID) (ids.ID, uint64, bool, error) {
+	return s.settleOut, s.settleAmount, s.settleFound, nil
+}
 
 type stubRelayer struct{}
 
@@ -118,5 +125,40 @@ func TestSubmitTx_SubmitterError(t *testing.T) {
 	err := svc.SubmitTx(nil, &SubmitTxArgs{Tx: "02"}, &SubmitTxReply{})
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("want submitter error propagated, got %v", err)
+	}
+}
+
+// TestGetSettlement_Pending proves the keeper's poll returns Settled=false before the
+// settling block accepts (or for a pure-refund settle) — the signal to keep polling.
+func TestGetSettlement_Pending(t *testing.T) {
+	svc := NewService(&stubVM{bootstrapped: true, settleFound: false})
+	reply := &GetSettlementReply{}
+	if err := svc.GetSettlement(nil, &GetSettlementArgs{CollateralRef: ids.GenerateTestID().String()}, reply); err != nil {
+		t.Fatalf("GetSettlement: %v", err)
+	}
+	if reply.Settled {
+		t.Fatalf("want Settled=false (pending), got true")
+	}
+}
+
+// TestGetSettlement_Found proves a settled-with-proceeds ref returns the proceeds
+// object's outputID + amount — the DS01 Phase-B body inputs.
+func TestGetSettlement_Found(t *testing.T) {
+	out := ids.GenerateTestID()
+	svc := NewService(&stubVM{bootstrapped: true, settleFound: true, settleOut: out, settleAmount: 4242})
+	reply := &GetSettlementReply{}
+	if err := svc.GetSettlement(nil, &GetSettlementArgs{CollateralRef: ids.GenerateTestID().String()}, reply); err != nil {
+		t.Fatalf("GetSettlement: %v", err)
+	}
+	if !reply.Settled || reply.OutputID != out.String() || reply.Amount != 4242 {
+		t.Fatalf("got settled=%v out=%s amt=%d, want true %s 4242", reply.Settled, reply.OutputID, reply.Amount, out)
+	}
+}
+
+// TestGetSettlement_BadRef proves a non-id collateralRef is a clean ErrInvalidRequest.
+func TestGetSettlement_BadRef(t *testing.T) {
+	svc := NewService(&stubVM{bootstrapped: true})
+	if err := svc.GetSettlement(nil, &GetSettlementArgs{CollateralRef: "not-an-id"}, &GetSettlementReply{}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("want ErrInvalidRequest, got %v", err)
 	}
 }
