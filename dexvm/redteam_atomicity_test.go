@@ -318,7 +318,7 @@ func TestRED_FractionalFill_NeverMints(t *testing.T) {
 	collateralRef := ids.GenerateTestID()
 	lockedAsset := ids.GenerateTestID()
 	const lockedQuote uint64 = 10
-	if err := cvm.inner.state.PutEscrow(collateralRef, lockedAsset, lockedQuote); err != nil {
+	if err := cvm.inner.state.PutEscrow(collateralRef, taker, lockedAsset, lockedQuote); err != nil {
 		t.Fatalf("seed escrow: %v", err)
 	}
 
@@ -328,14 +328,16 @@ func TestRED_FractionalFill_NeverMints(t *testing.T) {
 	}
 
 	// Split the exported value by asset: base proceeds vs the locked-quote refund.
+	// Export wire is rail(1)|owner(20)|asset(32)|amount(8) (encodeExportedOutput), so
+	// asset is [21:53] and amount [53:61].
 	var base, refund uint64
 	for _, reqs := range ar.reqs {
 		for _, e := range reqs.PutRequests {
-			if len(e.Value) < 60 {
+			if len(e.Value) != exportedOutputSize {
 				continue
 			}
 			var a ids.ID
-			copy(a[:], e.Value[20:52])
+			copy(a[:], e.Value[21:53])
 			amt := binary.BigEndian.Uint64(e.Value[53:61])
 			if a == lockedAsset {
 				refund += amt
@@ -443,7 +445,7 @@ func TestRED_OverflowFill_SaturatesUint64(t *testing.T) {
 		collateralRef := ids.GenerateTestID()
 		lockedAsset := ids.GenerateTestID()
 		const lockedQuote uint64 = 1000 // tiny escrow; an inflated refund would mint
-		if err := cvm.inner.state.PutEscrow(collateralRef, lockedAsset, lockedQuote); err != nil {
+		if err := cvm.inner.state.PutEscrow(collateralRef, taker, lockedAsset, lockedQuote); err != nil {
 			t.Fatalf("seed escrow: %v", err)
 		}
 
@@ -461,7 +463,7 @@ func TestRED_OverflowFill_SaturatesUint64(t *testing.T) {
 		}
 		// The escrow must NOT have been consumed by a refused settle (so a later,
 		// well-formed relay can still legitimately refund it).
-		_, _, haveEscrow, eerr := cvm.inner.state.GetEscrow(collateralRef)
+		_, _, _, haveEscrow, eerr := cvm.inner.state.GetEscrow(collateralRef)
 		if eerr != nil {
 			t.Fatalf("escrow lookup: %v", eerr)
 		}
@@ -682,7 +684,7 @@ func TestRED_EscrowTruncation_OverRefunds(t *testing.T) {
 	const locked uint64 = 100
 
 	// Import recorded escrow of 100 quote under this ref.
-	if err := cvm.inner.state.PutEscrow(collateralRef, lockedAsset, locked); err != nil {
+	if err := cvm.inner.state.PutEscrow(collateralRef, taker, lockedAsset, locked); err != nil {
 		t.Fatalf("seed escrow: %v", err)
 	}
 
@@ -781,7 +783,7 @@ func TestRED_SettlementExportKeyDeterminism(t *testing.T) {
 		// refund leg something to conserve so the export carries multiple outputs.
 		cvm, _, _, _, _ := newCountingHarness(t, fills)
 		cvm.inner.consensusRuntime.CChainID = sharedCChainID
-		if err := cvm.inner.state.PutEscrow(collateralRef, lockedAsset, locked); err != nil {
+		if err := cvm.inner.state.PutEscrow(collateralRef, taker, lockedAsset, locked); err != nil {
 			t.Fatalf("%s: seed escrow: %v", label, err)
 		}
 		ar := newAtomicRequests()
