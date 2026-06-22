@@ -251,14 +251,28 @@ func (vm *VM) executeImport(tx *txs.ImportTx, ar *atomicRequests) error {
 	// id a relay binds to via RelayOrderTx.CollateralRef. The locked amount is
 	// the credited output total; its asset is the locked asset. An import with no
 	// credited outputs (pure fee burn) locks nothing to refund.
+	//
+	// The escrow's OWNER is the AUTHENTICATED owner of the consumed C->D object —
+	// importedOwner, read back from shared memory and bound to every credited output
+	// above. This is the CRITICAL escrow-theft fix: settleFromFills derives BOTH the
+	// settle authority and the proceeds/refund payout target from this recorded
+	// owner, never from the unauthenticated relay tx sender, so a relay naming a
+	// victim's collateral ref cannot settle it or redirect its value. When there is
+	// no shared memory (single-chain test mode) there is no real cross-chain UTXO to
+	// authenticate against; the structurally-verified credited owner (Outputs[0].Owner,
+	// pinned uniform with the asset/rail axes in Verify) is the escrow owner.
 	if len(tx.Outputs) > 0 {
 		ref := tx.ImportedInputs[0].UTXOID
 		lockedAsset := tx.Outputs[0].Asset
+		escrowOwner := importedOwner
+		if !haveAsset {
+			escrowOwner = tx.Outputs[0].Owner
+		}
 		var locked uint64
 		for _, o := range tx.Outputs {
 			locked += o.Amount
 		}
-		if err := vm.state.PutEscrow(ref, lockedAsset, locked); err != nil {
+		if err := vm.state.PutEscrow(ref, escrowOwner, lockedAsset, locked); err != nil {
 			return fmt.Errorf("import: record escrow: %w", err)
 		}
 	}

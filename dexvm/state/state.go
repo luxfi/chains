@@ -10,19 +10,19 @@
 //
 //  1. NONCES            — per-account replay protection for proxy txs.
 //  2. RELAY RECEIPTS    — in-flight clob_* relays bound to (blockHash, txIndex),
-//                         so a re-execution / reorg / retry maps to exactly one
-//                         d-chain match (replay-idempotency).
+//     so a re-execution / reorg / retry maps to exactly one
+//     d-chain match (replay-idempotency).
 //  3. CONSUMED UTXOs    — the atomic-UTXO consumption set: source-chain UTXO ids
-//                         already claimed by an Import, so the same exported
-//                         value can never be imported twice.
+//     already claimed by an Import, so the same exported
+//     value can never be imported twice.
 //  4. COLLATERAL ESCROW — the locked-collateral ledger: per collateral ref, the
-//                         (asset, amount) an Import locked into the proxy. It is
-//                         the value-conservation witness: a settle credits the
-//                         realized proceeds and REFUNDS the unfilled remainder of
-//                         this locked amount, so value_in == value_out exactly.
-//                         This is NOT canonical DEX state — it is the transport
-//                         layer's record of value in flight, the exact analogue
-//                         of the consumed-UTXO set for the return leg.
+//     (asset, amount) an Import locked into the proxy. It is
+//     the value-conservation witness: a settle credits the
+//     realized proceeds and REFUNDS the unfilled remainder of
+//     this locked amount, so value_in == value_out exactly.
+//     This is NOT canonical DEX state — it is the transport
+//     layer's record of value in flight, the exact analogue
+//     of the consumed-UTXO set for the return leg.
 package state
 
 import (
@@ -190,37 +190,53 @@ func escrowKey(ref ids.ID) []byte {
 	return append(append([]byte{}, prefixEscrow...), ref[:]...)
 }
 
-// PutEscrow records the (asset, amount) an Import locked under a collateral ref.
-// The stored value is asset(32)||amount(8). Recording is the import leg of the
-// conservation equation; the matching ConsumeEscrow at settle pays the refund.
-func (s *State) PutEscrow(ref ids.ID, asset ids.ID, amount uint64) error {
+// escrowValueSize is the fixed collateral-escrow value width: owner(20) |
+// asset(32) | amount(8). The OWNER leads the record — it is the AUTHORITATIVE
+// settle-authority + payout target, the recorded owner of the consumed C->D UTXO
+// (executeImport reads it back from shared memory and binds the credited outputs to
+// it). Persisting it here is the CRITICAL escrow-theft fix: the settle leg derives
+// who may settle and where the proceeds/refund go from THIS recorded owner, never
+// from the unauthenticated relay tx sender, so an attacker naming a victim's
+// collateral ref can neither settle it nor redirect its value.
+const escrowValueSize = 20 + 32 + 8
+
+// PutEscrow records the (owner, asset, amount) an Import locked under a collateral
+// ref. The stored value is owner(20)||asset(32)||amount(8). owner is the recorded
+// owner of the consumed C->D object (the authenticated cross-chain value's owner,
+// bound in executeImport) — the only account that may later settle this escrow and
+// the sole payout target for its proceeds + refund. Recording is the import leg of
+// the conservation equation; the matching ConsumeEscrow at settle pays the refund.
+func (s *State) PutEscrow(ref ids.ID, owner ids.ShortID, asset ids.ID, amount uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	val := make([]byte, 40)
-	copy(val[0:32], asset[:])
-	binary.BigEndian.PutUint64(val[32:40], amount)
+	val := make([]byte, escrowValueSize)
+	copy(val[0:20], owner[:])
+	copy(val[20:52], asset[:])
+	binary.BigEndian.PutUint64(val[52:60], amount)
 	return s.db.Put(escrowKey(ref), val)
 }
 
-// GetEscrow returns the (asset, amount) locked under a collateral ref. found is
-// false when no escrow exists (e.g. a relay that was not preceded by an import
-// in this proxy — then there is nothing to refund and nothing to settle).
-func (s *State) GetEscrow(ref ids.ID) (asset ids.ID, amount uint64, found bool, err error) {
+// GetEscrow returns the (owner, asset, amount) locked under a collateral ref. found
+// is false when no escrow exists (e.g. a relay that was not preceded by an import
+// in this proxy — then there is nothing to refund and nothing to settle). owner is
+// the recorded owner the settle leg binds settle-authority and the payout target to.
+func (s *State) GetEscrow(ref ids.ID) (owner ids.ShortID, asset ids.ID, amount uint64, found bool, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	data, gerr := s.db.Get(escrowKey(ref))
 	if gerr != nil {
 		if errors.Is(gerr, database.ErrNotFound) {
-			return ids.Empty, 0, false, nil
+			return ids.ShortEmpty, ids.Empty, 0, false, nil
 		}
-		return ids.Empty, 0, false, gerr
+		return ids.ShortEmpty, ids.Empty, 0, false, gerr
 	}
-	if len(data) < 40 {
-		return ids.Empty, 0, false, ErrStateCorrupted
+	if len(data) < escrowValueSize {
+		return ids.ShortEmpty, ids.Empty, 0, false, ErrStateCorrupted
 	}
-	copy(asset[:], data[0:32])
-	amount = binary.BigEndian.Uint64(data[32:40])
-	return asset, amount, true, nil
+	copy(owner[:], data[0:20])
+	copy(asset[:], data[20:52])
+	amount = binary.BigEndian.Uint64(data[52:60])
+	return owner, asset, amount, true, nil
 }
 
 // ConsumeEscrow deletes a collateral escrow once it has been settled, so the

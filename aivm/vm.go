@@ -49,8 +49,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/holiman/uint256"
 	"github.com/luxfi/accel"
 	"github.com/luxfi/database"
+	"github.com/luxfi/database/versiondb"
+	"github.com/luxfi/geth/common"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/runtime"
@@ -216,6 +219,19 @@ type VM struct {
 	// Core AI VM from luxfi/ai package
 	core *aivm.VM
 
+	// A-Chain-native quorum settlement engine (the AI task quorum-settlement
+	// state machine: provider registry, stake/slash, selection, commit-reveal,
+	// settlement, receipts, and the cross-chain seam). State lives in qstate
+	// (DB-backed, committed under consensus); custody in qledger. quorum is the
+	// stateless handle bound to the deployment's chain ids.
+	quorum         *Engine
+	qstate         QuorumState
+	qdb            *versiondb.Database               // engine-state staging layer over vm.db; committed at Block.Accept
+	qledger        QuorumLedger
+	qledgerSnap    map[common.Address]*uint256.Int   // last committed ledger balances (for abort rollback)
+	ccv            CCommitVerifier // proves a C intent is committed before it can create a task
+	pendingIntents []CIntent       // committed intents buffered for consensus-gated import
+
 	// Attestation verifier (local nvtrust - no cloud dependency)
 	verifier *attestation.Verifier
 
@@ -252,6 +268,16 @@ type Block struct {
 	Results      []aivm.TaskResult `json:"results,omitempty"`
 	MerkleRoot   [32]byte          `json:"merkleRoot"`
 	ProviderRegs []ProviderReg     `json:"providerRegs,omitempty"`
+
+	// ImportedIntents are the committed C-Chain intents that this block turned
+	// into A-Chain quorum tasks (under consensus, via the verified inbound seam).
+	// Recorded so Block.Verify can deterministically re-run the same imports and
+	// every validator reaches identical engine state.
+	ImportedIntents []CIntent `json:"importedIntents,omitempty"`
+
+	// ReceiptRoot is the engine's committed receipt_root as of this block — the
+	// single commitment the A->C boundary exports.
+	ReceiptRoot common.Hash `json:"receiptRoot"`
 
 	bytes []byte
 	vm    *VM
@@ -302,6 +328,16 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 
 	// Initialize core AI VM
 	vm.core = aivm.NewVM()
+
+	// Initialize the A-Chain quorum settlement engine: DB-backed state (commits
+	// under consensus), native ledger, and chain ids from the deployment. The
+	// inbound C-intent seam defaults to a FAIL-CLOSED verifier — until a real
+	// CCommitVerifier is installed (SetCommitVerifier), NO intent is treated as
+	// committed and no task can be created from the boundary.
+	vm.initQuorum(nil)
+	if vm.ccv == nil {
+		vm.ccv = VerifierFunc(func(CIntent) error { return ErrIntentNotCommitted })
+	}
 
 	// Initialize attestation verifier (local nvtrust - no cloud dependency)
 	vm.verifier = attestation.NewVerifier()
@@ -560,12 +596,30 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		return nil, errors.New("no parent block")
 	}
 
-	// Create new block
+	height := parent.Height_ + 1
+
+	// Snapshot the ledger so that if this proposed block is never accepted, the
+	// engine-state delta (staged in vm.qdb) is aborted AND the ledger is rolled
+	// back — no value or state moves outside consensus.
+	vm.snapshotLedger()
+
+	// Drain buffered committed C-Chain intents into A-Chain quorum tasks UNDER
+	// CONSENSUS (this is the block-build path). importPending is the only caller
+	// of the engine's verified inbound seam; a live request can never reach it.
+	// Writes land in the staging versiondb, not the durable DB.
+	imported := vm.importPending(height)
+
+	// Create new block, recording the imported intents and the resulting
+	// receipt_root so Verify can re-derive identical engine state on every node.
 	blk := &Block{
-		ParentID_:  parent.ID_,
-		Height_:    parent.Height_ + 1,
-		Timestamp_: time.Now(),
-		vm:         vm,
+		ParentID_:       parent.ID_,
+		Height_:         height,
+		Timestamp_:      time.Now(),
+		ImportedIntents: imported,
+		vm:              vm,
+	}
+	if vm.quorum != nil && vm.qstate != nil {
+		blk.ReceiptRoot = vm.quorum.ReceiptRoot(vm.qstate)
 	}
 	blk.ID_ = blk.computeID()
 
@@ -711,17 +765,45 @@ func (blk *Block) Status() uint8 {
 	return 0 // Processing
 }
 
-// Verify verifies the block
+// Verify verifies the block. For A-Chain quorum, this deterministically re-runs
+// the committed C-Chain intents the proposer recorded (under consensus) and
+// checks they reproduce the proposer's receipt_root — so every validator reaches
+// identical engine state from the same committed inputs. A block that records an
+// intent which fails id binding / committedness / replay, or whose imports do
+// not reproduce the recorded receipt_root, is rejected.
 func (blk *Block) Verify(ctx context.Context) error {
-	return nil
+	if blk.vm == nil {
+		return nil
+	}
+	blk.vm.mu.Lock()
+	defer blk.vm.mu.Unlock()
+	if len(blk.ImportedIntents) == 0 && blk.ReceiptRoot == (common.Hash{}) {
+		return nil
+	}
+	// Snapshot the ledger before applying the recorded imports into the staging
+	// layer, so a block that verifies but is later rejected (lost the round) rolls
+	// back both engine state and ledger value via abortEngine.
+	blk.vm.snapshotLedger()
+	return blk.vm.verifyImported(blk.Height_, blk.ImportedIntents, blk.ReceiptRoot)
 }
 
-// Accept accepts the block
+// Accept accepts the block. This is the SOLE commit point for engine state: the
+// staged engine-state delta (importPending/Settle writes accumulated in vm.qdb)
+// is flushed to the durable DB here, and the ledger snapshot is cleared. A block
+// that is built/verified but never accepted moves NO durable engine state and NO
+// value (see Block.Reject -> abortEngine).
 func (blk *Block) Accept(ctx context.Context) error {
 	blk.vm.mu.Lock()
 	defer blk.vm.mu.Unlock()
 
-	// Store in database
+	// Commit the staged engine state FIRST. If this fails the block is not made
+	// last-accepted, so consensus surfaces the fault rather than diverging.
+	if err := blk.vm.commitEngine(); err != nil {
+		return err
+	}
+
+	// Store the block bytes (commitEngine already flushed engine slots; the block
+	// key is disjoint from the av/state/ keyspace).
 	bytes, err := json.Marshal(blk)
 	if err != nil {
 		return err
@@ -740,11 +822,14 @@ func (blk *Block) Accept(ctx context.Context) error {
 	return nil
 }
 
-// Reject rejects the block
+// Reject rejects the block and rolls back any engine-state delta + ledger value
+// it staged during BuildBlock/Verify, so a block that loses the round leaves zero
+// durable side effects (no funds pulled, no intent consumed, no task orphaned).
 func (blk *Block) Reject(ctx context.Context) error {
 	blk.vm.mu.Lock()
 	defer blk.vm.mu.Unlock()
 
+	blk.vm.abortEngine()
 	delete(blk.vm.pendingBlocks, blk.ID_)
 	return nil
 }
