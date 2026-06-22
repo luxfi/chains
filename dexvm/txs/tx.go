@@ -24,14 +24,20 @@
 package txs
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"time"
 
+	"github.com/luxfi/crypto/secp256k1"
 	"github.com/luxfi/ids"
 )
 
 var (
+	// ErrInvalidSignature is returned by RelayOrderTx.Verify when a relay carries a
+	// signature that does not recover to its From (a spoofed-From relay). It is the
+	// admission-time provenance gate; settle authority itself derives from the
+	// consumed C->D object's recorded owner (the escrow owner), not from From.
 	ErrInvalidSignature  = errors.New("invalid signature")
 	ErrInvalidTxType     = errors.New("invalid transaction type")
 	ErrInvalidAmount     = errors.New("invalid amount")
@@ -334,7 +340,9 @@ type RelayOrderTx struct {
 	CollateralRef ids.ID `json:"collateralRef"`
 }
 
-// NewRelayOrderTx creates a new relay-order transaction.
+// NewRelayOrderTx creates a new relay-order transaction (UNSIGNED). From carries no
+// settle authority (the escrow owner does), so an unsigned relay is admissible; a
+// client that wants authenticated From provenance calls Sign afterwards.
 func NewRelayOrderTx(from ids.ShortID, nonce uint64, method string, payload []byte, collateralRef ids.ID) *RelayOrderTx {
 	tx := &RelayOrderTx{
 		BaseTx: BaseTx{
@@ -359,7 +367,82 @@ func (tx *RelayOrderTx) Verify() error {
 	if len(tx.Payload) == 0 {
 		return errors.New("relay: empty payload")
 	}
+	// PROVENANCE AUTHENTICATION of the From field. From carries NO settle authority —
+	// the settle authority + payout target derive from the consumed C->D object's
+	// recorded owner (the escrow owner persisted at import; see chains/dexvm
+	// settleFromFills), exactly as platformvm import/export authority comes from the
+	// consumed UTXO, not a tx-level identity. So an UNSIGNED relay cannot escalate: it
+	// can only settle to whatever escrow its CollateralRef names, and that escrow pays
+	// its recorded owner regardless of From. The signature, WHEN PRESENT, cryptographi-
+	// cally binds From (a secp256k1/EVM-address recovery over the unsigned wire image),
+	// giving the routing/audit layer authenticated provenance and wiring the otherwise-
+	// dangling ErrInvalidSignature. A present-but-invalid signature is rejected at
+	// admission; an absent one is permitted (authority lives in the escrow bind).
+	if len(tx.Signature) > 0 {
+		if err := tx.verifyFrom(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// SigningBytes is the canonical message a RelayOrderTx signature commits to: the
+// wire bytes with the Signature field cleared (so the signature binds From, Method,
+// Payload, CollateralRef, Nonce — but never itself). Deterministic (the struct has
+// no maps; encoding/json emits fields in declaration order).
+func (tx *RelayOrderTx) SigningBytes() ([]byte, error) {
+	unsigned := *tx
+	unsigned.BaseTx.Signature = nil
+	unsigned.BaseTx.bytes = nil
+	unsigned.BaseTx.TxID = ids.Empty
+	return Marshal(&unsigned, TxRelayOrder)
+}
+
+// Sign stamps the relay with a secp256k1 signature over SigningBytes by `key`, and
+// sets From to key's EVM address (the owner format the C->D object carries). After
+// this, Verify authenticates From cryptographically. Used by clients/keepers that
+// build relays; the proxy itself never signs (it derives authority from escrow).
+func (tx *RelayOrderTx) Sign(key *secp256k1.PrivateKey) error {
+	tx.From = key.EVMAddress()
+	msg, err := tx.SigningBytes()
+	if err != nil {
+		return err
+	}
+	sig, err := key.SignHash(hashRelaySigningBytes(msg))
+	if err != nil {
+		return err
+	}
+	tx.Signature = sig
+	// Re-stamp the wire bytes + TxID now that From + Signature are set, so the signed
+	// tx is immediately wire-ready and Parse-round-trippable (same as every New*Tx).
+	finalize(tx, &tx.BaseTx)
+	return nil
+}
+
+// verifyFrom recovers the signer of the relay from its signature over the unsigned
+// wire image and requires the recovered EVM address to equal tx.From. A mismatch (or
+// an unrecoverable signature) is ErrInvalidSignature — a spoofed From is refused at
+// admission.
+func (tx *RelayOrderTx) verifyFrom() error {
+	msg, err := tx.SigningBytes()
+	if err != nil {
+		return err
+	}
+	pub, err := secp256k1.RecoverPublicKeyFromHash(hashRelaySigningBytes(msg), tx.Signature)
+	if err != nil {
+		return ErrInvalidSignature
+	}
+	if ids.ShortID(pub.EVMAddress()) != tx.From {
+		return ErrInvalidSignature
+	}
+	return nil
+}
+
+// hashRelaySigningBytes is the single hash the relay sign+recover paths share, so
+// signing and verification commit to the identical digest of the unsigned wire image.
+func hashRelaySigningBytes(msg []byte) []byte {
+	h := sha256.Sum256(msg)
+	return h[:]
 }
 
 // PlaceOrderTx is a thin relay envelope for a CLOB limit-order placement. It
