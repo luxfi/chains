@@ -46,12 +46,11 @@ var (
 
 	// Database prefixes — replay nonces, relay receipts, consumed UTXOs,
 	// collateral escrow.
-	prefixNonce      = []byte("nonce:")
-	prefixReceipt    = []byte("receipt:")
-	prefixConsumed   = []byte("consumed:")
-	prefixEscrow     = []byte("escrow:")
-	prefixSettlement = []byte("settlement:")
-	prefixLastBlock  = []byte("lastBlock")
+	prefixNonce     = []byte("nonce:")
+	prefixReceipt   = []byte("receipt:")
+	prefixConsumed  = []byte("consumed:")
+	prefixEscrow    = []byte("escrow:")
+	prefixLastBlock = []byte("lastBlock")
 )
 
 // Receipt records an in-flight ZAP relay: the d-chain operation it triggered,
@@ -261,66 +260,6 @@ func (s *State) ConsumeEscrow(ref ids.ID) error {
 		return err
 	}
 	return s.db.Delete(escrowKey(ref))
-}
-
-// ---------------------------------------------------------------------------
-// Settlement record — the D->C proceeds-object COORDINATE, keyed by collateral
-// ref (== the C->D intentID). It is a DETERMINISTIC by-product of settleFromFills:
-// the proceeds export's outputID (deriveUTXOID(settlementExportTx.ID(), 0)) and the
-// realized proceeds amount. Both are pure functions of consensus-agreed inputs
-// (block hash + txIndex seed the export identity; the carried fills give the amount),
-// so every validator writes the IDENTICAL record into the versiondb at accept and the
-// StateRoot stays consensus-safe. It is the seam the off-chain keeper reads (the
-// dex.getSettlement RPC) to learn the D->C object's outputID + amount so it can build
-// the C-side Phase-B ImportSettlement (DS01 outputID|amount|intentID). It is purely
-// INFORMATIONAL — it moves no value (the atomic export object alone does) and is never
-// consulted by the deterministic settle/consume path; a keeper that ignores it loses
-// only liveness (the locker reclaims after the deadline).
-// ---------------------------------------------------------------------------
-
-func settlementKey(ref ids.ID) []byte {
-	return append(append([]byte{}, prefixSettlement...), ref[:]...)
-}
-
-// settlementValueSize is the fixed record width: proceedsOutputID(32) | amount(8).
-const settlementValueSize = 32 + 8
-
-// PutSettlement records the proceeds D->C object's (outputID, amount) under the
-// collateral ref (the intentID), written in settleFromFills when a swap realizes
-// proceeds. Recorded ONLY for the proceeds leg (a pure refund has no D->C proceeds the
-// keeper must claim — the refund object is owner-addressed and reclaimed the same way).
-// Writing through the versiondb `db` makes it commit atomically with the block, so it
-// is visible exactly when the export object becomes claimable.
-func (s *State) PutSettlement(ref ids.ID, outputID ids.ID, amount uint64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	val := make([]byte, settlementValueSize)
-	copy(val[0:32], outputID[:])
-	binary.BigEndian.PutUint64(val[32:40], amount)
-	return s.db.Put(settlementKey(ref), val)
-}
-
-// GetSettlement returns the proceeds (outputID, amount) recorded under a collateral
-// ref. found is false when no settlement-with-proceeds has been recorded for the ref
-// (not yet settled, a pure-refund settle, or an unknown ref) — the keeper then keeps
-// polling (or, past the deadline, the taker reclaims). It reads the versiondb `db`, so
-// it reflects committed state.
-func (s *State) GetSettlement(ref ids.ID) (outputID ids.ID, amount uint64, found bool, err error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	data, gerr := s.db.Get(settlementKey(ref))
-	if gerr != nil {
-		if errors.Is(gerr, database.ErrNotFound) {
-			return ids.Empty, 0, false, nil
-		}
-		return ids.Empty, 0, false, gerr
-	}
-	if len(data) < settlementValueSize {
-		return ids.Empty, 0, false, ErrStateCorrupted
-	}
-	copy(outputID[:], data[0:32])
-	amount = binary.BigEndian.Uint64(data[32:40])
-	return outputID, amount, true, nil
 }
 
 // ---------------------------------------------------------------------------
