@@ -19,6 +19,7 @@ var (
 
 	// custody / conservation
 	ErrInsufficientFunds = errors.New("aivm/quorum: insufficient balance")
+	ErrLedgerNotFundable = errors.New("aivm/quorum: ledger does not support genesis funding")
 	ErrEscrowUnderflow   = errors.New("aivm/quorum: escrow underflow (invariant broken)")
 	ErrStakeOverflow     = errors.New("aivm/quorum: stake overflow")
 	ErrCreditOverflow    = errors.New("aivm/quorum: credit overflow")
