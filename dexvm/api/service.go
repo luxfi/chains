@@ -37,6 +37,11 @@ type Relayer interface {
 type VM interface {
 	IsBootstrapped() bool
 	Relay() Relayer
+	// GetSettlement returns the proceeds D->C object's (outputID, amount) recorded
+	// under a collateral ref (the C->D intentID) once a swap settled with proceeds.
+	// found is false until the settling block is accepted. Purely informational — it
+	// is the seam the keeper polls to build the C-side Phase-B ImportSettlement.
+	GetSettlement(ref ids.ID) (outputID ids.ID, amount uint64, found bool, err error)
 }
 
 // TxSubmitter is the OPTIONAL mempool-entry surface. The atomic proxy txs
@@ -217,6 +222,56 @@ func (s *Service) SubmitTx(_ *http.Request, args *SubmitTxArgs, reply *SubmitTxR
 	// byte-identical to txs.BaseTx.TxID (stampBase). Reuse it (not a private
 	// re-hash) so the id the keeper gets back is exactly the one the VM stamps.
 	reply.TxID = ids.Checksum256(raw).String()
+	return nil
+}
+
+// ============================================
+// Settlement coordinate (the keeper's Phase-B input)
+// ============================================
+
+// GetSettlementArgs names the collateral ref (the C->D intentID, hex/cb58 ids.ID
+// string) whose proceeds D->C object the keeper wants to claim.
+type GetSettlementArgs struct {
+	CollateralRef string `json:"collateralRef"`
+}
+
+// GetSettlementReply returns the proceeds object's coordinate. Settled=false means
+// the settling block has not been accepted yet (the keeper keeps polling) or the
+// settle was a pure refund (no proceeds object to claim). When Settled is true,
+// OutputID + Amount are the DS01 Phase-B body inputs (outputID|amount|intentID).
+type GetSettlementReply struct {
+	Settled  bool   `json:"settled"`
+	OutputID string `json:"outputID"`
+	Amount   uint64 `json:"amount"`
+}
+
+// GetSettlement reports the proceeds D->C object's (outputID, amount) recorded under
+// a collateral ref once the dexvm settled a swap with proceeds. This is the SEAM the
+// keeper polls after submitting the ImportTx + settling RelayOrderTx: once the
+// settling block accepts, settleFromFills records the proceeds export's outputID +
+// realized amount here, and the keeper reads them to build the C-side Phase-B
+// ImportSettlement (DS01 outputID|amount|intentID) that consumes the object and emits
+// DEXFill. It is a read of committed state; it credits nothing.
+func (s *Service) GetSettlement(_ *http.Request, args *GetSettlementArgs, reply *GetSettlementReply) error {
+	if !s.vm.IsBootstrapped() {
+		return ErrNotBootstrapped
+	}
+	if args.CollateralRef == "" {
+		return fmt.Errorf("%w: collateralRef required", ErrInvalidRequest)
+	}
+	ref, err := ids.FromString(args.CollateralRef)
+	if err != nil {
+		return fmt.Errorf("%w: collateralRef must be a valid id: %v", ErrInvalidRequest, err)
+	}
+	outputID, amount, found, err := s.vm.GetSettlement(ref)
+	if err != nil {
+		return err
+	}
+	reply.Settled = found
+	if found {
+		reply.OutputID = outputID.String()
+		reply.Amount = amount
+	}
 	return nil
 }
 
