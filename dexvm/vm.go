@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -356,6 +357,19 @@ type Genesis struct {
 	DexZapEndpoint string `json:"dexZapEndpoint,omitempty"`
 	// TrustedChains are chain IDs trusted for the Warp attestation channel.
 	TrustedChains []string `json:"trustedChains,omitempty"`
+	// FillAttestationPubKey is the venue's (d-chain matcher's) Ed25519 PUBLIC key,
+	// hex-encoded (32 bytes). It is GENESIS-PINNED — a single network-wide constant —
+	// because it participates in the deterministic settle decision (verifyFillAttestation
+	// gates trustCarried -> escrow-consume + export legs -> computeStateRoot). If two
+	// validators held DIFFERENT values they would reach different trust decisions for the
+	// same block and FORK the StateRoot, so it MUST NOT be per-node operator config: it
+	// lives ONLY here (genesis), never in parseConfig. Empty = enforcement off (the
+	// documented single-trusted-operator / dev model). Set (32 bytes) = enforcement on for
+	// an untrusted validator set: a block whose carried fills lack a valid venue
+	// attestation is settled as a FULL REFUND (fail-secure). A non-empty value that does
+	// not decode to exactly 32 bytes is a FATAL genesis error (fail-closed — a garbage key
+	// must never silently degrade to "no enforcement").
+	FillAttestationPubKey string `json:"fillAttestationPubKey,omitempty"`
 }
 
 // parseGenesis applies the proxy genesis (endpoint + trusted attestation chains).
@@ -374,8 +388,29 @@ func (vm *VM) parseGenesis(genesisBytes []byte) error {
 		}
 		vm.Config.TrustedChains = append(vm.Config.TrustedChains, chainID)
 	}
+	// FILL-ATTESTATION PUBKEY (the HIGH fix: the enforcement gate was inert because this
+	// network-pinned constant was never written). It is GENESIS-pinned and assigned ONLY
+	// here — NEVER in parseConfig — because it is consensus-affecting: verifyFillAttestation
+	// gates trustCarried, which decides whether a block's carried fills move proceeds, which
+	// feeds computeStateRoot. A per-node value would fork the StateRoot. A non-empty key
+	// that does not decode to exactly Ed25519's public-key width is a FATAL genesis error
+	// (fail-closed: a garbage key must never silently degrade to "no enforcement", which
+	// would re-open the fabricated-fills gap).
+	if genesis.FillAttestationPubKey != "" {
+		pub, err := hex.DecodeString(genesis.FillAttestationPubKey)
+		if err != nil {
+			return fmt.Errorf("invalid fillAttestationPubKey hex: %w", err)
+		}
+		if len(pub) != ed25519.PublicKeySize {
+			return fmt.Errorf("invalid fillAttestationPubKey: got %d bytes, need %d (Ed25519 public key)", len(pub), ed25519.PublicKeySize)
+		}
+		vm.Config.FillAttestationPubKey = pub
+	}
 	if !vm.log.IsZero() {
-		vm.log.Info("Genesis parsed", "trustedChains", len(vm.Config.TrustedChains))
+		vm.log.Info("Genesis parsed",
+			"trustedChains", len(vm.Config.TrustedChains),
+			"fillAttestationEnforced", len(vm.Config.FillAttestationPubKey) == ed25519.PublicKeySize,
+		)
 	}
 	return nil
 }
@@ -1043,7 +1078,17 @@ func (vm *VM) settleFromFills(relaySender ids.ShortID, collateralRef ids.ID, fil
 		if haveEscrow && outAsset == lockedAsset {
 			return fmt.Errorf("settle: output asset equals locked asset %s (not a cross-asset swap)", lockedAsset)
 		}
-		outs = append(outs, txs.AtomicOutput{Owner: taker, Asset: outAsset, Amount: proceeds})
+		// Carry the matched INPUT (spent) on the proceeds object so the C-side
+		// ImportSettlement can enforce the taker's OWN recorded slippage limit
+		// (proceeds >= spent * worstRate) INDEPENDENTLY of the keeper that built the relay.
+		// The dexvm's own per-fill limit check above uses the KEEPER-supplied priceLimit
+		// (RelayOrderTx); this witness lets C re-check against the TAKER-authentic limit it
+		// persisted at SubmitSwapIntent, so a keeper that zeroes the relay limit to sandwich
+		// the taker still produces a proceeds object C will REFUSE. Bounded: understating
+		// spent loosens the proceeds floor but inflates refund (= locked - spent), and the
+		// refund leg is independently capped by the taker's remaining principal + seam
+		// reserve — the keeper cannot both pass the floor and over-refund.
+		outs = append(outs, txs.AtomicOutput{Owner: taker, Asset: outAsset, Amount: proceeds, Spent: spent})
 	}
 
 	// REFUND leg — the unfilled remainder of the locked asset.
