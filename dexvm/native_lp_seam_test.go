@@ -121,7 +121,7 @@ func TestNativeLP_CollectExportsPrincipalPlusFees(t *testing.T) {
 	if !ok || len(req.PutRequests) != 1 {
 		t.Fatalf("collect export must produce exactly one D->C object")
 	}
-	r, o, a, amt, decOK := decodeExportedOutput(req.PutRequests[0].Value)
+	r, o, a, amt, _, decOK := decodeExportedOutput(req.PutRequests[0].Value)
 	if !decOK || r != txs.RailLP || o != lp || a != token || amt != withdrawable {
 		t.Fatalf("D->C collect object mismatch: ok=%v rail=%d owner=%v asset=%v amount=%d", decOK, r, o, a, amt)
 	}
@@ -173,7 +173,7 @@ func TestNativeLP_CommitCollectRoundTripConserves(t *testing.T) {
 	if realized != principal+fees {
 		t.Fatalf("round-trip realized %d != committed+fees %d", realized, principal+fees)
 	}
-	r, o, a, amt, ok := decodeExportedOutput(arWd.reqs[h.cChain].PutRequests[0].Value)
+	r, o, a, amt, _, ok := decodeExportedOutput(arWd.reqs[h.cChain].PutRequests[0].Value)
 	if !ok || r != txs.RailLP || o != lp || a != token || amt != principal+fees {
 		t.Fatalf("round-trip D->C object mismatch: ok=%v rail=%d owner=%v asset=%v amount=%d", ok, r, o, a, amt)
 	}

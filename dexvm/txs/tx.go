@@ -162,6 +162,15 @@ type AtomicOutput struct {
 	Owner  ids.ShortID `json:"owner"`
 	Asset  ids.ID      `json:"asset"`
 	Amount uint64      `json:"amount"`
+	// Spent is the matched INPUT amount (in the locked/input asset's units) that produced
+	// this output, set ONLY on a swap PROCEEDS leg (RailSwap, output asset != locked
+	// asset). It rides the shared-memory object so the C-side ImportSettlement can enforce
+	// the taker's OWN recorded slippage limit (proceeds >= spent * worstRate) INDEPENDENTLY
+	// of the keeper that built the relay — the taker-authenticated MEV/sandwich floor. It is
+	// 0 on a REFUND leg (output asset == locked asset; the per-taker principal cap governs
+	// that leg) and on every LP leg. It is informational to value conservation (the object's
+	// Amount alone moves value); it is the price-binding witness the proceeds floor checks.
+	Spent uint64 `json:"spent,omitempty"`
 }
 
 // ImportTx claims value exported from C-Chain (the SourceChain) into the proxy.
