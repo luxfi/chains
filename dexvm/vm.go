@@ -1121,6 +1121,25 @@ func (vm *VM) settleFromFills(relaySender ids.ShortID, collateralRef ids.ID, fil
 	// network-wide. This is the fix for the time.Now() shared-memory-key split.
 	createdAt := int64(binary.BigEndian.Uint64(blockHash[:8]))
 	tx := txs.NewSettlementExportTx(taker, txIndex, vm.cChainID(), outs, collateralRef, createdAt)
+
+	// Record the proceeds object's COORDINATE for the off-chain keeper (dex.getSettlement).
+	// When proceeds were realized they are outs[0] (appended first, before the refund leg,
+	// both > 0 when present so nonZeroOutputs preserves the index), so the proceeds export
+	// UTXO is deriveUTXOID(tx.ID(), 0) — the SAME key executeExport puts into shared memory
+	// (it derives elems by output index). The keeper reads this to build the C-side Phase-B
+	// ImportSettlement (DS01 outputID|amount|intentID). This is a deterministic, purely
+	// informational by-product: every validator computes the identical tx.ID() (the export
+	// identity is seeded by the consensus-agreed blockHash+txIndex, never wall-clock), so the
+	// versiondb write is consensus-safe. A record-write failure must NOT fail the settle
+	// (value movement is the export's job, not this index's), so it is logged, not returned.
+	if proceeds > 0 && len(outs) > 0 && outs[0].Amount == proceeds && outs[0].Asset == outAsset {
+		proceedsOutputID := deriveUTXOID(tx.ID(), 0)
+		if perr := vm.state.PutSettlement(collateralRef, proceedsOutputID, proceeds); perr != nil && !vm.log.IsZero() {
+			vm.log.Warn("settle: record proceeds coordinate failed (keeper falls back to deadline reclaim)",
+				"collateralRef", collateralRef, "error", perr)
+		}
+	}
+
 	return vm.executeExport(tx, ar)
 }
 
@@ -1346,6 +1365,20 @@ func (vm *VM) GetLastBlockTime() time.Time {
 // Relay exposes the relay client to the API pass-through layer as the neutral
 // api.Relayer surface (the proxy's only DEX capability is transport).
 func (vm *VM) Relay() api.Relayer { return vm.relay }
+
+// GetSettlement returns the proceeds D->C object's (outputID, amount) recorded under
+// a collateral ref (the C->D intentID) once a swap settled with proceeds, for the
+// dex.getSettlement RPC the keeper polls to build the C-side Phase-B ImportSettlement.
+// found is false until the settling block is accepted (the keeper keeps polling). It is
+// a read of committed versiondb state — purely informational, moves no value.
+func (vm *VM) GetSettlement(ref ids.ID) (outputID ids.ID, amount uint64, found bool, err error) {
+	vm.lock.RLock()
+	defer vm.lock.RUnlock()
+	if vm.state == nil {
+		return ids.Empty, 0, false, errVMNotInitialized
+	}
+	return vm.state.GetSettlement(ref)
+}
 
 // Gossip implements consensuscore.VM. The proxy gossips nothing matcher-related
 // (it has no book); it only acknowledges peer messages.
