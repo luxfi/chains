@@ -9,7 +9,7 @@ require (
 	github.com/holiman/uint256 v1.3.2
 	github.com/luxfi/accel v1.2.4
 	github.com/luxfi/ai v0.1.0
-	github.com/luxfi/consensus v1.25.18
+	github.com/luxfi/consensus v1.25.19
 	github.com/luxfi/constants v1.5.8
 	github.com/luxfi/crypto v1.19.21
 	github.com/luxfi/database v1.20.3
@@ -159,7 +159,7 @@ require (
 	github.com/luxfi/p2p v1.21.1 // indirect
 	github.com/luxfi/pq v1.0.3 // indirect
 	github.com/luxfi/proto v1.3.5 // indirect
-	github.com/luxfi/pulsar v1.1.2 // indirect
+	github.com/luxfi/pulsar v1.1.5 // indirect
 	github.com/luxfi/resource v0.0.1 // indirect
 	github.com/luxfi/sampler v1.1.0 // indirect
 	github.com/luxfi/staking v1.5.0 // indirect
