@@ -9,11 +9,11 @@ require (
 	github.com/holiman/uint256 v1.3.2
 	github.com/luxfi/accel v1.2.4
 	github.com/luxfi/ai v0.1.0
-	github.com/luxfi/consensus v1.25.19
+	github.com/luxfi/consensus v1.25.21
 	github.com/luxfi/constants v1.5.8
-	github.com/luxfi/crypto v1.19.21
-	github.com/luxfi/database v1.20.3
-	github.com/luxfi/evm v1.99.36
+	github.com/luxfi/crypto v1.19.22
+	github.com/luxfi/database v1.20.4
+	github.com/luxfi/evm v1.99.39
 	github.com/luxfi/geth v1.17.12
 	github.com/luxfi/ids v1.2.15
 	github.com/luxfi/lattice/v7 v7.1.4
@@ -21,10 +21,10 @@ require (
 	github.com/luxfi/metric v1.5.9
 	github.com/luxfi/node v1.30.6
 	github.com/luxfi/oracle v1.0.0
-	github.com/luxfi/precompile v0.5.56
+	github.com/luxfi/precompile v0.5.59
 	github.com/luxfi/relay v1.0.0
 	github.com/luxfi/rpc v1.1.0
-	github.com/luxfi/runtime v1.1.1
+	github.com/luxfi/runtime v1.1.3
 	github.com/luxfi/sys v0.1.0
 	github.com/luxfi/threshold v1.9.9
 	github.com/luxfi/timer v1.0.2
@@ -93,8 +93,10 @@ require (
 	github.com/ethereum/c-kzg-4844/v2 v2.1.7 // indirect
 	github.com/ethereum/go-bigmodexpfix v0.0.0-20250911101455-f9e208c548ab // indirect
 	github.com/ferranbt/fastssz v1.0.0 // indirect
+	github.com/fjl/gencodec v0.1.1 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.1 // indirect
+	github.com/garslo/gogen v0.0.0-20170306192744-1d203ffc1f61 // indirect
 	github.com/gballet/go-libpcsclite v0.0.0-20250918194357-1ec6f2e601c6 // indirect
 	github.com/getsentry/sentry-go v0.44.1 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect
@@ -118,7 +120,7 @@ require (
 	github.com/grandcat/zeroconf v1.0.0 // indirect
 	github.com/gtank/merlin v0.1.1 // indirect
 	github.com/gtank/ristretto255 v0.2.0 // indirect
-	github.com/hanzoai/vfs v0.4.1 // indirect
+	github.com/hanzoai/vfs v0.4.3 // indirect
 	github.com/hashicorp/go-bexpr v0.1.16 // indirect
 	github.com/holiman/billy v0.0.0-20250707135307-f2f9b9aae7db // indirect
 	github.com/holiman/bloomfilter/v2 v2.0.3 // indirect
@@ -133,6 +135,7 @@ require (
 	github.com/luxfi/age v1.5.0 // indirect
 	github.com/luxfi/api v1.0.15 // indirect
 	github.com/luxfi/atomic v1.0.0 // indirect
+	github.com/luxfi/bft v0.1.5 // indirect
 	github.com/luxfi/cache v1.2.1 // indirect
 	github.com/luxfi/codec v1.1.5 // indirect
 	github.com/luxfi/compress v0.0.5 // indirect
@@ -169,9 +172,9 @@ require (
 	github.com/luxfi/utils v1.2.0 // indirect
 	github.com/luxfi/utxo v0.3.7 // indirect
 	github.com/luxfi/validators v1.2.0 // indirect
-	github.com/luxfi/zap v0.7.2 // indirect
+	github.com/luxfi/zap v0.8.10 // indirect
 	github.com/luxfi/zapcodec v1.0.1 // indirect
-	github.com/luxfi/zapdb v1.10.0 // indirect
+	github.com/luxfi/zapdb v1.10.1 // indirect
 	github.com/luxfi/zwing v0.5.2 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
@@ -215,14 +218,14 @@ require (
 	github.com/supranational/blst v0.3.16 // indirect
 	github.com/syndtr/goleveldb v1.0.1-0.20220721030215-126854af5e6d // indirect
 	github.com/tinylib/msgp v1.6.4 // indirect
-	github.com/tklauser/go-sysconf v0.3.16 // indirect
-	github.com/tklauser/numcpus v0.11.0 // indirect
+	github.com/tklauser/go-sysconf v0.4.0 // indirect
+	github.com/tklauser/numcpus v0.12.0 // indirect
 	github.com/urfave/cli/v2 v2.27.7 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xrash/smetrics v0.0.0-20250705151800-55b8f293f342 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
-	go.mongodb.org/mongo-driver v1.17.4 // indirect
+	go.mongodb.org/mongo-driver v1.17.9 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
