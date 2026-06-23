@@ -24,14 +24,14 @@ const (
 	// activation under it may legitimately claim Byzantine-finality safety.
 	ConsensusModeQuorumFinality ConsensusMode = 1
 
-	// ConsensusModeHonestValidatorLaunch is a DELIBERATE, LABELED crash-fault-tolerant
+	// ConsensusModeHonestValidatorLabeled is a DELIBERATE, LABELED crash-fault-tolerant
 	// (CFT) parity mode: the validator set is assumed honest-but-crash-prone, NOT
 	// Byzantine. It is a legitimate launch posture, but it MUST NOT be presented as
 	// Byzantine-finality. Activating value under it is permitted ONLY when it asserts
 	// the launch safety bundle (caps-on + real-assets-only + halt-ready) and surfaces
 	// an explicit "no Byzantine-finality claim" status string. It is the only other
 	// legal value mode.
-	ConsensusModeHonestValidatorLaunch ConsensusMode = 2
+	ConsensusModeHonestValidatorLabeled ConsensusMode = 2
 )
 
 // String renders the mode as its canonical token.
@@ -39,8 +39,8 @@ func (m ConsensusMode) String() string {
 	switch m {
 	case ConsensusModeQuorumFinality:
 		return "QUORUM_FINALITY"
-	case ConsensusModeHonestValidatorLaunch:
-		return "HONEST_VALIDATOR_LAUNCH"
+	case ConsensusModeHonestValidatorLabeled:
+		return "HONEST_VALIDATOR_LABELED"
 	default:
 		return "UNSET"
 	}
@@ -52,16 +52,16 @@ func ParseConsensusMode(s string) (ConsensusMode, error) {
 	switch s {
 	case "QUORUM_FINALITY":
 		return ConsensusModeQuorumFinality, nil
-	case "HONEST_VALIDATOR_LAUNCH":
-		return ConsensusModeHonestValidatorLaunch, nil
+	case "HONEST_VALIDATOR_LABELED":
+		return ConsensusModeHonestValidatorLabeled, nil
 	case "", "UNSET":
 		return ConsensusModeUnset, nil
 	default:
-		return ConsensusModeUnset, fmt.Errorf("registry: unknown consensus mode %q (only QUORUM_FINALITY or HONEST_VALIDATOR_LAUNCH)", s)
+		return ConsensusModeUnset, fmt.Errorf("registry: unknown consensus mode %q (only QUORUM_FINALITY or HONEST_VALIDATOR_LABELED)", s)
 	}
 }
 
-// LaunchAssertions is the safety bundle a HONEST_VALIDATOR_LAUNCH activation MUST
+// LaunchAssertions is the safety bundle a HONEST_VALIDATOR_LABELED activation MUST
 // satisfy. It is the explicit, auditable record that the CFT-parity launch is
 // running with the compensating controls that justify it. Every field MUST be true
 // for value to activate under that mode; a false field is a refusal.
@@ -82,11 +82,11 @@ func (a LaunchAssertions) ok() bool {
 	return a.CapsOn && a.RealAssetsOnly && a.HaltReady
 }
 
-// NoByzantineFinalityClaim is the EXACT status string a HONEST_VALIDATOR_LAUNCH
+// NoByzantineFinalityClaim is the EXACT status string a HONEST_VALIDATOR_LABELED
 // activation surfaces. It is a constant so the UI/status surface and any audit
 // tooling can match it byte-for-byte; the launch posture must never be silently
 // presented as Byzantine-final.
-const NoByzantineFinalityClaim = "DEX value active under HONEST_VALIDATOR_LAUNCH (CFT parity): no Byzantine-finality claim"
+const NoByzantineFinalityClaim = "DEX value active under HONEST_VALIDATOR_LABELED (CFT parity): no Byzantine-finality claim"
 
 var (
 	// ErrValueModeUnset is returned when value activation is requested with no legal
@@ -94,10 +94,10 @@ var (
 	ErrValueModeUnset = errors.New("registry: refuse DEX value activation — consensus mode is UNSET (no Byzantine-finality and no labeled CFT-parity declared)")
 	// ErrValueModeIllegal is returned for any consensus mode that is not one of the
 	// two legal value modes.
-	ErrValueModeIllegal = errors.New("registry: refuse DEX value activation — consensus mode is not QUORUM_FINALITY or HONEST_VALIDATOR_LAUNCH")
-	// ErrLaunchAssertionsUnmet is returned when HONEST_VALIDATOR_LAUNCH is requested
+	ErrValueModeIllegal = errors.New("registry: refuse DEX value activation — consensus mode is not QUORUM_FINALITY or HONEST_VALIDATOR_LABELED")
+	// ErrLaunchAssertionsUnmet is returned when HONEST_VALIDATOR_LABELED is requested
 	// without the full caps-on + real-assets-only + halt-ready bundle.
-	ErrLaunchAssertionsUnmet = errors.New("registry: refuse HONEST_VALIDATOR_LAUNCH value activation — caps-on + real-assets-only + halt-ready not all asserted")
+	ErrLaunchAssertionsUnmet = errors.New("registry: refuse HONEST_VALIDATOR_LABELED value activation — caps-on + real-assets-only + halt-ready not all asserted")
 )
 
 // ValueModeStatus is the outcome of a successful value-activation guard check: the
@@ -106,7 +106,7 @@ var (
 // status is empty (Byzantine finality is genuine, so no disclaimer is required).
 type ValueModeStatus struct {
 	Mode   ConsensusMode
-	Status string // NoByzantineFinalityClaim for HONEST_VALIDATOR_LAUNCH, "" for QUORUM_FINALITY
+	Status string // NoByzantineFinalityClaim for HONEST_VALIDATOR_LABELED, "" for QUORUM_FINALITY
 }
 
 // GuardValueActivation is THE consensus-mode value guard. It decides whether the DEX
@@ -117,7 +117,7 @@ type ValueModeStatus struct {
 //
 //	if !dexNativeValueEnabled            -> no value to gate; returns the unset status, nil.
 //	if mode == QUORUM_FINALITY           -> permitted (PQ BFT); status "".
-//	if mode == HONEST_VALIDATOR_LAUNCH   -> permitted ONLY if assertions.ok();
+//	if mode == HONEST_VALIDATOR_LABELED   -> permitted ONLY if assertions.ok();
 //	                                        status = NoByzantineFinalityClaim.
 //	otherwise (UNSET or any other value) -> REFUSED. Never a silent third state.
 //
@@ -132,7 +132,7 @@ func GuardValueActivation(dexNativeValueEnabled bool, mode ConsensusMode, assert
 	switch mode {
 	case ConsensusModeQuorumFinality:
 		return ValueModeStatus{Mode: mode, Status: ""}, nil
-	case ConsensusModeHonestValidatorLaunch:
+	case ConsensusModeHonestValidatorLabeled:
 		if !assertions.ok() {
 			return ValueModeStatus{}, fmt.Errorf("%w (capsOn=%t realAssetsOnly=%t haltReady=%t)",
 				ErrLaunchAssertionsUnmet, assertions.CapsOn, assertions.RealAssetsOnly, assertions.HaltReady)

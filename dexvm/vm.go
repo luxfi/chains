@@ -25,6 +25,7 @@ import (
 	"github.com/luxfi/chains/dexvm/api"
 	"github.com/luxfi/chains/dexvm/config"
 	"github.com/luxfi/chains/dexvm/network"
+	"github.com/luxfi/chains/dexvm/registry"
 	dexstate "github.com/luxfi/chains/dexvm/state"
 	"github.com/luxfi/chains/dexvm/txs"
 	consensuscore "github.com/luxfi/consensus/core"
@@ -239,6 +240,12 @@ type VM struct {
 	// relay forwards clob_* frames to the d-chain ZAP gateway (order-relay leg).
 	relay *RelayClient
 
+	// dexValueStatus is the outcome of the Gate-A consensus-mode value guard: the mode
+	// that authorised native value and, for a labeled HONEST_VALIDATOR_LABELED, the exact
+	// "no Byzantine-finality claim" disclaimer to surface. Set once at Initialize after
+	// the real-assets-only gate passes.
+	dexValueStatus registry.ValueModeStatus
+
 	// fillSigningKey is the venue's Ed25519 signing key, derived ONCE from
 	// Config.FillAttestationSeed when this node is co-located with the venue (it is then
 	// authoritative to attest the fills it relayed). nil on a pure validator (verify-only)
@@ -337,6 +344,33 @@ func (vm *VM) Initialize(ctx context.Context, vmInit vmcore.Init) error {
 	// Wire the order-relay client to the configured d-chain endpoint. Empty
 	// endpoint => inert relay leg (ErrRelayNotConfigured on relay attempts).
 	vm.relay = NewRelayClient(vm.Config.DexZapEndpoint, vm.Config.DexZapTimeout)
+
+	// GATE A — real-assets-only backend enforcement. Runs after config + genesis parse,
+	// using the consensus-supplied network identity (never an operator-spoofable value),
+	// and BEFORE the VM is marked initialized. Fail-closed: any synthetic flag on a value
+	// net, any unknown/synthetic asset in an enabled market, any Liquidity/phantom/mock/
+	// ASCII-ticker/declared-credit reference, any bad allowed-kind, or value activation
+	// without a legal consensus mode REFUSES startup (hard init failure).
+	var netID uint32
+	var cChainID, xChainID ids.ID
+	if vm.consensusRuntime != nil {
+		netID = vm.consensusRuntime.NetworkID
+		cChainID = vm.consensusRuntime.CChainID
+		xChainID = vm.consensusRuntime.XChainID
+	}
+	valueStatus, err := enforceRealAssetsOnly(vm.Config, netID, cChainID, xChainID)
+	if err != nil {
+		return fmt.Errorf("DEX real-assets-only startup gate refused initialization: %w", err)
+	}
+	vm.dexValueStatus = valueStatus
+	if !vm.log.IsZero() {
+		vm.log.Info("DEX real-assets-only gate passed",
+			"networkID", netID,
+			"valueEnabled", vm.Config.DexNativeValueEnabled,
+			"consensusMode", valueStatus.Mode,
+			"valueModeStatus", valueStatus.Status,
+		)
+	}
 
 	vm.isInitialized = true
 	if !vm.log.IsZero() {
