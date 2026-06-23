@@ -1,0 +1,24 @@
+{
+  "network": "devnet",
+  "networkID": 3,
+  "evmChainID": 96370,
+  "cChainID": "Bm8X7THQtS2txLrQWTDXN8a4JDuhP4KGybUE754LLSiVFLQ7v",
+  "chainLabels": {
+    "186f101dd98bdebc5c84aef16dd5c15ba2f42f0b8ee5b9194eae11fd91e57b71": "Lux C-Chain (devnet)",
+    "667d186624a49f77082edabfa7cc34e64520fe837b6b4a21109a16975515892a": "Lux X-Chain (devnet)"
+  },
+  "assets": [
+    {
+      "networkID": 3,
+      "chainID": "Bm8X7THQtS2txLrQWTDXN8a4JDuhP4KGybUE754LLSiVFLQ7v",
+      "assetKind": "EVM_NATIVE",
+      "canonicalRef": "0x0000000000000000000000000000000000000000",
+      "decimals": 18,
+      "symbol": "LUX",
+      "name": "Lux",
+      "enabled": true,
+      "riskTier": 0
+    }
+  ],
+  "markets": []
+}
