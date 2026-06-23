@@ -115,7 +115,7 @@ func (p DexAssetPolicy) anySyntheticFlag() bool {
 }
 
 // AnySyntheticFlag is the exported predicate: true iff any synthetic/mock flag is set.
-// The node uses it to MACHINE-DERIVE the HONEST_VALIDATOR_LAUNCH "real-assets-only"
+// The node uses it to MACHINE-DERIVE the HONEST_VALIDATOR_LABELED "real-assets-only"
 // assertion rather than trusting an operator-supplied claim.
 func (p DexAssetPolicy) AnySyntheticFlag() bool { return p.anySyntheticFlag() }
 

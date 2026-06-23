@@ -1,0 +1,90 @@
+name: Validate DEX Asset Manifests
+
+# Gate A — the green-first gate for the DEX real-assets-only model. Every entry in
+# every per-network asset manifest MUST resolve to a real on-chain asset on its target
+# network, and the fail-closed registry gate MUST hold. This workflow proves both before
+# a change to the manifests or the registry can merge.
+#
+#   1. registry unit + gate tests (structural: no synthetic asset/market can register,
+#      AssetID binds the real token address / UTXO assetID, consensus-mode value guard,
+#      startup gate refuses synthetic flags / Liquidity / mock / ticker references).
+#   2. dexvm Gate-A wiring tests (enforceRealAssetsOnly refuses bad configs end-to-end).
+#   3. LIVE validation: for each net, dex-assets-validate proves every manifest entry
+#      real against that net's public RPC (eth_chainId, C-Chain consensus id, code>0 +
+#      decimals() for ERC-20, UTXO assetID on X-Chain) and that the gate passes.
+#
+# Any failure stops the job (and thus the merge/deploy). The live step is read-only.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dexvm/registry/**'
+      - 'cmd/dex-assets-validate/**'
+      - '.github/workflows/validate-asset-manifests.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'dexvm/registry/**'
+      - 'cmd/dex-assets-validate/**'
+      - '.github/workflows/validate-asset-manifests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # luxfi modules are re-tagged in place; skip the public sum DB for them (the same
+  # discipline release.yml uses). Never disables verification of third-party modules.
+  GONOSUMCHECK: github.com/luxfi/*
+  GONOSUMDB: github.com/luxfi/*
+  GOFLAGS: -mod=mod
+
+jobs:
+  registry-tests:
+    runs-on: ['self-hosted', 'linux', 'amd64']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: registry structural + gate tests
+        run: CGO_ENABLED=0 go test -count=1 -race=false ./dexvm/registry/...
+      - name: dexvm Gate-A wiring tests
+        run: CGO_ENABLED=0 go test -count=1 -run '^TestGateA' ./dexvm/
+
+  live-validation:
+    needs: registry-tests
+    runs-on: ['self-hosted', 'linux', 'amd64']
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - net: mainnet
+            manifest: dexvm/registry/manifests/assets.mainnet.json
+            evm_rpc: https://api.lux.network/ext/bc/C/rpc
+            api_base: https://api.lux.network
+          - net: testnet
+            manifest: dexvm/registry/manifests/assets.testnet.json
+            evm_rpc: https://api.lux-test.network/ext/bc/C/rpc
+            api_base: https://api.lux-test.network
+          - net: devnet
+            manifest: dexvm/registry/manifests/assets.devnet.json
+            evm_rpc: https://api.lux-dev.network/ext/bc/C/rpc
+            api_base: https://api.lux-dev.network
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: build validator
+        run: CGO_ENABLED=0 go build -trimpath -o build/dex-assets-validate ./cmd/dex-assets-validate
+      - name: validate ${{ matrix.net }} manifest against live RPC
+        run: |
+          ./build/dex-assets-validate \
+            -manifest '${{ matrix.manifest }}' \
+            -evm-rpc  '${{ matrix.evm_rpc }}' \
+            -api-base '${{ matrix.api_base }}' \
+            -timeout 90s
