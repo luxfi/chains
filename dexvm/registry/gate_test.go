@@ -25,25 +25,25 @@ func TestConsensusGuard_QuorumFinality_AllowsValue(t *testing.T) {
 	}
 }
 
-func TestConsensusGuard_HonestValidatorLaunch_RequiresBundleAndDisclaimer(t *testing.T) {
+func TestConsensusGuard_HonestValidatorLabeled_RequiresBundleAndDisclaimer(t *testing.T) {
 	// Missing any leg of the bundle => refuse.
 	for _, a := range []LaunchAssertions{
 		{CapsOn: false, RealAssetsOnly: true, HaltReady: true},
 		{CapsOn: true, RealAssetsOnly: false, HaltReady: true},
 		{CapsOn: true, RealAssetsOnly: true, HaltReady: false},
 	} {
-		if _, err := GuardValueActivation(true, ConsensusModeHonestValidatorLaunch, a); !errors.Is(err, ErrLaunchAssertionsUnmet) {
-			t.Fatalf("HONEST_VALIDATOR_LAUNCH must refuse without full bundle (a=%+v), got: %v", a, err)
+		if _, err := GuardValueActivation(true, ConsensusModeHonestValidatorLabeled, a); !errors.Is(err, ErrLaunchAssertionsUnmet) {
+			t.Fatalf("HONEST_VALIDATOR_LABELED must refuse without full bundle (a=%+v), got: %v", a, err)
 		}
 	}
 
 	// Full bundle => permitted AND surfaces the exact no-Byzantine-finality string.
-	st, err := GuardValueActivation(true, ConsensusModeHonestValidatorLaunch, LaunchAssertions{CapsOn: true, RealAssetsOnly: true, HaltReady: true})
+	st, err := GuardValueActivation(true, ConsensusModeHonestValidatorLabeled, LaunchAssertions{CapsOn: true, RealAssetsOnly: true, HaltReady: true})
 	if err != nil {
-		t.Fatalf("HONEST_VALIDATOR_LAUNCH with full bundle must permit value: %v", err)
+		t.Fatalf("HONEST_VALIDATOR_LABELED with full bundle must permit value: %v", err)
 	}
 	if st.Status != NoByzantineFinalityClaim {
-		t.Fatalf("HONEST_VALIDATOR_LAUNCH must surface the no-Byzantine-finality status, got %q", st.Status)
+		t.Fatalf("HONEST_VALIDATOR_LABELED must surface the no-Byzantine-finality status, got %q", st.Status)
 	}
 }
 
@@ -69,7 +69,7 @@ func TestParseConsensusMode_RejectsUnknown(t *testing.T) {
 	}
 	for tok, want := range map[string]ConsensusMode{
 		"QUORUM_FINALITY":         ConsensusModeQuorumFinality,
-		"HONEST_VALIDATOR_LAUNCH": ConsensusModeHonestValidatorLaunch,
+		"HONEST_VALIDATOR_LABELED": ConsensusModeHonestValidatorLabeled,
 		"":                        ConsensusModeUnset,
 	} {
 		got, err := ParseConsensusMode(tok)

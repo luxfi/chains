@@ -73,6 +73,73 @@ type Config struct {
 	// VERIFIES, using FillAttestationPubKey).
 	FillAttestationSeed []byte `json:"-"`
 
+	// --- Real-assets-only enforcement (Gate A, the green-first gate) ----------
+	//
+	// Every field's SAFE value is its zero value, so a zero-initialised config is the
+	// locked-down config. These are BACKEND-enforced at VM Initialize by the registry
+	// startup gate (registry.RefuseUnderSyntheticConfig + registry.GuardValueActivation):
+	// a front end cannot relax them, and a value-bearing network (mainnet/testnet) hard-
+	// fails startup if any synthetic flag is set or value is activated without a legal
+	// consensus mode. They are documented here and consumed ONLY in Initialize.
+
+	// DexAllowSyntheticAssets / DexAllowSyntheticMarkets / DexAllowMockLiquidity default
+	// false. true is permitted ONLY on a dev/local network (developer opt-in); on
+	// mainnet or testnet any true value FAILS startup (ErrSyntheticOnValueNet). The
+	// Liquidity / phantom / ASCII-ticker deny-scan runs on EVERY network regardless.
+	DexAllowSyntheticAssets  bool `json:"dexAllowSyntheticAssets"`
+	DexAllowSyntheticMarkets bool `json:"dexAllowSyntheticMarkets"`
+	DexAllowMockLiquidity    bool `json:"dexAllowMockLiquidity"`
+
+	// DexAllowedAssetKinds is the active allowed-kind policy as canonical tokens
+	// ("EVM_NATIVE","ERC20","UTXO"). Empty => the canonical default of all three. A
+	// configured set may only ever be a SUBSET of those three; any other token (an
+	// ASCII ticker, a "D_NATIVE", etc.) FAILS startup (ErrBadAllowedKind).
+	DexAllowedAssetKinds []string `json:"dexAllowedAssetKinds"`
+
+	// DexNativeValueEnabled gates real-money (native value) trading. Default false =
+	// paper/non-value mode (no value to authorise). When true, the consensus-mode value
+	// guard runs and REFUSES startup unless DexConsensusMode is one of exactly two legal
+	// value modes (see DexConsensusMode).
+	DexNativeValueEnabled bool `json:"dexNativeValueEnabled"`
+
+	// DexConsensusMode is the consensus posture under which native value may activate.
+	// Exactly two legal value modes: "QUORUM_FINALITY" (post-quantum BFT) or
+	// "HONEST_VALIDATOR_LABELED" (labeled CFT parity). Empty/"UNSET" with value enabled
+	// REFUSES startup; any unknown token REFUSES startup. There is never a silent third
+	// state.
+	DexConsensusMode string `json:"dexConsensusMode"`
+
+	// DexCapsOn / DexHaltReady are the operator-attested compensating controls required
+	// to activate value under HONEST_VALIDATOR_LABELED. The third leg of the launch
+	// bundle (real-assets-only) is NOT operator-attested — it is MACHINE-DERIVED from the
+	// registry being real and no synthetic flag being set, so the operator cannot lie
+	// about it. Both default false; under HONEST_VALIDATOR_LABELED either being false
+	// REFUSES value activation (ErrLaunchAssertionsUnmet).
+	DexCapsOn    bool `json:"dexCapsOn"`
+	DexHaltReady bool `json:"dexHaltReady"`
+
+	// DexAssetManifestPath optionally points at the per-network real-assets manifest
+	// (assets.{devnet,testnet,mainnet}.json). When set, the manifest is loaded, its
+	// declared C-Chain / X-Chain identity is bound to the node's ACTUAL running chain
+	// ids (RuntimeVerifier — a real check, not a stub), its assets/markets are admitted
+	// into the registry, and the fail-closed startup gate runs over them. Per-token
+	// existence on the live net (code>0, decimals(), UTXO assetID) is proven by CI
+	// against the target net's RPC BEFORE the artifact ships — the node binds identity +
+	// enforces policy; CI proves reality. Empty + DexNativeValueEnabled=true FAILS
+	// startup (you cannot activate value with no declared real assets).
+	DexAssetManifestPath string `json:"dexAssetManifestPath"`
+
+	// DexAssetManifestSHA256 PINS the manifest to its CI-approved artifact by content hash
+	// (M1). When set (a 32-byte SHA-256 in hex, optional "0x"/"sha256:" prefix), the node
+	// REFUSES to load a manifest whose bytes do not hash to this value — an edited local
+	// manifest (a fabricated token address, an added asset) no longer matches and fails
+	// startup. The dexvm proxy holds NO EVM state and cannot eth_getCode the tokens itself,
+	// so this content-hash binding is what stops a tampered manifest from loading; pair it
+	// with the CI validate-asset-manifests workflow that proves the pinned artifact real and
+	// emits this hash. Empty = no pin (shape validation only) — set it in genesis/config for
+	// any value-bearing deployment.
+	DexAssetManifestSHA256 string `json:"dexAssetManifestSHA256"`
+
 	// Block configuration
 	BlockInterval  time.Duration `json:"blockInterval"`
 	MaxBlockSize   uint64        `json:"maxBlockSize"`
