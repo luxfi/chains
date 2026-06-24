@@ -167,7 +167,7 @@ type BlockResult struct {
 type plannedRelay struct {
 	// txIndex is the relay's position in the block (the receipt-binding key).
 	txIndex uint32
-	// method is the ZAP CLOB method ("clob_submit" / "clob_place" / "clob_cancel").
+	// method is the ZAP CLOB method ("dex_submit" / "dex_place" / "dex_cancel").
 	method string
 	// payload is the opaque, byte-identical clob_* frame forwarded verbatim.
 	payload []byte
