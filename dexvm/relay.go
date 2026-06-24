@@ -19,24 +19,30 @@ import (
 // precompile (github.com/luxfi/precompile/dex/engine_zap.go). The proxy never
 // interprets order semantics — it forwards these frames verbatim to the single
 // source-of-truth matcher.
+// The wire method names are the dex_ namespace (the D-Chain DEX surface), FROZEN
+// byte-identical with the d-chain gateway (github.com/luxfi/dex/pkg/zapwire
+// Method*). The proxy re-defines them since it cannot import the cgo-tagged
+// d-chain package; the hardcoded-canonical values move in lockstep with zapwire
+// (same three-homes wire contract). `ZAPMethod*` Go identifiers are the proxy's
+// internal names; only the string values are dex_*.
 const (
-	ZAPMethodEnsureMarket = "clob_ensure_market"
-	ZAPMethodPlace        = "clob_place"
-	ZAPMethodCancel       = "clob_cancel"
-	ZAPMethodSubmit       = "clob_submit"
+	ZAPMethodEnsureMarket = "dex_ensure_market"
+	ZAPMethodPlace        = "dex_place"
+	ZAPMethodCancel       = "dex_cancel"
+	ZAPMethodSubmit       = "dex_submit"
 
 	// Custody methods — the funds-in / funds-out rail between the atomic
 	// shared-memory leg and the D-Chain balance ledger (where the money lives in
 	// the order book). FROZEN, byte-identical with the d-chain gateway
 	// (github.com/luxfi/dex/pkg/zapwire Method{Deposit,Withdraw,OpenMarket}).
-	//   - clob_deposit : credit an account's available D-Chain balance from value
+	//   - dex_deposit : credit an account's available D-Chain balance from value
 	//     this proxy atomically IMPORTED (so the book can draw from it).
-	//   - clob_withdraw: debit an account's realized D-Chain balance; the returned
+	//   - dex_withdraw: debit an account's realized D-Chain balance; the returned
 	//     realized amount is what this proxy atomically EXPORTS back out.
-	//   - clob_open_market: bind a market's (base,quote) asset handles.
-	ZAPMethodDeposit    = "clob_deposit"
-	ZAPMethodWithdraw   = "clob_withdraw"
-	ZAPMethodOpenMarket = "clob_open_market"
+	//   - dex_open_market: bind a market's (base,quote) asset handles.
+	ZAPMethodDeposit    = "dex_deposit"
+	ZAPMethodWithdraw   = "dex_withdraw"
+	ZAPMethodOpenMarket = "dex_open_market"
 )
 
 // Custody wire sizes (FROZEN, == github.com/luxfi/dex/pkg/zapwire). The proxy

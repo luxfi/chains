@@ -341,7 +341,7 @@ func (tx *ExportTx) Verify() error {
 // is pure transport and does not interpret it beyond routing.
 type RelayOrderTx struct {
 	BaseTx
-	// Method is the ZAP CLOB method ("clob_submit", "clob_place", "clob_cancel").
+	// Method is the ZAP CLOB method ("dex_submit", "dex_place", "dex_cancel").
 	Method string `json:"method"`
 	// Payload is the opaque, byte-identical clob_* frame forwarded verbatim.
 	Payload []byte `json:"payload"`
@@ -397,7 +397,7 @@ func NewRelayOrderTx(from ids.ShortID, nonce uint64, method string, payload []by
 // the taker's V4 SqrtPriceLimitX96. This is the canonical constructor for the settling
 // rail; non-settling relays use NewRelayOrderTx (assetOut empty).
 func NewSettlingRelayOrderTx(from ids.ShortID, nonce uint64, payload []byte, collateralRef, assetOut ids.ID, priceLimit uint64, limitIsUpper bool) *RelayOrderTx {
-	tx := NewRelayOrderTx(from, nonce, "clob_submit", payload, collateralRef)
+	tx := NewRelayOrderTx(from, nonce, "dex_submit", payload, collateralRef)
 	tx.AssetOut = assetOut
 	tx.PriceLimit = priceLimit
 	tx.LimitIsUpper = limitIsUpper
