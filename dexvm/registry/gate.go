@@ -72,7 +72,7 @@ type DexAssetPolicy struct {
 	// AllowSyntheticAssets, AllowSyntheticMarkets, AllowMockLiquidity default false.
 	// On a value-bearing network (mainnet/testnet) any true value fails startup. On
 	// a dev network a true value is permitted (developer opt-in) but is still subject
-	// to the forbidden-reference scan (Liquidity is never allowed, anywhere).
+	// to the forbidden-reference scan (off-network universes are never allowed).
 	AllowSyntheticAssets  bool `json:"dexAllowSyntheticAssets"`
 	AllowSyntheticMarkets bool `json:"dexAllowSyntheticMarkets"`
 	AllowMockLiquidity    bool `json:"dexAllowMockLiquidity"`
@@ -141,11 +141,11 @@ var (
 //  2. (mainnet OR testnet) AND any synthetic flag (assets/markets/liquidity) true.
 //  3. Any ENABLED market references an asset not in the registry (unknown/synthetic),
 //     references a disabled asset, or spans a network mismatch.
-//  4. Any registered asset carries a forbidden reference: a Liquidity (white-label)
+//  4. Any registered asset carries a forbidden reference: an off-network (white-label)
 //     universe chain, mock/synthetic/phantom liquidity, an ASCII-ticker asset id, or
 //     a declared-but-unbacked credit shape. (The positive reality check happened at
 //     Register; this is the residual deny-scan over whatever is enabled, plus the
-//     Liquidity/mock label scan that reality alone would not catch.)
+//     off-network/mock label scan that reality alone would not catch.)
 //
 // It returns nil ONLY when the registry is fully real and the policy is locked down
 // for the network. Anything ambiguous fails closed.

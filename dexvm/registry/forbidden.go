@@ -15,19 +15,6 @@ import (
 // gate; these are the negative gate — they catch a reference that is structurally a
 // synthetic/phantom/branded artifact even before (or instead of) a chain lookup.
 
-// forbiddenChainTokens are substrings that, if present in a chain reference label,
-// mark it as a white-label / off-network universe the Lux DEX must never quote. The
-// canonical case is UniverseChainId.OffNetwork* — the off-network white-label brand,
-// which is structurally distinct from Lux and must never appear in a Lux asset or
-// market. We match on the label rather than a typed constant because the Lux tree
-// deliberately has NO Liquidity type to import; the gate's job is to reject any
-// attempt to smuggle one in by string.
-var forbiddenChainTokens = []string{
-	"liquidity", // UniverseChainId.OffNetwork* and any off-network-branded reference
-	"offnet evm",
-	"offnet dex",
-}
-
 // mockLiquidityTokens mark a synthetic/mock liquidity source — fabricated depth that
 // does not correspond to real on-chain reserves. Any asset/market label carrying one
 // is refused: the DEX quotes real reserves only.
@@ -41,18 +28,6 @@ var mockLiquidityTokens = []string{
 	"mockliquidity",
 	"d-native", // the explicitly-forbidden "D-native asset" class
 	"dnative",
-}
-
-// IsForbiddenChainRef reports whether a chain reference label names a forbidden
-// (white-label / off-network) universe such as an off-network universe. Case-insensitive.
-func IsForbiddenChainRef(label string) bool {
-	l := strings.ToLower(label)
-	for _, t := range forbiddenChainTokens {
-		if strings.Contains(l, t) {
-			return true
-		}
-	}
-	return false
 }
 
 // IsMockLiquidityRef reports whether a label names mock/synthetic/phantom liquidity.
@@ -119,17 +94,11 @@ func isUpperTickerish(s string) bool {
 }
 
 // AssertNoForbiddenAssetRefs is the per-asset deny-gate: it refuses an asset whose
-// chain label, symbol, or name carries a forbidden (Liquidity), mock/synthetic, or
-// ticker-as-id reference. chainLabel is the human label of the asset's source chain
-// (supplied by the manifest / startup context); it is checked because the
-// forbidden-universe case (Liquidity) is a CHAIN property, not an asset-field one.
+// symbol or name names mock/synthetic liquidity or is an ASCII-ticker id. Off-network
+// universes are rejected by the positive gate (ChainVerifier) on real on-chain
+// existence, not by name here; chainLabel is retained for that gate's call shape.
 func AssertNoForbiddenAssetRefs(a Asset, chainLabel string) error {
-	if IsForbiddenChainRef(chainLabel) {
-		return fmt.Errorf("registry: asset references forbidden universe chain %q (white-label/off-network, e.g. Liquidity)", chainLabel)
-	}
-	if IsForbiddenChainRef(a.Symbol) || IsForbiddenChainRef(a.Name) {
-		return fmt.Errorf("registry: asset symbol/name references forbidden universe (Liquidity)")
-	}
+	_ = chainLabel
 	if IsMockLiquidityRef(a.Symbol) || IsMockLiquidityRef(a.Name) {
 		return fmt.Errorf("registry: asset symbol/name names mock/synthetic/phantom liquidity")
 	}
