@@ -121,6 +121,7 @@ require (
 	github.com/gtank/merlin v0.1.1 // indirect
 	github.com/gtank/ristretto255 v0.2.0 // indirect
 	github.com/hanzoai/vfs v0.4.3 // indirect
+	github.com/hanzos3/go-sdk v1.0.2 // indirect
 	github.com/hashicorp/go-bexpr v0.1.16 // indirect
 	github.com/holiman/billy v0.0.0-20250707135307-f2f9b9aae7db // indirect
 	github.com/holiman/bloomfilter/v2 v2.0.3 // indirect
@@ -172,7 +173,7 @@ require (
 	github.com/luxfi/utils v1.2.0 // indirect
 	github.com/luxfi/utxo v0.3.7 // indirect
 	github.com/luxfi/validators v1.2.0 // indirect
-	github.com/luxfi/zap v0.8.10 // indirect
+	github.com/luxfi/zap v0.8.11 // indirect
 	github.com/luxfi/zapcodec v1.0.1 // indirect
 	github.com/luxfi/zapdb v1.10.1 // indirect
 	github.com/luxfi/zwing v0.5.2 // indirect
