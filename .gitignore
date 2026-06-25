@@ -1,1 +1,4 @@
 build/
+
+# stray local VM build artifacts (never commit binaries)
+/aivm-gov-mcp
