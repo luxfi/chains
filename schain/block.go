@@ -7,6 +7,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/luxfi/ids"
@@ -15,6 +17,11 @@ import (
 
 // Ensure Block implements chain.Block.
 var _ chain.Block = (*Block)(nil)
+
+// errStateRootMismatch is returned by Verify when the proposer's claimed manifest
+// state root does not match the root recomputed from the applied transactions —
+// the multi-validator divergence the state root exists to catch.
+var errStateRootMismatch = errors.New("manifest state root mismatch")
 
 // Block is an S-Chain block. It wraps the deterministic ProcessBlock result and
 // implements chain.Block. It carries only the storage VM's needs: a header and
@@ -27,6 +34,14 @@ type Block struct {
 	parentID  ids.ID
 	height    uint64
 	timestamp time.Time
+
+	// stateRoot is the proposer's claimed manifest state root for this block — the
+	// commitment over the manifest keyspace after this block's writes, folded with
+	// the block's consensus binding (see VM.computeStateRoot). It travels in the
+	// block bytes (so the block id commits to it — a peer cannot swap the claimed
+	// root while keeping the same id) and Verify recomputes it independently and
+	// rejects a block whose claimed root does not match the computed one.
+	stateRoot ids.ID
 
 	// txs are the serialized transactions (each a txs.PutManifestTx wire image).
 	txs [][]byte
@@ -56,14 +71,16 @@ func (b *Block) Status() uint8        { return uint8(b.status) }
 
 // Bytes serializes the block. Wire format:
 //
-//	height[8] | timestamp[8] | parentID[32] |
+//	height[8] | timestamp[8] | parentID[32] | stateRoot[32] |
 //	txCount[4] | txCount × ( txLen[4] | txBytes )
 //
-// The txCount prefix makes the transactions self-delimiting. The block id is the
-// sha256 of these bytes, so the id commits to every transaction (a peer cannot
-// swap a manifest while keeping the same id).
+// The txCount prefix makes the transactions self-delimiting. stateRoot is the
+// proposer's claimed manifest state root, carried in the header so the block id
+// (sha256 of these bytes) commits to it — a peer cannot swap the claimed root or
+// a manifest while keeping the same id, and Verify rejects a claimed root that
+// does not match the root recomputed from the applied txs.
 func (b *Block) Bytes() []byte {
-	size := 8 + 8 + 32 + 4
+	size := 8 + 8 + 32 + 32 + 4
 	for _, tx := range b.txs {
 		size += 4 + len(tx)
 	}
@@ -80,6 +97,9 @@ func (b *Block) Bytes() []byte {
 	copy(data[offset:], b.parentID[:])
 	offset += 32
 
+	copy(data[offset:], b.stateRoot[:])
+	offset += 32
+
 	binary.BigEndian.PutUint32(data[offset:], uint32(len(b.txs)))
 	offset += 4
 	for _, tx := range b.txs {
@@ -91,14 +111,28 @@ func (b *Block) Bytes() []byte {
 	return data
 }
 
-// Verify processes the block deterministically against the version layer. It
-// performs NO external I/O on any node (mirror of dexvm/block.go:141). The
+// Verify processes the block deterministically against the version layer, then
+// enforces the manifest STATE ROOT: it recomputes the root from the txs it just
+// applied and rejects the block if that computed root does not match the root the
+// proposer claimed in the header. This is the multi-validator safety gate — a
+// proposer (or a corrupted replica) whose post-apply manifest state diverges from
+// what an honest validator computes cannot get its block accepted, because the
+// claimed root (committed by the block id) and the recomputed root disagree.
+// Verify performs NO external I/O on any node (mirror of dexvm/block.go:141); the
 // manifest writes land in the in-memory version layer and become durable only at
 // Accept.
 func (b *Block) Verify(ctx context.Context) error {
 	result, err := b.vm.inner.ProcessBlock(ctx, b.height, b.timestamp, b.txs)
 	if err != nil {
 		return err
+	}
+	if result.StateRoot != b.stateRoot {
+		// Drop this block's staged writes; the version layer must not retain a
+		// rejected block's mutations for the next Verify.
+		if b.vm.inner.db != nil {
+			b.vm.inner.db.Abort()
+		}
+		return fmt.Errorf("%w: claimed %s, computed %s", errStateRootMismatch, b.stateRoot, result.StateRoot)
 	}
 	b.result = result
 	b.status = StatusProcessing
@@ -131,7 +165,7 @@ func (b *Block) Reject(ctx context.Context) error {
 // length is bounds-checked so a malformed block is rejected as errInvalidBlock
 // rather than panicking or over-allocating.
 func parseBlock(vm *ChainVM, data []byte) (*Block, error) {
-	if len(data) < 8+8+32+4 {
+	if len(data) < 8+8+32+32+4 {
 		return nil, errInvalidBlock
 	}
 
@@ -146,6 +180,9 @@ func parseBlock(vm *ChainVM, data []byte) (*Block, error) {
 	offset += 8
 
 	copy(b.parentID[:], data[offset:offset+32])
+	offset += 32
+
+	copy(b.stateRoot[:], data[offset:offset+32])
 	offset += 32
 
 	txCount := binary.BigEndian.Uint32(data[offset:])

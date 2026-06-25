@@ -64,6 +64,13 @@ type BlockResult struct {
 	BlockHeight uint64
 	Timestamp   time.Time
 	blockHash   ids.ID
+
+	// StateRoot is the deterministic commitment over the manifest keyspace AFTER
+	// this block's writes are staged, folded with the block's consensus binding
+	// (blockHash + height). It travels in the block header and Block.Verify
+	// recomputes it on every validator and rejects a block whose claimed root
+	// does not match — the multi-validator safety gate M0 omitted.
+	StateRoot ids.ID
 }
 
 // VM is the inner functional storage VM. It holds the dual-DB layering and the
@@ -181,10 +188,48 @@ func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime ti
 		return nil, fmt.Errorf("failed to persist last block: %w", err)
 	}
 
+	// Commit the post-apply manifest state into the block's StateRoot. The writes
+	// are already staged in the versiondb in-memory layer, so the walk sees this
+	// block's mutations merged over the durable base — every validator that
+	// applied the identical txs computes the identical root (mirror of
+	// dexvm/vm.go:584). Block.Verify compares this against the block's claimed
+	// root and rejects a mismatch.
+	root, err := vm.computeStateRoot(blockHash)
+	if err != nil {
+		return nil, err
+	}
+	result.StateRoot = root
+
 	if !vm.log.IsZero() {
-		vm.log.Debug("S-Chain block processed", "height", blockHeight, "txs", len(blockTxs))
+		vm.log.Debug("S-Chain block processed", "height", blockHeight, "txs", len(blockTxs), "root", root)
 	}
 	return result, nil
+}
+
+// computeStateRoot folds the block's consensus binding (blockHash + height) with
+// the committed manifest state (state.Root) into the block's StateRoot. The
+// blockHash/height fold makes the root unique per block position; the manifest
+// fold makes it a FAITHFUL commitment to the object state — two nodes that
+// genuinely diverge on any (bucket,object) manifest produce different roots, so
+// a matching blockHash alone can no longer forge a matching root. This is the
+// storage-VM analog of dexvm/vm.go:1260, narrowed to the manifest keyspace (no
+// cross-chain atomic legs to fold). It errors only if the state walk fails (a
+// corrupt/closed DB), which callers treat as a block-processing failure.
+func (vm *VM) computeStateRoot(blockHash ids.ID) (ids.ID, error) {
+	h := sha256.New()
+
+	h.Write(blockHash[:])
+	var heightBuf [8]byte
+	binary.BigEndian.PutUint64(heightBuf[:], vm.currentBlockHeight)
+	h.Write(heightBuf[:])
+
+	manifestRoot, err := vm.state.Root()
+	if err != nil {
+		return ids.Empty, fmt.Errorf("compute state root: %w", err)
+	}
+	h.Write(manifestRoot[:])
+
+	return ids.ID(h.Sum(nil)), nil
 }
 
 // processTx parses one transaction and applies its mutation to the version

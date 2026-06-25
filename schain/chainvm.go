@@ -148,12 +148,29 @@ func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		newTimestamp = last
 	}
 
+	txs := cvm.pendingTxs
+
+	// Proposer build: apply the drained txs to the version layer to obtain the
+	// post-apply manifest STATE ROOT, then carry that root in the block header so
+	// every validator can recompute and check it (mirror of dexvm BuildBlock ->
+	// BuildBlockResult, chainvm.go:258). The staged writes remain in the version
+	// layer; the proposer's own Block.Verify re-applies the identical txs (same
+	// keys/values — idempotent over the versiondb) and a Rejected block's Abort
+	// drops them. The SAME timestamp is carried in the bytes and fed to every
+	// validator's ProcessBlock, so the root is reproducible network-wide.
+	result, err := cvm.inner.ProcessBlock(ctx, newHeight, newTimestamp, txs)
+	if err != nil {
+		return nil, fmt.Errorf("schain: build block result: %w", err)
+	}
+
 	block := &Block{
 		vm:        cvm,
 		parentID:  cvm.preferredID,
 		height:    newHeight,
 		timestamp: newTimestamp,
-		txs:       cvm.pendingTxs,
+		stateRoot: result.StateRoot,
+		txs:       txs,
+		result:    result,
 		status:    StatusProcessing,
 	}
 	hash := sha256.Sum256(block.Bytes())
@@ -163,7 +180,7 @@ func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	cvm.blocks[block.id] = block
 
 	if !cvm.log.IsZero() {
-		cvm.log.Debug("Built block", "id", block.id, "height", newHeight, "txCount", len(block.txs))
+		cvm.log.Debug("Built block", "id", block.id, "height", newHeight, "txCount", len(block.txs), "root", result.StateRoot)
 	}
 	return block, nil
 }
