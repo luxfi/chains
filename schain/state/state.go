@@ -20,12 +20,13 @@
 package state
 
 import (
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
+
+	"golang.org/x/crypto/sha3"
 
 	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
@@ -160,31 +161,59 @@ func (s *State) GetManifest(bucket, object string) (m Manifest, found bool, err 
 // excluded here exactly as dexvm excludes its proposer-local receipt prefix.
 //
 // Keys come out in lexicographic order, so the digest is independent of write
-// history and identical across nodes. Each entry is folded length-prefixed
-// (len(key)||key||len(value)||value) so no two distinct (key,value) splits can
-// collide by concatenation.
+// history. Each field (domain, key, value) is framed with SP 800-185 left_encode
+// of its BIT length before it is absorbed, so no two distinct (key,value) splits
+// can collide by concatenation — the same canonicalization the validator NodeID
+// scheme uses (ids/node_id_scheme.go). The hash is SHAKE256 (SHA-3): not
+// length-extendable (unlike SHA-256), domain-separated by stateRootDomain, and
+// PQ-strength (256-bit output → 128-bit collision/preimage even under Grover).
 func (s *State) Root() (ids.ID, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	h := sha256.New()
-	var lenBuf [8]byte
-	fold := func(b []byte) {
-		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(b)))
-		h.Write(lenBuf[:])
-		h.Write(b)
+	h := sha3.NewShake256()
+	// Domain separation: bind every digest to this construction + version.
+	_, _ = h.Write(leftEncode(uint64(len(stateRootDomain)) * 8))
+	_, _ = h.Write([]byte(stateRootDomain))
+	absorb := func(b []byte) {
+		_, _ = h.Write(leftEncode(uint64(len(b)) * 8))
+		_, _ = h.Write(b)
 	}
 
 	it := s.db.NewIteratorWithStartAndPrefix(nil, prefixManifest)
 	defer it.Release()
 	for it.Next() {
-		fold(it.Key())
-		fold(it.Value())
+		absorb(it.Key())
+		absorb(it.Value())
 	}
 	if err := it.Error(); err != nil {
 		return ids.Empty, fmt.Errorf("manifest state root: iterate: %w", err)
 	}
-	return ids.ID(h.Sum(nil)), nil
+	var out ids.ID
+	_, _ = h.Read(out[:])
+	return out, nil
+}
+
+// stateRootDomain is the SP 800-185 customization string binding the state root
+// to this construction and version. Bumping it invalidates every prior root.
+const stateRootDomain = "SCHAIN_STATE_ROOT_V1"
+
+// leftEncode is SP 800-185 left_encode: a length-self-describing prefix so the
+// concatenation of framed fields is unambiguous (no two field boundaries can be
+// confused). Mirrors leftEncodeNodeID in ids/node_id_scheme.go.
+func leftEncode(x uint64) []byte {
+	if x == 0 {
+		return []byte{0x01, 0x00}
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], x)
+	i := 0
+	for i < 7 && buf[i] == 0 {
+		i++
+	}
+	out := make([]byte, 0, 9-i)
+	out = append(out, byte(8-i))
+	return append(out, buf[i:]...)
 }
 
 // ---------------------------------------------------------------------------
