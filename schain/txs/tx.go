@@ -31,6 +31,12 @@ var (
 	// ErrNoFileIDs rejects a manifest that names no file blobs (M0 carries the
 	// content manifest; an object with zero files has nothing to commit).
 	ErrNoFileIDs = errors.New("manifest: no file ids")
+	// ErrEmptyRange rejects an allocation with no addressable partition key.
+	ErrEmptyRange = errors.New("allocate: empty range")
+	// ErrZeroCount rejects an allocation that requests no ids (a no-op write that
+	// would still consume a tx slot and move the counter by 0 — forbidden so every
+	// AllocateTx advances the counter and yields a non-empty id range).
+	ErrZeroCount = errors.New("allocate: zero count")
 )
 
 // TxType is the transaction discriminator (the leading wire byte).
@@ -40,12 +46,19 @@ const (
 	// TxPutManifest records a (bucket, object) -> manifest mapping. The single
 	// mutation of M0.
 	TxPutManifest TxType = iota
+	// TxAllocate reserves a contiguous, monotonic id range in a per-range
+	// allocator counter — the leaderless pinned-writer replacement for raft's
+	// global volume-id / fileId sequence. Emitted ONLY by the HRW owner of the
+	// range; the owner gate is enforced at block Verify, not in the tx codec.
+	TxAllocate
 )
 
 func (t TxType) String() string {
 	switch t {
 	case TxPutManifest:
 		return "put_manifest"
+	case TxAllocate:
+		return "allocate"
 	default:
 		return "unknown"
 	}
@@ -123,6 +136,55 @@ func (tx *PutManifestTx) Verify() error {
 	return nil
 }
 
+// AllocateTx reserves Count ids in the per-range allocator counter alloc/<Range>.
+// Range is the pinned key-range / partition (a volume-collection or bucket-shard)
+// the allocation belongs to; the HRW owner of Range is the ONLY validator
+// permitted to emit this tx, and a block containing an AllocateTx whose proposer
+// is not that owner is rejected at Verify (the leaderless pinned-writer safety
+// gate — see DESIGN_pinned_writer.md §2-3). The id range it reserves is a pure
+// function of the committed counter: [base, base+Count), where base is the
+// counter's value before this tx — so every validator derives identical ids.
+//
+// Stage 1 carries Range + Count only. The Epoch/Owner/Fingerprint fields the
+// DESIGN sketches (§2) are the master-cutover stage's concern: in Stage 1 the
+// owner gate is evaluated by the VM against the block's threaded validator-set +
+// proposer identity, so the owner identity is NOT yet self-attested in the tx.
+// Keeping the tx minimal now means the codec does not change when those fields
+// are added — they are additive JSON fields a later parse tolerates.
+type AllocateTx struct {
+	BaseTx
+	Range string `json:"range"`
+	Count uint32 `json:"count"`
+}
+
+// NewAllocateTx builds a wire-ready Allocate transaction. finalize stamps the
+// deterministic wire bytes + TxID, so the returned tx is immediately
+// Parse-round-trippable (mirrors NewPutManifestTx and every dexvm New*Tx).
+func NewAllocateTx(rng string, count uint32) *AllocateTx {
+	tx := &AllocateTx{
+		BaseTx: BaseTx{TxType: TxAllocate},
+		Range:  rng,
+		Count:  count,
+	}
+	return finalize(tx, &tx.BaseTx)
+}
+
+// Verify validates an Allocate in isolation: it must name a non-empty range and
+// reserve at least one id. No state is consulted and the OWNER GATE is NOT
+// checked here — Verify is pure and per-tx, but ownership is a function of the
+// BLOCK's validator set + proposer, which a single tx cannot see. The owner gate
+// lives in the VM's block-level apply (see schain.VM.applyAllocate), the same
+// discipline that keeps PutManifestTx.Verify state-free.
+func (tx *AllocateTx) Verify() error {
+	if tx.Range == "" {
+		return ErrEmptyRange
+	}
+	if tx.Count == 0 {
+		return ErrZeroCount
+	}
+	return nil
+}
+
 // TxParser parses raw transaction bytes off the wire.
 type TxParser struct{}
 
@@ -134,6 +196,8 @@ func (p *TxParser) Parse(data []byte) (Tx, error) {
 	switch TxType(data[0]) {
 	case TxPutManifest:
 		return parse[PutManifestTx](data, TxPutManifest)
+	case TxAllocate:
+		return parse[AllocateTx](data, TxAllocate)
 	default:
 		return nil, ErrInvalidTxType
 	}
