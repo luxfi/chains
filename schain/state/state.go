@@ -20,6 +20,7 @@
 package state
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -135,6 +136,55 @@ func (s *State) GetManifest(bucket, object string) (m Manifest, found bool, err 
 		return Manifest{}, false, ErrStateCorrupted
 	}
 	return m, true, nil
+}
+
+// ---------------------------------------------------------------------------
+// Manifest state root — the deterministic commitment that makes the chain safe
+// for more than one validator.
+// ---------------------------------------------------------------------------
+
+// Root returns a deterministic SHA-256 commitment over the COMMITTED manifest
+// keyspace: every manifest/<bucket>/<object> -> {fileIds,size,etag} entry the
+// chain holds after this block's writes are staged. It is the value the block
+// header binds, so two validators whose manifest state actually diverges (a
+// different object set, a changed etag/size/fileIds for the same object) ALWAYS
+// produce different roots — divergence can never hide behind a matching block
+// hash. This is the manifest-VM analog of dexvm's State.StateHash (dexvm/state/
+// state.go:395), narrowed to the storage VM's one keyspace.
+//
+// The walk uses the zapdb prefix iterator NewIteratorWithStartAndPrefix(nil,
+// prefixManifest), so it reads through the versiondb (this block's staged
+// in-memory writes merged over the durable base, deleted keys dropped) and only
+// the manifest keyspace — the last-block pointer is consensus binding folded
+// separately into the header via blockHash/height, NOT object state, so it is
+// excluded here exactly as dexvm excludes its proposer-local receipt prefix.
+//
+// Keys come out in lexicographic order, so the digest is independent of write
+// history and identical across nodes. Each entry is folded length-prefixed
+// (len(key)||key||len(value)||value) so no two distinct (key,value) splits can
+// collide by concatenation.
+func (s *State) Root() (ids.ID, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	h := sha256.New()
+	var lenBuf [8]byte
+	fold := func(b []byte) {
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(b)))
+		h.Write(lenBuf[:])
+		h.Write(b)
+	}
+
+	it := s.db.NewIteratorWithStartAndPrefix(nil, prefixManifest)
+	defer it.Release()
+	for it.Next() {
+		fold(it.Key())
+		fold(it.Value())
+	}
+	if err := it.Error(); err != nil {
+		return ids.Empty, fmt.Errorf("manifest state root: iterate: %w", err)
+	}
+	return ids.ID(h.Sum(nil)), nil
 }
 
 // ---------------------------------------------------------------------------
