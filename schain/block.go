@@ -43,8 +43,24 @@ type Block struct {
 	// rejects a block whose claimed root does not match the computed one.
 	stateRoot ids.ID
 
-	// txs are the serialized transactions (each a txs.PutManifestTx wire image).
+	// txs are the serialized transactions (each a txs.PutManifestTx or
+	// txs.AllocateTx wire image).
 	txs [][]byte
+
+	// blockCtx carries the deterministic consensus inputs the AllocateTx owner
+	// gate needs (validator set frozen at the epoch + proposer NodeID + epoch).
+	// It is NOT part of the block bytes: it is reconstructed deterministically on
+	// every node from the consensus runtime (the frozen P-Chain set at the block's
+	// pChainHeight + the block's proposer), so two honest nodes resolve the SAME
+	// owner. For a block with no AllocateTx it is the empty context (ignored).
+	//
+	// WIRE SEAM: in Stage 1 this is set by BuildBlock (proposer-side) and must be
+	// reconstructed on the verifying side by the chains-manager / engine wrapper
+	// when it parses a block, from the consensus block's pChainHeight + proposer.
+	// See BlockContext for the exact production sources. parseBlock leaves it empty
+	// (a parsed block carrying an AllocateTx therefore fails closed until the
+	// verifying wrapper populates it — the safe default).
+	blockCtx BlockContext
 
 	// result is populated after Verify.
 	result *BlockResult
@@ -122,7 +138,7 @@ func (b *Block) Bytes() []byte {
 // manifest writes land in the in-memory version layer and become durable only at
 // Accept.
 func (b *Block) Verify(ctx context.Context) error {
-	result, err := b.vm.inner.ProcessBlock(ctx, b.height, b.timestamp, b.txs)
+	result, err := b.vm.inner.ProcessBlock(ctx, b.height, b.timestamp, b.txs, b.blockCtx)
 	if err != nil {
 		return err
 	}
