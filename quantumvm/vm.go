@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/rpc/v2"
-	consensusdag "github.com/luxfi/consensus/engine/dag"
+	consensuschain "github.com/luxfi/consensus/engine/chain"
 	"github.com/luxfi/consensus/protocol/quasar"
 	"github.com/luxfi/database"
 	"github.com/luxfi/database/versiondb"
@@ -49,8 +49,14 @@ var (
 	errInvalidQuantumStamp      = errors.New("invalid quantum stamp")
 	errParallelProcessingFailed = errors.New("parallel transaction processing failed")
 
-	// Compile-time check that *VM satisfies chain.ChainVM (= block.ChainVM).
-	_ chain.ChainVM = (*VM)(nil)
+	// Compile-time check that *VM satisfies chain.ChainVM (= block.ChainVM)
+	// AND the consensus engine's BlockBuilder. Together these prove Q-Chain
+	// takes the LINEAR ⅔-stake cert path in the chain manager (buildChain →
+	// consensuschain.NewRuntime), not the DAG path. Do NOT add a
+	// GetEngine() consensusdag.Engine method: that would route the manager's
+	// type switch back to createDAG and bypass the certificate.
+	_ chain.ChainVM               = (*VM)(nil)
+	_ consensuschain.BlockBuilder = (*VM)(nil)
 )
 
 // BCLookup provides blockchain alias lookup
@@ -67,7 +73,6 @@ type SharedMemory interface {
 
 // VM implements the Q-chain Virtual Machine with quantum features
 type VM struct {
-	engine consensusdag.Engine
 	config.Config
 
 	// Core components
@@ -639,14 +644,6 @@ func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, er
 func (vm *VM) WaitForEvent(ctx context.Context) (luxvm.Message, error) {
 	<-ctx.Done()
 	return luxvm.Message{}, ctx.Err()
-}
-
-// GetEngine returns the DAG consensus engine
-func (vm *VM) GetEngine() consensusdag.Engine {
-	if vm.engine == nil {
-		vm.engine = consensusdag.New()
-	}
-	return vm.engine
 }
 
 // GetQuasarBridge returns the Quasar hybrid consensus bridge
