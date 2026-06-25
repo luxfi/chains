@@ -1,6 +1,7 @@
 [
   {"vm": "evm",          "image": "ghcr.io/luxfi/chains/evm",          "cgo": "1"},
   {"vm": "dexvm",        "image": "ghcr.io/luxfi/chains/dexvm",        "cgo": "0"},
+  {"vm": "schain",       "image": "ghcr.io/luxfi/chains/schain",       "cgo": "0"},
   {"vm": "aivm",         "image": "ghcr.io/luxfi/chains/aivm",         "cgo": "0"},
   {"vm": "bridgevm",     "image": "ghcr.io/luxfi/chains/bridgevm",     "cgo": "0"},
   {"vm": "graphvm",      "image": "ghcr.io/luxfi/chains/graphvm",      "cgo": "0"},
