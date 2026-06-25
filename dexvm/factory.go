@@ -12,7 +12,9 @@
 //   - LX-First arbitrage strategy support
 //
 // Architecture:
-//   - Uses Quasar consensus (BLS + Corona + ML-DSA) for finality
+//   - Finalizes via the linear consensus engine (Photon → Wave → Focus) and
+//     the ⅔-by-stake BFT certificate path, identical to C-Chain — the chain
+//     manager routes dexvm through the chain.ChainVM linear runtime.
 //   - Integrates with Warp 1.5 for cross-chain messaging
 //   - Supports both spot and perpetual trading
 //   - Designed for institutional-grade performance
