@@ -1,0 +1,277 @@
+// Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
+// See the file LICENSE for licensing terms.
+
+package schain
+
+import (
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/luxfi/ids"
+	"github.com/luxfi/log"
+	vmcore "github.com/luxfi/vm"
+	"github.com/luxfi/vm/chain"
+	"github.com/luxfi/version"
+)
+
+var (
+	_ chain.ChainVM = (*ChainVM)(nil)
+
+	errInvalidBlock     = errors.New("invalid block")
+	errBlockNotFound    = errors.New("block not found")
+	errVMNotInitialized = errors.New("VM not initialized")
+
+	genesisBlockID = ids.ID{}
+)
+
+// ChainVM wraps the functional storage VM to implement chain.ChainVM — the
+// interface the chains manager drives. It owns the in-memory block index,
+// mempool, and last-accepted pointers; the inner VM owns state + commit. This is
+// the dexvm/chainvm.go boilerplate, stripped of the DEX fee gate and DAG hooks
+// the storage VM does not need.
+type ChainVM struct {
+	inner *VM
+
+	log  log.Logger
+	lock sync.RWMutex
+
+	// In-memory block index.
+	blocks map[ids.ID]*Block
+
+	lastAcceptedID     ids.ID
+	lastAcceptedHeight uint64
+	preferredID        ids.ID
+
+	// Pending transactions for the next block (the mempool).
+	pendingTxs [][]byte
+
+	toEngine chan<- vmcore.Message
+
+	initialized bool
+}
+
+// NewChainVM constructs a ChainVM wrapping a fresh inner storage VM.
+func NewChainVM(logger log.Logger) *ChainVM {
+	return &ChainVM{
+		inner:  &VM{},
+		log:    logger,
+		blocks: make(map[ids.ID]*Block),
+	}
+}
+
+// Initialize wires the inner VM and seeds the genesis block.
+func (cvm *ChainVM) Initialize(ctx context.Context, vmInit vmcore.Init) error {
+	cvm.lock.Lock()
+	defer cvm.lock.Unlock()
+
+	cvm.toEngine = vmInit.ToEngine
+
+	if cvm.inner == nil {
+		cvm.inner = &VM{}
+	}
+	cvm.inner.log = cvm.log
+	if err := cvm.inner.Initialize(ctx, vmInit); err != nil {
+		return err
+	}
+
+	genesisBlock := &Block{
+		vm:        cvm,
+		id:        genesisBlockID,
+		parentID:  ids.Empty,
+		height:    0,
+		timestamp: time.Unix(0, 0),
+		status:    StatusAccepted,
+	}
+	cvm.blocks[genesisBlockID] = genesisBlock
+	cvm.lastAcceptedID = genesisBlockID
+	cvm.lastAcceptedHeight = 0
+	cvm.preferredID = genesisBlockID
+
+	cvm.initialized = true
+	if !cvm.log.IsZero() {
+		cvm.log.Info("S-Chain ChainVM initialized", "genesisID", genesisBlockID)
+	}
+	return nil
+}
+
+// SubmitTx admits a transaction to the mempool and notifies the engine to build
+// a block. This is the canonical user-mempool entry. The bytes are validated
+// (parse + Verify) before they touch the pending pool, so a malformed manifest
+// never enters a block.
+func (cvm *ChainVM) SubmitTx(tx []byte) error {
+	parsed, err := parser.Parse(tx)
+	if err != nil {
+		return err
+	}
+	if err := parsed.Verify(); err != nil {
+		return err
+	}
+
+	cvm.lock.Lock()
+	cvm.pendingTxs = append(cvm.pendingTxs, tx)
+	cvm.lock.Unlock()
+
+	if cvm.toEngine != nil {
+		select {
+		case cvm.toEngine <- vmcore.Message{Type: vmcore.PendingTxs}:
+		default:
+		}
+	}
+	return nil
+}
+
+// BuildBlock drains the mempool into a new block on top of the preferred tip.
+// The proposer chooses the block time (wall clock, clamped non-decreasing) and
+// carries it in the bytes — the consensus-agreement point. The block id is the
+// hash of the serialized bytes, so it commits to every drained transaction.
+func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
+	cvm.lock.Lock()
+	defer cvm.lock.Unlock()
+
+	if !cvm.initialized {
+		return nil, errVMNotInitialized
+	}
+
+	parent, ok := cvm.blocks[cvm.preferredID]
+	if !ok {
+		return nil, fmt.Errorf("preferred block not found: %s", cvm.preferredID)
+	}
+
+	newHeight := parent.height + 1
+	newTimestamp := cvm.inner.clock.Time()
+	if last := cvm.inner.GetLastBlockTime(); newTimestamp.Before(last) {
+		newTimestamp = last
+	}
+
+	block := &Block{
+		vm:        cvm,
+		parentID:  cvm.preferredID,
+		height:    newHeight,
+		timestamp: newTimestamp,
+		txs:       cvm.pendingTxs,
+		status:    StatusProcessing,
+	}
+	hash := sha256.Sum256(block.Bytes())
+	copy(block.id[:], hash[:])
+
+	cvm.pendingTxs = nil
+	cvm.blocks[block.id] = block
+
+	if !cvm.log.IsZero() {
+		cvm.log.Debug("Built block", "id", block.id, "height", newHeight, "txCount", len(block.txs))
+	}
+	return block, nil
+}
+
+// ParseBlock parses a block from bytes, deduplicating against the index.
+func (cvm *ChainVM) ParseBlock(ctx context.Context, data []byte) (chain.Block, error) {
+	cvm.lock.Lock()
+	defer cvm.lock.Unlock()
+
+	block, err := parseBlock(cvm, data)
+	if err != nil {
+		return nil, err
+	}
+	if existing, ok := cvm.blocks[block.id]; ok {
+		return existing, nil
+	}
+	cvm.blocks[block.id] = block
+	return block, nil
+}
+
+// GetBlock returns a block by id.
+func (cvm *ChainVM) GetBlock(ctx context.Context, blkID ids.ID) (chain.Block, error) {
+	cvm.lock.RLock()
+	defer cvm.lock.RUnlock()
+	block, ok := cvm.blocks[blkID]
+	if !ok {
+		return nil, errBlockNotFound
+	}
+	return block, nil
+}
+
+// SetPreference sets the tip new blocks build on.
+func (cvm *ChainVM) SetPreference(ctx context.Context, blkID ids.ID) error {
+	cvm.lock.Lock()
+	defer cvm.lock.Unlock()
+	if _, ok := cvm.blocks[blkID]; !ok {
+		return fmt.Errorf("block not found: %s", blkID)
+	}
+	cvm.preferredID = blkID
+	return nil
+}
+
+// LastAccepted returns the last accepted block id.
+func (cvm *ChainVM) LastAccepted(ctx context.Context) (ids.ID, error) {
+	cvm.lock.RLock()
+	defer cvm.lock.RUnlock()
+	return cvm.lastAcceptedID, nil
+}
+
+// GetBlockIDAtHeight returns the accepted block id at a height.
+func (cvm *ChainVM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
+	cvm.lock.RLock()
+	defer cvm.lock.RUnlock()
+	for id, block := range cvm.blocks {
+		if block.height == height && block.status == StatusAccepted {
+			return id, nil
+		}
+	}
+	return ids.Empty, errBlockNotFound
+}
+
+// SetState delegates to the inner VM.
+func (cvm *ChainVM) SetState(ctx context.Context, stateNum uint32) error {
+	return cvm.inner.SetState(ctx, stateNum)
+}
+
+// Shutdown delegates to the inner VM.
+func (cvm *ChainVM) Shutdown(ctx context.Context) error { return cvm.inner.Shutdown(ctx) }
+
+// Version delegates to the inner VM.
+func (cvm *ChainVM) Version(ctx context.Context) (string, error) { return cvm.inner.Version(ctx) }
+
+// NewHTTPHandler assembles the inner VM's handlers behind one mux.
+func (cvm *ChainVM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
+	handlers, err := cvm.inner.CreateHandlers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	mux := http.NewServeMux()
+	for path, handler := range handlers {
+		if path == "" {
+			path = "/"
+		}
+		mux.Handle(path, handler)
+	}
+	return mux, nil
+}
+
+// HealthCheck delegates to the inner VM.
+func (cvm *ChainVM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
+	return cvm.inner.HealthCheck(ctx)
+}
+
+// Connected is a no-op for M0 (no peer-version tracking needed).
+func (cvm *ChainVM) Connected(ctx context.Context, nodeID ids.NodeID, v *version.Application) error {
+	return nil
+}
+
+// Disconnected is a no-op for M0.
+func (cvm *ChainVM) Disconnected(ctx context.Context, nodeID ids.NodeID) error { return nil }
+
+// WaitForEvent blocks until an event should trigger block building. M0 triggers
+// builds via SubmitTx -> PendingTxs on toEngine, so this simply parks until the
+// context is cancelled (mirror of dexvm/chainvm.go:408).
+func (cvm *ChainVM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
+	<-ctx.Done()
+	return vmcore.Message{}, ctx.Err()
+}
+
+// GetInnerVM exposes the inner VM for direct reads (e.g. GetManifest).
+func (cvm *ChainVM) GetInnerVM() *VM { return cvm.inner }
