@@ -16,6 +16,7 @@
 package txs
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 
@@ -139,27 +140,76 @@ func (tx *PutManifestTx) Verify() error {
 // AllocateTx reserves Count ids in the per-range allocator counter alloc/<Range>.
 // Range is the pinned key-range / partition (a volume-collection or bucket-shard)
 // the allocation belongs to; the HRW owner of Range is the ONLY validator
-// permitted to emit this tx, and a block containing an AllocateTx whose proposer
-// is not that owner is rejected at Verify (the leaderless pinned-writer safety
-// gate — see DESIGN_pinned_writer.md §2-3). The id range it reserves is a pure
-// function of the committed counter: [base, base+Count), where base is the
-// counter's value before this tx — so every validator derives identical ids.
+// permitted to emit this tx, and a block containing an AllocateTx not signed by
+// that owner is rejected at Verify (the leaderless pinned-writer safety gate —
+// see DESIGN_pinned_writer.md §2-3). The id range it reserves is a pure function
+// of the committed counter: [base, base+Count), where base is the counter's value
+// before this tx — so every validator derives identical ids.
 //
-// Stage 1 carries Range + Count only. The Epoch/Owner/Fingerprint fields the
-// DESIGN sketches (§2) are the master-cutover stage's concern: in Stage 1 the
-// owner gate is evaluated by the VM against the block's threaded validator-set +
-// proposer identity, so the owner identity is NOT yet self-attested in the tx.
-// Keeping the tx minimal now means the codec does not change when those fields
-// are added — they are additive JSON fields a later parse tolerates.
+// SIGNED PINNED-WRITER AUTHORIZATION (the property that replaces raft's
+// serialized writer). The original gate keyed on the block's "proposer" identity,
+// which a verifying node CANNOT check — a Lux block carries no verifiable
+// proposer, and resolving one may need a network call, so the gate was
+// unenforceable for >1 validator. The fix makes ownership SELF-ATTESTED and
+// cryptographically verifiable inside the pure, local block apply:
+//
+//   - Signer       — the claimed HRW owner's NodeID. Verify recomputes
+//                    pinning.Owner(Range, V@Epoch) and requires Signer == owner.
+//   - SignerScheme — the NodeIDScheme byte (0x42 ML-DSA-65 / 0x43 ML-DSA-87) the
+//                    NodeID was derived under.
+//   - SignerPubKey — the signer's ML-DSA public key. Verify RE-DERIVES the NodeID
+//                    from this key (NodeID = SHAKE256-384(domain‖chainID‖scheme‖
+//                    pubkey)[:20]) and requires it to equal Signer. The NodeID is
+//                    thus a binding commitment to the key — a forger cannot supply
+//                    a different key for the owner's NodeID (~2^160 second-preimage
+//                    on the truncated SHAKE; the same bound the identity system
+//                    already rests on).
+//   - Sig          — an ML-DSA signature over SigningBytes() (the canonical,
+//                    SP 800-185-framed encoding of Range‖Count‖Epoch‖Nonce‖
+//                    Fingerprint — NOT over the Sig/Signer/PubKey fields, which
+//                    would be circular). Only the holder of the owner's secret key
+//                    can produce it.
+//   - Epoch        — the P-Chain height the validator set was frozen at. Verify
+//                    requires it to equal the block's epoch so ownership is
+//                    resolved against the agreed set, and binding it into the
+//                    signature stops cross-epoch replay where ownership differs.
+//   - Nonce        — a per-emission uniquifier (the proposer stamps the block
+//                    height) so two allocations of the same Range/Count in
+//                    different blocks sign distinct messages.
+//   - Fingerprint  — pinning.EpochFingerprint(Epoch, members): the signer's
+//                    commitment to the EXACT validator set it pinned against.
+//                    Verify recomputes it from its OWN local snapshot and rejects
+//                    a mismatch (DESIGN §6.4) — so a proposer that pinned against a
+//                    set the verifier does not hold cannot get its block accepted,
+//                    and Verify never has to fetch a set over the network.
+//
+// An AllocateTx enters the mempool as an UNSIGNED intent (Range+Count only); the
+// owning proposer stamps Epoch/Nonce/Fingerprint and signs it at BuildBlock with
+// its ML-DSA staking key.
 type AllocateTx struct {
 	BaseTx
 	Range string `json:"range"`
 	Count uint32 `json:"count"`
+
+	// Epoch / Nonce / Fingerprint are proposer-stamped at BuildBlock and bound
+	// into the signature. Zero on an unsigned mempool intent.
+	Epoch       uint64 `json:"epoch"`
+	Nonce       uint64 `json:"nonce"`
+	Fingerprint ids.ID `json:"fingerprint"`
+
+	// Signer / SignerScheme / SignerPubKey / Sig are the ML-DSA pinned-writer
+	// authorization. Empty on an unsigned intent.
+	Signer       ids.NodeID `json:"signer"`
+	SignerScheme uint8      `json:"signerScheme"`
+	SignerPubKey []byte     `json:"signerPubKey"`
+	Sig          []byte     `json:"sig"`
 }
 
-// NewAllocateTx builds a wire-ready Allocate transaction. finalize stamps the
-// deterministic wire bytes + TxID, so the returned tx is immediately
-// Parse-round-trippable (mirrors NewPutManifestTx and every dexvm New*Tx).
+// NewAllocateTx builds a wire-ready UNSIGNED Allocate intent (Range + Count). The
+// proposer stamps Epoch/Nonce/Fingerprint and the ML-DSA authorization at
+// BuildBlock via WithAuthorization. finalize stamps the deterministic wire bytes +
+// TxID, so the returned tx is immediately Parse-round-trippable (mirrors
+// NewPutManifestTx and every dexvm New*Tx).
 func NewAllocateTx(rng string, count uint32) *AllocateTx {
 	tx := &AllocateTx{
 		BaseTx: BaseTx{TxType: TxAllocate},
@@ -169,12 +219,71 @@ func NewAllocateTx(rng string, count uint32) *AllocateTx {
 	return finalize(tx, &tx.BaseTx)
 }
 
+// IsSigned reports whether the pinned-writer authorization has been stamped.
+func (tx *AllocateTx) IsSigned() bool { return len(tx.Sig) > 0 }
+
+// allocateSigDomain is the SP 800-185 customization string bound into the canonical
+// allocate signing bytes. Bumping it invalidates every prior signature, the correct
+// behaviour for a hardfork of the signing encoding.
+const allocateSigDomain = "lux/schain/allocate/v1"
+
+// AllocateSigningBytes is the canonical message an AllocateTx's owner signs: the
+// SP 800-185-framed encoding of (domain, Range, Count, Epoch, Nonce, Fingerprint).
+// Every field is length-framed (left_encode of its bit length) so concatenation is
+// unambiguous — a verifier cannot be tricked by a Range whose bytes spell another
+// field's payload. The Signer/PubKey/Sig fields are deliberately NOT covered: the
+// signature authenticates the key, the key re-derives the NodeID, and signing the
+// Sig would be circular.
+func AllocateSigningBytes(rng string, count uint32, epoch, nonce uint64, fingerprint ids.ID) []byte {
+	var b []byte
+	b = appendFramed(b, []byte(allocateSigDomain))
+	b = appendFramed(b, []byte(rng))
+	b = appendFramedU64(b, uint64(count))
+	b = appendFramedU64(b, epoch)
+	b = appendFramedU64(b, nonce)
+	b = appendFramed(b, fingerprint[:])
+	return b
+}
+
+// SigningBytes returns this tx's canonical signing message (see AllocateSigningBytes).
+func (tx *AllocateTx) SigningBytes() []byte {
+	return AllocateSigningBytes(tx.Range, tx.Count, tx.Epoch, tx.Nonce, tx.Fingerprint)
+}
+
+// WithAuthorization returns a NEW finalized, wire-ready AllocateTx carrying the
+// proposer-stamped Epoch/Nonce/Fingerprint and the ML-DSA pinned-writer
+// authorization (Signer/SignerScheme/SignerPubKey/Sig). The receiver supplies only
+// Range/Count; the returned tx is the authoritative signed image that travels in
+// the block (its TxID covers the authorization, so a peer cannot strip or swap it).
+func (tx *AllocateTx) WithAuthorization(
+	epoch, nonce uint64,
+	fingerprint ids.ID,
+	signer ids.NodeID,
+	scheme uint8,
+	pub, sig []byte,
+) *AllocateTx {
+	out := &AllocateTx{
+		BaseTx:       BaseTx{TxType: TxAllocate},
+		Range:        tx.Range,
+		Count:        tx.Count,
+		Epoch:        epoch,
+		Nonce:        nonce,
+		Fingerprint:  fingerprint,
+		Signer:       signer,
+		SignerScheme: scheme,
+		SignerPubKey: pub,
+		Sig:          sig,
+	}
+	return finalize(out, &out.BaseTx)
+}
+
 // Verify validates an Allocate in isolation: it must name a non-empty range and
 // reserve at least one id. No state is consulted and the OWNER GATE is NOT
-// checked here — Verify is pure and per-tx, but ownership is a function of the
-// BLOCK's validator set + proposer, which a single tx cannot see. The owner gate
-// lives in the VM's block-level apply (see schain.VM.applyAllocate), the same
-// discipline that keeps PutManifestTx.Verify state-free.
+// checked here — Verify is pure and per-tx, but ownership (and the signature over
+// the validator set) is a function of the BLOCK's frozen validator set, which a
+// single tx cannot see. The owner + signature gate lives in the VM's block-level
+// apply (see schain.VM.applyAllocate), the same discipline that keeps
+// PutManifestTx.Verify state-free.
 func (tx *AllocateTx) Verify() error {
 	if tx.Range == "" {
 		return ErrEmptyRange
@@ -183,6 +292,38 @@ func (tx *AllocateTx) Verify() error {
 		return ErrZeroCount
 	}
 	return nil
+}
+
+// appendFramed appends SP 800-185 left_encode(len(data)*8) followed by data.
+func appendFramed(dst, data []byte) []byte {
+	dst = append(dst, leftEncode(uint64(len(data))*8)...)
+	return append(dst, data...)
+}
+
+// appendFramedU64 appends a framed 8-byte big-endian encoding of v.
+func appendFramedU64(dst []byte, v uint64) []byte {
+	var u8 [8]byte
+	binary.BigEndian.PutUint64(u8[:], v)
+	return appendFramed(dst, u8[:])
+}
+
+// leftEncode is the SP 800-185 §2.3.1 left_encode operation — byte-for-byte
+// identical to the helper in ids/node_id_scheme.go and consensus/config, so the
+// framing here matches the framing the NodeID derivation uses.
+func leftEncode(x uint64) []byte {
+	if x == 0 {
+		return []byte{0x01, 0x00}
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], x)
+	i := 0
+	for i < 7 && buf[i] == 0 {
+		i++
+	}
+	out := make([]byte, 0, 9-i)
+	out = append(out, byte(8-i))
+	out = append(out, buf[i:]...)
+	return out
 }
 
 // TxParser parses raw transaction bytes off the wire.

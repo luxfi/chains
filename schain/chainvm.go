@@ -17,6 +17,9 @@ import (
 	"github.com/luxfi/version"
 	vmcore "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
+
+	"github.com/luxfi/chains/schain/pinning"
+	"github.com/luxfi/chains/schain/txs"
 )
 
 var (
@@ -62,6 +65,12 @@ type ChainVM struct {
 	// block's proposer (see BlockContext doc). When nil, blocks build with the
 	// empty context — the M0/no-allocate path, where any AllocateTx fails closed.
 	blockCtxBuilder BlockContextBuilder
+
+	// allocateSigner signs the AllocateTxs this node OWNS at BuildBlock with its
+	// ML-DSA staking key (the pinned-writer authorization). When nil, allocates are
+	// left unsigned and therefore fail closed at Verify — a node that cannot sign
+	// cannot get an allocation accepted. Installed only on validating nodes.
+	allocateSigner *AllocateSigner
 }
 
 // BlockContextBuilder resolves the deterministic consensus inputs (validator set,
@@ -78,6 +87,17 @@ func (cvm *ChainVM) SetBlockContextBuilder(b BlockContextBuilder) {
 	cvm.lock.Lock()
 	defer cvm.lock.Unlock()
 	cvm.blockCtxBuilder = b
+}
+
+// SetAllocateSigner installs the ML-DSA staking key this node signs its owned
+// allocates with at BuildBlock. A node only ever produces VALID allocates for the
+// ranges it owns (a signed allocate whose signer is not the HRW owner is rejected
+// at Verify on every node), so installing a signer never lets a node write a range
+// it does not own — it only lets it authorize the ranges it does.
+func (cvm *ChainVM) SetAllocateSigner(s *AllocateSigner) {
+	cvm.lock.Lock()
+	defer cvm.lock.Unlock()
+	cvm.allocateSigner = s
 }
 
 // NewChainVM constructs a ChainVM wrapping a fresh inner storage VM.
@@ -173,7 +193,7 @@ func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		newTimestamp = last
 	}
 
-	txs := cvm.pendingTxs
+	drained := cvm.pendingTxs
 
 	// Resolve the deterministic BlockContext (validator set + proposer + epoch)
 	// the AllocateTx owner gate needs. The proposer pins against the SAME frozen
@@ -185,6 +205,18 @@ func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		return nil, fmt.Errorf("schain: resolve block context: %w", err)
 	}
 
+	// Sign the AllocateTxs this node owns: stamp Epoch/Nonce/Fingerprint from the
+	// resolved context and ML-DSA-sign with the installed staking key. This is the
+	// emitter side of the pinned-writer authorization — the network call (validator
+	// set resolution) happens HERE, outside Verify, so block apply stays pure. A
+	// node with no signer leaves allocates unsigned; they then fail closed at Verify
+	// (and below, the build itself fails so the unsigned intent is not retried).
+	blockTxs, err := cvm.signOwnedAllocates(drained, blockCtx, newHeight)
+	if err != nil {
+		cvm.pendingTxs = nil
+		return nil, fmt.Errorf("schain: sign allocates: %w", err)
+	}
+
 	// Proposer build: apply the drained txs to the version layer to obtain the
 	// post-apply STATE ROOT, then carry that root in the block header so every
 	// validator can recompute and check it (mirror of dexvm BuildBlock ->
@@ -193,7 +225,7 @@ func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	// keys/values — idempotent over the versiondb) and a Rejected block's Abort
 	// drops them. The SAME timestamp + block context are fed to every validator's
 	// ProcessBlock, so the root and the owner verdict are reproducible network-wide.
-	result, err := cvm.inner.ProcessBlock(ctx, newHeight, newTimestamp, txs, blockCtx)
+	result, err := cvm.inner.ProcessBlock(ctx, newHeight, newTimestamp, blockTxs, blockCtx)
 	if err != nil {
 		// A block-level reject (a non-owner AllocateTx, or one with no validator
 		// set) means this proposer must NOT build this block. Drain the mempool so
@@ -211,7 +243,7 @@ func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		height:    newHeight,
 		timestamp: newTimestamp,
 		stateRoot: result.StateRoot,
-		txs:       txs,
+		txs:       blockTxs,
 		blockCtx:  blockCtx,
 		result:    result,
 		status:    StatusProcessing,
@@ -226,6 +258,39 @@ func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		cvm.log.Debug("Built block", "id", block.id, "height", newHeight, "txCount", len(block.txs), "root", result.StateRoot)
 	}
 	return block, nil
+}
+
+// signOwnedAllocates returns a copy of rawTxs with every unsigned AllocateTx
+// signed by the installed AllocateSigner (stamping Epoch from the block context,
+// Nonce from the block height, and the validator-set Fingerprint). PutManifest txs
+// and already-signed allocates pass through untouched. With no signer installed, or
+// no validator set to pin against, allocates pass through UNSIGNED — they then fail
+// closed in ProcessBlock (an unsigned allocate is unauthorized), which fails the
+// build and drains the offending intent. The caller holds cvm.lock.
+func (cvm *ChainVM) signOwnedAllocates(rawTxs [][]byte, blockCtx BlockContext, height uint64) ([][]byte, error) {
+	if cvm.allocateSigner == nil || len(blockCtx.Members) == 0 {
+		return rawTxs, nil
+	}
+	fingerprint := pinning.EpochFingerprint(blockCtx.Epoch, blockCtx.Members)
+
+	out := make([][]byte, len(rawTxs))
+	for i, raw := range rawTxs {
+		parsed, perr := parser.Parse(raw)
+		if perr != nil {
+			return nil, perr
+		}
+		at, ok := parsed.(*txs.AllocateTx)
+		if !ok || at.IsSigned() {
+			out[i] = raw
+			continue
+		}
+		signed, serr := cvm.allocateSigner.signAllocate(at, blockCtx.Epoch, height, fingerprint)
+		if serr != nil {
+			return nil, serr
+		}
+		out[i] = signed.Bytes()
+	}
+	return out, nil
 }
 
 // resolveBlockContext computes the deterministic BlockContext for a block at

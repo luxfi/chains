@@ -55,12 +55,14 @@ var (
 	errShutdown = errors.New("VM is shutting down")
 
 	// errNonOwnerAllocate is returned by ProcessBlock/Verify when a block carries
-	// an AllocateTx for a range whose HRW owner (under the block's frozen
-	// validator set + epoch) is NOT the block's proposer. This is the leaderless
-	// pinned-writer safety property: only the one owner of a range may emit an
-	// allocation, so two writers for the same range — and therefore a double
-	// allocation — are impossible by construction.
-	errNonOwnerAllocate = errors.New("allocate: proposer is not the range owner")
+	// an AllocateTx whose claimed (and cryptographically authenticated) Signer is
+	// NOT the HRW owner of the range under the block's frozen validator set + epoch.
+	// This is the leaderless pinned-writer safety property: only the one owner of a
+	// range may emit an allocation, so two writers for the same range — and
+	// therefore a double allocation — are impossible by construction. A non-owner
+	// with a valid validator key still fails here (its NodeID != owner), and a
+	// non-owner claiming the owner's NodeID fails the signature gate instead.
+	errNonOwnerAllocate = errors.New("allocate: signer is not the range owner")
 
 	// errNoValidatorSet is returned when a block carries an AllocateTx but the
 	// block context supplies no validator set to resolve ownership against.
@@ -102,10 +104,17 @@ var (
 type BlockContext struct {
 	// Members is the validator set frozen at Epoch, projected to (NodeID, Weight).
 	Members []pinning.Member
-	// Proposer is the NodeID that built this block — the candidate range owner.
+	// Proposer is the NodeID that built this block. It is NO LONGER part of the
+	// owner-gate trust path (the gate keys on the tx's verifiable ML-DSA signer);
+	// it remains so BuildBlock knows which key signs and for logging.
 	Proposer ids.NodeID
 	// Epoch is the P-Chain height Members was frozen at (block.pChainHeight).
 	Epoch uint64
+	// IdentityChainID is the chain id the validator NodeIDs were derived under
+	// (ids.DeriveMLDSA). Verify re-derives a signer's NodeID from its carried public
+	// key under this id to check the key-to-NodeID binding. It is a fixed,
+	// network-wide constant (the staking chain id), so this stays a pure local input.
+	IdentityChainID ids.ID
 }
 
 // BlockResult is the deterministic result of processing one block. For the
@@ -251,7 +260,7 @@ func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime ti
 			//   - Any OTHER per-tx failure (a malformed/invalid manifest) does not
 			//     fail the block: it simply stages no write, mirroring dexvm's
 			//     per-tx-failure-continues discipline (dexvm/vm.go:562).
-			if errors.Is(err, errNonOwnerAllocate) || errors.Is(err, errNoValidatorSet) {
+			if isAllocateGateError(err) {
 				return nil, err
 			}
 			if !vm.log.IsZero() {
@@ -342,12 +351,29 @@ func (vm *VM) processTx(txBytes []byte, blockCtx BlockContext) error {
 // range and the IDENTICAL post-state, and the owner gate resolves to the same
 // verdict on every node.
 //
-// The owner gate is the leaderless-pinned-writer enforcement: a block may carry
-// an AllocateTx for range R ONLY if its proposer is pinning.Owner(R, V(epoch)).
-// A non-owner allocate is rejected (errNonOwnerAllocate), failing the block — so
-// the same range can never have two writers, and the same id can never be
-// allocated twice. With no validator set the gate fails closed (errNoValidatorSet):
-// ownership cannot be proven, so nothing may be written (never assume self-owner).
+// The owner gate is the leaderless-pinned-writer enforcement, now CRYPTOGRAPHICALLY
+// VERIFIABLE — the property that replaces raft's serialized writer. A block may
+// carry an AllocateTx for range R ONLY if it is signed by pinning.Owner(R, V(epoch))
+// with that owner's ML-DSA staking key. The gate, in order (each step fails the
+// whole block):
+//
+//  1. fail closed with no validator set — ownership is unprovable (never assume
+//     self-owner);
+//  2. the signed Epoch must equal the block's epoch, so ownership is resolved
+//     against the set the signer attested to;
+//  3. the signed Fingerprint must equal pinning.EpochFingerprint over the
+//     verifier's OWN local snapshot — the DESIGN §6.4 guard that lets Verify stay
+//     pure/local: a proposer that pinned against a different set is rejected, not
+//     reconciled over the network;
+//  4. the claimed Signer must BE the HRW owner of R;
+//  5. the ML-DSA signature must verify under the owner's key AND that key must
+//     re-derive to the owner's NodeID (verifyAllocateSig) — so a non-owner cannot
+//     forge it: they cannot sign as the owner, and cannot claim the owner's NodeID
+//     with a foreign key.
+//
+// This makes a non-owner's forged allocate unverifiable BY CONSTRUCTION, with no
+// dependence on an unverifiable "proposer identity" and no network I/O. The same
+// range can never have two writers, so the same id can never be allocated twice.
 //
 // The reserved id range is [base, base+Count) where base is the counter's
 // committed value before this tx — a pure function of prior committed state, so
@@ -355,15 +381,41 @@ func (vm *VM) processTx(txBytes []byte, blockCtx BlockContext) error {
 // across blocks AND across owner re-pin (the counter is committed VM state, not
 // owner-local memory — DESIGN §6.5).
 func (vm *VM) applyAllocate(tx *txs.AllocateTx, blockCtx BlockContext) error {
-	// Owner gate. Fail closed when the set is empty: with no validators nobody can
-	// be proven the owner (pinning.Owner returns false on an empty set), so we must
-	// refuse rather than silently treat the proposer as owner.
+	// (1) Fail closed when the set is empty: with no validators nobody can be proven
+	// the owner (pinning.Owner returns false on an empty set).
 	if len(blockCtx.Members) == 0 {
 		return errNoValidatorSet
 	}
 	rangeKey := []byte(tx.Range)
-	if !pinning.IsOwner(rangeKey, blockCtx.Proposer, blockCtx.Members) {
+	owner, ok := pinning.Owner(rangeKey, blockCtx.Members)
+	if !ok {
+		return errNoValidatorSet
+	}
+
+	// (2) Epoch binding: the signer attested ownership for a specific epoch; reject
+	// if it is not the epoch this block resolves the set at.
+	if tx.Epoch != blockCtx.Epoch {
+		return errEpochMismatch
+	}
+
+	// (3) Validator-set fingerprint: the signer committed to the EXACT set it pinned
+	// against. Recompute it from the local snapshot and reject a mismatch — so a
+	// proposer pinned against a set this verifier does not hold cannot be accepted,
+	// and Verify never has to fetch a validator set over the network.
+	if tx.Fingerprint != pinning.EpochFingerprint(blockCtx.Epoch, blockCtx.Members) {
+		return errEpochFingerprintMismatch
+	}
+
+	// (4) The claimed signer must be the HRW owner of the range.
+	if tx.Signer != owner {
 		return errNonOwnerAllocate
+	}
+
+	// (5) The signature must verify under the owner's key, and the key must bind to
+	// the owner's NodeID. This is the cryptographic core: only the holder of the
+	// owner's secret key can produce a valid authorization.
+	if err := verifyAllocateSig(tx, blockCtx.IdentityChainID); err != nil {
+		return err
 	}
 
 	base, err := vm.state.GetAlloc(tx.Range)
