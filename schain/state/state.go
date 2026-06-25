@@ -37,10 +37,20 @@ var (
 	// its expected shape — a corrupt record must never be silently reinterpreted.
 	ErrStateCorrupted = errors.New("state corrupted")
 
-	// Database prefixes. Manifests are keyed manifest/<bucket>/<object>; the
-	// last-block pointer is a single fixed key.
+	// Database prefixes. Manifests are keyed manifest/<bucket>/<object>; allocator
+	// counters are keyed alloc/<range>; the last-block pointer is a single fixed
+	// key. Manifests and allocator counters are BOTH committed object state and
+	// BOTH folded into Root() — the last-block pointer is consensus binding folded
+	// separately into the block header, never into the state root.
 	prefixManifest  = []byte("manifest/")
+	prefixAlloc     = []byte("alloc/")
 	prefixLastBlock = []byte("lastBlock")
+
+	// rootPrefixes is the ordered list of committed-state prefixes Root() walks.
+	// The order is FIXED (it is part of the root's definition): two validators
+	// must absorb the same prefixes in the same order to agree. Adding a new
+	// committed keyspace means appending here AND bumping stateRootDomain.
+	rootPrefixes = [][]byte{prefixManifest, prefixAlloc}
 )
 
 // Manifest is the committed content manifest for one object: the file blobs that
@@ -140,33 +150,95 @@ func (s *State) GetManifest(bucket, object string) (m Manifest, found bool, err 
 }
 
 // ---------------------------------------------------------------------------
-// Manifest state root — the deterministic commitment that makes the chain safe
-// for more than one validator.
+// Allocator counters — the per-range monotonic id sequence (alloc/<range>).
+//
+// This is the leaderless pinned-writer replacement for raft's global volume-id
+// (MaxVolumeIdCommand) + fileId sequence (MemorySequencer). Each range carries
+// its OWN counter, so disjoint ranges allocate independently (their counters are
+// disjoint state keys) while same-range allocations serialize through the one
+// HRW owner. The counter is COMMITTED VM state (not owner-local memory), so it
+// survives owner re-pin at an epoch boundary with no id reuse (DESIGN §6.5).
 // ---------------------------------------------------------------------------
 
-// Root returns a deterministic SHA-256 commitment over the COMMITTED manifest
-// keyspace: every manifest/<bucket>/<object> -> {fileIds,size,etag} entry the
-// chain holds after this block's writes are staged. It is the value the block
-// header binds, so two validators whose manifest state actually diverges (a
-// different object set, a changed etag/size/fileIds for the same object) ALWAYS
-// produce different roots — divergence can never hide behind a matching block
-// hash. This is the manifest-VM analog of dexvm's State.StateHash (dexvm/state/
-// state.go:395), narrowed to the storage VM's one keyspace.
+// allocKey builds the deterministic key alloc/<range>. range is length-prefixed
+// for symmetry with manifestKey, so no two distinct ranges can ever collide on a
+// shared key boundary.
+func allocKey(rng string) []byte {
+	k := make([]byte, 0, len(prefixAlloc)+4+len(rng))
+	k = append(k, prefixAlloc...)
+	var lp [4]byte
+	binary.BigEndian.PutUint32(lp[:], uint32(len(rng)))
+	k = append(k, lp[:]...)
+	k = append(k, rng...)
+	return k
+}
+
+// GetAlloc returns the current allocator counter for range — the next id that
+// will be handed out. An absent range reads as 0 (its first allocation starts at
+// id 0). Reads through the version layer, so it observes a counter staged in this
+// block before commit and the durable value after commit.
+func (s *State) GetAlloc(rng string) (uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	data, err := s.db.Get(allocKey(rng))
+	if err != nil {
+		if errors.Is(err, database.ErrNotFound) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if len(data) != 8 {
+		return 0, ErrStateCorrupted
+	}
+	return binary.BigEndian.Uint64(data), nil
+}
+
+// SetAlloc stages the allocator counter for range into the version layer. It
+// becomes durable only when the VM commits the block's batch at Accept — the
+// same versiondb/CommitBatch discipline as PutManifest. The value is a fixed
+// 8-byte big-endian uint64 so the stored bytes are canonical (GetAlloc rejects
+// any other width as corruption).
+func (s *State) SetAlloc(rng string, n uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], n)
+	return s.db.Put(allocKey(rng), buf[:])
+}
+
+// ---------------------------------------------------------------------------
+// State root — the deterministic commitment that makes the chain safe for more
+// than one validator. Covers the manifest AND allocator keyspaces.
+// ---------------------------------------------------------------------------
+
+// Root returns a deterministic SHA-256 commitment over the COMMITTED object
+// keyspaces: every manifest/<bucket>/<object> -> {fileIds,size,etag} entry AND
+// every alloc/<range> -> counter entry the chain holds after this block's writes
+// are staged. It is the value the block header binds, so two validators whose
+// committed state actually diverges — a different object set, a changed
+// etag/size/fileIds for an object, OR a different allocator counter for a range —
+// ALWAYS produce different roots. Divergence can never hide behind a matching
+// block hash. This is the manifest-VM analog of dexvm's State.StateHash
+// (dexvm/state/state.go:395), covering the storage VM's two committed keyspaces.
 //
-// The walk uses the zapdb prefix iterator NewIteratorWithStartAndPrefix(nil,
-// prefixManifest), so it reads through the versiondb (this block's staged
-// in-memory writes merged over the durable base, deleted keys dropped) and only
-// the manifest keyspace — the last-block pointer is consensus binding folded
-// separately into the header via blockHash/height, NOT object state, so it is
-// excluded here exactly as dexvm excludes its proposer-local receipt prefix.
+// The walk iterates each rootPrefix in turn via the zapdb prefix iterator
+// NewIteratorWithStartAndPrefix(nil, prefix), so it reads through the versiondb
+// (this block's staged in-memory writes merged over the durable base, deleted
+// keys dropped). Only the manifest + alloc keyspaces are folded — the last-block
+// pointer is consensus binding folded separately into the header via
+// blockHash/height, NOT object state, so it is excluded here exactly as dexvm
+// excludes its proposer-local receipt prefix.
 //
-// Keys come out in lexicographic order, so the digest is independent of write
-// history. Each field (domain, key, value) is framed with SP 800-185 left_encode
-// of its BIT length before it is absorbed, so no two distinct (key,value) splits
-// can collide by concatenation — the same canonicalization the validator NodeID
-// scheme uses (ids/node_id_scheme.go). The hash is SHAKE256 (SHA-3): not
-// length-extendable (unlike SHA-256), domain-separated by stateRootDomain, and
-// PQ-strength (256-bit output → 128-bit collision/preimage even under Grover).
+// The prefix order (rootPrefixes) is fixed and the keys within each prefix come
+// out in lexicographic order, so the digest is independent of write history. Each
+// field (domain, key, value) is framed with SP 800-185 left_encode of its BIT
+// length before it is absorbed, so no two distinct (key,value) splits can collide
+// by concatenation — the same canonicalization the validator NodeID scheme uses
+// (ids/node_id_scheme.go). And because every key is absorbed WITH its full
+// prefix, a manifest key and an alloc key can never alias even if their suffixes
+// coincide. The hash is SHAKE256 (SHA-3): not length-extendable (unlike SHA-256),
+// domain-separated by stateRootDomain, and PQ-strength (256-bit output → 128-bit
+// collision/preimage even under Grover).
 func (s *State) Root() (ids.ID, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -180,14 +252,17 @@ func (s *State) Root() (ids.ID, error) {
 		_, _ = h.Write(b)
 	}
 
-	it := s.db.NewIteratorWithStartAndPrefix(nil, prefixManifest)
-	defer it.Release()
-	for it.Next() {
-		absorb(it.Key())
-		absorb(it.Value())
-	}
-	if err := it.Error(); err != nil {
-		return ids.Empty, fmt.Errorf("manifest state root: iterate: %w", err)
+	for _, prefix := range rootPrefixes {
+		it := s.db.NewIteratorWithStartAndPrefix(nil, prefix)
+		for it.Next() {
+			absorb(it.Key())
+			absorb(it.Value())
+		}
+		if err := it.Error(); err != nil {
+			it.Release()
+			return ids.Empty, fmt.Errorf("state root: iterate %q: %w", prefix, err)
+		}
+		it.Release()
 	}
 	var out ids.ID
 	_, _ = h.Read(out[:])
@@ -195,8 +270,9 @@ func (s *State) Root() (ids.ID, error) {
 }
 
 // stateRootDomain is the SP 800-185 customization string binding the state root
-// to this construction and version. Bumping it invalidates every prior root.
-const stateRootDomain = "SCHAIN_STATE_ROOT_V1"
+// to this construction and version. Bumping it invalidates every prior root. V2
+// folds the allocator keyspace (alloc/<range>) in alongside manifests.
+const stateRootDomain = "SCHAIN_STATE_ROOT_V2"
 
 // leftEncode is SP 800-185 left_encode: a length-self-describing prefix so the
 // concatenation of framed fields is unambiguous (no two field boundaries can be

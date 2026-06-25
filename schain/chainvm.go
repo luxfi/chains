@@ -14,9 +14,9 @@ import (
 
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
+	"github.com/luxfi/version"
 	vmcore "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
-	"github.com/luxfi/version"
 )
 
 var (
@@ -53,6 +53,31 @@ type ChainVM struct {
 	toEngine chan<- vmcore.Message
 
 	initialized bool
+
+	// blockCtxBuilder resolves the deterministic BlockContext (validator set +
+	// proposer + epoch) for a block at the given height. It is the SEAM to the
+	// real consensus runtime: Stage 1 lets the test/harness inject a deterministic
+	// resolver; the master-cutover stage wires it to
+	// runtime.ValidatorState.GetValidatorSet(ctx, pChainHeight, netID) + the
+	// block's proposer (see BlockContext doc). When nil, blocks build with the
+	// empty context — the M0/no-allocate path, where any AllocateTx fails closed.
+	blockCtxBuilder BlockContextBuilder
+}
+
+// BlockContextBuilder resolves the deterministic consensus inputs (validator set,
+// proposer, epoch) the AllocateTx owner gate needs for a block at the given
+// height. It MUST be a pure local computation (no network I/O) so block Verify
+// stays deterministic. height is the S-Chain block height; the implementation
+// maps it to the epoch's pChainHeight and the block's proposer.
+type BlockContextBuilder func(ctx context.Context, height uint64) (BlockContext, error)
+
+// SetBlockContextBuilder installs the resolver that supplies the AllocateTx owner
+// gate its validator set + proposer identity. Stage 1 wire point; production
+// installs the real consensus-runtime-backed resolver here.
+func (cvm *ChainVM) SetBlockContextBuilder(b BlockContextBuilder) {
+	cvm.lock.Lock()
+	defer cvm.lock.Unlock()
+	cvm.blockCtxBuilder = b
 }
 
 // NewChainVM constructs a ChainVM wrapping a fresh inner storage VM.
@@ -150,16 +175,33 @@ func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
 
 	txs := cvm.pendingTxs
 
+	// Resolve the deterministic BlockContext (validator set + proposer + epoch)
+	// the AllocateTx owner gate needs. The proposer pins against the SAME frozen
+	// set every verifier will reconstruct, so the owner verdict is identical
+	// network-wide. With no builder installed the context is empty (M0 path); a
+	// block carrying an AllocateTx then fails closed in ProcessBlock.
+	blockCtx, err := cvm.resolveBlockContext(ctx, newHeight)
+	if err != nil {
+		return nil, fmt.Errorf("schain: resolve block context: %w", err)
+	}
+
 	// Proposer build: apply the drained txs to the version layer to obtain the
-	// post-apply manifest STATE ROOT, then carry that root in the block header so
-	// every validator can recompute and check it (mirror of dexvm BuildBlock ->
+	// post-apply STATE ROOT, then carry that root in the block header so every
+	// validator can recompute and check it (mirror of dexvm BuildBlock ->
 	// BuildBlockResult, chainvm.go:258). The staged writes remain in the version
 	// layer; the proposer's own Block.Verify re-applies the identical txs (same
 	// keys/values — idempotent over the versiondb) and a Rejected block's Abort
-	// drops them. The SAME timestamp is carried in the bytes and fed to every
-	// validator's ProcessBlock, so the root is reproducible network-wide.
-	result, err := cvm.inner.ProcessBlock(ctx, newHeight, newTimestamp, txs)
+	// drops them. The SAME timestamp + block context are fed to every validator's
+	// ProcessBlock, so the root and the owner verdict are reproducible network-wide.
+	result, err := cvm.inner.ProcessBlock(ctx, newHeight, newTimestamp, txs, blockCtx)
 	if err != nil {
+		// A block-level reject (a non-owner AllocateTx, or one with no validator
+		// set) means this proposer must NOT build this block. Drain the mempool so
+		// the offending tx is dropped rather than retried into the next block — a
+		// non-owner can never validly emit it, so retaining it would wedge block
+		// production. (Per-tx soft failures never reach here; ProcessBlock swallows
+		// those and builds anyway.)
+		cvm.pendingTxs = nil
 		return nil, fmt.Errorf("schain: build block result: %w", err)
 	}
 
@@ -170,6 +212,7 @@ func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		timestamp: newTimestamp,
 		stateRoot: result.StateRoot,
 		txs:       txs,
+		blockCtx:  blockCtx,
 		result:    result,
 		status:    StatusProcessing,
 	}
@@ -185,6 +228,19 @@ func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	return block, nil
 }
 
+// resolveBlockContext computes the deterministic BlockContext for a block at
+// height. It delegates to the installed BlockContextBuilder (the consensus-runtime
+// seam); with no builder it returns the empty context (the M0/no-allocate path).
+// The caller holds cvm.lock, so this reads cvm.blockCtxBuilder directly without
+// re-locking. The builder MUST be pure/local — no network I/O — so the resolved
+// context is identical on the proposer and every verifier.
+func (cvm *ChainVM) resolveBlockContext(ctx context.Context, height uint64) (BlockContext, error) {
+	if cvm.blockCtxBuilder == nil {
+		return BlockContext{}, nil
+	}
+	return cvm.blockCtxBuilder(ctx, height)
+}
+
 // ParseBlock parses a block from bytes, deduplicating against the index.
 func (cvm *ChainVM) ParseBlock(ctx context.Context, data []byte) (chain.Block, error) {
 	cvm.lock.Lock()
@@ -197,6 +253,16 @@ func (cvm *ChainVM) ParseBlock(ctx context.Context, data []byte) (chain.Block, e
 	if existing, ok := cvm.blocks[block.id]; ok {
 		return existing, nil
 	}
+	// Reconstruct the deterministic BlockContext on the verifying side from the
+	// block's height (→ epoch + frozen validator set + proposer). This is the same
+	// resolver the proposer used, so every node resolves the SAME owner for an
+	// AllocateTx in this block. Without it a parsed AllocateTx block fails closed
+	// (errNoValidatorSet) — the safe default if the seam is not yet wired.
+	blockCtx, err := cvm.resolveBlockContext(ctx, block.height)
+	if err != nil {
+		return nil, fmt.Errorf("schain: resolve block context for parsed block: %w", err)
+	}
+	block.blockCtx = blockCtx
 	cvm.blocks[block.id] = block
 	return block, nil
 }

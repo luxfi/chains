@@ -46,6 +46,7 @@ import (
 	vmcore "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
 
+	"github.com/luxfi/chains/schain/pinning"
 	"github.com/luxfi/chains/schain/state"
 	"github.com/luxfi/chains/schain/txs"
 )
@@ -53,8 +54,59 @@ import (
 var (
 	errShutdown = errors.New("VM is shutting down")
 
+	// errNonOwnerAllocate is returned by ProcessBlock/Verify when a block carries
+	// an AllocateTx for a range whose HRW owner (under the block's frozen
+	// validator set + epoch) is NOT the block's proposer. This is the leaderless
+	// pinned-writer safety property: only the one owner of a range may emit an
+	// allocation, so two writers for the same range — and therefore a double
+	// allocation — are impossible by construction.
+	errNonOwnerAllocate = errors.New("allocate: proposer is not the range owner")
+
+	// errNoValidatorSet is returned when a block carries an AllocateTx but the
+	// block context supplies no validator set to resolve ownership against.
+	// Fail closed: with no set, nobody can be proven the owner, so no allocation
+	// may commit (never default to "I am the owner" — see pinning.TestEmptySet).
+	errNoValidatorSet = errors.New("allocate: empty validator set in block context")
+
 	parser = &txs.TxParser{}
 )
+
+// BlockContext carries the deterministic consensus inputs an AllocateTx's owner
+// gate needs: the validator set frozen at the block's epoch (block.pChainHeight)
+// and the identity of the block's proposer. Both are pure inputs — every node
+// verifying the block resolves the SAME owner against the SAME frozen set, so the
+// gate is evaluated inside deterministic block apply with ZERO network I/O
+// (the purity premise the whole model rests on — DESIGN_pinned_writer.md §6.4).
+//
+// WIRE SEAM (master-cutover stage): in Stage 1 BlockContext is an explicit
+// parameter threaded from the test harness / proposer. In production it must be
+// populated from the REAL consensus runtime, ONCE, at the points the validator
+// set + proposer are cleanly available WITHOUT a network round-trip inside
+// Verify:
+//
+//   - Members:  pinning.Member projection of
+//     vm.consensusRuntime.ValidatorState.GetValidatorSet(ctx, block.pChainHeight,
+//     netID) — id+weight only. This MUST be a LOCAL lookup against already-synced
+//     P-Chain state at the historical height; if it can block on the network,
+//     resolution moves OUT of Verify (pin in BuildBlock, carry owner+fingerprint
+//     in the tx, Verify only re-checks the fingerprint). See §6.4 fallback.
+//   - Proposer: the block's proposer NodeID, from the consensus block header
+//     (block.pChainHeight's proposer / the engine's BuildBlock identity), NOT
+//     vm.consensusRuntime.NodeID — that is "me", which is only the proposer on
+//     the building node, not on a verifying node.
+//   - Epoch:    block.pChainHeight, the height Members was frozen at, so a peer
+//     can recompute pinning.EpochFingerprint and reject an epoch-skewed pin.
+//
+// An empty BlockContext (nil Members) is the M0/no-allocate path: a block with
+// no AllocateTx is unaffected, so existing PutManifest blocks need no context.
+type BlockContext struct {
+	// Members is the validator set frozen at Epoch, projected to (NodeID, Weight).
+	Members []pinning.Member
+	// Proposer is the NodeID that built this block — the candidate range owner.
+	Proposer ids.NodeID
+	// Epoch is the P-Chain height Members was frozen at (block.pChainHeight).
+	Epoch uint64
+}
 
 // BlockResult is the deterministic result of processing one block. For the
 // storage VM the per-block output is simply the height/time/blockHash binding —
@@ -156,12 +208,27 @@ func (vm *VM) Initialize(ctx context.Context, vmInit vmcore.Init) error {
 // on every node, so Verify is a pure function (mirror of dexvm/vm.go:542). The
 // manifest writes land in vm.db's in-memory layer and become durable only when
 // acceptBlock commits the batch.
-func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime time.Time, blockTxs [][]byte) (*BlockResult, error) {
+func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime time.Time, blockTxs [][]byte, blockCtx BlockContext) (*BlockResult, error) {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
 
 	if vm.shutdown {
 		return nil, errShutdown
+	}
+
+	// Apply over COMMITTED state, not accumulated staging. A block is processed
+	// twice on the proposer — once in BuildBlock (to compute the claimed root) and
+	// again in Block.Verify — and both must produce the identical post-state. For
+	// an idempotent write (PutManifest: same key→same value) re-application is
+	// harmless, but the allocator is a READ-MODIFY-WRITE: re-applying over the
+	// prior staging would double-advance the counter (base 0→Count, then Count→2·
+	// Count) and the two roots would diverge. Aborting the versiondb's in-memory
+	// layer first discards any uncommitted staging so every ProcessBlock starts
+	// from the last-accepted state — making the apply a pure function of COMMITTED
+	// state + this block's txs, idempotent for every tx type. (Abort never touches
+	// the durable base; CommitBatch at Accept is still the only durability point.)
+	if vm.db != nil {
+		vm.db.Abort()
 	}
 
 	blockHash := deriveBlockHash(blockHeight, blockTime)
@@ -172,10 +239,21 @@ func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime ti
 	}
 
 	for i, txBytes := range blockTxs {
-		if err := vm.processTx(txBytes); err != nil {
-			// An individual tx failure does not fail the block: a malformed or
-			// invalid manifest simply stages no write. Mirrors dexvm's
-			// per-tx-failure-continues discipline (dexvm/vm.go:562).
+		if err := vm.processTx(txBytes, blockCtx); err != nil {
+			// Two failure classes, two dispositions:
+			//
+			//   - A SAFETY-GATE violation (a non-owner AllocateTx, or an allocate
+			//     with no validator set to prove ownership) FAILS THE WHOLE BLOCK.
+			//     Letting it through as a skipped tx would silently admit a block a
+			//     malicious proposer built to write a range it does not own — the
+			//     exact double-write the pinned writer forbids. The block must be
+			//     rejected so no validator accepts it.
+			//   - Any OTHER per-tx failure (a malformed/invalid manifest) does not
+			//     fail the block: it simply stages no write, mirroring dexvm's
+			//     per-tx-failure-continues discipline (dexvm/vm.go:562).
+			if errors.Is(err, errNonOwnerAllocate) || errors.Is(err, errNoValidatorSet) {
+				return nil, err
+			}
 			if !vm.log.IsZero() {
 				vm.log.Warn("S-Chain transaction failed", "index", i, "error", err)
 			}
@@ -233,8 +311,8 @@ func (vm *VM) computeStateRoot(blockHash ids.ID) (ids.ID, error) {
 }
 
 // processTx parses one transaction and applies its mutation to the version
-// layer. M0 has a single mutation: PutManifest.
-func (vm *VM) processTx(txBytes []byte) error {
+// layer. The S-Chain has two mutations: PutManifest (M0) and Allocate (Stage 1).
+func (vm *VM) processTx(txBytes []byte, blockCtx BlockContext) error {
 	tx, err := parser.Parse(txBytes)
 	if err != nil {
 		return err
@@ -249,9 +327,63 @@ func (vm *VM) processTx(txBytes []byte) error {
 			Size:    t.Size,
 			ETag:    t.ETag,
 		})
+	case *txs.AllocateTx:
+		return vm.applyAllocate(t, blockCtx)
 	default:
 		return txs.ErrInvalidTxType
 	}
+}
+
+// applyAllocate deterministically reserves tx.Count ids in the per-range counter
+// alloc/<tx.Range>, gated on the block proposer being the HRW OWNER of the range.
+// It mirrors PutManifest's discipline exactly: version-layer only, NO I/O, pure
+// function of (committed state, block context) — so every validator that applies
+// the same tx against the same frozen validator set derives the IDENTICAL id
+// range and the IDENTICAL post-state, and the owner gate resolves to the same
+// verdict on every node.
+//
+// The owner gate is the leaderless-pinned-writer enforcement: a block may carry
+// an AllocateTx for range R ONLY if its proposer is pinning.Owner(R, V(epoch)).
+// A non-owner allocate is rejected (errNonOwnerAllocate), failing the block — so
+// the same range can never have two writers, and the same id can never be
+// allocated twice. With no validator set the gate fails closed (errNoValidatorSet):
+// ownership cannot be proven, so nothing may be written (never assume self-owner).
+//
+// The reserved id range is [base, base+Count) where base is the counter's
+// committed value before this tx — a pure function of prior committed state, so
+// the ids are reproduced identically on every node and continue monotonically
+// across blocks AND across owner re-pin (the counter is committed VM state, not
+// owner-local memory — DESIGN §6.5).
+func (vm *VM) applyAllocate(tx *txs.AllocateTx, blockCtx BlockContext) error {
+	// Owner gate. Fail closed when the set is empty: with no validators nobody can
+	// be proven the owner (pinning.Owner returns false on an empty set), so we must
+	// refuse rather than silently treat the proposer as owner.
+	if len(blockCtx.Members) == 0 {
+		return errNoValidatorSet
+	}
+	rangeKey := []byte(tx.Range)
+	if !pinning.IsOwner(rangeKey, blockCtx.Proposer, blockCtx.Members) {
+		return errNonOwnerAllocate
+	}
+
+	base, err := vm.state.GetAlloc(tx.Range)
+	if err != nil {
+		return fmt.Errorf("allocate: read counter for range %q: %w", tx.Range, err)
+	}
+	next := base + uint64(tx.Count)
+	if next < base {
+		// uint64 wraparound — the range has exhausted its 2^64 id space. Refuse
+		// rather than reissue ids from 0 (which would violate uniqueness). In
+		// practice unreachable, but a silent wrap would be a correctness hole.
+		return fmt.Errorf("allocate: range %q counter overflow", tx.Range)
+	}
+	if err := vm.state.SetAlloc(tx.Range, next); err != nil {
+		return fmt.Errorf("allocate: stage counter for range %q: %w", tx.Range, err)
+	}
+	if !vm.log.IsZero() {
+		vm.log.Debug("S-Chain allocate", "range", tx.Range, "base", base, "count", tx.Count, "next", next)
+	}
+	return nil
 }
 
 // acceptBlock is the SINGLE COMMIT POINT. It snapshots the version layer's
