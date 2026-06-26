@@ -9,9 +9,9 @@ require (
 	github.com/holiman/uint256 v1.3.2
 	github.com/luxfi/accel v1.2.4
 	github.com/luxfi/ai v0.1.0
-	github.com/luxfi/consensus v1.25.21
+	github.com/luxfi/consensus v1.25.29
 	github.com/luxfi/constants v1.5.8
-	github.com/luxfi/crypto v1.19.22
+	github.com/luxfi/crypto v1.19.26
 	github.com/luxfi/database v1.20.4
 	github.com/luxfi/evm v1.99.39
 	github.com/luxfi/geth v1.17.12
@@ -144,6 +144,7 @@ require (
 	github.com/luxfi/container v0.0.4 // indirect
 	github.com/luxfi/corona v0.7.9 // indirect
 	github.com/luxfi/crypto/ipa v1.2.4 // indirect
+	github.com/luxfi/dex v1.5.20 // indirect
 	github.com/luxfi/fhe v1.8.2 // indirect
 	github.com/luxfi/filesystem v0.0.1 // indirect
 	github.com/luxfi/formatting v1.0.1 // indirect
@@ -166,7 +167,7 @@ require (
 	github.com/luxfi/pulsar v1.1.5 // indirect
 	github.com/luxfi/resource v0.0.1 // indirect
 	github.com/luxfi/sampler v1.1.0 // indirect
-	github.com/luxfi/staking v1.5.0 // indirect
+	github.com/luxfi/staking v1.5.1 // indirect
 	github.com/luxfi/tls v1.0.3 // indirect
 	github.com/luxfi/trace v1.1.0 // indirect
 	github.com/luxfi/upgrade v1.0.1 // indirect
@@ -210,6 +211,7 @@ require (
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/sagikazarmark/locafero v0.12.0 // indirect
 	github.com/shirou/gopsutil v3.21.11+incompatible // indirect
+	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/spf13/afero v1.15.0 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
