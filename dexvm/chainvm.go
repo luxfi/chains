@@ -69,11 +69,14 @@ type ChainVM struct {
 	// Initialization state
 	initialized bool
 
-	// Fee policy gating user-submitted tx admission. Set at Init time
-	// from init.Runtime.NetworkID. user-tx-accepting -> FlatPolicy at
-	// MinTxFeeFloor. Internal (consensus engine -> VM) paths bypass
-	// this gate; only SubmitTx consults it. See feegate.go.
+	// Fee policy gating user-submitted tx admission: the canonical FlatPolicy
+	// at MinTxFeeFloor denominated in canonical LUX (network-independent, so an
+	// L2/L3 still settles DEX fees to LUX). Internal (consensus engine -> VM)
+	// paths bypass this gate; only SubmitTx consults it. See feegate.go.
 	feePolicy fee.Policy
+	// networkID is this chain's primary-network identity (1 mainnet, 2 testnet,
+	// ...), recorded at Init. It no longer selects the fee asset — fees are LUX
+	// on every network — but is retained for diagnostics/identity.
 	networkID uint32
 }
 
@@ -98,14 +101,16 @@ func (cvm *ChainVM) Initialize(
 	// Store the message channel
 	cvm.toEngine = vmInit.ToEngine
 
-	// Pin fee policy from runtime networkID. D-Chain is user-tx-
-	// accepting so we attach the canonical FlatPolicy at MinTxFeeFloor;
-	// boot-time Validate (fee.Validate) refuses zero-fee user-facing
-	// chains before they ever accept a block.
+	// Attach the canonical D-Chain fee policy. D-Chain is user-tx-accepting
+	// so it charges a non-zero floor at MinTxFeeFloor; boot-time Validate
+	// (fee.Validate) refuses zero-fee user-facing chains before they ever
+	// accept a block. The policy denominates the fee in canonical LUX and is
+	// therefore network-INDEPENDENT — an L2/L3 with its own native currency
+	// still settles DEX fees to LUX. networkID is retained as chain identity.
 	if vmInit.Runtime != nil {
 		cvm.networkID = vmInit.Runtime.NetworkID
 	}
-	cvm.feePolicy = newFeePolicy(cvm.networkID)
+	cvm.feePolicy = newFeePolicy()
 	if err := fee.Validate(cvm.feePolicy); err != nil {
 		return fmt.Errorf("dexvm: fee policy: %w", err)
 	}
