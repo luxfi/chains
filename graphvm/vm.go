@@ -70,8 +70,13 @@ type VM struct {
 	toEngine  chan<- vmcore.Message
 	appSender warp.Sender
 
-	// State
-	preferredID ids.ID
+	// State. The G-Chain is read-only and never advances past genesis, so
+	// genesisBlock is permanently the last-accepted block. lastAcceptedID is
+	// what LastAccepted() returns and what the engine resolves via GetBlock at
+	// initialization; preferredID tracks SetPreference separately.
+	genesisBlock   *Block
+	lastAcceptedID ids.ID
+	preferredID    ids.ID
 
 	// Graph-specific fields
 	schemas       map[string]*GraphSchema
@@ -187,9 +192,25 @@ func (vm *VM) Initialize(
 		}
 	}
 
+	// Build the deterministic genesis block and pin it as the last-accepted
+	// block. The G-Chain is a read-only query/index VM that never advances
+	// past genesis, but the consensus engine still REQUIRES a resolvable
+	// last-accepted block at boot: the ZAP VM server calls LastAccepted() then
+	// GetBlock(lastAccepted) inside Initialize, and a miss there is the
+	// "get last accepted block: not implemented" failure that fails the node's
+	// G-Chain health check on lux-mainnet.
+	genesisBlock, err := newGenesisBlock(vm, vmInit.Genesis)
+	if err != nil {
+		return fmt.Errorf("failed to build genesis block: %w", err)
+	}
+	vm.genesisBlock = genesisBlock
+	vm.lastAcceptedID = genesisBlock.ID()
+	vm.preferredID = genesisBlock.ID()
+
 	if logger, ok := vm.rt.Log.(log.Logger); ok {
 		logger.Info("initialized Graph VM",
 			log.Reflect("version", Version),
+			log.String("genesisBlockID", vm.lastAcceptedID.String()),
 		)
 	}
 
@@ -321,14 +342,26 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	return nil, errNotImplemented
 }
 
-// ParseBlock implements the chain.ChainVM interface
+// ParseBlock implements the chain.ChainVM interface. It decodes the canonical
+// block encoding produced by Block.Bytes(), recomputing the content-addressed
+// ID so a re-parsed block is byte- and ID-identical to the original.
 func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (chain.Block, error) {
-	return nil, errNotImplemented
+	blk, err := parseBlock(vm, blockBytes)
+	if err != nil {
+		return nil, err
+	}
+	return blk, nil
 }
 
-// GetBlock implements the chain.ChainVM interface
+// GetBlock implements the chain.ChainVM interface. The G-Chain has exactly one
+// block — genesis — which is permanently the accepted frontier; any other ID is
+// unknown. Returning database.ErrNotFound (not errNotImplemented) lets the ZAP
+// VM server map a genuine miss to the wire NotFound code.
 func (vm *VM) GetBlock(ctx context.Context, blkID ids.ID) (chain.Block, error) {
-	return nil, errNotImplemented
+	if vm.genesisBlock != nil && blkID == vm.genesisBlock.ID() {
+		return vm.genesisBlock, nil
+	}
+	return nil, database.ErrNotFound
 }
 
 // SetPreference implements the chain.ChainVM interface
@@ -337,13 +370,17 @@ func (vm *VM) SetPreference(ctx context.Context, blkID ids.ID) error {
 	return nil
 }
 
-// LastAccepted implements the chain.ChainVM interface
+// LastAccepted implements the chain.ChainVM interface.
 func (vm *VM) LastAccepted(context.Context) (ids.ID, error) {
-	return vm.preferredID, nil
+	return vm.lastAcceptedID, nil
 }
 
-// GetBlockIDAtHeight implements the chain.ChainVM interface
+// GetBlockIDAtHeight implements the chain.ChainVM interface. Genesis (height 0)
+// is the only block; every other height is absent.
 func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
+	if height == 0 && vm.genesisBlock != nil {
+		return vm.genesisBlock.ID(), nil
+	}
 	return ids.Empty, database.ErrNotFound
 }
 
