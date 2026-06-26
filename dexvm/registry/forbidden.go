@@ -30,6 +30,31 @@ var mockLiquidityTokens = []string{
 	"dnative",
 }
 
+// forbiddenUniverseLabels name OFF-NETWORK white-label universes a Lux-native DEX must
+// never carry assets from. A source chain that labels itself a "Liquidity" / "Liquid"
+// (Liquid EVM / Liquid DEX white-label) universe — or the upstream "satschel" lineage —
+// is refused at STARTUP, even when the token itself is real on-chain: the DEX serves the
+// Lux primary network and its L1s/L2s, never a foreign branded universe. This is the
+// negative half of the never-mix-Liquidity boundary (the positive ChainVerifier gate
+// proves real on-chain existence; this refuses a forbidden BRAND regardless).
+var forbiddenUniverseLabels = []string{
+	"liquid",   // catches "Liquid EVM" / "Liquid DEX" / "Liquidity" (all contain "liquid")
+	"satschel", // upstream poison-lineage org
+}
+
+// IsForbiddenUniverseLabel reports whether a chain's human label names a forbidden
+// off-network white-label universe. Case-insensitive substring match — no Lux/Hanzo/Zoo
+// chain label contains these tokens, so the match is precise to the forbidden brands.
+func IsForbiddenUniverseLabel(label string) bool {
+	l := strings.ToLower(label)
+	for _, t := range forbiddenUniverseLabels {
+		if strings.Contains(l, t) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsMockLiquidityRef reports whether a label names mock/synthetic/phantom liquidity.
 // Case-insensitive.
 func IsMockLiquidityRef(label string) bool {
@@ -94,11 +119,15 @@ func isUpperTickerish(s string) bool {
 }
 
 // AssertNoForbiddenAssetRefs is the per-asset deny-gate: it refuses an asset whose
-// symbol or name names mock/synthetic liquidity or is an ASCII-ticker id. Off-network
-// universes are rejected by the positive gate (ChainVerifier) on real on-chain
-// existence, not by name here; chainLabel is retained for that gate's call shape.
+// SOURCE CHAIN is labeled a forbidden off-network white-label universe (Liquid/Liquidity/
+// satschel), or whose symbol/name names mock/synthetic liquidity, or whose symbol is an
+// ASCII-ticker id. The chain-label scan is the negative half of the never-mix-Liquidity
+// boundary — a branded universe is refused BY NAME even when the token is real on-chain
+// (the positive ChainVerifier gate proves existence; it does not police brand).
 func AssertNoForbiddenAssetRefs(a Asset, chainLabel string) error {
-	_ = chainLabel
+	if IsForbiddenUniverseLabel(chainLabel) {
+		return fmt.Errorf("registry: asset source chain %q is a forbidden off-network white-label universe", chainLabel)
+	}
 	if IsMockLiquidityRef(a.Symbol) || IsMockLiquidityRef(a.Name) {
 		return fmt.Errorf("registry: asset symbol/name names mock/synthetic/phantom liquidity")
 	}
