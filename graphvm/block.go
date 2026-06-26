@@ -5,13 +5,22 @@ package graphvm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
 	"github.com/luxfi/consensus/core/choices"
-	"github.com/luxfi/ids"
+	"github.com/luxfi/consensus/engine/chain/block"
 	"github.com/luxfi/crypto/hash"
+	"github.com/luxfi/ids"
 )
+
+// The consensus engine requires every ChainVM to resolve a real last-accepted
+// block at boot (LastAccepted -> GetBlock). This assertion guarantees *Block
+// satisfies block.Block; it is what catches the Status() signature mismatch
+// (the interface needs a concrete uint8, not the named choices.Status) at
+// compile time so GetBlock can actually return a *Block.
+var _ block.Block = (*Block)(nil)
 
 var (
 	errInvalidBlock = errors.New("invalid block")
@@ -126,6 +135,7 @@ func (b *Block) Accept(context.Context) error {
 	}
 
 	// Update last accepted
+	b.vm.lastAcceptedID = b.id
 	b.vm.preferredID = b.id
 
 	return nil
@@ -137,9 +147,12 @@ func (b *Block) Reject(context.Context) error {
 	return nil
 }
 
-// Status implements the chain.Block interface
-func (b *Block) Status() choices.Status {
-	return b.status
+// Status implements the block.Block interface. The interface requires a
+// concrete uint8; choices.Status is `type Status uint8`, so a method returning
+// the named type would NOT satisfy block.Block — which is why GetBlock could
+// never have returned a *Block before this fix.
+func (b *Block) Status() uint8 {
+	return uint8(b.status)
 }
 
 // Parent implements the chain.Block interface
@@ -184,10 +197,74 @@ func (b *Block) Verify(ctx context.Context) error {
 	return nil
 }
 
-// Bytes implements the chain.Block interface
+// Bytes implements the block.Block interface. It returns the deterministic
+// canonical encoding set at construction; the block ID is the SHA-256 of
+// exactly these bytes, so ParseBlock(b.Bytes()).ID() == b.ID().
 func (b *Block) Bytes() []byte {
-	if b.bytes == nil {
-		b.bytes = hash.ComputeHash256([]byte(b.id.String()))
-	}
 	return b.bytes
+}
+
+// genesisTimestamp is the deterministic timestamp of the G-Chain genesis block.
+// Genesis is the root of trust (accepted by definition), so a fixed,
+// node-independent value is used — never time.Now(), which would make the
+// genesis block ID diverge across validators and break consensus agreement.
+var genesisTimestamp = time.Unix(0, 0).UTC()
+
+// blockWire is the deterministic on-wire encoding of a G-Chain block. The block
+// ID is hash.ComputeHash256 of these bytes, so marshal/parse round-trips a
+// byte-identical ID across nodes and restarts.
+type blockWire struct {
+	ParentID  ids.ID `json:"parentID"`
+	Height    uint64 `json:"height"`
+	Timestamp int64  `json:"timestamp"`
+	Payload   []byte `json:"payload,omitempty"`
+}
+
+// newGenesisBlock builds the G-Chain genesis block (height 0) deterministically
+// from the genesis config bytes. The G-Chain is a read-only query/index chain —
+// it never builds blocks past genesis — so this is its permanent last-accepted
+// block, the one GetBlock(LastAccepted()) must return during Initialize.
+func newGenesisBlock(vm *VM, genesisBytes []byte) (*Block, error) {
+	return newBlock(vm, ids.Empty, 0, genesisTimestamp, genesisBytes)
+}
+
+// newBlock constructs a block, computes its canonical bytes and content-
+// addressed ID, and returns it ready to serve.
+func newBlock(vm *VM, parentID ids.ID, height uint64, timestamp time.Time, payload []byte) (*Block, error) {
+	raw, err := json.Marshal(blockWire{
+		ParentID:  parentID,
+		Height:    height,
+		Timestamp: timestamp.Unix(),
+		Payload:   payload,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Block{
+		vm:        vm,
+		id:        ids.ID(hash.ComputeHash256(raw)),
+		parentID:  parentID,
+		height:    height,
+		timestamp: timestamp,
+		status:    choices.Accepted,
+		bytes:     raw,
+	}, nil
+}
+
+// parseBlock decodes the canonical wire bytes produced by newBlock back into a
+// Block whose ID is recomputed from those exact bytes.
+func parseBlock(vm *VM, raw []byte) (*Block, error) {
+	var wire blockWire
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return nil, err
+	}
+	return &Block{
+		vm:        vm,
+		id:        ids.ID(hash.ComputeHash256(raw)),
+		parentID:  wire.ParentID,
+		height:    wire.Height,
+		timestamp: time.Unix(wire.Timestamp, 0).UTC(),
+		status:    choices.Accepted,
+		bytes:     raw,
+	}, nil
 }
