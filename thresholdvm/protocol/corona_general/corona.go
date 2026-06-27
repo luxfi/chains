@@ -2,7 +2,7 @@
 // See the file LICENSE for licensing terms.
 
 // Package corona_general declares the M-Chain general-purpose
-// Corona (Ring-LWE) threshold protocol surface.
+// Corona (Module-LWE) threshold protocol surface.
 //
 // This is **not** consensus-Corona. Consensus uses Corona at
 // fixed parameters as the post-quantum cert lane (Q-Chain runs that
