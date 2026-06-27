@@ -1,10 +1,9 @@
-// Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
+// Copyright (C) 2019-2026, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package keyvm
 
 import (
-	"github.com/luxfi/accel"
 	"github.com/luxfi/chains/keyvm/config"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
@@ -13,49 +12,32 @@ import (
 
 var _ vms.Factory = (*Factory)(nil)
 
-// VMID is the unique identifier for KeyVM (K-Chain)
+// VMID is the K-Chain VM identifier (matches constants.KeyVMID).
 var VMID = ids.ID{'k', 'e', 'y', 'v', 'm'}
 
-// Factory implements vms.Factory interface for creating K-Chain VM instances.
+// Factory builds K-Chain VM instances. Unlike the prior design it allocates no
+// GPU/accel session: an auth-only VM performs no key generation or batch
+// cryptography on its hot path, so there is nothing to accelerate and one fewer
+// failure mode / native dependency.
 type Factory struct {
 	config.Config
 }
 
-// New creates a new K-Chain VM instance.
-// Allocates a per-VM GPU session at PriorityHigh because key management
-// is on the hot path for cross-chain operations.
+// New constructs a VM. It is dependency-free (like the Q/Z core factories), so
+// it can be registered either as a plugin (cmd/plugin) or, once the hardened
+// chains module is the one the node pins, in-process.
 func (f *Factory) New(logger log.Logger) (interface{}, error) {
-	// Set default configuration if not provided
 	if f.Config.ListenPort == 0 {
 		f.Config = config.DefaultConfig()
 	}
-
-	// Validate configuration
 	if err := f.Config.Validate(); err != nil {
 		return nil, err
 	}
-
-	sess, err := accel.NewVMSession("keyvm", accel.WithPriority(accel.PriorityHigh))
-	if err != nil {
-		return nil, err
-	}
-
-	// Create and return new K-Chain VM instance
-	vm := &VM{
-		Config: f.Config,
-		log:    logger,
-		accel:  sess,
-	}
-
-	return vm, nil
+	return &VM{Config: f.Config, log: logger}, nil
 }
 
-// NewFactory creates a new K-Chain VM factory with the given configuration.
-func NewFactory(cfg config.Config) *Factory {
-	return &Factory{Config: cfg}
-}
+// NewFactory builds a factory with the given configuration.
+func NewFactory(cfg config.Config) *Factory { return &Factory{Config: cfg} }
 
-// NewDefaultFactory creates a new K-Chain VM factory with default configuration.
-func NewDefaultFactory() *Factory {
-	return &Factory{Config: config.DefaultConfig()}
-}
+// NewDefaultFactory builds a factory with default configuration.
+func NewDefaultFactory() *Factory { return &Factory{Config: config.DefaultConfig()} }

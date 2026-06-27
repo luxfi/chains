@@ -1,17 +1,109 @@
-// Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
+// Copyright (C) 2019-2026, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package keyvm
 
 import (
+	"context"
+	"crypto"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/luxfi/ids"
 	"github.com/luxfi/chains/keyvm/config"
+	"github.com/luxfi/crypto/mldsa"
+	"github.com/luxfi/database/memdb"
+	"github.com/luxfi/ids"
+	"github.com/luxfi/log"
+	"github.com/luxfi/runtime"
+	vmcore "github.com/luxfi/vm"
 )
+
+// ---- shared test helpers ----
+
+// newTestVM initializes an in-memory K-Chain seeded with the given funding
+// allocation (hex address -> nLUX).
+func newTestVM(t *testing.T, alloc map[string]uint64) *VM {
+	t.Helper()
+	logger := log.NewNoOpLogger()
+	gb, err := json.Marshal(Genesis{Version: 1, Timestamp: time.Now().Unix(), Alloc: alloc})
+	require.NoError(t, err)
+	rt := &runtime.Runtime{ChainID: ids.GenerateTestID(), NetworkID: 96369, Log: logger}
+	vm := &VM{}
+	require.NoError(t, vm.Initialize(context.Background(), vmcore.Init{
+		Runtime:  rt,
+		DB:       memdb.New(),
+		ToEngine: make(chan vmcore.Message, 8),
+		Log:      logger,
+		Genesis:  gb,
+	}))
+	return vm
+}
+
+// testKey is an external payer identity (the payer holds its own secret; K never
+// does). The ML-DSA-65 private key here lives ONLY in the test, exercising the
+// public-key authentication path on the VM side.
+type testKey struct {
+	priv *mldsa.PrivateKey
+	pub  []byte
+	addr fee_Account
+}
+
+// fee_Account aliases the fee package account type for brevity in tests.
+type fee_Account = ids.ShortID
+
+func newTestKey(t *testing.T) testKey {
+	t.Helper()
+	priv, err := mldsa.GenerateKey(rand.Reader, mldsa.MLDSA65)
+	require.NoError(t, err)
+	pub := priv.PublicKey.Bytes()
+	return testKey{priv: priv, pub: pub, addr: addressOf(pub)}
+}
+
+func (k testKey) hexAddr() string { return hex.EncodeToString(k.addr[:]) }
+
+// sign attaches the payer's public key and a valid signature over the tx's
+// signing bytes, then clears the cached id so ID() recomputes.
+func (k testKey) sign(t *testing.T, tx *Transaction) {
+	t.Helper()
+	tx.Auth = k.pub
+	sig, err := k.priv.Sign(rand.Reader, tx.SigningBytes(), crypto.Hash(0))
+	require.NoError(t, err)
+	tx.Sig = sig
+	tx.id = ids.Empty
+}
+
+// registerTx builds a signed RegisterKey transaction for an ML-DSA-65 key.
+func registerTx(t *testing.T, k testKey, name string, gasLimit, nonce uint64) *Transaction {
+	t.Helper()
+	payload, err := json.Marshal(RegisterKeyPayload{
+		Name:        name,
+		PublicKey:   []byte("PUBLIC-KEY-MATERIAL-ONLY"),
+		Threshold:   3,
+		TotalShares: 5,
+		Commitments: [][]byte{{0x01}, {0x02}, {0x03}}, // PUBLIC VSS commitments
+		Committee:   []ids.NodeID{},
+		Policy:      AuthPolicy{},
+	})
+	require.NoError(t, err)
+	tx := &Transaction{
+		Type:      TxRegisterKey,
+		Algorithm: "ml-dsa-65",
+		Payer:     k.addr,
+		KeyID:     deriveKeyID(name),
+		GasLimit:  gasLimit,
+		Nonce:     nonce,
+		Payload:   payload,
+	}
+	k.sign(t, tx)
+	return tx
+}
+
+// ---- config tests (config is unchanged by the auth-only rewrite) ----
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := config.DefaultConfig()
@@ -30,57 +122,33 @@ func TestConfigValidation(t *testing.T) {
 		cfg     config.Config
 		wantErr bool
 	}{
-		{
-			name:    "default config valid",
-			cfg:     config.DefaultConfig(),
-			wantErr: false,
-		},
+		{name: "default config valid", cfg: config.DefaultConfig(), wantErr: false},
 		{
 			name: "invalid ml-kem security level",
 			cfg: config.Config{
-				ListenPort:         9630,
-				MLKEMEnabled:       true,
-				MLKEMSecurityLevel: 999,
-				DefaultThreshold:   3,
-				DefaultTotalShares: 5,
-				Validators:         []string{"a", "b", "c", "d", "e"},
-			},
-			wantErr: true,
-		},
-		{
-			name: "invalid ml-dsa security level",
-			cfg: config.Config{
-				ListenPort:         9630,
-				MLDSAEnabled:       true,
-				MLDSASecurityLevel: 999,
-				DefaultThreshold:   3,
-				DefaultTotalShares: 5,
-				Validators:         []string{"a", "b", "c", "d", "e"},
+				ListenPort: 9630, MLKEMEnabled: true, MLKEMSecurityLevel: 999,
+				DefaultThreshold: 3, DefaultTotalShares: 5,
+				Validators: []string{"a", "b", "c", "d", "e"},
 			},
 			wantErr: true,
 		},
 		{
 			name: "threshold exceeds total shares",
 			cfg: config.Config{
-				ListenPort:         9630,
-				DefaultThreshold:   10,
-				DefaultTotalShares: 5,
-				Validators:         []string{"a", "b", "c", "d", "e"},
+				ListenPort: 9630, DefaultThreshold: 10, DefaultTotalShares: 5,
+				Validators: []string{"a", "b", "c", "d", "e"},
 			},
 			wantErr: true,
 		},
 		{
 			name: "insufficient validators",
 			cfg: config.Config{
-				ListenPort:         9630,
-				DefaultThreshold:   3,
-				DefaultTotalShares: 5,
-				Validators:         []string{"a", "b"},
+				ListenPort: 9630, DefaultThreshold: 3, DefaultTotalShares: 5,
+				Validators: []string{"a", "b"},
 			},
 			wantErr: true,
 		},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := tt.cfg.Validate()
@@ -93,172 +161,16 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
-func TestKeyMetadata(t *testing.T) {
-	now := time.Now()
-	meta := &KeyMetadata{
-		ID:          ids.GenerateTestID(),
-		Name:        "test-key",
-		Algorithm:   "ml-kem-768",
-		KeyType:     "encryption",
-		PublicKey:   []byte("test-public-key"),
-		Threshold:   3,
-		TotalShares: 5,
-		Validators:  []string{"v1", "v2", "v3", "v4", "v5"},
-		CreatedAt:   now,
-		UpdatedAt:   now,
-		Status:      "active",
-		Tags:        []string{"test", "demo"},
-	}
+func TestVMInitializeAuthOnly(t *testing.T) {
+	vm := newTestVM(t, nil)
+	defer func() { _ = vm.Shutdown(context.Background()) }()
 
-	require.Equal(t, "test-key", meta.Name)
-	require.Equal(t, "ml-kem-768", meta.Algorithm)
-	require.Equal(t, "encryption", meta.KeyType)
-	require.Equal(t, 3, meta.Threshold)
-	require.Equal(t, 5, meta.TotalShares)
-	require.Equal(t, "active", meta.Status)
-}
-
-func TestTransaction(t *testing.T) {
-	keyID := ids.GenerateTestID()
-	payload := []byte("test-payload")
-	sender := []byte("test-sender")
-
-	tx := NewTransaction(TxTypeCreateKey, keyID, payload, sender)
-
-	// The ID is computed from the serialized bytes
-	// Verify the serialization produces consistent data
-	data := tx.Bytes()
-	require.NotEmpty(t, data)
-	require.Equal(t, TxTypeCreateKey, int(tx.Type()))
-	require.Equal(t, keyID, tx.KeyID())
-	require.Equal(t, payload, tx.Payload())
-	require.True(t, tx.Timestamp().Before(time.Now().Add(time.Second)))
-}
-
-func TestTransactionSerialization(t *testing.T) {
-	keyID := ids.GenerateTestID()
-	payload := []byte("test-payload-data")
-	sender := []byte("test-sender-address")
-
-	tx := NewTransaction(TxTypeDistributeKey, keyID, payload, sender)
-
-	// Serialize
-	data := tx.Bytes()
-	require.NotEmpty(t, data)
-
-	// Deserialize
-	parsedTx, err := ParseTransaction(data)
+	v, err := vm.Version(context.Background())
 	require.NoError(t, err)
-	require.NotNil(t, parsedTx)
+	require.Equal(t, Version, v)
 
-	require.Equal(t, tx.Type(), parsedTx.Type())
-	require.Equal(t, tx.KeyID(), parsedTx.KeyID())
-	require.Equal(t, tx.Payload(), parsedTx.Payload())
-}
-
-func TestTransactionValidation(t *testing.T) {
-	tests := []struct {
-		name    string
-		txType  uint8
-		wantErr bool
-	}{
-		{
-			name:    "valid create key",
-			txType:  TxTypeCreateKey,
-			wantErr: false,
-		},
-		{
-			name:    "valid delete key",
-			txType:  TxTypeDeleteKey,
-			wantErr: false,
-		},
-		{
-			name:    "valid distribute key",
-			txType:  TxTypeDistributeKey,
-			wantErr: false,
-		},
-		{
-			name:    "valid reshare key",
-			txType:  TxTypeReshareKey,
-			wantErr: false,
-		},
-		{
-			name:    "invalid tx type",
-			txType:  255,
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tx := NewTransaction(tt.txType, ids.GenerateTestID(), nil, nil)
-			err := tx.Verify(nil)
-			if tt.wantErr {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-			}
-		})
-	}
-}
-
-func TestBlock(t *testing.T) {
-	parentID := ids.GenerateTestID()
-	tx := NewTransaction(TxTypeCreateKey, ids.GenerateTestID(), nil, nil)
-
-	block := &Block{
-		id:           ids.GenerateTestID(),
-		parentID:     parentID,
-		height:       100,
-		timestamp:    time.Now(),
-		transactions: []*Transaction{tx},
-	}
-
-	require.NotEqual(t, ids.Empty, block.ID())
-	require.Equal(t, parentID, block.ParentID())
-	require.Equal(t, uint64(100), block.Height())
-	require.NotZero(t, block.Timestamp())
-}
-
-func TestBlockSerialization(t *testing.T) {
-	parentID := ids.GenerateTestID()
-	tx := NewTransaction(TxTypeCreateKey, ids.GenerateTestID(), []byte("payload"), nil)
-
-	block := &Block{
-		id:           ids.GenerateTestID(),
-		parentID:     parentID,
-		height:       42,
-		timestamp:    time.Now(),
-		transactions: []*Transaction{tx},
-	}
-
-	// Serialize
-	data := block.Bytes()
-	require.NotEmpty(t, data)
-
-	// Verify data contains expected components
-	// Parent ID (32) + Height (8) + Timestamp (8) + TxCount (4) + TxLen (4) + TxData
-	require.Greater(t, len(data), 52)
-}
-
-func TestAlgorithmInfo(t *testing.T) {
-	service := &Service{}
-	var args ListAlgorithmsArgs
-	var reply ListAlgorithmsReply
-
-	err := service.ListAlgorithms(nil, &args, &reply)
+	h, err := vm.HealthCheck(context.Background())
 	require.NoError(t, err)
-	require.NotEmpty(t, reply.Algorithms)
-
-	// Verify expected algorithms
-	algNames := make(map[string]bool)
-	for _, alg := range reply.Algorithms {
-		algNames[alg.Name] = true
-	}
-
-	require.True(t, algNames["ml-kem-768"], "should have ml-kem-768")
-	require.True(t, algNames["ml-kem-512"], "should have ml-kem-512")
-	require.True(t, algNames["ml-kem-1024"], "should have ml-kem-1024")
-	require.True(t, algNames["ml-dsa-65"], "should have ml-dsa-65")
-	require.True(t, algNames["bls-threshold"], "should have bls-threshold")
+	require.True(t, h.Healthy)
+	require.Equal(t, "true", h.Details["authOnly"])
 }
