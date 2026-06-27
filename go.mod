@@ -9,7 +9,7 @@ require (
 	github.com/holiman/uint256 v1.3.2
 	github.com/luxfi/accel v1.2.4
 	github.com/luxfi/ai v0.1.0
-	github.com/luxfi/consensus v1.25.29
+	github.com/luxfi/consensus v1.25.35
 	github.com/luxfi/constants v1.5.8
 	github.com/luxfi/crypto v1.19.26
 	github.com/luxfi/database v1.20.4
