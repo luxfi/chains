@@ -1,40 +1,32 @@
-// Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
+// Copyright (C) 2019-2026, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package keyvm
 
 import (
-	"fmt"
-
 	"github.com/luxfi/constants"
-	"github.com/luxfi/node/vms/types/fee"
+	nodefee "github.com/luxfi/node/vms/types/fee"
 )
 
-// newFeePolicy returns the canonical K-Chain FeePolicy. K-Chain accepts
-// user-submitted mutating RPCs (CreateKey, DeleteKey, Encrypt) that
-// produce on-chain effects, so it MUST charge a non-zero floor; see
-// vms/types/fee/policy.go.
-func newFeePolicy(networkID uint32) fee.Policy {
-	return fee.FlatPolicy{
-		Fee:     fee.MinTxFeeFloor,
+// newFeePolicy returns the K-Chain ADMISSION policy: a non-zero floor so the
+// chain Manager's boot-time fee.Validate never flags K as a zero-fee
+// user-facing chain (see node/vms/types/fee/policy.go).
+//
+// This is ORTHOGONAL to SETTLEMENT. Admission (here) is a static declaration
+// "this chain charges at least the floor"; settlement (github.com/luxfi/chains/
+// fee, driven in block Accept) performs the actual per-operation debit + burn,
+// priced by the per-algorithm gas schedule (gas.go). The floor declared here
+// equals MinScheduledFee()'s lower bound, so the two surfaces agree — proven in
+// gas_test.go. The old per-RPC "fee is a uint64 the caller writes into the JSON
+// request" gate is GONE: a fee is never an unbacked integer, it is gas metered
+// and burned from the payer's on-chain balance inside consensus.
+func newFeePolicy(networkID uint32) nodefee.Policy {
+	return nodefee.FlatPolicy{
+		Fee:     nodefee.MinTxFeeFloor,
 		AssetID: constants.UTXOAssetIDFor(networkID),
 	}
 }
 
-// gateUserFee refuses paidFee < MinTxFeeFloor. Called from each
-// mutating service RPC (CreateKey, DeleteKey, Encrypt) before the
-// state-modifying VM method runs.
-//
-// Read-only RPCs (ListKeys, GetKey*) are not gated — they consume no
-// chain state and produce no on-chain effects.
-func (vm *VM) gateUserFee(paidFee uint64) error {
-	if vm.feePolicy == nil {
-		return fmt.Errorf("keyvm: fee policy not initialized")
-	}
-	asset := constants.UTXOAssetIDFor(vm.networkID)
-	return vm.feePolicy.ValidateFee(paidFee, asset)
-}
-
-// FeePolicy exposes the chain's declared fee policy for diagnostics
-// and the boot-time Validate gate.
-func (vm *VM) FeePolicy() fee.Policy { return vm.feePolicy }
+// FeePolicy exposes the chain's declared admission policy for diagnostics and
+// the boot-time Validate gate.
+func (vm *VM) FeePolicy() nodefee.Policy { return vm.feePolicy }

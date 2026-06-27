@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
+// Copyright (C) 2019-2026, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package keyvm
@@ -6,508 +6,302 @@ package keyvm
 import (
 	"context"
 	"encoding/base64"
-	"net"
+	"encoding/hex"
 	"net/http"
-	"sync"
-	"time"
+	"strings"
 
+	"github.com/luxfi/chains/fee"
 	"github.com/luxfi/ids"
 )
 
-// Service provides JSON-RPC endpoints for the K-Chain VM.
+// Service is the K-Chain JSON-RPC surface. Mutating operations are submitted as
+// CLIENT-SIGNED transactions (the client holds its own key; K never does) and
+// take effect only through fee-settled consensus blocks. Everything else is a
+// read-only query of PUBLIC state. There is no synchronous key creation, no
+// encryption endpoint, and no "fee" integer in any request — the prior design's
+// secret-bearing, fee-as-JSON-integer surface is gone.
 type Service struct {
 	vm *VM
 }
 
-// ======== Key Management API ========
+// ---- Mutating: submit a signed transaction ----
 
-// ListKeysArgs contains arguments for ListKeys.
+// SubmitTransactionArgs carries a hex-encoded, client-signed transaction
+// (Transaction.Bytes()). The client builds and signs it offline with its own
+// ML-DSA-65 key; K only verifies the signature and settles the fee.
+type SubmitTransactionArgs struct {
+	Tx string `json:"tx"`
+}
+
+// SubmitTransactionReply returns the accepted transaction's ID. The fee is
+// settled when the transaction's block is accepted, not here.
+type SubmitTransactionReply struct {
+	TxID string `json:"txId"`
+}
+
+// SubmitTransaction parses, authenticates, admission-checks, and enqueues a
+// signed transaction.
+func (s *Service) SubmitTransaction(r *http.Request, args *SubmitTransactionArgs, reply *SubmitTransactionReply) error {
+	raw, err := hex.DecodeString(strings.TrimPrefix(args.Tx, "0x"))
+	if err != nil {
+		return err
+	}
+	tx, err := ParseTransaction(raw)
+	if err != nil {
+		return err
+	}
+	id, err := s.vm.SubmitTx(tx)
+	if err != nil {
+		return err
+	}
+	reply.TxID = id.String()
+	return nil
+}
+
+// ---- Read-only queries (PUBLIC state only) ----
+
+// KeyView is the PUBLIC JSON view of a key record. It exposes the public key and
+// commitments; there is no field for a private key or share because none exists.
+type KeyView struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Algorithm   string   `json:"algorithm"`
+	PublicKey   string   `json:"publicKey"` // base64
+	Threshold   uint32   `json:"threshold"`
+	TotalShares uint32   `json:"totalShares"`
+	Commitments []string `json:"commitments"` // base64 public VSS commitments
+	Committee   []string `json:"committee"`
+	Owner       string   `json:"owner"`
+	Status      string   `json:"status"`
+	CreatedAt   int64    `json:"createdAt"`
+	UpdatedAt   int64    `json:"updatedAt"`
+}
+
+func toKeyView(r *KeyRecord) KeyView {
+	commits := make([]string, len(r.Commitments))
+	for i, c := range r.Commitments {
+		commits[i] = base64.StdEncoding.EncodeToString(c)
+	}
+	committee := make([]string, len(r.Committee))
+	for i, n := range r.Committee {
+		committee[i] = n.String()
+	}
+	return KeyView{
+		ID:          r.ID.String(),
+		Name:        r.Name,
+		Algorithm:   r.Algorithm,
+		PublicKey:   base64.StdEncoding.EncodeToString(r.PublicKey),
+		Threshold:   r.Threshold,
+		TotalShares: r.TotalShares,
+		Commitments: commits,
+		Committee:   committee,
+		Owner:       r.Owner.String(),
+		Status:      r.Status,
+		CreatedAt:   r.CreatedAt,
+		UpdatedAt:   r.UpdatedAt,
+	}
+}
+
+// GetKeyArgs selects a key by ID or Name (ID takes precedence).
+type GetKeyArgs struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// GetKeyReply returns the public key view.
+type GetKeyReply struct {
+	Key KeyView `json:"key"`
+}
+
+// GetKey returns a key record by ID or name.
+func (s *Service) GetKey(r *http.Request, args *GetKeyArgs, reply *GetKeyReply) error {
+	var rec *KeyRecord
+	var ok bool
+	if args.ID != "" {
+		id, err := ids.FromString(args.ID)
+		if err != nil {
+			return err
+		}
+		rec, ok = s.vm.KeyByID(id)
+	} else {
+		rec, ok = s.vm.KeyByName(args.Name)
+	}
+	if !ok {
+		return ErrKeyNotFound
+	}
+	reply.Key = toKeyView(rec)
+	return nil
+}
+
+// ListKeysArgs filters the key listing.
 type ListKeysArgs struct {
-	Offset    int    `json:"offset"`
-	Limit     int    `json:"limit"`
 	Algorithm string `json:"algorithm"`
 	Status    string `json:"status"`
 }
 
-// ListKeysReply contains the response for ListKeys.
+// ListKeysReply returns matching key views.
 type ListKeysReply struct {
-	Keys  []KeyMetadataReply `json:"keys"`
-	Total int                `json:"total"`
+	Keys  []KeyView `json:"keys"`
+	Total int       `json:"total"`
 }
 
-// KeyMetadataReply is the JSON representation of KeyMetadata.
-type KeyMetadataReply struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	Algorithm   string   `json:"algorithm"`
-	KeyType     string   `json:"keyType"`
-	PublicKey   string   `json:"publicKey"`
-	Threshold   int      `json:"threshold"`
-	TotalShares int      `json:"totalShares"`
-	CreatedAt   string   `json:"createdAt"`
-	UpdatedAt   string   `json:"updatedAt"`
-	Status      string   `json:"status"`
-	Tags        []string `json:"tags"`
-}
-
-// ListKeys lists all keys.
+// ListKeys lists keys, optionally filtered by algorithm and status.
 func (s *Service) ListKeys(r *http.Request, args *ListKeysArgs, reply *ListKeysReply) error {
-	keys, err := s.vm.ListKeys(r.Context())
-	if err != nil {
-		return err
-	}
-
-	reply.Keys = make([]KeyMetadataReply, 0, len(keys))
-	for _, meta := range keys {
-		// Apply filters
-		if args.Algorithm != "" && meta.Algorithm != args.Algorithm {
+	for _, rec := range s.vm.Keys() {
+		if args.Algorithm != "" && rec.Algorithm != args.Algorithm {
 			continue
 		}
-		if args.Status != "" && meta.Status != args.Status {
+		if args.Status != "" && rec.Status != args.Status {
 			continue
 		}
-
-		reply.Keys = append(reply.Keys, KeyMetadataReply{
-			ID:          meta.ID.String(),
-			Name:        meta.Name,
-			Algorithm:   meta.Algorithm,
-			KeyType:     meta.KeyType,
-			PublicKey:   base64.StdEncoding.EncodeToString(meta.PublicKey),
-			Threshold:   meta.Threshold,
-			TotalShares: meta.TotalShares,
-			CreatedAt:   meta.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
-			UpdatedAt:   meta.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
-			Status:      meta.Status,
-			Tags:        meta.Tags,
-		})
+		reply.Keys = append(reply.Keys, toKeyView(rec))
 	}
-
-	// Apply pagination
-	start := args.Offset
-	if start > len(reply.Keys) {
-		start = len(reply.Keys)
-	}
-	end := start + args.Limit
-	if args.Limit == 0 || end > len(reply.Keys) {
-		end = len(reply.Keys)
-	}
-
 	reply.Total = len(reply.Keys)
-	reply.Keys = reply.Keys[start:end]
-
 	return nil
 }
 
-// GetKeyByIDArgs contains arguments for GetKeyByID.
-type GetKeyByIDArgs struct {
+// GetCeremonyArgs selects a ceremony by ID.
+type GetCeremonyArgs struct {
 	ID string `json:"id"`
 }
 
-// GetKeyByIDReply contains the response for GetKeyByID.
-type GetKeyByIDReply struct {
-	KeyMetadataReply
-}
-
-// GetKeyByID retrieves a key by ID.
-func (s *Service) GetKeyByID(r *http.Request, args *GetKeyByIDArgs, reply *GetKeyByIDReply) error {
-	keyID, err := ids.FromString(args.ID)
-	if err != nil {
-		return err
-	}
-
-	meta, err := s.vm.GetKey(r.Context(), keyID)
-	if err != nil {
-		return err
-	}
-
-	reply.ID = meta.ID.String()
-	reply.Name = meta.Name
-	reply.Algorithm = meta.Algorithm
-	reply.KeyType = meta.KeyType
-	reply.PublicKey = base64.StdEncoding.EncodeToString(meta.PublicKey)
-	reply.Threshold = meta.Threshold
-	reply.TotalShares = meta.TotalShares
-	reply.CreatedAt = meta.CreatedAt.Format("2006-01-02T15:04:05Z07:00")
-	reply.UpdatedAt = meta.UpdatedAt.Format("2006-01-02T15:04:05Z07:00")
-	reply.Status = meta.Status
-	reply.Tags = meta.Tags
-
-	return nil
-}
-
-// GetKeyByNameArgs contains arguments for GetKeyByName.
-type GetKeyByNameArgs struct {
-	Name string `json:"name"`
-}
-
-// GetKeyByNameReply contains the response for GetKeyByName.
-type GetKeyByNameReply struct {
-	KeyMetadataReply
-}
-
-// GetKeyByName retrieves a key by name.
-func (s *Service) GetKeyByName(r *http.Request, args *GetKeyByNameArgs, reply *GetKeyByNameReply) error {
-	meta, err := s.vm.GetKeyByName(r.Context(), args.Name)
-	if err != nil {
-		return err
-	}
-
-	reply.ID = meta.ID.String()
-	reply.Name = meta.Name
-	reply.Algorithm = meta.Algorithm
-	reply.KeyType = meta.KeyType
-	reply.PublicKey = base64.StdEncoding.EncodeToString(meta.PublicKey)
-	reply.Threshold = meta.Threshold
-	reply.TotalShares = meta.TotalShares
-	reply.CreatedAt = meta.CreatedAt.Format("2006-01-02T15:04:05Z07:00")
-	reply.UpdatedAt = meta.UpdatedAt.Format("2006-01-02T15:04:05Z07:00")
-	reply.Status = meta.Status
-	reply.Tags = meta.Tags
-
-	return nil
-}
-
-// CreateKeyArgs contains arguments for CreateKey.
-type CreateKeyArgs struct {
-	Name        string   `json:"name"`
-	Algorithm   string   `json:"algorithm"`
-	Threshold   int      `json:"threshold"`
-	TotalShares int      `json:"totalShares"`
-	Tags        []string `json:"tags"`
-	// Fee is the user-paid tx burn in nLUX. Must be >=
-	// fee.MinTxFeeFloor (1 mLUX). Refused at the fee gate before any
-	// key material is allocated.
-	Fee uint64 `json:"fee"`
-}
-
-// CreateKeyReply contains the response for CreateKey.
-type CreateKeyReply struct {
-	Key       KeyMetadataReply `json:"key"`
-	PublicKey string           `json:"publicKey"`
-	ShareIDs  []string         `json:"shareIds"`
-}
-
-// CreateKey creates a new distributed key.
-func (s *Service) CreateKey(r *http.Request, args *CreateKeyArgs, reply *CreateKeyReply) error {
-	// Fee gate: refuse zero-fee user requests before allocating key
-	// material or consuming MPC capacity. Consensus-internal callers
-	// bypass via VM.CreateKey direct.
-	if err := s.vm.gateUserFee(args.Fee); err != nil {
-		return err
-	}
-
-	// Use defaults if not specified
-	threshold := args.Threshold
-	if threshold == 0 {
-		threshold = s.vm.Config.DefaultThreshold
-	}
-	totalShares := args.TotalShares
-	if totalShares == 0 {
-		totalShares = s.vm.Config.DefaultTotalShares
-	}
-	algorithm := args.Algorithm
-	if algorithm == "" {
-		algorithm = "ml-kem-768"
-	}
-
-	meta, err := s.vm.CreateKey(r.Context(), args.Name, algorithm, threshold, totalShares)
-	if err != nil {
-		return err
-	}
-
-	reply.Key = KeyMetadataReply{
-		ID:          meta.ID.String(),
-		Name:        meta.Name,
-		Algorithm:   meta.Algorithm,
-		KeyType:     meta.KeyType,
-		Threshold:   meta.Threshold,
-		TotalShares: meta.TotalShares,
-		CreatedAt:   meta.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
-		UpdatedAt:   meta.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
-		Status:      meta.Status,
-		Tags:        meta.Tags,
-	}
-	reply.PublicKey = base64.StdEncoding.EncodeToString(meta.PublicKey)
-	reply.ShareIDs = []string{} // Shares are distributed separately
-
-	return nil
-}
-
-// DeleteKeyArgs contains arguments for DeleteKey.
-type DeleteKeyArgs struct {
-	ID    string `json:"id"`
-	Force bool   `json:"force"`
-	// Fee is the user-paid tx burn in nLUX; see CreateKeyArgs.
-	Fee uint64 `json:"fee"`
-}
-
-// DeleteKeyReply contains the response for DeleteKey.
-type DeleteKeyReply struct {
-	Success       bool     `json:"success"`
-	DeletedShares []string `json:"deletedShares"`
-}
-
-// DeleteKey deletes a key.
-func (s *Service) DeleteKey(r *http.Request, args *DeleteKeyArgs, reply *DeleteKeyReply) error {
-	if err := s.vm.gateUserFee(args.Fee); err != nil {
-		return err
-	}
-
-	keyID, err := ids.FromString(args.ID)
-	if err != nil {
-		return err
-	}
-
-	if err := s.vm.DeleteKey(r.Context(), keyID); err != nil {
-		return err
-	}
-
-	reply.Success = true
-	return nil
-}
-
-// ======== Cryptographic Operations ========
-
-// EncryptArgs contains arguments for Encrypt.
-type EncryptArgs struct {
+// CeremonyView is the PUBLIC view of a ceremony record.
+type CeremonyView struct {
+	ID        string `json:"id"`
 	KeyID     string `json:"keyId"`
-	Plaintext string `json:"plaintext"` // Base64-encoded
-	// Fee is the user-paid tx burn in nLUX; see CreateKeyArgs.
-	Fee uint64 `json:"fee"`
+	Type      string `json:"type"`
+	Requester string `json:"requester"`
+	Message   string `json:"message"` // base64 public digest
+	Result    string `json:"result"`  // base64 public result
+	Status    string `json:"status"`
+	CreatedAt int64  `json:"createdAt"`
 }
 
-// EncryptReply contains the response for Encrypt.
-type EncryptReply struct {
-	Ciphertext string `json:"ciphertext"` // Base64-encoded
-	Nonce      string `json:"nonce"`
-	Tag        string `json:"tag"`
+// GetCeremonyReply returns the ceremony view.
+type GetCeremonyReply struct {
+	Ceremony CeremonyView `json:"ceremony"`
 }
 
-// Encrypt encrypts data.
-func (s *Service) Encrypt(r *http.Request, args *EncryptArgs, reply *EncryptReply) error {
-	if err := s.vm.gateUserFee(args.Fee); err != nil {
-		return err
-	}
-
-	keyID, err := ids.FromString(args.KeyID)
+// GetCeremony returns an authorized/fulfilled ceremony record.
+func (s *Service) GetCeremony(r *http.Request, args *GetCeremonyArgs, reply *GetCeremonyReply) error {
+	id, err := ids.FromString(args.ID)
 	if err != nil {
 		return err
 	}
-
-	plaintext, err := base64.StdEncoding.DecodeString(args.Plaintext)
-	if err != nil {
-		return err
+	c, ok := s.vm.Ceremony(id)
+	if !ok {
+		return ErrInvalidCeremony
 	}
-
-	ciphertext, nonce, err := s.vm.Encrypt(r.Context(), keyID, plaintext)
-	if err != nil {
-		return err
+	reply.Ceremony = CeremonyView{
+		ID:        c.ID.String(),
+		KeyID:     c.KeyID.String(),
+		Type:      c.Type,
+		Requester: c.Requester.String(),
+		Message:   base64.StdEncoding.EncodeToString(c.Message),
+		Result:    base64.StdEncoding.EncodeToString(c.Result),
+		Status:    c.Status,
+		CreatedAt: c.CreatedAt,
 	}
-
-	reply.Ciphertext = base64.StdEncoding.EncodeToString(ciphertext)
-	reply.Nonce = base64.StdEncoding.EncodeToString(nonce)
-
 	return nil
 }
 
-// ======== Health Check ========
+// BalanceArgs selects an account by hex address.
+type BalanceArgs struct {
+	Address string `json:"address"`
+}
 
-// HealthArgs contains arguments for Health.
+// BalanceReply returns the account balance and total burned supply, both nLUX.
+type BalanceReply struct {
+	BalanceNLUX uint64 `json:"balanceNLux"`
+	BurnedNLUX  uint64 `json:"burnedNLux"`
+}
+
+// Balance returns an account's spendable balance and the chain's burned supply.
+func (s *Service) Balance(r *http.Request, args *BalanceArgs, reply *BalanceReply) error {
+	acct, err := accountFromHex(args.Address)
+	if err != nil {
+		return err
+	}
+	bal, err := s.vm.Balance(acct)
+	if err != nil {
+		return err
+	}
+	burned, err := s.vm.Burned()
+	if err != nil {
+		return err
+	}
+	reply.BalanceNLUX = bal
+	reply.BurnedNLUX = burned
+	return nil
+}
+
+// ---- Diagnostics ----
+
+// HealthArgs is empty.
 type HealthArgs struct{}
 
-// HealthReply contains the response for Health.
+// HealthReply reports VM health.
 type HealthReply struct {
-	Healthy    bool             `json:"healthy"`
-	Version    string           `json:"version"`
-	Validators map[string]bool  `json:"validators"`
-	Latency    map[string]int64 `json:"latency"`
+	Healthy bool              `json:"healthy"`
+	Details map[string]string `json:"details"`
 }
 
-// Health checks service health.
+// Health reports VM health.
 func (s *Service) Health(r *http.Request, args *HealthArgs, reply *HealthReply) error {
-	health, err := s.vm.HealthCheck(context.Background())
+	res, err := s.vm.HealthCheck(context.Background())
 	if err != nil {
 		return err
 	}
-
-	reply.Healthy = health.Healthy
-	reply.Version = health.Details["version"]
-	reply.Validators = make(map[string]bool)
-	reply.Latency = make(map[string]int64)
-
-	// Check validator connectivity with TCP dial
-	// Only check validators that are in the configured allowlist
-	timeout := s.vm.Config.ValidatorTimeout
-	if timeout == 0 {
-		timeout = 5 * time.Second
-	}
-
-	// Limit concurrent health checks to prevent resource exhaustion
-	const maxConcurrent = 10
-	semaphore := make(chan struct{}, maxConcurrent)
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	for _, v := range s.vm.Config.Validators {
-		// Validate address format (host:port)
-		host, port, err := net.SplitHostPort(v)
-		if err != nil {
-			// Invalid format - skip this validator
-			mu.Lock()
-			reply.Validators[v] = false
-			reply.Latency[v] = -2 // Invalid format
-			mu.Unlock()
-			continue
-		}
-
-		// Basic validation: ensure host and port are not empty
-		if host == "" || port == "" {
-			mu.Lock()
-			reply.Validators[v] = false
-			reply.Latency[v] = -2
-			mu.Unlock()
-			continue
-		}
-
-		wg.Add(1)
-		go func(validator string) {
-			defer wg.Done()
-
-			// Acquire semaphore
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			start := time.Now()
-			conn, err := net.DialTimeout("tcp", validator, timeout)
-			if err != nil {
-				mu.Lock()
-				reply.Validators[validator] = false
-				reply.Latency[validator] = -1 // Unreachable
-				mu.Unlock()
-				return
-			}
-			latency := time.Since(start).Milliseconds()
-			conn.Close()
-
-			mu.Lock()
-			reply.Validators[validator] = true
-			reply.Latency[validator] = latency
-			mu.Unlock()
-		}(v)
-	}
-
-	wg.Wait()
+	reply.Healthy = res.Healthy
+	reply.Details = res.Details
 	return nil
 }
 
-// ======== Algorithm Information ========
+// FeeScheduleArgs is empty.
+type FeeScheduleArgs struct{}
 
-// ListAlgorithmsArgs contains arguments for ListAlgorithms.
-type ListAlgorithmsArgs struct{}
-
-// AlgorithmInfo describes a supported algorithm.
-type AlgorithmInfo struct {
-	Name             string   `json:"name"`
-	Type             string   `json:"type"`
-	SecurityLevel    int      `json:"securityLevel"`
-	KeySize          int      `json:"keySize"`
-	SignatureSize    int      `json:"signatureSize"`
-	PostQuantum      bool     `json:"postQuantum"`
-	ThresholdSupport bool     `json:"thresholdSupport"`
-	Description      string   `json:"description"`
-	Standards        []string `json:"standards"`
+// FeeScheduleEntry prices one (operation, algorithm) pair.
+type FeeScheduleEntry struct {
+	Operation string `json:"operation"`
+	Algorithm string `json:"algorithm"`
+	Gas       uint64 `json:"gas"`
+	FeeNLUX   uint64 `json:"feeNLux"`
 }
 
-// ListAlgorithmsReply contains the response for ListAlgorithms.
-type ListAlgorithmsReply struct {
-	Algorithms []AlgorithmInfo `json:"algorithms"`
+// FeeScheduleReply returns the per-algorithm gas/fee schedule and the price.
+type FeeScheduleReply struct {
+	GasPrice uint64             `json:"gasPriceNLuxPerGas"`
+	Entries  []FeeScheduleEntry `json:"entries"`
 }
 
-// ListAlgorithms lists supported algorithms.
-func (s *Service) ListAlgorithms(r *http.Request, args *ListAlgorithmsArgs, reply *ListAlgorithmsReply) error {
-	reply.Algorithms = []AlgorithmInfo{
-		{
-			Name:             "ml-kem-768",
-			Type:             "key-exchange",
-			SecurityLevel:    192,
-			KeySize:          2400,
-			PostQuantum:      true,
-			ThresholdSupport: false,
-			Description:      "ML-KEM-768 post-quantum key encapsulation",
-			Standards:        []string{"NIST FIPS 203"},
-		},
-		{
-			Name:             "ml-kem-512",
-			Type:             "key-exchange",
-			SecurityLevel:    128,
-			KeySize:          1632,
-			PostQuantum:      true,
-			ThresholdSupport: false,
-			Description:      "ML-KEM-512 post-quantum key encapsulation",
-			Standards:        []string{"NIST FIPS 203"},
-		},
-		{
-			Name:             "ml-kem-1024",
-			Type:             "key-exchange",
-			SecurityLevel:    256,
-			KeySize:          3168,
-			PostQuantum:      true,
-			ThresholdSupport: false,
-			Description:      "ML-KEM-1024 post-quantum key encapsulation",
-			Standards:        []string{"NIST FIPS 203"},
-		},
-		{
-			Name:             "ml-dsa-65",
-			Type:             "signing",
-			SecurityLevel:    192,
-			SignatureSize:    3309,
-			PostQuantum:      true,
-			ThresholdSupport: false,
-			Description:      "ML-DSA-65 post-quantum digital signature",
-			Standards:        []string{"NIST FIPS 204"},
-		},
-		{
-			Name:             "ml-dsa-44",
-			Type:             "signing",
-			SecurityLevel:    128,
-			SignatureSize:    2420,
-			PostQuantum:      true,
-			ThresholdSupport: false,
-			Description:      "ML-DSA-44 post-quantum digital signature",
-			Standards:        []string{"NIST FIPS 204"},
-		},
-		{
-			Name:             "ml-dsa-87",
-			Type:             "signing",
-			SecurityLevel:    256,
-			SignatureSize:    4627,
-			PostQuantum:      true,
-			ThresholdSupport: false,
-			Description:      "ML-DSA-87 post-quantum digital signature",
-			Standards:        []string{"NIST FIPS 204"},
-		},
-		{
-			Name:             "bls-threshold",
-			Type:             "signing",
-			SecurityLevel:    128,
-			SignatureSize:    96,
-			PostQuantum:      false,
-			ThresholdSupport: true,
-			Description:      "BLS12-381 threshold signatures",
-			Standards:        []string{"IETF BLS Signature"},
-		},
-		{
-			Name:             "secp256k1",
-			Type:             "signing",
-			SecurityLevel:    128,
-			SignatureSize:    64,
-			PostQuantum:      false,
-			ThresholdSupport: false,
-			Description:      "ECDSA on secp256k1 (Ethereum compatible)",
-			Standards:        []string{"SEC 2"},
-		},
+// FeeSchedule returns the chain's per-operation, per-algorithm fee schedule so
+// clients can compute the exact burn before submitting a transaction.
+func (s *Service) FeeSchedule(r *http.Request, args *FeeScheduleArgs, reply *FeeScheduleReply) error {
+	reply.GasPrice = uint64(GasPrice)
+	opNames := map[uint8]string{
+		TxRegisterKey: "registerKey",
+		TxSetPolicy:   "setPolicy",
+		TxAuthorize:   "authorize",
+		TxRevokeKey:   "revokeKey",
 	}
-
+	for op, name := range opNames {
+		if usesAlgorithm(op) {
+			for algo := range algoGas {
+				tx := &Transaction{Type: op, Algorithm: algo}
+				g, _ := GasFor(tx)
+				f, _ := fee.Cost(g, GasPrice)
+				reply.Entries = append(reply.Entries, FeeScheduleEntry{
+					Operation: name, Algorithm: algo, Gas: uint64(g), FeeNLUX: f,
+				})
+			}
+		} else {
+			tx := &Transaction{Type: op}
+			g, _ := GasFor(tx)
+			f, _ := fee.Cost(g, GasPrice)
+			reply.Entries = append(reply.Entries, FeeScheduleEntry{
+				Operation: name, Algorithm: "", Gas: uint64(g), FeeNLUX: f,
+			})
+		}
+	}
 	return nil
 }

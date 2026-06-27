@@ -1,237 +1,214 @@
-// Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
+// Copyright (C) 2019-2026, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
-// Package kmsvm implements the KMS Virtual Machine (K-Chain) for distributed
-// key management using ML-KEM post-quantum cryptography and threshold sharing.
+// Package keyvm implements the K-Chain: an AUTH-ONLY service VM for distributed
+// key management. K authorizes and coordinates key ceremonies; it never holds,
+// stores, reconstructs, or transmits secret key material or threshold shares.
+// See state.go for the structurally-enforced zero-secret invariant. Mutating
+// operations take effect only through fee-settled consensus blocks (block.go),
+// priced by a per-algorithm gas schedule (gas.go) and burned from the payer's
+// on-chain balance via the native fee settlement primitive (github.com/luxfi/
+// chains/fee).
 package keyvm
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/rpc/v2"
 	grjson "github.com/gorilla/rpc/v2/json"
-	"golang.org/x/crypto/hkdf"
 
-	"github.com/luxfi/accel"
+	"github.com/luxfi/chains/fee"
 	"github.com/luxfi/chains/keyvm/config"
-	"github.com/luxfi/crypto/bls"
-	"github.com/luxfi/crypto/mldsa"
-	"github.com/luxfi/crypto/mlkem"
 	"github.com/luxfi/database"
 	"github.com/luxfi/database/versiondb"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/cache"
-	"github.com/luxfi/node/vms/types/fee"
-	"github.com/luxfi/runtime"
+	nodefee "github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/timer/mockable"
 	vmcore "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
 )
 
 const (
-	// Version of the K-Chain VM
-	Version = "1.0.0"
-
-	// VMName is the human-readable name of K-Chain VM
+	// Version of the K-Chain VM.
+	Version = "2.0.0"
+	// VMName is the human-readable name of the K-Chain VM.
 	VMName = "keyvm"
 
-	// MaxParallelOperations is the maximum number of concurrent crypto operations
-	MaxParallelOperations = 100
-
-	// SharePrefix is the database prefix for key shares
-	SharePrefix = "share:"
-
-	// KeyPrefix is the database prefix for key metadata
-	KeyPrefix = "key:"
+	// Database namespaces. Key/ceremony records are JSON; balances live under
+	// the fee ledger's own namespace (github.com/luxfi/chains/fee).
+	KeyPrefix      = "key:"
+	CeremonyPrefix = "ceremony:"
+	BlockPrefix    = "block:"
 )
 
 var (
-	// Verify KeyVM implements chain.ChainVM interface
-	_ chain.ChainVM = (*VM)(nil)
-
-	errVMShutdown         = errors.New("VM is shutting down")
-	errKeyNotFound        = errors.New("key not found")
-	errKeyExists          = errors.New("key already exists")
-	errInvalidThreshold   = errors.New("invalid threshold")
-	errInsufficientShares = errors.New("insufficient shares for reconstruction")
-	errInvalidSignature   = errors.New("invalid signature")
-	errMLKEMNotEnabled    = errors.New("ML-KEM not enabled")
-	errMLDSANotEnabled    = errors.New("ML-DSA not enabled")
-	errValidatorNotFound  = errors.New("validator not found")
+	lastAcceptedKey = []byte("keyvm/last-accepted")
+	genesisMarker   = []byte("keyvm/genesis-applied")
 )
 
-// secureZeroBytes overwrites a byte slice with zeros to clear sensitive data from memory.
-// This helps prevent key material from remaining in memory after use.
-func secureZeroBytes(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
-}
+// Verify VM implements the consensus ChainVM interface.
+var _ chain.ChainVM = (*VM)(nil)
 
-// KeyMetadata stores information about a distributed key.
-type KeyMetadata struct {
-	ID          ids.ID            `json:"id"`
-	Name        string            `json:"name"`
-	Algorithm   string            `json:"algorithm"`
-	KeyType     string            `json:"keyType"`
-	PublicKey   []byte            `json:"publicKey"`
-	Threshold   int               `json:"threshold"`
-	TotalShares int               `json:"totalShares"`
-	Validators  []string          `json:"validators"`
-	CreatedAt   time.Time         `json:"createdAt"`
-	UpdatedAt   time.Time         `json:"updatedAt"`
-	Status      string            `json:"status"`
-	Tags        []string          `json:"tags"`
-	Metadata    map[string]string `json:"metadata"`
-}
+// Sentinel errors. Every one denies an operation — the package fails secure.
+var (
+	errVMShutdown    = errors.New("keyvm: shutting down")
+	errNoPendingTxs  = errors.New("keyvm: no pending transactions")
+	errNoParentBlock = errors.New("keyvm: no parent block")
 
-// KeyShare represents a share of a distributed key.
-type KeyShare struct {
-	KeyID       ids.ID `json:"keyId"`
-	ShareIndex  int    `json:"shareIndex"`
-	ShareData   []byte `json:"shareData"` // Encrypted share
-	ValidatorID string `json:"validatorId"`
-	Timestamp   int64  `json:"timestamp"`
-}
+	ErrInvalidTxType    = errors.New("keyvm: invalid transaction type")
+	ErrInvalidPayload   = errors.New("keyvm: invalid transaction payload")
+	ErrUnknownAlgorithm = errors.New("keyvm: unsupported algorithm")
+	ErrInvalidThreshold = errors.New("keyvm: invalid threshold (need 0 < t <= n)")
+	ErrInvalidCeremony  = errors.New("keyvm: invalid ceremony type")
 
-// VM implements the K-Chain Virtual Machine.
+	ErrUnsignedTx    = errors.New("keyvm: transaction missing payer auth/signature")
+	ErrPayerMismatch = errors.New("keyvm: payer does not match auth public key")
+	ErrBadSignature  = errors.New("keyvm: invalid payer signature")
+
+	ErrKeyNotFound  = errors.New("keyvm: key not found")
+	ErrKeyExists    = errors.New("keyvm: key already exists")
+	ErrKeyRevoked   = errors.New("keyvm: key is revoked")
+	ErrUnauthorized = errors.New("keyvm: payer not authorized for operation")
+
+	// ErrBadNonce rejects a replayed or out-of-order transaction. A payer's
+	// transactions MUST carry strictly increasing nonces starting at 1; this is
+	// what stops a captured signed transaction from being resubmitted to drain
+	// the payer's balance through repeated fee burns.
+	ErrBadNonce = errors.New("keyvm: bad or replayed nonce")
+)
+
+var noncePrefix = []byte("nonce:")
+
+// VM implements the K-Chain auth-only Virtual Machine.
+//
+// STRUCTURAL ZERO-SECRET NOTE: every field below is either runtime plumbing or
+// a cache of PUBLIC records (KeyRecord / CeremonyRecord). There is deliberately
+// no key cache of private keys, no share store, and no GPU crypto session — the
+// previous design's *mlkem.PrivateKey cache, KeyShare store, and accel session
+// are gone. authonly_test.go proves no reachable field can hold a secret.
 type VM struct {
 	config.Config
 
-	// Per-VM GPU acceleration session. Reserved for future ML-KEM/ML-DSA
-	// batch operations on the K-Chain hot path.
-	accel *accel.VMSession
+	cancel   context.CancelFunc
+	log      log.Logger
+	db       database.Database
+	versdb   *versiondb.Database
+	state    database.Database // == versdb; buffered writes commit per block
+	toEngine chan<- vmcore.Message
+	notify   chan struct{}
 
-	// Core components
-	rt           *runtime.Runtime
-	cancel       context.CancelFunc
-	log          log.Logger
-	db           database.Database
-	versiondb    *versiondb.Database
-	blockchainID ids.ID
-	networkID    uint32
-	toEngine     chan<- vmcore.Message
+	networkID uint32
+	clock     mockable.Clock
 
-	// Key management
-	keys       map[ids.ID]*KeyMetadata
+	// PUBLIC state caches (authoritative copy lives in the DB).
+	stateLock  sync.RWMutex
+	keys       map[ids.ID]*KeyRecord
 	keysByName map[string]ids.ID
-	shares     map[ids.ID][]*KeyShare
-	keysLock   sync.RWMutex
+	ceremonies map[ids.ID]*CeremonyRecord
 
-	// ML-KEM keys cache
-	mlkemCache    *cache.LRU[ids.ID, *mlkem.PrivateKey]
-	mlkemPubCache *cache.LRU[ids.ID, *mlkem.PublicKey]
+	// Native fee balance ledger (debit + burn), backed by the VM's versiondb so
+	// settlement commits atomically with the operations it pays for.
+	ledger *fee.Ledger
 
-	// Transaction pool
-	pendingTxs []*Transaction
-	txLock     sync.Mutex
+	// Admission policy (node/vms/types/fee). Orthogonal to settlement: this is
+	// the boot-time floor declaration Manager validates; the per-op burn is done
+	// through `ledger`. Kept so the chain still satisfies the zero-fee refusal.
+	feePolicy nodefee.Policy
 
-	// Fee policy gating user-submitted RPCs (CreateKey, DeleteKey,
-	// Encrypt). FlatPolicy at MinTxFeeFloor; consensus-internal
-	// paths bypass.
-	feePolicy fee.Policy
-
-	// State management
-	state         database.Database
-	lastAccepted  ids.ID
-	lastAccepted_ *Block
+	// Consensus mempool + block bookkeeping.
+	mempoolLock   sync.Mutex
+	mempool       []*Transaction
 	pendingBlocks map[ids.ID]*Block
+	lastAccepted  ids.ID
+	lastBlock     *Block
 	height        uint64
 
-	// HTTP service
 	rpcServer *rpc.Server
 
-	// Lifecycle
-	shuttingDown bool
 	shutdownLock sync.RWMutex
-
-	// Clock
-	clock mockable.Clock
+	shuttingDown bool
 }
 
-// Genesis represents the genesis state
+// Genesis is the K-Chain genesis: a funding allocation (address hex -> nLUX) and
+// metadata. Initial keys are registered via consensus transactions, not genesis,
+// so genesis carries no key material.
 type Genesis struct {
-	Version   int    `json:"version"`
-	Message   string `json:"message"`
-	Timestamp int64  `json:"timestamp"`
+	Version   int               `json:"version"`
+	Message   string            `json:"message"`
+	Timestamp int64             `json:"timestamp"`
+	Alloc     map[string]uint64 `json:"alloc"`
 }
 
-// Initialize initializes the K-Chain VM with the unified Init struct.
+// Initialize wires the VM: database, ledger, fee policy, caches, genesis seeding,
+// and the JSON-RPC service.
 func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	_, vm.cancel = context.WithCancel(ctx)
-	vm.rt = init.Runtime
 	vm.db = init.DB
+	vm.versdb = versiondb.New(init.DB)
+	vm.state = vm.versdb
 	vm.toEngine = init.ToEngine
-	vm.versiondb = versiondb.New(init.DB)
-	vm.state = vm.versiondb
+	vm.notify = make(chan struct{}, 1)
 
-	if logger, ok := vm.rt.Log.(log.Logger); ok {
-		vm.log = logger
-	} else {
-		return errors.New("invalid logger type")
+	if init.Runtime != nil {
+		if logger, ok := init.Runtime.Log.(log.Logger); ok {
+			vm.log = logger
+		}
 	}
-
-	// Parse configuration
-	cfg, err := config.ParseConfig(init.Config)
-	if err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
-	}
-	vm.Config = cfg
-
-	// Validate configuration
-	if err := vm.Config.Validate(); err != nil {
-		return fmt.Errorf("invalid configuration: %w", err)
-	}
-
-	// Initialize maps under lock to prevent races with early network messages
-	vm.shutdownLock.Lock()
-	vm.keys = make(map[ids.ID]*KeyMetadata)
-	vm.keysByName = make(map[string]ids.ID)
-	vm.shares = make(map[ids.ID][]*KeyShare)
-	vm.pendingTxs = make([]*Transaction, 0)
-	vm.pendingBlocks = make(map[ids.ID]*Block)
-	vm.shutdownLock.Unlock()
-
-	// Pin networkID for fee policy + asset derivation.
-	if vm.rt != nil {
-		vm.networkID = vm.rt.NetworkID
-	}
-	// Honour an explicit config-supplied NetworkID if set (legacy
-	// override path; runtime.NetworkID is the canonical source).
-	if vm.Config.NetworkID != 0 {
-		vm.networkID = vm.Config.NetworkID
-	}
-	vm.feePolicy = newFeePolicy(vm.networkID)
-	if err := fee.Validate(vm.feePolicy); err != nil {
-		return fmt.Errorf("keyvm: fee policy: %w", err)
-	}
-
-	// Initialize caches
-	vm.mlkemCache = cache.NewLRU[ids.ID, *mlkem.PrivateKey](vm.Config.ShareCacheSize)
-	vm.mlkemPubCache = cache.NewLRU[ids.ID, *mlkem.PublicKey](vm.Config.ShareCacheSize)
-
-	// Parse genesis (JSON format)
-	genesis := &Genesis{}
-	if len(init.Genesis) > 0 {
-		if err := json.Unmarshal(init.Genesis, genesis); err != nil {
-			return fmt.Errorf("failed to parse genesis: %w", err)
+	if vm.log == nil {
+		if init.Log != nil {
+			vm.log = init.Log
+		} else {
+			vm.log = log.NewNoOpLogger()
 		}
 	}
 
-	// Create genesis block
+	cfg, err := config.ParseConfig(init.Config)
+	if err != nil {
+		return fmt.Errorf("keyvm: parse config: %w", err)
+	}
+	vm.Config = cfg
+	if err := vm.Config.Validate(); err != nil {
+		return fmt.Errorf("keyvm: invalid config: %w", err)
+	}
+
+	vm.stateLock.Lock()
+	vm.keys = make(map[ids.ID]*KeyRecord)
+	vm.keysByName = make(map[string]ids.ID)
+	vm.ceremonies = make(map[ids.ID]*CeremonyRecord)
+	vm.stateLock.Unlock()
+	vm.pendingBlocks = make(map[ids.ID]*Block)
+
+	if init.Runtime != nil {
+		vm.networkID = init.Runtime.NetworkID
+	}
+	if vm.Config.NetworkID != 0 {
+		vm.networkID = vm.Config.NetworkID
+	}
+
+	vm.ledger = fee.NewLedger(vm.versdb)
+	vm.feePolicy = newFeePolicy(vm.networkID)
+	if err := nodefee.Validate(vm.feePolicy); err != nil {
+		return fmt.Errorf("keyvm: fee policy: %w", err)
+	}
+
+	genesis := &Genesis{}
+	if len(init.Genesis) > 0 {
+		if err := json.Unmarshal(init.Genesis, genesis); err != nil {
+			return fmt.Errorf("keyvm: parse genesis: %w", err)
+		}
+	}
+
+	// Genesis block at height 0.
 	genesisBlock := &Block{
 		id:        ids.Empty,
 		parentID:  ids.Empty,
@@ -241,613 +218,489 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	}
 	genesisBlock.id = genesisBlock.computeID()
 	vm.lastAccepted = genesisBlock.id
-	vm.lastAccepted_ = genesisBlock
+	vm.lastBlock = genesisBlock
 
-	// Load existing keys from database
-	if err := vm.loadKeys(); err != nil {
-		if !vm.log.IsZero() {
-			vm.log.Warn("failed to load keys from database", log.String("error", err.Error()))
-		}
+	if err := vm.seedGenesis(genesis); err != nil {
+		return fmt.Errorf("keyvm: seed genesis: %w", err)
+	}
+	if err := vm.loadState(); err != nil {
+		return fmt.Errorf("keyvm: load state: %w", err)
+	}
+	if err := vm.initHTTP(); err != nil {
+		return fmt.Errorf("keyvm: init http: %w", err)
 	}
 
-	// Initialize HTTP handlers
-	if err := vm.initializeHTTPHandlers(); err != nil {
-		return fmt.Errorf("failed to initialize HTTP handlers: %w", err)
-	}
-
-	if !vm.log.IsZero() {
-		vm.log.Info("KMS VM initialized",
-			log.String("version", Version),
-			log.Bool("mlkemEnabled", vm.Config.MLKEMEnabled),
-			log.Bool("mldsaEnabled", vm.Config.MLDSAEnabled),
-			log.Int("threshold", vm.Config.DefaultThreshold),
-			log.Int("totalShares", vm.Config.DefaultTotalShares),
-		)
-	}
-
-	return nil
-}
-
-// CreateKey creates a new distributed key.
-func (vm *VM) CreateKey(ctx context.Context, name, algorithm string, threshold, totalShares int) (*KeyMetadata, error) {
-	vm.keysLock.Lock()
-	defer vm.keysLock.Unlock()
-
-	// Check if key already exists
-	if _, exists := vm.keysByName[name]; exists {
-		return nil, errKeyExists
-	}
-
-	// Validate threshold
-	if threshold <= 0 || totalShares <= 0 || threshold > totalShares {
-		return nil, errInvalidThreshold
-	}
-
-	// Generate key ID
-	idBytes := make([]byte, 32)
-	if _, err := rand.Read(idBytes); err != nil {
-		return nil, fmt.Errorf("failed to generate key ID: %w", err)
-	}
-	keyID, _ := ids.ToID(idBytes)
-
-	// Create key based on algorithm
-	var pubKey []byte
-	var keyType string
-
-	switch algorithm {
-	case "ml-kem-512", "ml-kem-768", "ml-kem-1024":
-		if !vm.Config.MLKEMEnabled {
-			return nil, errMLKEMNotEnabled
-		}
-		// Determine mode based on algorithm
-		var mode mlkem.Mode
-		switch algorithm {
-		case "ml-kem-512":
-			mode = mlkem.MLKEM512
-		case "ml-kem-768":
-			mode = mlkem.MLKEM768
-		case "ml-kem-1024":
-			mode = mlkem.MLKEM1024
-		}
-		// Generate ML-KEM key pair
-		mlkemPubKey, privKey, err := mlkem.GenerateKey(mode)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate ML-KEM key: %w", err)
-		}
-		pubKey = mlkemPubKey.Bytes()
-		keyType = "encryption"
-
-		// Cache the key
-		vm.mlkemCache.Put(keyID, privKey)
-		vm.mlkemPubCache.Put(keyID, mlkemPubKey)
-
-	case "ml-dsa-44", "ml-dsa-65", "ml-dsa-87":
-		if !vm.Config.MLDSAEnabled {
-			return nil, errMLDSANotEnabled
-		}
-		// Determine mode based on algorithm
-		var dsaMode mldsa.Mode
-		switch algorithm {
-		case "ml-dsa-44":
-			dsaMode = mldsa.MLDSA44
-		case "ml-dsa-65":
-			dsaMode = mldsa.MLDSA65
-		case "ml-dsa-87":
-			dsaMode = mldsa.MLDSA87
-		}
-		// Generate ML-DSA key pair
-		mldsaPrivKey, err := mldsa.GenerateKey(rand.Reader, dsaMode)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate ML-DSA key: %w", err)
-		}
-		pubKey = mldsaPrivKey.PublicKey.Bytes()
-		keyType = "signing"
-
-	case "bls-threshold":
-		keyType = "threshold-signing"
-		// Generate BLS key pair
-		blsSecretKey, err := bls.NewSecretKey()
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate BLS key: %w", err)
-		}
-		blsPubKey := blsSecretKey.PublicKey()
-		pubKey = bls.PublicKeyToCompressedBytes(blsPubKey)
-
-	default:
-		return nil, fmt.Errorf("unsupported algorithm: %s", algorithm)
-	}
-
-	// Create key metadata
-	now := time.Now()
-	meta := &KeyMetadata{
-		ID:          keyID,
-		Name:        name,
-		Algorithm:   algorithm,
-		KeyType:     keyType,
-		PublicKey:   pubKey,
-		Threshold:   threshold,
-		TotalShares: totalShares,
-		Validators:  vm.Config.Validators[:totalShares],
-		CreatedAt:   now,
-		UpdatedAt:   now,
-		Status:      "active",
-		Metadata:    make(map[string]string),
-	}
-
-	// Store key metadata
-	vm.keys[keyID] = meta
-	vm.keysByName[name] = keyID
-
-	// Persist to database
-	if err := vm.saveKeyMetadata(meta); err != nil {
-		return nil, fmt.Errorf("failed to save key metadata: %w", err)
-	}
-
-	vm.log.Info("created new key",
-		"keyID", keyID,
-		"name", name,
-		"algorithm", algorithm,
-		"threshold", threshold,
-		"totalShares", totalShares,
+	vm.log.Info("K-Chain (auth-only) initialized",
+		log.String("version", Version),
+		log.Uint32("networkID", vm.networkID),
+		log.Uint64("height", vm.height),
 	)
-
-	return meta, nil
-}
-
-// GetKey retrieves key metadata by ID.
-func (vm *VM) GetKey(ctx context.Context, keyID ids.ID) (*KeyMetadata, error) {
-	vm.keysLock.RLock()
-	defer vm.keysLock.RUnlock()
-
-	meta, exists := vm.keys[keyID]
-	if !exists {
-		return nil, errKeyNotFound
-	}
-
-	return meta, nil
-}
-
-// GetKeyByName retrieves key metadata by name.
-func (vm *VM) GetKeyByName(ctx context.Context, name string) (*KeyMetadata, error) {
-	vm.keysLock.RLock()
-	defer vm.keysLock.RUnlock()
-
-	keyID, exists := vm.keysByName[name]
-	if !exists {
-		return nil, errKeyNotFound
-	}
-
-	return vm.keys[keyID], nil
-}
-
-// ListKeys lists all keys.
-func (vm *VM) ListKeys(ctx context.Context) ([]*KeyMetadata, error) {
-	vm.keysLock.RLock()
-	defer vm.keysLock.RUnlock()
-
-	keys := make([]*KeyMetadata, 0, len(vm.keys))
-	for _, meta := range vm.keys {
-		keys = append(keys, meta)
-	}
-
-	return keys, nil
-}
-
-// DeleteKey deletes a key and its shares with secure zeroing of sensitive material.
-func (vm *VM) DeleteKey(ctx context.Context, keyID ids.ID) error {
-	vm.keysLock.Lock()
-	defer vm.keysLock.Unlock()
-
-	meta, exists := vm.keys[keyID]
-	if !exists {
-		return errKeyNotFound
-	}
-
-	// Secure zero key shares before deletion
-	if shares, ok := vm.shares[keyID]; ok {
-		for _, share := range shares {
-			secureZeroBytes(share.ShareData)
-		}
-	}
-
-	// Zero public key in metadata
-	if meta != nil && len(meta.PublicKey) > 0 {
-		secureZeroBytes(meta.PublicKey)
-	}
-
-	// Remove from maps
-	delete(vm.keys, keyID)
-	delete(vm.keysByName, meta.Name)
-	delete(vm.shares, keyID)
-
-	// Remove from caches (cache.Evict handles the eviction,
-	// but we've already zeroed what we can access)
-	vm.mlkemCache.Evict(keyID)
-	vm.mlkemPubCache.Evict(keyID)
-
-	// Delete from database
-	if err := vm.deleteKeyFromDB(keyID); err != nil {
-		vm.log.Warn("failed to delete key from database", "error", err)
-	}
-
-	vm.log.Info("deleted key", "keyID", keyID, "name", meta.Name)
-
 	return nil
 }
 
-// Encrypt encrypts data using the key's ML-KEM public key.
-func (vm *VM) Encrypt(ctx context.Context, keyID ids.ID, plaintext []byte) ([]byte, []byte, error) {
-	vm.keysLock.RLock()
-	meta, exists := vm.keys[keyID]
-	vm.keysLock.RUnlock()
-
-	if !exists {
-		return nil, nil, errKeyNotFound
-	}
-
-	if meta.KeyType != "encryption" {
-		return nil, nil, fmt.Errorf("key type %s does not support encryption", meta.KeyType)
-	}
-
-	// Get public key from cache
-	pubKey, exists := vm.mlkemPubCache.Get(keyID)
-	if !exists {
-		return nil, nil, fmt.Errorf("public key not in cache")
-	}
-
-	// Encapsulate to get shared secret
-	ciphertext, sharedSecret, err := pubKey.Encapsulate()
+// seedGenesis credits the funding allocation once (idempotent via a marker key).
+// It is the only trusted state mutation; all later mutations go through blocks.
+func (vm *VM) seedGenesis(g *Genesis) error {
+	applied, err := vm.versdb.Has(genesisMarker)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to encapsulate: %w", err)
+		return err
 	}
-
-	// Use AES-GCM for authenticated encryption
-	// Derive a 32-byte key from the shared secret using HKDF (RFC 5869)
-	// This provides proper key derivation with domain separation
-	var key [32]byte
-	kdf := hkdf.New(sha256.New, sharedSecret, nil, []byte("keyvm-mlkem-encryption-v1"))
-	if _, err := io.ReadFull(kdf, key[:]); err != nil {
-		return nil, nil, fmt.Errorf("failed to derive encryption key: %w", err)
+	if applied {
+		return nil
 	}
-
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create cipher: %w", err)
+	for addrHex, amount := range g.Alloc {
+		acct, err := accountFromHex(addrHex)
+		if err != nil {
+			return fmt.Errorf("alloc %q: %w", addrHex, err)
+		}
+		if err := vm.ledger.Credit(acct, amount); err != nil {
+			return fmt.Errorf("alloc %q: %w", addrHex, err)
+		}
 	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create GCM: %w", err)
+	if err := vm.versdb.Put(genesisMarker, []byte{1}); err != nil {
+		return err
 	}
-
-	// Generate random nonce
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, nil, fmt.Errorf("failed to generate nonce: %w", err)
-	}
-
-	// Encrypt and authenticate
-	encrypted := gcm.Seal(nonce, nonce, plaintext, nil)
-
-	return encrypted, ciphertext, nil
+	return vm.versdb.Commit()
 }
 
-// BuildBlock builds a new block from pending transactions.
-func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
-	vm.shutdownLock.Lock()
-	defer vm.shutdownLock.Unlock()
+// loadState rebuilds the PUBLIC caches and lastAccepted pointer from the DB.
+func (vm *VM) loadState() error {
+	vm.stateLock.Lock()
+	defer vm.stateLock.Unlock()
+	return vm.loadStateLocked()
+}
 
-	if vm.shuttingDown {
+// loadStateLocked is loadState's body; callers must hold stateLock. The block
+// Accept error path uses it to reload caches after a versiondb Abort while it
+// still holds the lock.
+func (vm *VM) loadStateLocked() error {
+	vm.keys = make(map[ids.ID]*KeyRecord)
+	vm.keysByName = make(map[string]ids.ID)
+	vm.ceremonies = make(map[ids.ID]*CeremonyRecord)
+
+	kit := vm.state.NewIteratorWithPrefix([]byte(KeyPrefix))
+	defer kit.Release()
+	for kit.Next() {
+		var rec KeyRecord
+		if err := json.Unmarshal(kit.Value(), &rec); err != nil {
+			vm.log.Warn("keyvm: skip corrupt key record", log.String("error", err.Error()))
+			continue
+		}
+		r := rec
+		vm.keys[r.ID] = &r
+		vm.keysByName[r.Name] = r.ID
+	}
+	if err := kit.Error(); err != nil {
+		return err
+	}
+
+	cit := vm.state.NewIteratorWithPrefix([]byte(CeremonyPrefix))
+	defer cit.Release()
+	for cit.Next() {
+		var c CeremonyRecord
+		if err := json.Unmarshal(cit.Value(), &c); err != nil {
+			vm.log.Warn("keyvm: skip corrupt ceremony record", log.String("error", err.Error()))
+			continue
+		}
+		cc := c
+		vm.ceremonies[cc.ID] = &cc
+	}
+	if err := cit.Error(); err != nil {
+		return err
+	}
+
+	if b, err := vm.state.Get(lastAcceptedKey); err == nil && len(b) == 32 {
+		copy(vm.lastAccepted[:], b)
+		if blk, err := vm.getBlockLocked(vm.lastAccepted); err == nil {
+			vm.lastBlock = blk
+			vm.height = blk.height
+		}
+	}
+	return nil
+}
+
+// ---- PUBLIC state accessors (used by tx Apply, under stateLock held by Accept) ----
+
+func (vm *VM) getKey(id ids.ID) (*KeyRecord, bool) {
+	r, ok := vm.keys[id]
+	return r, ok
+}
+
+func (vm *VM) putKey(rec *KeyRecord) error {
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	if err := vm.state.Put([]byte(KeyPrefix+rec.ID.String()), data); err != nil {
+		return err
+	}
+	vm.keys[rec.ID] = rec
+	vm.keysByName[rec.Name] = rec.ID
+	return nil
+}
+
+func (vm *VM) putCeremony(c *CeremonyRecord) error {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	if err := vm.state.Put([]byte(CeremonyPrefix+c.ID.String()), data); err != nil {
+		return err
+	}
+	vm.ceremonies[c.ID] = c
+	return nil
+}
+
+// nonceOf returns the payer's last-used nonce (0 if the account has never
+// transacted). The next valid nonce is nonceOf(payer)+1. Caller holds a lock.
+func (vm *VM) nonceOf(payer fee.Account) uint64 {
+	key := append(append([]byte{}, noncePrefix...), payer[:]...)
+	b, err := vm.state.Get(key)
+	if err != nil || len(b) != 8 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(b)
+}
+
+// setNonce records the payer's last-used nonce (writes to the versiondb, so it
+// commits atomically with the block). Caller holds stateLock.
+func (vm *VM) setNonce(payer fee.Account, n uint64) error {
+	key := append(append([]byte{}, noncePrefix...), payer[:]...)
+	var u [8]byte
+	binary.BigEndian.PutUint64(u[:], n)
+	return vm.state.Put(key, u[:])
+}
+
+// ---- Read-only public queries (RPC) ----
+
+// KeyByID returns a copy of a key record.
+func (vm *VM) KeyByID(id ids.ID) (*KeyRecord, bool) {
+	vm.stateLock.RLock()
+	defer vm.stateLock.RUnlock()
+	r, ok := vm.keys[id]
+	if !ok {
+		return nil, false
+	}
+	c := *r
+	return &c, true
+}
+
+// KeyByName returns a copy of a key record by name.
+func (vm *VM) KeyByName(name string) (*KeyRecord, bool) {
+	vm.stateLock.RLock()
+	defer vm.stateLock.RUnlock()
+	id, ok := vm.keysByName[name]
+	if !ok {
+		return nil, false
+	}
+	r := *vm.keys[id]
+	return &r, true
+}
+
+// Keys returns copies of all key records.
+func (vm *VM) Keys() []*KeyRecord {
+	vm.stateLock.RLock()
+	defer vm.stateLock.RUnlock()
+	out := make([]*KeyRecord, 0, len(vm.keys))
+	for _, r := range vm.keys {
+		c := *r
+		out = append(out, &c)
+	}
+	return out
+}
+
+// Ceremony returns a copy of a ceremony record.
+func (vm *VM) Ceremony(id ids.ID) (*CeremonyRecord, bool) {
+	vm.stateLock.RLock()
+	defer vm.stateLock.RUnlock()
+	c, ok := vm.ceremonies[id]
+	if !ok {
+		return nil, false
+	}
+	cc := *c
+	return &cc, true
+}
+
+// Balance returns an account's spendable nLUX.
+func (vm *VM) Balance(acct fee.Account) (uint64, error) {
+	vm.stateLock.RLock()
+	defer vm.stateLock.RUnlock()
+	return vm.ledger.Balance(acct)
+}
+
+// Burned returns cumulative burned supply in nLUX.
+func (vm *VM) Burned() (uint64, error) {
+	vm.stateLock.RLock()
+	defer vm.stateLock.RUnlock()
+	return vm.ledger.Burned()
+}
+
+// ---- Mempool / consensus driver ----
+
+// SubmitTx validates, authenticates, and admission-checks a transaction, then
+// enqueues it and signals the engine to build a block. The fee is SETTLED later,
+// in block Accept — never here. Returns the transaction ID.
+func (vm *VM) SubmitTx(tx *Transaction) (ids.ID, error) {
+	if err := tx.SyntacticVerify(); err != nil {
+		return ids.Empty, err
+	}
+	if err := tx.authenticate(); err != nil {
+		return ids.Empty, err
+	}
+	feeAmt, err := FeeFor(tx)
+	if err != nil {
+		return ids.Empty, err
+	}
+	vm.stateLock.RLock()
+	if tx.Nonce <= vm.nonceOf(tx.Payer) {
+		vm.stateLock.RUnlock()
+		return ids.Empty, ErrBadNonce
+	}
+	if err := tx.checkAuth(vm, vm.clock.Time().Unix()); err != nil {
+		vm.stateLock.RUnlock()
+		return ids.Empty, err
+	}
+	err = fee.CanPay(vm.ledger, tx.Payer, feeAmt)
+	vm.stateLock.RUnlock()
+	if err != nil {
+		return ids.Empty, err
+	}
+
+	vm.mempoolLock.Lock()
+	vm.mempool = append(vm.mempool, tx)
+	vm.mempoolLock.Unlock()
+
+	select {
+	case vm.notify <- struct{}{}:
+	default:
+	}
+	return tx.ID(), nil
+}
+
+// WaitForEvent blocks until there are pending transactions or the VM stops.
+func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
+	select {
+	case <-ctx.Done():
+		return vmcore.Message{}, ctx.Err()
+	case <-vm.notify:
+		return vmcore.Message{Type: vmcore.PendingTxs}, nil
+	}
+}
+
+// BuildBlock drains the mempool into a new block extending the last accepted
+// block. The block is not yet verified or accepted — settlement happens in
+// Verify/Accept.
+func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
+	vm.shutdownLock.RLock()
+	down := vm.shuttingDown
+	vm.shutdownLock.RUnlock()
+	if down {
 		return nil, errVMShutdown
 	}
 
-	vm.txLock.Lock()
-	txs := vm.pendingTxs
-	vm.pendingTxs = make([]*Transaction, 0)
-	vm.txLock.Unlock()
-
-	// Create block even without transactions for block-based consensus
-	parent := vm.lastAccepted_
-	if parent == nil {
-		return nil, errors.New("no parent block")
+	vm.mempoolLock.Lock()
+	txs := vm.mempool
+	vm.mempool = nil
+	vm.mempoolLock.Unlock()
+	if len(txs) == 0 {
+		return nil, errNoPendingTxs
 	}
 
-	// Create block
-	newHeight := parent.height + 1
-	blockData := make([]byte, 0, 100)
-	blockData = append(blockData, vm.lastAccepted[:]...)
-	heightBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(heightBytes, newHeight)
-	blockData = append(blockData, heightBytes...)
+	vm.stateLock.RLock()
+	parent := vm.lastBlock
+	parentID := vm.lastAccepted
+	vm.stateLock.RUnlock()
+	if parent == nil {
+		vm.requeue(txs)
+		return nil, errNoParentBlock
+	}
 
-	blockID, _ := ids.ToID(blockData)
-	block := &Block{
-		id:           blockID,
-		parentID:     vm.lastAccepted,
-		height:       newHeight,
+	blk := &Block{
+		parentID:     parentID,
+		height:       parent.height + 1,
 		timestamp:    vm.clock.Time(),
 		transactions: txs,
 		vm:           vm,
 	}
+	blk.id = blk.computeID()
 
-	if vm.pendingBlocks == nil {
-		vm.pendingBlocks = make(map[ids.ID]*Block)
-	}
-	vm.pendingBlocks[blockID] = block
-
-	if !vm.log.IsZero() {
-		vm.log.Debug("built block",
-			log.Stringer("blockID", blockID),
-			log.Uint64("height", newHeight),
-			log.Int("txCount", len(txs)),
-		)
-	}
-
-	return block, nil
+	vm.shutdownLock.Lock()
+	vm.pendingBlocks[blk.id] = blk
+	vm.shutdownLock.Unlock()
+	return blk, nil
 }
 
-// ParseBlock parses a block from bytes.
+// requeue returns transactions to the front of the mempool (on build/reject).
+func (vm *VM) requeue(txs []*Transaction) {
+	if len(txs) == 0 {
+		return
+	}
+	vm.mempoolLock.Lock()
+	vm.mempool = append(txs, vm.mempool...)
+	vm.mempoolLock.Unlock()
+	select {
+	case vm.notify <- struct{}{}:
+	default:
+	}
+}
+
+// dropFromMempool removes accepted transactions from the mempool by ID.
+func (vm *VM) dropFromMempool(txs []*Transaction) {
+	if len(txs) == 0 {
+		return
+	}
+	accepted := make(map[ids.ID]struct{}, len(txs))
+	for _, tx := range txs {
+		accepted[tx.ID()] = struct{}{}
+	}
+	vm.mempoolLock.Lock()
+	kept := vm.mempool[:0]
+	for _, tx := range vm.mempool {
+		if _, ok := accepted[tx.ID()]; !ok {
+			kept = append(kept, tx)
+		}
+	}
+	vm.mempool = kept
+	vm.mempoolLock.Unlock()
+}
+
+// ---- Block storage ----
+
+// ParseBlock decodes a block from bytes.
 func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (chain.Block, error) {
-	block := &Block{vm: vm}
-	// Parse block - for now, minimal parsing
-	if len(blockBytes) >= 32 {
-		copy(block.parentID[:], blockBytes[:32])
-	}
-	if len(blockBytes) >= 40 {
-		block.height = binary.BigEndian.Uint64(blockBytes[32:40])
-	}
-	if len(blockBytes) >= 48 {
-		block.timestamp = time.Unix(int64(binary.BigEndian.Uint64(blockBytes[40:48])), 0)
-	}
-	block.id = block.computeID()
-	return block, nil
+	return parseBlock(vm, blockBytes)
 }
 
-// GetBlock retrieves a block by ID.
+// GetBlock returns a block by ID.
 func (vm *VM) GetBlock(ctx context.Context, blockID ids.ID) (chain.Block, error) {
 	vm.shutdownLock.RLock()
 	defer vm.shutdownLock.RUnlock()
+	return vm.getBlockLocked(blockID)
+}
 
-	// Check pending blocks (nil-safe for early calls before initialization)
+func (vm *VM) getBlockLocked(blockID ids.ID) (*Block, error) {
 	if vm.pendingBlocks != nil {
-		if blk, exists := vm.pendingBlocks[blockID]; exists {
+		if blk, ok := vm.pendingBlocks[blockID]; ok {
 			return blk, nil
 		}
 	}
-
-	// Check last accepted
-	if vm.lastAccepted_ != nil && vm.lastAccepted_.id == blockID {
-		return vm.lastAccepted_, nil
+	if vm.lastBlock != nil && vm.lastBlock.id == blockID {
+		return vm.lastBlock, nil
 	}
-
-	// Get from database
-	if vm.state == nil {
-		return nil, fmt.Errorf("block not found: state not initialized")
-	}
-	blockBytes, err := vm.state.Get(blockID[:])
+	b, err := vm.state.Get(append([]byte(BlockPrefix), blockID[:]...))
 	if err != nil {
-		return nil, fmt.Errorf("block not found: %w", err)
+		return nil, fmt.Errorf("keyvm: block %s: %w", blockID, err)
 	}
-	return vm.ParseBlock(ctx, blockBytes)
+	return parseBlock(vm, b)
 }
 
-// SetState sets the VM state.
-func (vm *VM) SetState(ctx context.Context, state uint32) error {
-	if !vm.log.IsZero() {
-		vm.log.Info("KMS VM state transition", log.Uint32("state", state))
-	}
-	return nil
-}
+// ---- ChainVM lifecycle / misc ----
 
-// SetPreference sets the preferred block tip.
-func (vm *VM) SetPreference(ctx context.Context, id ids.ID) error {
-	return nil
-}
+func (vm *VM) SetState(ctx context.Context, state uint32) error { return nil }
 
-// LastAccepted returns the last accepted block ID.
+func (vm *VM) SetPreference(ctx context.Context, id ids.ID) error { return nil }
+
 func (vm *VM) LastAccepted(ctx context.Context) (ids.ID, error) {
+	vm.stateLock.RLock()
+	defer vm.stateLock.RUnlock()
 	return vm.lastAccepted, nil
 }
 
-// GetBlockIDAtHeight returns the block ID at a given height.
 func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
-	return ids.Empty, errors.New("height index not implemented")
+	return ids.Empty, errors.New("keyvm: height index not implemented")
 }
 
-// NewHTTPHandler returns an HTTP handler for the VM.
 func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
 	handlers, err := vm.CreateHandlers(ctx)
 	if err != nil {
 		return nil, err
 	}
-
 	mux := http.NewServeMux()
-	for path, handler := range handlers {
+	for path, h := range handlers {
 		if path == "" {
 			path = "/"
 		}
-		mux.Handle(path, handler)
+		mux.Handle(path, h)
 	}
 	return mux, nil
 }
 
-// WaitForEvent waits for a VM event.
-func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
-	// Block until context is cancelled - this VM doesn't proactively build blocks
-	// CRITICAL: Must block here to avoid notification flood loop in chains/manager.go
-	<-ctx.Done()
-	return vmcore.Message{}, ctx.Err()
+func (vm *VM) CreateHandlers(ctx context.Context) (map[string]http.Handler, error) {
+	return map[string]http.Handler{"/rpc": vm.rpcServer}, nil
 }
 
-// Shutdown shuts down the VM with secure cleanup of sensitive key material.
+func (vm *VM) CreateStaticHandlers(ctx context.Context) (map[string]http.Handler, error) {
+	return nil, nil
+}
+
+func (vm *VM) Version(ctx context.Context) (string, error) { return Version, nil }
+
+func (vm *VM) Connected(ctx context.Context, nodeID ids.NodeID, ver *chain.VersionInfo) error {
+	return nil
+}
+
+func (vm *VM) Disconnected(ctx context.Context, nodeID ids.NodeID) error { return nil }
+
+func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
+	vm.shutdownLock.RLock()
+	down := vm.shuttingDown
+	vm.shutdownLock.RUnlock()
+
+	vm.stateLock.RLock()
+	keyCount := len(vm.keys)
+	ceremonyCount := len(vm.ceremonies)
+	vm.stateLock.RUnlock()
+	burned, _ := vm.Burned()
+
+	return chain.HealthResult{
+		Healthy: !down,
+		Details: map[string]string{
+			"version":    Version,
+			"authOnly":   "true",
+			"keys":       fmt.Sprintf("%d", keyCount),
+			"ceremonies": fmt.Sprintf("%d", ceremonyCount),
+			"height":     fmt.Sprintf("%d", vm.height),
+			"burnedNLUX": fmt.Sprintf("%d", burned),
+		},
+	}, nil
+}
+
+// Shutdown stops the VM. There is no secret material to zero — by construction
+// the VM never held any.
 func (vm *VM) Shutdown(ctx context.Context) error {
 	vm.shutdownLock.Lock()
 	vm.shuttingDown = true
 	vm.shutdownLock.Unlock()
 
-	vm.log.Info("shutting down KMS VM")
-
-	// Cancel context
 	if vm.cancel != nil {
 		vm.cancel()
 	}
-
-	// Secure zero all key material before shutdown
-	vm.keysLock.Lock()
-	for _, shares := range vm.shares {
-		for _, share := range shares {
-			secureZeroBytes(share.ShareData)
+	if vm.versdb != nil {
+		if err := vm.versdb.Close(); err != nil {
+			vm.log.Error("keyvm: close db", log.String("error", err.Error()))
 		}
 	}
-	for _, meta := range vm.keys {
-		if meta != nil && len(meta.PublicKey) > 0 {
-			secureZeroBytes(meta.PublicKey)
-		}
-	}
-	// Clear maps
-	vm.shares = make(map[ids.ID][]*KeyShare)
-	vm.keys = make(map[ids.ID]*KeyMetadata)
-	vm.keysByName = make(map[string]ids.ID)
-	vm.keysLock.Unlock()
-
-	// Flush caches (this removes cached ML-KEM keys from memory)
-	vm.mlkemCache.Flush()
-	vm.mlkemPubCache.Flush()
-
-	// Close database
-	if vm.versiondb != nil {
-		if err := vm.versiondb.Close(); err != nil {
-			vm.log.Error("failed to close database", "error", err)
-		}
-	}
-
-	vm.log.Info("KMS VM shutdown complete")
+	vm.log.Info("K-Chain shut down")
 	return nil
 }
 
-// Version returns the VM version.
-func (vm *VM) Version(ctx context.Context) (string, error) {
-	return Version, nil
-}
-
-// Connected handles node connection events.
-func (vm *VM) Connected(ctx context.Context, nodeID ids.NodeID, nodeVersion *chain.VersionInfo) error {
-	vm.log.Debug("node connected", "nodeID", nodeID, "version", nodeVersion)
-	return nil
-}
-
-// Disconnected handles node disconnection events.
-func (vm *VM) Disconnected(ctx context.Context, nodeID ids.NodeID) error {
-	vm.log.Debug("node disconnected", "nodeID", nodeID)
-	return nil
-}
-
-// HealthCheck returns VM health status.
-func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
-	vm.shutdownLock.RLock()
-	shuttingDown := vm.shuttingDown
-	vm.shutdownLock.RUnlock()
-
-	vm.keysLock.RLock()
-	keyCount := len(vm.keys)
-	vm.keysLock.RUnlock()
-
-	return chain.HealthResult{
-		Healthy: !shuttingDown,
-		Details: map[string]string{
-			"version":      Version,
-			"mlkemEnabled": fmt.Sprintf("%v", vm.Config.MLKEMEnabled),
-			"mldsaEnabled": fmt.Sprintf("%v", vm.Config.MLDSAEnabled),
-			"keyCount":     fmt.Sprintf("%d", keyCount),
-			"validators":   fmt.Sprintf("%d", len(vm.Config.Validators)),
-		},
-	}, nil
-}
-
-// CreateHandlers returns HTTP handlers for the VM.
-func (vm *VM) CreateHandlers(ctx context.Context) (map[string]http.Handler, error) {
-	return map[string]http.Handler{
-		"/rpc": vm.rpcServer,
-	}, nil
-}
-
-// CreateStaticHandlers returns static HTTP handlers.
-func (vm *VM) CreateStaticHandlers(ctx context.Context) (map[string]http.Handler, error) {
-	return nil, nil
-}
-
-// Helper methods
-
-func (vm *VM) initializeHTTPHandlers() error {
+func (vm *VM) initHTTP() error {
 	vm.rpcServer = rpc.NewServer()
-
-	service := &Service{vm: vm}
 	vm.rpcServer.RegisterCodec(grjson.NewCodec(), "application/json")
 	vm.rpcServer.RegisterCodec(grjson.NewCodec(), "application/json;charset=UTF-8")
-	return vm.rpcServer.RegisterService(service, "kchain")
+	return vm.rpcServer.RegisterService(&Service{vm: vm}, "kchain")
 }
 
-func (vm *VM) parseGenesis(genesisBytes []byte) error {
-	vm.log.Info("parsing genesis", "size", len(genesisBytes))
-	return nil
-}
-
-func (vm *VM) loadKeys() error {
-	if vm.state == nil {
-		return nil
-	}
-
-	// Iterate over all keys with KeyPrefix
-	iter := vm.state.NewIteratorWithPrefix([]byte(KeyPrefix))
-	defer iter.Release()
-
-	for iter.Next() {
-		value := iter.Value()
-		var meta KeyMetadata
-		if err := json.Unmarshal(value, &meta); err != nil {
-			vm.log.Warn("failed to unmarshal key metadata", "error", err)
-			continue
-		}
-
-		vm.keys[meta.ID] = &meta
-		vm.keysByName[meta.Name] = meta.ID
-	}
-
-	if err := iter.Error(); err != nil {
-		return fmt.Errorf("failed to iterate keys: %w", err)
-	}
-
-	vm.log.Info("loaded keys from database", "count", len(vm.keys))
-	return nil
-}
-
-func (vm *VM) saveKeyMetadata(meta *KeyMetadata) error {
-	if vm.state == nil {
-		return errors.New("database not initialized")
-	}
-
-	data, err := json.Marshal(meta)
+// accountFromHex parses a 20-byte hex address into a fee.Account.
+func accountFromHex(s string) (fee.Account, error) {
+	var a fee.Account
+	b, err := hex.DecodeString(strings.TrimPrefix(s, "0x"))
 	if err != nil {
-		return fmt.Errorf("failed to marshal key metadata: %w", err)
+		return a, err
 	}
-
-	key := []byte(KeyPrefix + meta.ID.String())
-	if err := vm.state.Put(key, data); err != nil {
-		return fmt.Errorf("failed to store key metadata: %w", err)
+	if len(b) != ids.ShortIDLen {
+		return a, fmt.Errorf("address must be %d bytes, got %d", ids.ShortIDLen, len(b))
 	}
-
-	return nil
-}
-
-func (vm *VM) deleteKeyFromDB(keyID ids.ID) error {
-	if vm.state == nil {
-		return errors.New("database not initialized")
-	}
-
-	key := []byte(KeyPrefix + keyID.String())
-	if err := vm.state.Delete(key); err != nil {
-		return fmt.Errorf("failed to delete key from database: %w", err)
-	}
-
-	return nil
+	copy(a[:], b)
+	return a, nil
 }

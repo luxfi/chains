@@ -1,335 +1,460 @@
-// Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
+// Copyright (C) 2019-2026, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package keyvm
 
 import (
-	"context"
+	"crypto/sha256"
 	"encoding/binary"
-	"errors"
-	"time"
+	"encoding/json"
+	"fmt"
 
+	"github.com/luxfi/chains/fee"
+	"github.com/luxfi/crypto/mldsa"
 	"github.com/luxfi/ids"
 )
 
-// Transaction types
+// Transaction types. Each is a MUTATING operation that may only take effect
+// through a fee-settled consensus block — never through a synchronous RPC.
 const (
-	TxTypeCreateKey     = 1
-	TxTypeDeleteKey     = 2
-	TxTypeDistributeKey = 3
-	TxTypeReshareKey    = 4
-	TxTypeUpdateKeyMeta = 5
-	TxTypeRevokeKey     = 6
+	TxRegisterKey uint8 = 1 // record a key's PUBLIC material + commitments + policy
+	TxSetPolicy   uint8 = 2 // update a key's authorization policy
+	TxAuthorize   uint8 = 3 // authorize (trigger) a committee ceremony: dkg/sign/reshare
+	TxRevokeKey   uint8 = 4 // revoke a key
 )
 
-var (
-	ErrInvalidTxType    = errors.New("invalid transaction type")
-	ErrInvalidTxData    = errors.New("invalid transaction data")
-	ErrTxAlreadyExists  = errors.New("transaction already exists")
-	ErrKeyNotFound      = errors.New("key not found")
-	ErrKeyAlreadyExists = errors.New("key already exists")
-	ErrUnauthorized     = errors.New("unauthorized operation")
-)
+// payerAuthMode is the algorithm K uses to authenticate a transaction's payer.
+// It is the platform service-identity scheme (ML-DSA-65). Authentication is a
+// PUBLIC operation: K parses the payer's public key and verifies a signature;
+// it never possesses the payer's secret.
+const payerAuthMode = mldsa.MLDSA65
 
-// Transaction represents a K-Chain transaction.
+// Transaction is a K-Chain consensus transaction. Its header is deterministic
+// binary; Payload is an opaque, PUBLIC, op-specific JSON blob; Auth is the
+// payer's ML-DSA-65 public key and Sig the payer's signature over the signing
+// bytes. Nothing here is or can become secret material.
 type Transaction struct {
-	id        ids.ID
-	txType    uint8
-	timestamp time.Time
-	keyID     ids.ID
-	payload   []byte
-	signature []byte
-	sender    []byte
+	Type      uint8
+	Algorithm string      // key algorithm (drives per-algorithm gas); "" for policy-only ops
+	Payer     fee.Account // fee payer + authorization subject (public address)
+	KeyID     ids.ID      // target key (RegisterKey derives it; others reference it)
+	GasLimit  uint64      // payer-declared gas ceiling for this tx
+	Nonce     uint64      // payer replay/uniqueness nonce
+	Payload   []byte      // op-specific PUBLIC encoding
+	Auth      []byte      // payer ML-DSA-65 PUBLIC key
+	Sig       []byte      // payer signature over SigningBytes()
+
+	id ids.ID // cached, computed from full Bytes()
 }
 
-// NewTransaction creates a new transaction.
-func NewTransaction(txType uint8, keyID ids.ID, payload []byte, sender []byte) *Transaction {
-	tx := &Transaction{
-		txType:    txType,
-		timestamp: time.Now(),
-		keyID:     keyID,
-		payload:   payload,
-		sender:    sender,
-	}
-	// Compute ID from serialized data
-	data := tx.Bytes()
-	txID, _ := ids.ToID(data)
-	tx.id = txID
-	return tx
+// Operation payloads. All fields are PUBLIC.
+
+// RegisterKeyPayload records the PUBLIC result of an off-K DKG (or anchors a new
+// key): its public key, threshold parameters, VSS commitments, the committee
+// that holds the shares off-K, and the initial policy. No shares appear here.
+type RegisterKeyPayload struct {
+	Name        string       `json:"name"`
+	PublicKey   []byte       `json:"publicKey"`
+	Threshold   uint32       `json:"threshold"`
+	TotalShares uint32       `json:"totalShares"`
+	Commitments [][]byte     `json:"commitments"`
+	Committee   []ids.NodeID `json:"committee"`
+	Policy      AuthPolicy   `json:"policy"`
 }
 
-// ID returns the transaction's unique identifier.
+// SetPolicyPayload replaces a key's authorization policy.
+type SetPolicyPayload struct {
+	Policy AuthPolicy `json:"policy"`
+}
+
+// AuthorizePayload triggers a committee ceremony. Message is the PUBLIC digest
+// to be signed (for sign ceremonies); empty for dkg/reshare.
+type AuthorizePayload struct {
+	Ceremony string `json:"ceremony"` // CeremonyDKG | CeremonySign | CeremonyReshare
+	Message  []byte `json:"message"`
+}
+
+// RevokePayload revokes a key.
+type RevokePayload struct {
+	Reason string `json:"reason"`
+}
+
+// putU16/putU32/putU64 append big-endian length-prefixed fields.
+func putBytes(dst []byte, b []byte) []byte {
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], uint32(len(b)))
+	dst = append(dst, l[:]...)
+	return append(dst, b...)
+}
+
+// SigningBytes is the deterministic encoding the payer signs. It binds every
+// semantically meaningful field — including Payer — but excludes Auth and Sig.
+// Because Payer is bound here and authenticate() requires Payer ==
+// addressOf(Auth), an attacker cannot swap in a different public key.
+func (tx *Transaction) SigningBytes() []byte {
+	b := make([]byte, 0, 128+len(tx.Payload))
+	b = append(b, tx.Type)
+	b = putBytes(b, []byte(tx.Algorithm))
+	b = append(b, tx.Payer[:]...)
+	b = append(b, tx.KeyID[:]...)
+	var u8 [8]byte
+	binary.BigEndian.PutUint64(u8[:], tx.GasLimit)
+	b = append(b, u8[:]...)
+	binary.BigEndian.PutUint64(u8[:], tx.Nonce)
+	b = append(b, u8[:]...)
+	b = putBytes(b, tx.Payload)
+	return b
+}
+
+// Bytes is the full wire encoding: SigningBytes followed by Auth and Sig.
+func (tx *Transaction) Bytes() []byte {
+	b := tx.SigningBytes()
+	b = putBytes(b, tx.Auth)
+	b = putBytes(b, tx.Sig)
+	return b
+}
+
+// ID returns the transaction's content hash (over the full Bytes).
 func (tx *Transaction) ID() ids.ID {
+	if tx.id == ids.Empty {
+		tx.id = ids.ID(sha256.Sum256(tx.Bytes()))
+	}
 	return tx.id
 }
 
-// Type returns the transaction type.
-func (tx *Transaction) Type() uint8 {
-	return tx.txType
+type cursor struct {
+	b   []byte
+	off int
 }
 
-// Timestamp returns the transaction timestamp.
-func (tx *Transaction) Timestamp() time.Time {
-	return tx.timestamp
+func (c *cursor) u8() (uint8, error) {
+	if c.off+1 > len(c.b) {
+		return 0, ErrInvalidPayload
+	}
+	v := c.b[c.off]
+	c.off++
+	return v, nil
 }
 
-// KeyID returns the key ID this transaction operates on.
-func (tx *Transaction) KeyID() ids.ID {
-	return tx.keyID
+func (c *cursor) fixed(n int) ([]byte, error) {
+	if c.off+n > len(c.b) {
+		return nil, ErrInvalidPayload
+	}
+	v := c.b[c.off : c.off+n]
+	c.off += n
+	return v, nil
 }
 
-// Payload returns the transaction payload.
-func (tx *Transaction) Payload() []byte {
-	return tx.payload
+func (c *cursor) u64() (uint64, error) {
+	v, err := c.fixed(8)
+	if err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint64(v), nil
 }
 
-// Bytes serializes the transaction to bytes.
-func (tx *Transaction) Bytes() []byte {
-	data := make([]byte, 0, 256)
-
-	// Type (1 byte)
-	data = append(data, tx.txType)
-
-	// Timestamp (8 bytes)
-	tsBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(tsBytes, uint64(tx.timestamp.Unix()))
-	data = append(data, tsBytes...)
-
-	// Key ID (32 bytes)
-	data = append(data, tx.keyID[:]...)
-
-	// Payload length + payload
-	payloadLen := make([]byte, 4)
-	binary.BigEndian.PutUint32(payloadLen, uint32(len(tx.payload)))
-	data = append(data, payloadLen...)
-	data = append(data, tx.payload...)
-
-	// Sender length + sender
-	senderLen := make([]byte, 4)
-	binary.BigEndian.PutUint32(senderLen, uint32(len(tx.sender)))
-	data = append(data, senderLen...)
-	data = append(data, tx.sender...)
-
-	// Signature length + signature
-	sigLen := make([]byte, 4)
-	binary.BigEndian.PutUint32(sigLen, uint32(len(tx.signature)))
-	data = append(data, sigLen...)
-	data = append(data, tx.signature...)
-
-	return data
+func (c *cursor) bytes() ([]byte, error) {
+	lb, err := c.fixed(4)
+	if err != nil {
+		return nil, err
+	}
+	n := int(binary.BigEndian.Uint32(lb))
+	return c.fixed(n)
 }
 
-// ParseTransaction deserializes a transaction from bytes.
+// ParseTransaction decodes a transaction from its wire encoding.
 func ParseTransaction(data []byte) (*Transaction, error) {
-	if len(data) < 45 { // minimum: 1 + 8 + 32 + 4
-		return nil, ErrInvalidTxData
-	}
-
+	c := &cursor{b: data}
 	tx := &Transaction{}
-	offset := 0
-
-	// Type
-	tx.txType = data[offset]
-	offset++
-
-	// Timestamp
-	ts := binary.BigEndian.Uint64(data[offset : offset+8])
-	tx.timestamp = time.Unix(int64(ts), 0)
-	offset += 8
-
-	// Key ID
-	copy(tx.keyID[:], data[offset:offset+32])
-	offset += 32
-
-	// Payload
-	if offset+4 > len(data) {
-		return nil, ErrInvalidTxData
+	var err error
+	if tx.Type, err = c.u8(); err != nil {
+		return nil, err
 	}
-	payloadLen := binary.BigEndian.Uint32(data[offset : offset+4])
-	offset += 4
-	if offset+int(payloadLen) > len(data) {
-		return nil, ErrInvalidTxData
+	algo, err := c.bytes()
+	if err != nil {
+		return nil, err
 	}
-	tx.payload = make([]byte, payloadLen)
-	copy(tx.payload, data[offset:offset+int(payloadLen)])
-	offset += int(payloadLen)
-
-	// Sender
-	if offset+4 > len(data) {
-		return nil, ErrInvalidTxData
+	tx.Algorithm = string(algo)
+	payer, err := c.fixed(ids.ShortIDLen)
+	if err != nil {
+		return nil, err
 	}
-	senderLen := binary.BigEndian.Uint32(data[offset : offset+4])
-	offset += 4
-	if offset+int(senderLen) > len(data) {
-		return nil, ErrInvalidTxData
+	copy(tx.Payer[:], payer)
+	keyID, err := c.fixed(32)
+	if err != nil {
+		return nil, err
 	}
-	tx.sender = make([]byte, senderLen)
-	copy(tx.sender, data[offset:offset+int(senderLen)])
-	offset += int(senderLen)
-
-	// Signature
-	if offset+4 > len(data) {
-		return nil, ErrInvalidTxData
+	copy(tx.KeyID[:], keyID)
+	if tx.GasLimit, err = c.u64(); err != nil {
+		return nil, err
 	}
-	sigLen := binary.BigEndian.Uint32(data[offset : offset+4])
-	offset += 4
-	if offset+int(sigLen) > len(data) {
-		return nil, ErrInvalidTxData
+	if tx.Nonce, err = c.u64(); err != nil {
+		return nil, err
 	}
-	tx.signature = make([]byte, sigLen)
-	copy(tx.signature, data[offset:offset+int(sigLen)])
-
-	// Recompute ID
-	txID, _ := ids.ToID(tx.Bytes())
-	tx.id = txID
-
+	if tx.Payload, err = c.bytes(); err != nil {
+		return nil, err
+	}
+	if tx.Auth, err = c.bytes(); err != nil {
+		return nil, err
+	}
+	if tx.Sig, err = c.bytes(); err != nil {
+		return nil, err
+	}
+	if c.off != len(data) {
+		return nil, fmt.Errorf("keyvm: %w: trailing bytes", ErrInvalidPayload)
+	}
+	tx.id = ids.ID(sha256.Sum256(data))
 	return tx, nil
 }
 
-// Verify verifies the transaction is valid.
-func (tx *Transaction) Verify(ctx context.Context) error {
-	// Validate transaction type
-	switch tx.txType {
-	case TxTypeCreateKey, TxTypeDeleteKey, TxTypeDistributeKey,
-		TxTypeReshareKey, TxTypeUpdateKeyMeta, TxTypeRevokeKey:
-		// Valid type
+// addressOf derives a payer account from an ML-DSA public key. K is internally
+// consistent: it derives the same address it checks a payer against. This is a
+// PUBLIC, one-way derivation (no secret involved).
+func addressOf(pub []byte) fee.Account {
+	h := sha256.Sum256(pub)
+	var a fee.Account
+	copy(a[:], h[:ids.ShortIDLen])
+	return a
+}
+
+// SyntacticVerify checks the transaction is well-formed and priceable, without
+// any state. It rejects unknown types, unpriceable algorithms, and undecodable
+// or out-of-range payloads — all fail-closed.
+func (tx *Transaction) SyntacticVerify() error {
+	switch tx.Type {
+	case TxRegisterKey, TxSetPolicy, TxAuthorize, TxRevokeKey:
 	default:
 		return ErrInvalidTxType
 	}
-
-	// Validate timestamp is not in the future
-	if tx.timestamp.After(time.Now().Add(time.Minute)) {
-		return errors.New("transaction timestamp too far in the future")
+	// Pricing also validates the algorithm membership for algorithm-bearing ops.
+	if _, err := GasFor(tx); err != nil {
+		return err
 	}
-
-	// Additional validation could include:
-	// - Signature verification
-	// - Sender authorization
-	// - Payload format validation
-
+	switch tx.Type {
+	case TxRegisterKey:
+		var p RegisterKeyPayload
+		if err := json.Unmarshal(tx.Payload, &p); err != nil {
+			return fmt.Errorf("keyvm: %w: register: %v", ErrInvalidPayload, err)
+		}
+		if p.Name == "" || len(p.PublicKey) == 0 {
+			return fmt.Errorf("keyvm: %w: register: empty name or public key", ErrInvalidPayload)
+		}
+		if p.Threshold == 0 || p.TotalShares == 0 || p.Threshold > p.TotalShares {
+			return fmt.Errorf("keyvm: %w: t=%d n=%d", ErrInvalidThreshold, p.Threshold, p.TotalShares)
+		}
+		if len(p.Commitments) == 0 {
+			return fmt.Errorf("keyvm: %w: register: no commitments", ErrInvalidPayload)
+		}
+	case TxSetPolicy:
+		var p SetPolicyPayload
+		if err := json.Unmarshal(tx.Payload, &p); err != nil {
+			return fmt.Errorf("keyvm: %w: setpolicy: %v", ErrInvalidPayload, err)
+		}
+	case TxAuthorize:
+		var p AuthorizePayload
+		if err := json.Unmarshal(tx.Payload, &p); err != nil {
+			return fmt.Errorf("keyvm: %w: authorize: %v", ErrInvalidPayload, err)
+		}
+		switch p.Ceremony {
+		case CeremonyDKG, CeremonySign, CeremonyReshare:
+		default:
+			return fmt.Errorf("keyvm: %w: %q", ErrInvalidCeremony, p.Ceremony)
+		}
+	case TxRevokeKey:
+		var p RevokePayload
+		if err := json.Unmarshal(tx.Payload, &p); err != nil {
+			return fmt.Errorf("keyvm: %w: revoke: %v", ErrInvalidPayload, err)
+		}
+	}
 	return nil
 }
 
-// Execute executes the transaction against the VM state.
-func (tx *Transaction) Execute(ctx context.Context, vm *VM) error {
-	switch tx.txType {
-	case TxTypeCreateKey:
-		return tx.executeCreateKey(ctx, vm)
-	case TxTypeDeleteKey:
-		return tx.executeDeleteKey(ctx, vm)
-	case TxTypeDistributeKey:
-		return tx.executeDistributeKey(ctx, vm)
-	case TxTypeReshareKey:
-		return tx.executeReshareKey(ctx, vm)
-	case TxTypeUpdateKeyMeta:
-		return tx.executeUpdateKeyMeta(ctx, vm)
-	case TxTypeRevokeKey:
-		return tx.executeRevokeKey(ctx, vm)
+// authenticate verifies the payer authorized this transaction. PUBLIC ONLY:
+// parse the payer's ML-DSA-65 public key, require it hashes to Payer, and verify
+// the signature over SigningBytes. No secret material is touched.
+func (tx *Transaction) authenticate() error {
+	if len(tx.Auth) == 0 || len(tx.Sig) == 0 {
+		return ErrUnsignedTx
+	}
+	if addressOf(tx.Auth) != tx.Payer {
+		return ErrPayerMismatch
+	}
+	pub, err := mldsa.PublicKeyFromBytes(tx.Auth, payerAuthMode)
+	if err != nil {
+		return fmt.Errorf("keyvm: payer public key: %w", err)
+	}
+	if !pub.VerifySignature(tx.SigningBytes(), tx.Sig) {
+		return ErrBadSignature
+	}
+	return nil
+}
+
+func deriveKeyID(name string) ids.ID {
+	return ids.ID(sha256.Sum256([]byte("keyvm/key/" + name)))
+}
+
+// checkAuth is the single, read-only authorization predicate for a transaction:
+// it decides whether tx may take effect against the CURRENT committed state at
+// time now. It mutates nothing. It is the one place the policy model is
+// enforced, called at three layers so unauthorized transactions are rejected at
+// the earliest gate and never charged: admission (SubmitTx), consensus
+// (Block.Verify), and — as defense in depth — application (Apply). The caller
+// holds the appropriate stateLock.
+func (tx *Transaction) checkAuth(vm *VM, now int64) error {
+	switch tx.Type {
+	case TxRegisterKey:
+		var p RegisterKeyPayload
+		if err := json.Unmarshal(tx.Payload, &p); err != nil {
+			return fmt.Errorf("keyvm: %w: register", ErrInvalidPayload)
+		}
+		if _, ok := vm.getKey(deriveKeyID(p.Name)); ok {
+			return ErrKeyExists
+		}
+		return nil
+	case TxSetPolicy:
+		rec, ok := vm.getKey(tx.KeyID)
+		if !ok {
+			return ErrKeyNotFound
+		}
+		if rec.Status != StatusActive {
+			return ErrKeyRevoked
+		}
+		if !rec.Policy.MayAdmin(tx.Payer) {
+			return ErrUnauthorized
+		}
+		return nil
+	case TxAuthorize:
+		rec, ok := vm.getKey(tx.KeyID)
+		if !ok {
+			return ErrKeyNotFound
+		}
+		if rec.Status != StatusActive {
+			return ErrKeyRevoked
+		}
+		if !rec.Policy.MayInvoke(tx.Payer, now) {
+			return ErrUnauthorized
+		}
+		return nil
+	case TxRevokeKey:
+		rec, ok := vm.getKey(tx.KeyID)
+		if !ok {
+			return ErrKeyNotFound
+		}
+		if !rec.Policy.MayAdmin(tx.Payer) {
+			return ErrUnauthorized
+		}
+		return nil
 	default:
 		return ErrInvalidTxType
 	}
 }
 
-func (tx *Transaction) executeCreateKey(ctx context.Context, vm *VM) error {
-	// Parse payload for key creation params
-	if len(tx.payload) < 4 {
-		return ErrInvalidTxData
+// Apply mutates VM state for an already-verified, already-paid transaction. It
+// runs inside block.Accept, writing through the VM's versiondb so the effect
+// commits atomically with the fee burn. now is the accepting block's unix time.
+// It re-runs checkAuth (defense in depth) before mutating.
+func (tx *Transaction) Apply(vm *VM, now int64) error {
+	if err := tx.checkAuth(vm, now); err != nil {
+		return err
 	}
-
-	// Key already stored via the RPC call that created the transaction
-	// This just logs the creation on-chain for auditability
-	vm.log.Info("key creation recorded on-chain",
-		"keyID", tx.keyID,
-		"txID", tx.id,
-	)
-
-	return nil
+	switch tx.Type {
+	case TxRegisterKey:
+		return tx.applyRegister(vm, now)
+	case TxSetPolicy:
+		return tx.applySetPolicy(vm, now)
+	case TxAuthorize:
+		return tx.applyAuthorize(vm, now)
+	case TxRevokeKey:
+		return tx.applyRevoke(vm, now)
+	default:
+		return ErrInvalidTxType
+	}
 }
 
-func (tx *Transaction) executeDeleteKey(ctx context.Context, vm *VM) error {
-	// Mark key as deleted in state
-	vm.log.Info("key deletion recorded on-chain",
-		"keyID", tx.keyID,
-		"txID", tx.id,
-	)
-
-	return nil
+func (tx *Transaction) applyRegister(vm *VM, now int64) error {
+	var p RegisterKeyPayload
+	if err := json.Unmarshal(tx.Payload, &p); err != nil {
+		return fmt.Errorf("keyvm: %w: register", ErrInvalidPayload)
+	}
+	// The registrant is always an admin of the key it registers, so it can never
+	// lock itself out (fail-secure default).
+	policy := p.Policy
+	if !policy.MayAdmin(tx.Payer) {
+		policy.Admins = append(policy.Admins, tx.Payer)
+	}
+	rec := &KeyRecord{
+		ID:          deriveKeyID(p.Name),
+		Name:        p.Name,
+		Algorithm:   tx.Algorithm,
+		PublicKey:   p.PublicKey,
+		Threshold:   p.Threshold,
+		TotalShares: p.TotalShares,
+		Commitments: p.Commitments,
+		Committee:   p.Committee,
+		Policy:      policy,
+		Owner:       tx.Payer,
+		Status:      StatusActive,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	return vm.putKey(rec)
 }
 
-func (tx *Transaction) executeDistributeKey(ctx context.Context, vm *VM) error {
-	// Record key distribution event
-	vm.log.Info("key distribution recorded on-chain",
-		"keyID", tx.keyID,
-		"txID", tx.id,
-	)
-
-	return nil
+func (tx *Transaction) applySetPolicy(vm *VM, now int64) error {
+	var p SetPolicyPayload
+	if err := json.Unmarshal(tx.Payload, &p); err != nil {
+		return fmt.Errorf("keyvm: %w: setpolicy", ErrInvalidPayload)
+	}
+	rec, ok := vm.getKey(tx.KeyID)
+	if !ok {
+		return ErrKeyNotFound
+	}
+	// The owner remains an admin no matter what the new policy says — a key's
+	// owner can never be evicted by a policy update (fail-secure).
+	newPolicy := p.Policy
+	if !newPolicy.MayAdmin(rec.Owner) {
+		newPolicy.Admins = append(newPolicy.Admins, rec.Owner)
+	}
+	rec.Policy = newPolicy
+	rec.UpdatedAt = now
+	return vm.putKey(rec)
 }
 
-func (tx *Transaction) executeReshareKey(ctx context.Context, vm *VM) error {
-	// Record reshare event
-	vm.log.Info("key reshare recorded on-chain",
-		"keyID", tx.keyID,
-		"txID", tx.id,
-	)
-
-	return nil
+func (tx *Transaction) applyAuthorize(vm *VM, now int64) error {
+	var p AuthorizePayload
+	if err := json.Unmarshal(tx.Payload, &p); err != nil {
+		return fmt.Errorf("keyvm: %w: authorize", ErrInvalidPayload)
+	}
+	// CeremonyID binds key, requester, nonce and message so it is unique and
+	// auditable. K records the AUTHORIZATION; the committee fulfils it off-K.
+	var seed []byte
+	seed = append(seed, tx.KeyID[:]...)
+	seed = append(seed, tx.Payer[:]...)
+	var nb [8]byte
+	binary.BigEndian.PutUint64(nb[:], tx.Nonce)
+	seed = append(seed, nb[:]...)
+	seed = append(seed, p.Message...)
+	c := &CeremonyRecord{
+		ID:        ids.ID(sha256.Sum256(seed)),
+		KeyID:     tx.KeyID,
+		Type:      p.Ceremony,
+		Requester: tx.Payer,
+		Message:   p.Message,
+		Status:    CeremonyAuthorized,
+		CreatedAt: now,
+	}
+	return vm.putCeremony(c)
 }
 
-func (tx *Transaction) executeUpdateKeyMeta(ctx context.Context, vm *VM) error {
-	// Record metadata update
-	vm.log.Info("key metadata update recorded on-chain",
-		"keyID", tx.keyID,
-		"txID", tx.id,
-	)
-
-	return nil
-}
-
-func (tx *Transaction) executeRevokeKey(ctx context.Context, vm *VM) error {
-	// Record key revocation
-	vm.log.Info("key revocation recorded on-chain",
-		"keyID", tx.keyID,
-		"txID", tx.id,
-	)
-
-	return nil
-}
-
-// CreateKeyPayload represents the payload for a CreateKey transaction.
-type CreateKeyPayload struct {
-	Name        string
-	Algorithm   string
-	Threshold   int
-	TotalShares int
-	Tags        []string
-}
-
-// DeleteKeyPayload represents the payload for a DeleteKey transaction.
-type DeleteKeyPayload struct {
-	Force bool
-}
-
-// DistributeKeyPayload represents the payload for a DistributeKey transaction.
-type DistributeKeyPayload struct {
-	Validators []string
-	Threshold  int
-}
-
-// ReshareKeyPayload represents the payload for a ReshareKey transaction.
-type ReshareKeyPayload struct {
-	NewValidators []string
-	NewThreshold  int
-}
-
-// UpdateKeyMetaPayload represents the payload for an UpdateKeyMeta transaction.
-type UpdateKeyMetaPayload struct {
-	Name   string
-	Tags   []string
-	Status string
-}
-
-// RevokeKeyPayload represents the payload for a RevokeKey transaction.
-type RevokeKeyPayload struct {
-	Reason string
+func (tx *Transaction) applyRevoke(vm *VM, now int64) error {
+	rec, ok := vm.getKey(tx.KeyID)
+	if !ok {
+		return ErrKeyNotFound
+	}
+	if !rec.Policy.MayAdmin(tx.Payer) {
+		return ErrUnauthorized
+	}
+	rec.Status = StatusRevoked
+	rec.UpdatedAt = now
+	return vm.putKey(rec)
 }
