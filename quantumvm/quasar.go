@@ -106,44 +106,15 @@ func NewQuasar(cfg QuasarConfig) (*Quasar, error) {
 	return q, nil
 }
 
-// InitializeDualThreshold sets up BLS and Corona threshold keys for a new epoch
-func (q *Quasar) InitializeDualThreshold(ctx context.Context) error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	// Generate dual threshold keys (BLS + Corona)
-	config, err := quasar.GenerateDualKeys(q.threshold, q.totalNodes)
-	if err != nil {
-		return fmt.Errorf("failed to generate dual threshold keys: %w", err)
-	}
-
-	// Create new Signer engine with full dual threshold support
-	signer, err := quasar.NewSignerWithConfig(*config)
-	if err != nil {
-		return fmt.Errorf("failed to initialize dual threshold signer: %w", err)
-	}
-	// Note: signer is used for logging only - actual signing goes through q.quasar
-	_ = signer
-
-	// Initialize validators on the Quasar core
-	validatorIDs := make([]string, q.totalNodes)
-	for i := 0; i < q.totalNodes; i++ {
-		validatorIDs[i] = fmt.Sprintf("v%d", i)
-	}
-	if err := q.quasar.InitializeValidators(validatorIDs); err != nil {
-		return fmt.Errorf("failed to initialize validators: %w", err)
-	}
-
-	q.log.Info("═══════════════════════════════════════════════════════════════════")
-	q.log.Info("║ QUASAR PQ-BFT INITIALIZED                                       ║")
-	q.log.Info("───────────────────────────────────────────────────────────────────")
-	q.log.Info("║ Threshold:", log.Int("t", q.threshold), log.Int("n", q.totalNodes))
-	q.log.Info("║ BLS Threshold Mode:", log.Bool("enabled", signer.IsThresholdMode()))
-	q.log.Info("║ Corona PQ Mode:", log.Bool("enabled", signer.IsDualThresholdMode()))
-	q.log.Info("═══════════════════════════════════════════════════════════════════")
-
-	return nil
-}
+// NOTE: there is intentionally no per-epoch dual-threshold key generation here.
+// A prior helper (InitializeDualThreshold) called consensus quasar.GenerateDualKeys,
+// a TRUSTED-DEALER keygen in which one process mints and holds every validator's
+// BLS+Corona secret share — defeating threshold security. Consensus fenced that
+// helper test-only (corona-genesis hardening), and this VM never invoked it: the
+// Quasar bridge below signs through the consensus core with per-validator keys, and
+// validators join via AddValidator. If a genuine per-epoch group key is ever needed,
+// it MUST come from a dealerless DKG (corona dkg2 / pulsar v0.3 distributed), never a
+// trusted dealer.
 
 // SignBlock creates both BLS and Corona signatures for a block in parallel.
 // Returns both signatures; both must reach threshold for quantum finality.
@@ -165,7 +136,7 @@ func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte
 	q.mu.Unlock()
 
 	if qcore == nil {
-		return nil, fmt.Errorf("quasar not initialized - call InitializeDualThreshold first")
+		return nil, fmt.Errorf("quasar core not initialized")
 	}
 
 	// Run both lanes in parallel
