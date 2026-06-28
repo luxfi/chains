@@ -15,7 +15,7 @@ import (
 	"github.com/luxfi/lattice/v7/core/rlwe"
 	"github.com/luxfi/lattice/v7/schemes/ckks"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms/platformvm/warp"
+	"github.com/luxfi/warp"
 	"github.com/stretchr/testify/require"
 )
 
@@ -375,12 +375,12 @@ func TestWarpHandler(t *testing.T) {
 	require.Error(err)
 
 	// Invalid payload (too short)
-	msg := &warp.Message{
-		UnsignedMessage: warp.UnsignedMessage{
+	env := &warp.Envelope{
+		Message: warp.Message{
 			Payload: []byte{0x01, 0x02},
 		},
 	}
-	err = handler.HandleMessage(context.Background(), msg)
+	err = handler.HandleMessage(context.Background(), env)
 	require.Error(err)
 	require.Equal(ErrInvalidPayload, err)
 }

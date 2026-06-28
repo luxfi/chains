@@ -13,7 +13,7 @@ require (
 	github.com/luxfi/constants v1.5.8
 	github.com/luxfi/crypto v1.19.26
 	github.com/luxfi/database v1.20.4
-	github.com/luxfi/evm v1.99.39
+	github.com/luxfi/evm v1.99.48
 	github.com/luxfi/geth v1.17.12
 	github.com/luxfi/ids v1.2.15
 	github.com/luxfi/lattice/v7 v7.1.4
@@ -21,7 +21,7 @@ require (
 	github.com/luxfi/metric v1.5.9
 	github.com/luxfi/node v1.30.6
 	github.com/luxfi/oracle v1.0.0
-	github.com/luxfi/precompile v0.5.59
+	github.com/luxfi/precompile v0.16.0
 	github.com/luxfi/relay v1.0.0
 	github.com/luxfi/rpc v1.1.0
 	github.com/luxfi/runtime v1.1.3
@@ -30,7 +30,7 @@ require (
 	github.com/luxfi/timer v1.0.2
 	github.com/luxfi/version v1.0.1
 	github.com/luxfi/vm v1.2.5
-	github.com/luxfi/warp v1.19.5
+	github.com/luxfi/warp v1.23.0
 	github.com/stretchr/testify v1.11.1
 	github.com/zeebo/blake3 v0.2.4
 	golang.org/x/crypto v0.52.0
@@ -93,10 +93,8 @@ require (
 	github.com/ethereum/c-kzg-4844/v2 v2.1.7 // indirect
 	github.com/ethereum/go-bigmodexpfix v0.0.0-20250911101455-f9e208c548ab // indirect
 	github.com/ferranbt/fastssz v1.0.0 // indirect
-	github.com/fjl/gencodec v0.1.1 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.1 // indirect
-	github.com/garslo/gogen v0.0.0-20170306192744-1d203ffc1f61 // indirect
 	github.com/gballet/go-libpcsclite v0.0.0-20250918194357-1ec6f2e601c6 // indirect
 	github.com/getsentry/sentry-go v0.44.1 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect
@@ -136,7 +134,6 @@ require (
 	github.com/luxfi/age v1.5.0 // indirect
 	github.com/luxfi/api v1.0.15 // indirect
 	github.com/luxfi/atomic v1.0.0 // indirect
-	github.com/luxfi/bft v0.1.5 // indirect
 	github.com/luxfi/cache v1.2.1 // indirect
 	github.com/luxfi/codec v1.1.5 // indirect
 	github.com/luxfi/compress v0.0.5 // indirect
@@ -184,7 +181,6 @@ require (
 	github.com/mimoo/StrobeGo v0.0.0-20220103164710-9a04d6ca976b // indirect
 	github.com/minio/crc64nvme v1.1.1 // indirect
 	github.com/minio/md5-simd v1.1.2 // indirect
-	github.com/minio/minio-go/v7 v7.0.100 // indirect
 	github.com/minio/sha256-simd v1.0.1 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/mitchellh/pointerstructure v1.2.1 // indirect
@@ -248,7 +244,6 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.45.0 // indirect
 	gonum.org/v1/gonum v0.17.0 // indirect
-	google.golang.org/grpc v1.81.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect

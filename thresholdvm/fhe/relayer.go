@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/luxfi/chains/internal/warpmsg"
 	"github.com/luxfi/geth/common"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/lattice/v7/core/rlwe"
@@ -20,8 +21,8 @@ import (
 	mpckks "github.com/luxfi/lattice/v7/multiparty/mpckks"
 	"github.com/luxfi/lattice/v7/schemes/ckks"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms/platformvm/warp"
-	"github.com/luxfi/node/vms/platformvm/warp/payload"
+	"github.com/luxfi/warp"
+	"github.com/luxfi/warp/payload"
 )
 
 var (
@@ -74,7 +75,7 @@ type Relayer struct {
 	shutdownChan chan struct{}
 
 	// Message handler callback for sending signed messages
-	onMessage func(context.Context, *warp.Message) error
+	onMessage func(context.Context, *warp.Envelope) error
 }
 
 // DecryptionResult contains the result of a threshold decryption
@@ -93,7 +94,7 @@ func NewRelayer(
 	chainID ids.ID,
 	zChainID ids.ID,
 	signer warp.Signer,
-	onMessage func(context.Context, *warp.Message) error,
+	onMessage func(context.Context, *warp.Envelope) error,
 ) *Relayer {
 	return &Relayer{
 		logger:          logger,
@@ -295,41 +296,16 @@ func (r *Relayer) sendFulfillment(ctx context.Context, req *DecryptionRequest) e
 		return fmt.Errorf("create addressed call: %w", err)
 	}
 
-	// Create unsigned warp message
-	unsignedMsg, err := warp.NewUnsignedMessage(
-		r.networkID,
-		r.chainID,
-		addressedCall.Bytes(),
-	)
+	// Build, sign, and wrap the fulfillment as a single-signer Warp envelope.
+	// warpmsg.BuildSigned is the one place that performs build→sign→wrap.
+	env, err := warpmsg.BuildSigned(r.signer, r.networkID, r.chainID, addressedCall.Bytes())
 	if err != nil {
-		return fmt.Errorf("create unsigned message: %w", err)
-	}
-
-	// Sign the message
-	sigBytes, err := r.signer.Sign(unsignedMsg)
-	if err != nil {
-		return fmt.Errorf("sign warp message: %w", err)
-	}
-
-	// Convert signature bytes to fixed-size array
-	var sig [96]byte
-	copy(sig[:], sigBytes)
-
-	// Create BitSetSignature
-	bitSetSig := &warp.BitSetSignature{
-		Signers:   []byte{0x01},
-		Signature: sig,
-	}
-
-	// Create final signed message
-	msg, err := warp.NewMessage(unsignedMsg, bitSetSig)
-	if err != nil {
-		return fmt.Errorf("create warp message: %w", err)
+		return fmt.Errorf("build signed warp message: %w", err)
 	}
 
 	// Send via message handler
 	if r.onMessage != nil {
-		if err := r.onMessage(ctx, msg); err != nil {
+		if err := r.onMessage(ctx, env); err != nil {
 			return fmt.Errorf("send warp message: %w", err)
 		}
 	}

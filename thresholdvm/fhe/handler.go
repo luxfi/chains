@@ -13,7 +13,7 @@ import (
 	"github.com/luxfi/geth/common"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms/platformvm/warp"
+	"github.com/luxfi/warp"
 )
 
 const (
@@ -41,11 +41,16 @@ func NewWarpHandler(logger log.Logger, relayer *Relayer) *WarpHandler {
 	}
 }
 
-// HandleMessage processes an incoming Warp message for FHE decryption
-func (h *WarpHandler) HandleMessage(ctx context.Context, msg *warp.Message) error {
-	if msg == nil {
+// HandleMessage processes an incoming signed Warp envelope for FHE decryption.
+// The envelope's Beam BitSetSignature is aggregated and verified against the
+// canonical validator set by the node warp backend before delivery; this
+// handler reads the authenticated content from env.Message.
+func (h *WarpHandler) HandleMessage(ctx context.Context, env *warp.Envelope) error {
+	if env == nil {
 		return errors.New("nil message")
 	}
+
+	msg := &env.Message
 
 	payload := msg.Payload
 	if len(payload) < 4 {
