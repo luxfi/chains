@@ -13,7 +13,7 @@ require (
 	github.com/luxfi/constants v1.5.8
 	github.com/luxfi/crypto v1.19.26
 	github.com/luxfi/database v1.20.4
-	github.com/luxfi/evm v1.99.48
+	github.com/luxfi/evm v1.99.51
 	github.com/luxfi/geth v1.17.12
 	github.com/luxfi/ids v1.2.15
 	github.com/luxfi/lattice/v7 v7.1.4
