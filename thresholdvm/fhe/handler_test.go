@@ -10,14 +10,16 @@ import (
 
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms/platformvm/warp"
+	"github.com/luxfi/warp"
 	"github.com/stretchr/testify/require"
 )
 
-func createTestWarpMessage(payload []byte, sourceChainID ids.ID) *warp.Message {
-	unsignedMsg, _ := warp.NewUnsignedMessage(0, sourceChainID, payload)
-	return &warp.Message{
-		UnsignedMessage: *unsignedMsg,
+func createTestWarpEnvelope(payload []byte, sourceChainID ids.ID) *warp.Envelope {
+	return &warp.Envelope{
+		Message: warp.Message{
+			SourceChainID: sourceChainID,
+			Payload:       payload,
+		},
 	}
 }
 
@@ -38,7 +40,7 @@ func TestWarpHandlerPayloadTooShort(t *testing.T) {
 	handler := NewWarpHandler(logger, nil)
 
 	// Create a message with payload < 4 bytes
-	msg := createTestWarpMessage([]byte{0x01, 0x02, 0x03}, ids.GenerateTestID())
+	msg := createTestWarpEnvelope([]byte{0x01, 0x02, 0x03}, ids.GenerateTestID())
 
 	err := handler.HandleMessage(context.Background(), msg)
 	require.ErrorIs(err, ErrInvalidPayload)
@@ -53,7 +55,7 @@ func TestWarpHandlerUnknownSelector(t *testing.T) {
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, 0xDEADBEEF) // Unknown selector
 
-	msg := createTestWarpMessage(payload, ids.GenerateTestID())
+	msg := createTestWarpEnvelope(payload, ids.GenerateTestID())
 
 	err := handler.HandleMessage(context.Background(), msg)
 	require.ErrorIs(err, ErrInvalidSelector)
@@ -69,7 +71,7 @@ func TestWarpHandlerDecryptionRequestPayloadTooShort(t *testing.T) {
 	payload := make([]byte, 20) // 4 (selector) + 16 (insufficient)
 	binary.BigEndian.PutUint32(payload, SelectorRequestDecryption)
 
-	msg := createTestWarpMessage(payload, ids.GenerateTestID())
+	msg := createTestWarpEnvelope(payload, ids.GenerateTestID())
 
 	err := handler.HandleMessage(context.Background(), msg)
 	require.ErrorIs(err, ErrInvalidPayload)
@@ -85,7 +87,7 @@ func TestWarpHandlerDecryptionWithCallbackPayloadTooShort(t *testing.T) {
 	payload := make([]byte, 40) // 4 (selector) + 36 (insufficient)
 	binary.BigEndian.PutUint32(payload, SelectorRequestDecryptionCallback)
 
-	msg := createTestWarpMessage(payload, ids.GenerateTestID())
+	msg := createTestWarpEnvelope(payload, ids.GenerateTestID())
 
 	err := handler.HandleMessage(context.Background(), msg)
 	require.ErrorIs(err, ErrInvalidPayload)
@@ -223,7 +225,7 @@ func TestWarpHandlerDecryptionRequestWithRelayer(t *testing.T) {
 	})
 	payload[36] = 0x01 // decryptionType
 
-	msg := createTestWarpMessage(payload, ids.GenerateTestID())
+	msg := createTestWarpEnvelope(payload, ids.GenerateTestID())
 
 	err := handler.HandleMessage(context.Background(), msg)
 	require.NoError(err)
@@ -262,7 +264,7 @@ func TestWarpHandlerDecryptionWithCallbackWithRelayer(t *testing.T) {
 	// callbackSelector (4 bytes)
 	binary.BigEndian.PutUint32(payload[57:61], 0x12345678)
 
-	msg := createTestWarpMessage(payload, ids.GenerateTestID())
+	msg := createTestWarpEnvelope(payload, ids.GenerateTestID())
 
 	err := handler.HandleMessage(context.Background(), msg)
 	require.NoError(err)

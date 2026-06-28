@@ -12,10 +12,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/luxfi/chains/internal/warpmsg"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms/platformvm/warp"
-	"github.com/luxfi/node/vms/platformvm/warp/payload"
+	"github.com/luxfi/warp"
+	"github.com/luxfi/warp/payload"
 )
 
 // OpCode represents an FHE operation code
@@ -117,7 +118,7 @@ type WarpCallback struct {
 	networkID uint32
 	chainID   ids.ID
 	signer    warp.Signer
-	onMessage func(context.Context, *warp.Message) error
+	onMessage func(context.Context, *warp.Envelope) error
 }
 
 // NewWarpCallback creates a new Warp callback handler
@@ -126,7 +127,7 @@ func NewWarpCallback(
 	networkID uint32,
 	chainID ids.ID,
 	signer warp.Signer,
-	onMessage func(context.Context, *warp.Message) error,
+	onMessage func(context.Context, *warp.Envelope) error,
 ) *WarpCallback {
 	return &WarpCallback{
 		logger:    logger,
@@ -152,40 +153,15 @@ func (w *WarpCallback) SendTaskResult(ctx context.Context, task *Task) error {
 		return fmt.Errorf("create addressed call: %w", err)
 	}
 
-	// Create unsigned warp message
-	unsignedMsg, err := warp.NewUnsignedMessage(
-		w.networkID,
-		w.chainID,
-		addressedCall.Bytes(),
-	)
+	// Build, sign, and wrap the result as a single-signer Warp envelope.
+	// warpmsg.BuildSigned is the one place that performs build→sign→wrap.
+	env, err := warpmsg.BuildSigned(w.signer, w.networkID, w.chainID, addressedCall.Bytes())
 	if err != nil {
-		return fmt.Errorf("create unsigned message: %w", err)
-	}
-
-	// Sign the message
-	sigBytes, err := w.signer.Sign(unsignedMsg)
-	if err != nil {
-		return fmt.Errorf("sign warp message: %w", err)
-	}
-
-	// Convert signature bytes to fixed-size array
-	var sig [96]byte
-	copy(sig[:], sigBytes)
-
-	// Create BitSetSignature
-	bitSetSig := &warp.BitSetSignature{
-		Signers:   []byte{0x01},
-		Signature: sig,
-	}
-
-	// Create final signed message
-	msg, err := warp.NewMessage(unsignedMsg, bitSetSig)
-	if err != nil {
-		return fmt.Errorf("create warp message: %w", err)
+		return fmt.Errorf("build signed warp message: %w", err)
 	}
 
 	// Send via message handler
-	if err := w.onMessage(ctx, msg); err != nil {
+	if err := w.onMessage(ctx, env); err != nil {
 		return fmt.Errorf("send warp message: %w", err)
 	}
 

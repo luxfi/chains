@@ -13,16 +13,16 @@ import (
 	"github.com/luxfi/geth/common"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms/platformvm/warp"
+	"github.com/luxfi/warp"
 	"github.com/stretchr/testify/require"
 )
 
 // mockSigner implements warp.Signer for testing
 type mockSigner struct {
-	signFunc func(*warp.UnsignedMessage) ([]byte, error)
+	signFunc func(*warp.Message) ([]byte, error)
 }
 
-func (m *mockSigner) Sign(msg *warp.UnsignedMessage) ([]byte, error) {
+func (m *mockSigner) Sign(msg *warp.Message) ([]byte, error) {
 	if m.signFunc != nil {
 		return m.signFunc(msg)
 	}
@@ -73,7 +73,7 @@ func TestNewRelayer(t *testing.T) {
 		chainID := ids.GenerateTestID()
 		zChainID := ids.GenerateTestID()
 
-		onMessage := func(_ context.Context, _ *warp.Message) error {
+		onMessage := func(_ context.Context, _ *warp.Envelope) error {
 			return nil
 		}
 
