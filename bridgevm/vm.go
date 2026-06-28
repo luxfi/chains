@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/luxfi/chains/internal/warpmsg"
 	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
@@ -1027,42 +1028,22 @@ func (vm *VM) triggerReshareProtocol(sessionID string, removedNodeID ids.NodeID,
 		return fmt.Errorf("failed to marshal MPC request: %w", err)
 	}
 
-	// Create warp unsigned message with the reshare request payload
-	unsignedMsg, err := warp.NewUnsignedMessage(
-		vm.rt.NetworkID,
-		vm.rt.ChainID,
-		requestBytes,
-	)
+	// Build, sign, and wrap the reshare request as a single-signer Warp
+	// envelope. The node signs with its BLS key over the Beam domain; the
+	// receiving ThresholdVM nodes aggregate and verify the signature against
+	// the canonical validator set. warpmsg.BuildSigned is the one place that
+	// performs this build→sign→wrap sequence.
+	env, err := warpmsg.BuildSigned(vm.rt.WarpSigner, vm.rt.NetworkID, vm.rt.ChainID, requestBytes)
 	if err != nil {
-		return fmt.Errorf("failed to create unsigned warp message: %w", err)
-	}
-
-	// Sign the message using the node's BLS key
-	sigBytes, err := vm.rt.WarpSigner.Sign(unsignedMsg)
-	if err != nil {
-		return fmt.Errorf("failed to sign warp message: %w", err)
-	}
-
-	// Create a BitSetSignature with this node as the sole signer
-	// The signature will be aggregated by receiving nodes in ThresholdVM
-	var sigArray [96]byte // BLS signature length
-	copy(sigArray[:], sigBytes)
-
-	// Create signers bitset with only this node (index 0)
-	signers := warp.NewBitSet()
-	signers.Add(0)
-
-	signature := warp.NewBitSetSignature(signers, sigArray)
-
-	// Create the signed warp message
-	signedMsg, err := warp.NewMessage(unsignedMsg, signature)
-	if err != nil {
-		return fmt.Errorf("failed to create signed warp message: %w", err)
+		return fmt.Errorf("failed to build signed warp message: %w", err)
 	}
 
 	// Broadcast the reshare request to all signers via gossip
 	// The ThresholdVM nodes will receive this and participate in the reshare protocol
-	msgBytes := signedMsg.Bytes()
+	msgBytes, err := env.Bytes()
+	if err != nil {
+		return fmt.Errorf("failed to encode warp envelope: %w", err)
+	}
 
 	config := warp.SendConfig{
 		Validators: len(vm.signerSet.Signers), // Send to all validators in signer set
