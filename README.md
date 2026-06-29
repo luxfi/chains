@@ -1,3 +1,5 @@
+<p align="center"><img src=".github/hero.svg" alt="chains" width="880"></p>
+
 # Lux Chains
 
 Independent VM plugin binaries for the Lux Network.
