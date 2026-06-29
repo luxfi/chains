@@ -26,7 +26,7 @@ require (
 	github.com/luxfi/rpc v1.1.0
 	github.com/luxfi/runtime v1.1.3
 	github.com/luxfi/sys v0.1.0
-	github.com/luxfi/threshold v1.9.9
+	github.com/luxfi/threshold v1.10.2
 	github.com/luxfi/timer v1.0.2
 	github.com/luxfi/version v1.0.1
 	github.com/luxfi/vm v1.2.5
@@ -139,9 +139,10 @@ require (
 	github.com/luxfi/compress v0.0.5 // indirect
 	github.com/luxfi/concurrent v0.0.3 // indirect
 	github.com/luxfi/container v0.0.4 // indirect
-	github.com/luxfi/corona v0.7.9 // indirect
+	github.com/luxfi/corona v0.10.2 // indirect
 	github.com/luxfi/crypto/ipa v1.2.4 // indirect
 	github.com/luxfi/dex v1.5.20 // indirect
+	github.com/luxfi/dkg v0.3.5 // indirect
 	github.com/luxfi/fhe v1.8.2 // indirect
 	github.com/luxfi/filesystem v0.0.1 // indirect
 	github.com/luxfi/formatting v1.0.1 // indirect
@@ -156,12 +157,13 @@ require (
 	github.com/luxfi/math/big v0.1.0 // indirect
 	github.com/luxfi/math/safe v0.0.1 // indirect
 	github.com/luxfi/mdns v0.1.1 // indirect
+	github.com/luxfi/mlwe v0.2.1 // indirect
 	github.com/luxfi/mock v0.1.1 // indirect
 	github.com/luxfi/net v0.0.5 // indirect
 	github.com/luxfi/p2p v1.21.1 // indirect
 	github.com/luxfi/pq v1.0.3 // indirect
 	github.com/luxfi/proto v1.3.5 // indirect
-	github.com/luxfi/pulsar v1.1.5 // indirect
+	github.com/luxfi/pulsar v1.7.1 // indirect
 	github.com/luxfi/resource v0.0.1 // indirect
 	github.com/luxfi/sampler v1.1.0 // indirect
 	github.com/luxfi/staking v1.5.1 // indirect
