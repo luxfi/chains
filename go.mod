@@ -139,7 +139,7 @@ require (
 	github.com/luxfi/compress v0.0.5 // indirect
 	github.com/luxfi/concurrent v0.0.3 // indirect
 	github.com/luxfi/container v0.0.4 // indirect
-	github.com/luxfi/corona v0.10.2 // indirect
+	github.com/luxfi/corona v0.10.3 // indirect
 	github.com/luxfi/crypto/ipa v1.2.4 // indirect
 	github.com/luxfi/dex v1.5.20 // indirect
 	github.com/luxfi/dkg v0.3.5 // indirect
@@ -163,7 +163,7 @@ require (
 	github.com/luxfi/p2p v1.21.1 // indirect
 	github.com/luxfi/pq v1.0.3 // indirect
 	github.com/luxfi/proto v1.3.5 // indirect
-	github.com/luxfi/pulsar v1.7.1 // indirect
+	github.com/luxfi/pulsar v1.8.0 // indirect
 	github.com/luxfi/resource v0.0.1 // indirect
 	github.com/luxfi/sampler v1.1.0 // indirect
 	github.com/luxfi/staking v1.5.1 // indirect
