@@ -18,7 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"math"
+	"math/big"
 	"sort"
 	"sync"
 	"testing"
@@ -172,7 +172,7 @@ func makeBlock(cvm *ChainVM, parentID ids.ID, height uint64, ts time.Time, txByt
 // This test exercises the validator path (makeBlock, no build), which never relays,
 // so its reject strands nothing.
 func TestRED_VerifyThenReject_StrandsDChainFill(t *testing.T) {
-	fills := []Fill{{Price: 1, Size: 1000, Side: 0}} // taker BUY, receives 1000 base
+	fills := []Fill{{Price: fp(1), Size: 1000, Side: 0}} // taker BUY, receives 1000 base
 	cvm, matcher, cChainSM, proxyChain, _ := newCountingHarness(t, fills)
 	ctx := context.Background()
 
@@ -294,24 +294,22 @@ func TestRED_ReVerify_DoublesPlaceOrder(t *testing.T) {
 	}
 }
 
-// TestRED_FractionalFill_NeverMints is the fractional-fill conservation proof. A
-// CLOB fill crosses the wire as float64, but on-chain value is integer asset
-// units, so a sub-integer proceeds amount cannot be credited without minting a
-// fractional unit. The CONSERVATION-SAFE rule (the law: the proxy NEVER mints)
-// is to round a RECEIVED quantity DOWN (quantToCredit) and a SPENT quantity UP
-// (quantToCharge). Worst case the taker is under-credited by <1 unit; that
-// sub-unit is conserved on the d-chain side (the maker's leg), never fabricated
-// out of the proxy — the opposite of a mint.
+// TestRED_FractionalFill_NeverMints is the fractional-QUOTE conservation proof.
+// The wire now carries EXACT integers (size in whole base units, price fixed-point
+// ×PriceScale), so a fill's quote = floor(size × price / PriceScale) is itself an
+// exact integer — the SAME per-fill floor the venue matcher moved. There is no
+// float and no directional rounding seam; the proxy spends precisely the venue's
+// quote and the escrow-truncation mint is structurally impossible.
 //
-// This pins the resolved behavior with an ESCROW present so both legs are
-// auditable: a taker BUY locks 10 quote and fills 4.5 base @ price 2 (a fill
-// stream with a fractional base AND a fractional notional). The quote spent
-// ceils to 9, base proceeds floor to 4; value_out (4 base + 1 quote refund) must
-// never exceed value_in, and the locked-quote ledger must balance exactly.
+// This pins the behavior with an ESCROW present so both legs are auditable: a taker
+// BUY locks 10 quote and fills 3 base @ price 2.5 (fixed-point fp(2.5)). The quote =
+// floor(3 × 2.5) = floor(7.5) = 7 (the venue's own integer quote), base proceeds =
+// 3; value_out (3 base + 3 quote refund) must never exceed value_in, and the
+// locked-quote ledger must balance exactly (spent 7 + refund 3 == locked 10).
 func TestRED_FractionalFill_NeverMints(t *testing.T) {
-	// BUY: receives base = sum(size) = 4.5 -> floor 4. spends quote =
-	// sum(price*size) = 9.0 -> ceil 9. locked 10 quote -> refund 10-9 = 1.
-	fills := []Fill{{Price: 2, Size: 4.5, Side: 0}}
+	// BUY: receives base = Σ size = 3. spends quote = floor(3 × fp(2.5)/PriceScale) =
+	// floor(7.5) = 7. locked 10 quote -> refund 10-7 = 3.
+	fills := []Fill{{Price: fp(2.5), Size: 3, Side: 0}}
 	cvm, _, _, _, _ := newCountingHarness(t, fills)
 
 	taker := ids.GenerateTestShortID()
@@ -346,57 +344,41 @@ func TestRED_FractionalFill_NeverMints(t *testing.T) {
 			}
 		}
 	}
-	t.Logf("fractional fill: base proceeds=%d (floor 4.5) quote refund=%d (locked 10 - ceil(9.0))", base, refund)
+	t.Logf("fractional-quote fill: base proceeds=%d (Σ size = 3) quote refund=%d (locked 10 - floor(7.5)=7)", base, refund)
 
-	// Proceeds round DOWN: never credit more base than the integer floor.
-	if base > 4 {
-		t.Fatalf("MINT: credited %d base for a 4.5 fill — proceeds must floor to 4, never round up.", base)
+	// Proceeds are the exact base traded: never credit more base than Σ size.
+	if base > 3 {
+		t.Fatalf("MINT: credited %d base for a 3-base fill — proceeds must equal Σ size = 3, never more.", base)
 	}
-	// Spent quote ceils to 9, so refund is exactly 1 — never inflated (that would
-	// be the escrow-truncation mint), never negative.
-	if refund != lockedQuote-9 {
-		t.Fatalf("CONSERVATION VIOLATED: quote refund=%d, want %d (locked 10 - spent ceil(9.0)=9).", refund, lockedQuote-9)
+	// Spent quote floors to 7 (the venue's exact quote), so refund is exactly 3 —
+	// never inflated (that would be the escrow-truncation mint), never negative.
+	if refund != lockedQuote-7 {
+		t.Fatalf("CONSERVATION VIOLATED: quote refund=%d, want %d (locked 10 - spent floor(7.5)=7).", refund, lockedQuote-7)
 	}
-	// No-mint over the locked-quote ledger: spent(9) + refund(1) == locked(10).
-	if spent := lockedQuote - refund; spent != 9 {
+	// No-mint over the locked-quote ledger: spent(7) + refund(3) == locked(10).
+	if spent := lockedQuote - refund; spent != 7 {
 		t.Fatalf("NO-MINT VIOLATED: spent+refund != locked (spent=%d refund=%d locked=%d).", spent, refund, lockedQuote)
 	}
 }
 
-// TestRED_OverflowFill_SaturatesUint64 is the float64->uint64 SATURATION proof —
-// the headline of the finding: a fill amount that exceeds what a uint64 can hold
-// must be REFUSED at the asset boundary, never silently truncated/saturated into
-// a valid-looking on-chain amount.
+// TestRED_OverflowFill_SaturatesUint64 is the exact-integer OVERFLOW-REFUSAL proof
+// — the headline of the finding: an aggregate fill amount that exceeds what a uint64
+// can hold must be REFUSED at the asset boundary, never silently wrapped/truncated
+// into a valid-looking on-chain amount.
 //
-// Go's float64->uint64 conversion does NOT wrap or error on overflow: uint64(19e18)
-// SATURATES to 18446744073709551615 (uint64 max). uint64 max is ~1.845e19 = only
-// ~18.44 tokens at 18 decimals, so a single 19-token fill, cast naively, would be
-// summed into the exported amount as a plausible ~18.44-token value — value minted
-// out of thin air, and (because the export amount is a fixed 8-byte uint64 with no
-// widening downstream — atomic.go encodeExportedOutput PutUint64(v[53:61])) there
-// is nothing downstream to catch it.
+// The old float64->uint64 cast SATURATED on overflow (uint64(19e18) -> uint64 max),
+// minting a plausible ~18.44-token value. The exact-integer wire removes the float
+// entirely: base = Σ size and quote = Σ floor(size × price / PriceScale) are summed
+// in big.Int, and settleUint64 REFUSES any aggregate that does not fit uint64 (via
+// big.Int.IsUint64) BEFORE it becomes an export amount. So an oversized aggregate
+// makes settleFromFills ERROR and export NOTHING — refusal, never a wrapped mint.
 //
-// The closed behavior: settlement aggregates fills as exact float64 ONCE, then
-// quantToCredit/quantToCharge reject any aggregate > maxSettlementUnit (the largest
-// float64 strictly below 2^64) BEFORE the uint64() cast. So an oversized fill makes
-// settleFromFills ERROR and export NOTHING — refusal, never a saturated mint.
-//
-// Two legs are exercised, since the finding's PoC inflates BOTH the proceeds cast
-// (uint64(size)) and the spent/notional cast (uint64(price*size)):
-//   - PROCEEDS overflow: a taker BUY whose base size sums to 19e18 (> uint64 max).
-//   - NOTIONAL overflow: a taker BUY whose quote notional (price*size) overflows,
-//     which would understate spent => inflate the escrow refund (the mint vector).
+// Two legs are exercised, since the finding's PoC inflates BOTH the proceeds
+// aggregate (Σ size) and the spent/notional aggregate (Σ quote):
+//   - PROCEEDS overflow: a taker BUY whose base size SUM exceeds uint64 max.
+//   - NOTIONAL overflow: a taker BUY whose quote notional overflows uint64 while the
+//     base stays in range, which would understate spent => inflate the escrow refund.
 func TestRED_OverflowFill_SaturatesUint64(t *testing.T) {
-	// Ground truth the guard must beat: a naive cast saturates instead of erroring.
-	// overSize is a runtime float64 (NOT an untyped constant) so the uint64() cast
-	// is the runtime saturating conversion under test — a constant conversion of an
-	// out-of-range value is a compile error, which is not the behavior being probed.
-	var overSize float64 = 19e18 // 19 tokens @ 18 decimals; > uint64 max (~1.845e19)
-	if uint64(overSize) != ^uint64(0) {
-		t.Fatalf("precondition: expected uint64(%v) to saturate to uint64 max, got %d",
-			overSize, uint64(overSize))
-	}
-
 	auditCredited := func(ar *atomicRequests) uint64 {
 		var total uint64
 		for _, reqs := range ar.reqs {
@@ -409,36 +391,39 @@ func TestRED_OverflowFill_SaturatesUint64(t *testing.T) {
 		return total
 	}
 
-	// --- Leg 1: PROCEEDS overflow (uint64(size) saturation) ---------------------
-	// taker BUY receives base = sum(size) = 19e18 -> overflows; settle must refuse.
+	// --- Leg 1: PROCEEDS overflow (Σ size > uint64 max) -------------------------
+	// taker BUY receives base = Σ size = uint64max + 2 -> overflows; settle must refuse.
 	t.Run("proceeds", func(t *testing.T) {
-		fills := []Fill{{Price: 1, Size: overSize, Side: 0}}
+		fills := []Fill{
+			{Price: fp(1), Size: ^uint64(0), Side: 0},
+			{Price: fp(1), Size: 2, Side: 0},
+		}
 		cvm, _, _, _, _ := newCountingHarness(t, fills)
 
 		taker := ids.GenerateTestShortID()
-		// No escrow: isolate the proceeds cast (refund leg absent).
+		// No escrow: isolate the proceeds aggregate (refund leg absent).
 		ar := newAtomicRequests()
 		err := cvm.inner.settleFromFills(taker, ids.GenerateTestID(), fills, ids.GenerateTestID(), 0, false, ids.GenerateTestID(), 0, ar)
 		credited := auditCredited(ar)
-		t.Logf("proceeds overflow: settle err=%v  exported=%d (naive cast would saturate to %d)", err, credited, ^uint64(0))
+		t.Logf("proceeds overflow: settle err=%v  exported=%d (Σ size = 2^64+1 must not wrap)", err, credited)
 
 		if err == nil {
-			t.Fatalf("SATURATION MINT: settle accepted a 19e18 base fill (> uint64 max); it must be "+
-				"refused at the asset boundary, not cast (which saturates to %d).", ^uint64(0))
+			t.Fatalf("OVERFLOW MINT: settle accepted a base aggregate > uint64 max; it must be "+
+				"refused at the asset boundary, not wrapped into a uint64 export amount.")
 		}
 		if credited != 0 {
-			t.Fatalf("SATURATION MINT: refused settle still exported %d — refusal must export nothing.", credited)
+			t.Fatalf("OVERFLOW MINT: refused settle still exported %d — refusal must export nothing.", credited)
 		}
 	})
 
-	// --- Leg 2: NOTIONAL overflow (uint64(price*size) saturation) ---------------
-	// taker BUY spends quote = sum(price*size); make the NOTIONAL overflow while
-	// the base size stays in range, so the only overflow is the spent/refund leg.
-	// A saturated-but-floored spent would UNDERstate spend => inflate refund =
-	// locked - spent => quote minted out of the proxy's own escrow.
+	// --- Leg 2: NOTIONAL overflow (Σ quote > uint64 max) ------------------------
+	// taker BUY spends quote = Σ floor(size × price / PriceScale); make the NOTIONAL
+	// overflow while the base size stays in range, so the only overflow is the
+	// spent/refund leg. A wrapped/understated spent would inflate refund = locked -
+	// spent => quote minted out of the proxy's own escrow.
 	t.Run("notional_refund", func(t *testing.T) {
-		// size 1e10 (in range), price 1e10 -> notional 1e20 > uint64 max.
-		fills := []Fill{{Price: 1e10, Size: 1e10, Side: 0}}
+		// size 2e10 (base in range); price fp(1e10) -> quote = 2e10 × 1e10 = 2e20 > uint64 max.
+		fills := []Fill{{Price: fp(1e10), Size: 20_000_000_000, Side: 0}}
 		cvm, _, _, _, _ := newCountingHarness(t, fills)
 
 		taker := ids.GenerateTestShortID()
@@ -455,11 +440,11 @@ func TestRED_OverflowFill_SaturatesUint64(t *testing.T) {
 		t.Logf("notional overflow: settle err=%v  exported=%d (a saturated/floored spent would inflate the refund)", err, credited)
 
 		if err == nil {
-			t.Fatalf("SATURATION MINT: settle accepted a 1e20 quote notional (> uint64 max); the spent " +
-				"cast would saturate and inflate refund = locked - spent => minted quote.")
+			t.Fatalf("OVERFLOW MINT: settle accepted a 2e20 quote notional (> uint64 max); a wrapped " +
+				"spent would inflate refund = locked - spent => minted quote.")
 		}
 		if credited != 0 {
-			t.Fatalf("SATURATION MINT: refused settle still exported %d — refusal must export nothing.", credited)
+			t.Fatalf("OVERFLOW MINT: refused settle still exported %d — refusal must export nothing.", credited)
 		}
 		// The escrow must NOT have been consumed by a refused settle (so a later,
 		// well-formed relay can still legitimately refund it).
@@ -468,58 +453,40 @@ func TestRED_OverflowFill_SaturatesUint64(t *testing.T) {
 			t.Fatalf("escrow lookup: %v", eerr)
 		}
 		if !haveEscrow {
-			t.Fatalf("SATURATION MINT: refused settle consumed the escrow — a refused settle must leave it intact.")
+			t.Fatalf("OVERFLOW MINT: refused settle consumed the escrow — a refused settle must leave it intact.")
 		}
 	})
 }
 
-// TestRED_SettlementBoundary_ExactUint64Edge pins the float->uint64 boundary
-// CONSTANT (maxSettlementUnit) exactly, so a future edit cannot widen it past the
-// representable range and silently reintroduce the saturation mint. maxSettlementUnit
-// is the largest float64 strictly below 2^64 (== 2^64 - 2048; 2^64 itself is the
-// next representable float64 and is ONE above uint64 max):
+// TestRED_SettlementBoundary_ExactUint64Edge pins the exact-integer settlement
+// boundary (settleUint64) precisely, so a future edit cannot silently widen it past
+// the representable range and reintroduce the overflow mint. The seam is now a pure
+// big.Int -> uint64 narrowing:
 //
-//   - the largest passing aggregate (maxSettlementUnit) converts IN-RANGE for both
-//     a credit (floor) and a charge (ceil);
-//   - the next float64 up (2^64) is refused by both — it is exactly one above
-//     uint64 max, the value uint64(.) would wrap/saturate on.
+//   - the largest passing aggregate (uint64 max) narrows IN-RANGE;
+//   - one above uint64 max (2^64) is REFUSED — the value a wrapped conversion would
+//     have minted;
+//   - a negative aggregate (impossible over non-negative summands, but defensive) is
+//     REFUSED rather than reinterpreted as a huge uint64.
 func TestRED_SettlementBoundary_ExactUint64Edge(t *testing.T) {
 	const u64max = ^uint64(0)
 
-	// maxSettlementUnit must be strictly below 2^64 and cast in-range.
-	if maxSettlementUnit >= float64(u64max) {
-		// (float64(u64max) rounds to 2^64; the constant must be below it.)
-		t.Fatalf("maxSettlementUnit %.0f must be strictly below 2^64", maxSettlementUnit)
-	}
-	if got, err := quantToCredit(maxSettlementUnit); err != nil {
-		t.Fatalf("quantToCredit(maxSettlementUnit) must pass, got err=%v", err)
-	} else if uint64(got) > u64max { // tautology on uint64, but documents in-range intent
-		t.Fatalf("quantToCredit(maxSettlementUnit)=%d out of uint64 range", got)
-	}
-	if _, err := quantToCharge(maxSettlementUnit); err != nil {
-		t.Fatalf("quantToCharge(maxSettlementUnit) must pass, got err=%v", err)
+	// The largest representable amount passes and round-trips exactly.
+	maxV := new(big.Int).SetUint64(u64max)
+	if got, err := settleUint64(maxV, "base"); err != nil || got != u64max {
+		t.Fatalf("settleUint64(uint64max) = (%d, %v), want (%d, nil)", got, err, u64max)
 	}
 
-	// The next representable float64 above the boundary is exactly 2^64 — one above
-	// uint64 max — and MUST be refused by both directions.
-	over := math.Nextafter(maxSettlementUnit, math.Inf(1))
-	if over != float64(u64max)+1 && over != 18446744073709551616.0 {
-		t.Logf("note: nextafter(maxSettlementUnit)=%.0f (expected 2^64=18446744073709551616)", over)
-	}
-	if _, err := quantToCredit(over); err == nil {
-		t.Fatalf("OVERFLOW: quantToCredit(%.0f) accepted a value above uint64 max — must refuse.", over)
-	}
-	if _, err := quantToCharge(over); err == nil {
-		t.Fatalf("OVERFLOW: quantToCharge(%.0f) accepted a value above uint64 max — must refuse.", over)
+	// Exactly one above uint64 max (2^64) MUST be refused — it is the value a wrapped
+	// conversion would have minted.
+	over := new(big.Int).Add(maxV, big.NewInt(1))
+	if _, err := settleUint64(over, "base"); err == nil {
+		t.Fatalf("OVERFLOW: settleUint64(2^64) accepted a value above uint64 max — must refuse.")
 	}
 
-	// +Inf (e.g. a per-fill product that overflowed to +Inf in the aggregate loop)
-	// is refused too — the aggregate never reaches the cast.
-	if _, err := quantToCredit(math.Inf(1)); err == nil {
-		t.Fatalf("OVERFLOW: quantToCredit(+Inf) accepted — must refuse.")
-	}
-	if _, err := quantToCharge(math.Inf(1)); err == nil {
-		t.Fatalf("OVERFLOW: quantToCharge(+Inf) accepted — must refuse.")
+	// A negative aggregate is refused (never reinterpreted as a large uint64).
+	if _, err := settleUint64(big.NewInt(-1), "quote"); err == nil {
+		t.Fatalf("OVERFLOW: settleUint64(-1) accepted a negative aggregate — must refuse.")
 	}
 }
 
@@ -538,8 +505,8 @@ func TestRED_MixedSideFills_OverCredits(t *testing.T) {
 	// First fill BUY 10 base, second claims SELL 1000 base — a stream no honest
 	// single submit can produce.
 	fills := []Fill{
-		{Price: 1, Size: 10, Side: 0},
-		{Price: 1, Size: 1000, Side: 1},
+		{Price: fp(1), Size: 10, Side: 0},
+		{Price: fp(1), Size: 1000, Side: 1},
 	}
 	cvm, _, _, _, _ := newCountingHarness(t, fills)
 
@@ -565,7 +532,6 @@ func TestRED_MixedSideFills_OverCredits(t *testing.T) {
 	if credited != 0 {
 		t.Fatalf("OVER-CREDIT/MINT: refused settle still exported %d base — refusal must accumulate nothing.", credited)
 	}
-	_ = math.Float64bits
 }
 
 // TestRED_DecodeFills_RejectsInvalidSideByte is the WIRE-BOUNDARY proof for the
@@ -582,8 +548,8 @@ func TestRED_DecodeFills_RejectsInvalidSideByte(t *testing.T) {
 	// Two structurally-valid fills; poison the SECOND fill's side byte to 7 — a
 	// value no honest matcher emits.
 	wire := encodeFillsWire([]Fill{
-		{Price: 1, Size: 10, Side: 0},
-		{Price: 1, Size: 5, Side: 0},
+		{Price: fp(1), Size: 10, Side: 0},
+		{Price: fp(1), Size: 5, Side: 0},
 	})
 	// Overwrite the second fill's side byte (offset: 4 count + 1*FillWireSize + 16).
 	wire[4+FillWireSize+16] = 7
@@ -611,7 +577,7 @@ func TestRED_DecodeFills_RejectsInvalidSideByte(t *testing.T) {
 // (db.Abort on restart), so re-Verify re-submits the SAME order to the d-chain:
 // a SECOND irreversible match. The maker is filled twice; the taker double-pays.
 func TestRED_CrashBeforeAccept_DoubleSubmits(t *testing.T) {
-	fills := []Fill{{Price: 1, Size: 1000, Side: 0}}
+	fills := []Fill{{Price: fp(1), Size: 1000, Side: 0}}
 	cvm, matcher, cChainSM, proxyChain, _ := newCountingHarness(t, fills)
 	ctx := context.Background()
 
@@ -659,22 +625,25 @@ func TestRED_CrashBeforeAccept_DoubleSubmits(t *testing.T) {
 	}
 }
 
-// TestRED_EscrowTruncation_OverRefunds is the value-EXTRACTION proof. The settle
-// computes spent quote as sum(uint64(price*size)) — truncating each fill's notional
-// DOWN. For a taker BUY, refund = locked - spent. Understated spent => INFLATED
-// refund. The taker receives the (real) base proceeds AND a refund larger than
-// their true unspent collateral: net value extracted from the proxy escrow.
+// TestRED_EscrowTruncation_OverRefunds is the value-EXTRACTION proof, now
+// structurally CLOSED by the exact-integer wire. The old settle summed spent as
+// Σ uint64(price*size) with a PER-FILL float truncation, so many small fills each
+// floored to 0 recorded spent=0 and refunded the whole lock (mint). The wire now
+// carries the venue's EXACT integer quote and settleFromFills spends exactly
+// Σ floor(size × price / PriceScale) — the SAME per-fill quote the venue moved — so
+// spent can never be understated relative to what the taker actually owes the venue.
 //
-// Concretely: lock 100 quote. Fill 100 base across fills priced 0.99 each, so the
-// TRUE quote cost is 99 (taker should get ~1 quote refund + 100 base). But each
-// uint64(0.99*1)=0 => recorded spent=0 => refund=100 quote, PLUS 100 base. The
-// taker walks away with 100 quote + 100 base from a 100-quote lock that bought
-// 100 base. ~99 quote minted.
+// Concretely: lock 100 quote. Fill 100 base across 100 fills each of size 4 @ price
+// 0.25 (fixed-point fp(0.25)); each fill's quote = floor(4 × 0.25) = floor(1.0) = 1,
+// so spent = 100 (the venue's exact quote), refund = 0, and value_out = 100 base +
+// 0 quote refund — no over-refund. The refund is exactly locked - spent; any refund
+// beyond that would be the escrow mint this test forbids.
 func TestRED_EscrowTruncation_OverRefunds(t *testing.T) {
-	// 100 fills of size 1 @ price 0.99 (taker BUY). True spent ~= 99 quote.
+	// 100 fills of size 4 @ price 0.25 (taker BUY). Per-fill quote = floor(4×0.25)=1,
+	// so total spent = 100 quote — the exact value the venue moved.
 	fills := make([]Fill, 100)
 	for i := range fills {
-		fills[i] = Fill{Price: 0.99, Size: 1, Side: 0}
+		fills[i] = Fill{Price: fp(0.25), Size: 4, Side: 0}
 	}
 	cvm, _, _, _, _ := newCountingHarness(t, fills)
 
@@ -694,14 +663,15 @@ func TestRED_EscrowTruncation_OverRefunds(t *testing.T) {
 	}
 
 	// Sum the exported value by asset: base (proceeds) vs the locked asset (refund).
+	// Export wire is rail(1)|owner(20)|asset(32)|amount(8), so asset is [21:53].
 	var refund, base uint64
 	for _, reqs := range ar.reqs {
 		for _, e := range reqs.PutRequests {
-			if len(e.Value) < 60 {
+			if len(e.Value) != exportedOutputSize {
 				continue
 			}
 			var a ids.ID
-			copy(a[:], e.Value[20:52])
+			copy(a[:], e.Value[21:53])
 			amt := binary.BigEndian.Uint64(e.Value[53:61])
 			if a == lockedAsset {
 				refund += amt
@@ -710,8 +680,8 @@ func TestRED_EscrowTruncation_OverRefunds(t *testing.T) {
 			}
 		}
 	}
-	trueBase := uint64(100) // sum(size)
-	trueSpent := uint64(99) // 100 * 0.99
+	trueBase := uint64(400)  // Σ size = 100 × 4
+	trueSpent := uint64(100) // Σ floor(4 × 0.25) = 100 × 1
 	trueRefund := locked - trueSpent
 	t.Logf("locked=%d  base proceeds=%d (true %d)  refund=%d (true %d)",
 		locked, base, trueBase, refund, trueRefund)
@@ -720,9 +690,9 @@ func TestRED_EscrowTruncation_OverRefunds(t *testing.T) {
 	// base proceeds (the bought asset), so any refund > trueRefund is net theft.
 	if refund > trueRefund {
 		t.Fatalf("VALUE EXTRACTION: settle refunded %d of the locked asset but only %d "+
-			"was truly unspent (spent quote truncated via uint64(price*size)). The taker "+
+			"was truly unspent (spent = Σ floor(size×price/PriceScale) = %d). The taker "+
 			"keeps %d base proceeds too. ~%d quote minted out of the proxy escrow.",
-			refund, trueRefund, base, refund-trueRefund)
+			refund, trueRefund, trueSpent, base, refund-trueRefund)
 	}
 }
 
@@ -762,8 +732,8 @@ func exportKeys(ar *atomicRequests) [][]byte {
 // deterministic-seed fix.
 func TestRED_SettlementExportKeyDeterminism(t *testing.T) {
 	fills := []Fill{
-		{Price: 2, Size: 50, Side: 0}, // taker BUY: receives base, pays quote
-		{Price: 2, Size: 50, Side: 0},
+		{Price: fp(2), Size: 50, Side: 0}, // taker BUY: receives base, pays quote
+		{Price: fp(2), Size: 50, Side: 0},
 	}
 	// The consensus-agreed settlement coordinate every validator sees identically.
 	blockHash := deriveBlockHash(7, time.Unix(1_700_000_000, 0))
@@ -829,7 +799,7 @@ func TestRED_SettlementExportKeyDeterminism(t *testing.T) {
 // time.Now() (or any per-call nondeterminism) back into the settlement export's
 // TxID, deriveUTXOID flips and this fails.
 func TestRED_SettlementExportKeyIndependentOfWallClock(t *testing.T) {
-	fills := []Fill{{Price: 1, Size: 1000, Side: 0}}
+	fills := []Fill{{Price: fp(1), Size: 1000, Side: 0}}
 	blockHash := deriveBlockHash(42, time.Unix(123, 0))
 	const txIndex = uint32(0)
 	taker := ids.GenerateTestShortID()

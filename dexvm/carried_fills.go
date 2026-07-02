@@ -6,7 +6,6 @@ package dexvm
 import (
 	"encoding/binary"
 	"fmt"
-	"math"
 )
 
 // carried_fills.go — the CARRIED-FILLS primitive of the stateless atomic ZAP
@@ -51,8 +50,9 @@ import (
 // bump.
 //
 // FROZEN-FRAME NOTE. This is the BLOCK format, NOT the ZAP fill frame. The 17-byte
-// FillWireSize ZAP frame (relay.go / dex/pkg/zapwire / precompile) is UNCHANGED;
-// the per-fill encoding here reuses the same price[8]+size[8]+side[1] layout for
+// FillWireSize ZAP frame (relay.go / dex/pkg/zapwire / precompile) carries a uint64
+// FIXED-POINT ×PriceScale price and a uint64 ATOMIC-BASE-UNIT size; the per-fill
+// encoding here reuses the same exact-integer price[8]+size[8]+side[1] layout for
 // continuity but is a distinct, block-level structure.
 
 // carriedFill binds one settling relay's confirmed fills to its position in the
@@ -109,8 +109,8 @@ func encodeCarriedFills(entries []carriedFill, sig []byte) []byte {
 		binary.BigEndian.PutUint32(buf[off:], uint32(len(e.fills)))
 		off += 4
 		for _, f := range e.fills {
-			binary.BigEndian.PutUint64(buf[off:off+8], math.Float64bits(f.Price))
-			binary.BigEndian.PutUint64(buf[off+8:off+16], math.Float64bits(f.Size))
+			binary.BigEndian.PutUint64(buf[off:off+8], f.Price)
+			binary.BigEndian.PutUint64(buf[off+8:off+16], f.Size)
 			buf[off+16] = f.Side
 			off += FillWireSize
 		}
@@ -125,9 +125,9 @@ func encodeCarriedFills(entries []carriedFill, sig []byte) []byte {
 // encodeCarriedFills. It returns the entries, the reserved signature, the number
 // of bytes consumed, and any error. Every field is range-checked so a hostile or
 // truncated block cannot inject a malformed fill into settlement or over-allocate:
-//   - the per-fill price/size must be finite and strictly positive and side ∈
-//     {0,1} (the SAME boundary invariant DecodeFills enforces on the ZAP wire),
-//     so no impossible Fill ever reaches settleFromFills;
+//   - the per-fill price/size must be strictly positive and side ∈ {0,1} (the
+//     SAME boundary invariant DecodeFills enforces on the ZAP wire), so no
+//     impossible Fill ever reaches settleFromFills;
 //   - counts are bounded (maxCarriedFillEntries / maxFillsPerEntry);
 //   - the section must be exactly consumed by the declared lengths.
 //
@@ -161,15 +161,15 @@ func decodeCarriedFills(data []byte) (entries []carriedFill, sig []byte, consume
 		}
 		fills := make([]Fill, 0, fc)
 		for j := 0; j < fc; j++ {
-			p := float64FromBits(data[off : off+8])
-			s := float64FromBits(data[off+8 : off+16])
+			p := binary.BigEndian.Uint64(data[off : off+8])
+			s := binary.BigEndian.Uint64(data[off+8 : off+16])
 			side := data[off+16]
 			off += FillWireSize
-			if !isFinitePositive(p) {
-				return nil, nil, 0, fmt.Errorf("carried fills: entry %d fill %d invalid price %v", i, j, p)
+			if p == 0 {
+				return nil, nil, 0, fmt.Errorf("carried fills: entry %d fill %d invalid price %d", i, j, p)
 			}
-			if !isFinitePositive(s) {
-				return nil, nil, 0, fmt.Errorf("carried fills: entry %d fill %d invalid size %v", i, j, s)
+			if s == 0 {
+				return nil, nil, 0, fmt.Errorf("carried fills: entry %d fill %d invalid size %d", i, j, s)
 			}
 			if side > 1 {
 				return nil, nil, 0, fmt.Errorf("carried fills: entry %d fill %d invalid side %d", i, j, side)

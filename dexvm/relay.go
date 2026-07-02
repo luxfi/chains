@@ -81,8 +81,16 @@ const (
 )
 
 // FillWireSize is one fill in a clob_submit response: price[8]+size[8]+side[1].
-// FROZEN — must equal dex/pkg/api.FillWireSize and the precompile's fillWireSize.
+// FROZEN — must equal dex/pkg/zapwire.FillWireSize and the precompile's fillWireSize.
+// price is a uint64 FIXED-POINT ×PriceScale value; size is uint64 ATOMIC BASE UNITS.
 const FillWireSize = 17
+
+// PriceScale is the fixed-point scale of the wire price field (price × 1e8) — the
+// matcher's PriceInt grid. FROZEN, == dex/pkg/zapwire.PriceScale. quote owed =
+// size × price / PriceScale, computed in EXACT integers so no value-bearing
+// float→int conversion (whose out-of-range result is architecture-dependent) can
+// fork two honest validators on different CPUs.
+const PriceScale = 100000000
 
 // ErrRelayNotConfigured is returned when an order relay is attempted but no
 // d-chain ZAP endpoint is configured. The proxy is inert on the relay leg until
@@ -187,24 +195,28 @@ func (r *RelayClient) Close() error {
 }
 
 // Fill is one execution returned by the d-chain matcher: price + size + the
-// taker side this submit took with. The proxy derives the settlement delta
-// ONLY from these server-returned fills — never from a client-supplied amount.
+// taker side this submit took with. Price is a uint64 FIXED-POINT ×PriceScale
+// value (the matcher's PriceInt grid); Size is uint64 ATOMIC BASE UNITS. The
+// proxy derives the settlement delta ONLY from these server-returned EXACT
+// integers — never from a client-supplied amount, and never through a float
+// (whose out-of-range int conversion is architecture-dependent and would fork).
 type Fill struct {
-	Price float64
-	Size  float64
+	Price uint64
+	Size  uint64
 	Side  uint8
 }
 
 // DecodeFills parses a clob_submit response: count[4] then count×(price[8] +
-// size[8] + side[1]). Every field is range-checked so a backend that lies (or a
-// MITM on the socket) cannot inject a structurally invalid fill into settlement:
-// price/size must be finite and strictly positive, and side MUST be a valid CLOB
-// side (0=BUY, 1=SELL). A side byte outside {0,1} is malformed wire exactly like
-// a NaN price — rejecting it here keeps a Fill value always well-formed, so no
-// downstream consumer ever sees an impossible side. (Cross-fill side CONSISTENCY
-// — "a single submit takes exactly one side" — is a settlement-policy invariant
-// enforced in settleFromFills, not a per-fill wire property; the two checks own
-// different invariants and do not overlap.)
+// size[8] + side[1]), every multi-byte field a big-endian uint64. Each field is
+// range-checked so a backend that lies (or a MITM on the socket) cannot inject a
+// structurally invalid fill into settlement: price/size must be strictly positive
+// (a zero-price or zero-size execution is not a real fill), and side MUST be a
+// valid CLOB side (0=BUY, 1=SELL). A side byte outside {0,1} is malformed wire
+// exactly like a zero price — rejecting it here keeps a Fill value always
+// well-formed, so no downstream consumer ever sees an impossible side. (Cross-fill
+// side CONSISTENCY — "a single submit takes exactly one side" — is a
+// settlement-policy invariant enforced in settleFromFills, not a per-fill wire
+// property; the two checks own different invariants and do not overlap.)
 func DecodeFills(data []byte) ([]Fill, error) {
 	if len(data) < 4 {
 		return nil, fmt.Errorf("fills response too short: %d", len(data))
@@ -216,15 +228,15 @@ func DecodeFills(data []byte) ([]Fill, error) {
 	fills := make([]Fill, 0, n)
 	off := 4
 	for i := 0; i < n; i++ {
-		p := float64FromBits(data[off : off+8])
-		s := float64FromBits(data[off+8 : off+16])
+		p := binary.BigEndian.Uint64(data[off : off+8])
+		s := binary.BigEndian.Uint64(data[off+8 : off+16])
 		side := data[off+16]
 		off += FillWireSize
-		if !isFinitePositive(p) {
-			return nil, fmt.Errorf("fill %d: invalid price %v", i, p)
+		if p == 0 {
+			return nil, fmt.Errorf("fill %d: invalid price %d", i, p)
 		}
-		if !isFinitePositive(s) {
-			return nil, fmt.Errorf("fill %d: invalid size %v", i, s)
+		if s == 0 {
+			return nil, fmt.Errorf("fill %d: invalid size %d", i, s)
 		}
 		if side > 1 {
 			return nil, fmt.Errorf("fill %d: invalid side %d (must be 0=BUY or 1=SELL)", i, side)

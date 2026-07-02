@@ -17,7 +17,6 @@ package dexvm
 import (
 	"context"
 	"encoding/binary"
-	"math"
 	"testing"
 	"time"
 
@@ -66,19 +65,28 @@ func (f *fakeMatcherConn) Call(_ context.Context, method string, payload []byte)
 func (f *fakeMatcherConn) Close() error { return nil }
 
 // encodeFillsWire encodes fills in the FROZEN clob_submit response format:
-// count[4] then count×(price[8]+size[8]+side[1]).
+// count[4] then count×(price[8]+size[8]+side[1]), price a uint64 fixed-point
+// ×PriceScale value and size a uint64 atomic-base-unit count — the exact-integer
+// inverse of DecodeFills.
 func encodeFillsWire(fills []Fill) []byte {
 	resp := make([]byte, 4+len(fills)*FillWireSize)
 	binary.BigEndian.PutUint32(resp[0:4], uint32(len(fills)))
 	off := 4
 	for _, fl := range fills {
-		binary.BigEndian.PutUint64(resp[off:off+8], math.Float64bits(fl.Price))
-		binary.BigEndian.PutUint64(resp[off+8:off+16], math.Float64bits(fl.Size))
+		binary.BigEndian.PutUint64(resp[off:off+8], fl.Price)
+		binary.BigEndian.PutUint64(resp[off+8:off+16], fl.Size)
 		resp[off+16] = fl.Side
 		off += FillWireSize
 	}
 	return resp
 }
+
+// fp scales a human quote-per-base price onto the wire's fixed-point ×PriceScale
+// grid (the SAME conversion dex's wirePriceUnits applies), so a test keeps readable
+// human prices while the Fill/wire carries the exact-integer PriceInt value. quote =
+// size × fp(price) / PriceScale, so for whole human prices the settled quote equals
+// the old human price × size exactly.
+func fp(human float64) uint64 { return uint64(human * float64(PriceScale)) }
 
 // conservationHarness wires a proxy VM with REAL two-chain shared memory and a
 // fake matcher, returning the proxy VM, the C-Chain's shared-memory handle, and
@@ -208,13 +216,14 @@ func mustParseImport(t *testing.T, b []byte) *txs.ImportTx {
 }
 
 // clobSubmitPayload builds the FROZEN 66-byte clob_submit request frame:
-// poolId[32] | side[1] | isMarket[1] | limit[8] | size[8] | user[16].
+// poolId[32] | side[1] | isMarket[1] | limit[8] | size[8] | user[16]. size is a
+// uint64 atomic-base-unit count written directly (no float on the wire).
 func clobSubmitPayload(poolID ids.ID, size uint64) []byte {
 	p := make([]byte, 66)
 	copy(p[0:32], poolID[:])
 	p[32] = 0 // buy
 	p[33] = 1 // market
-	putZAPFloat(p[42:50], float64(size))
+	binary.BigEndian.PutUint64(p[42:50], size)
 	return p
 }
 
@@ -266,7 +275,7 @@ func indexedByTaker(t *testing.T, h *conservationHarness) [][]byte {
 func TestEndToEndAtomicValueConservation(t *testing.T) {
 	// Matcher fills: 600 base @ price 1 + ... summing to a known notional. Use a
 	// single fill of 1000 base @ price 1 so base=1000, quote=1000 (integer-exact).
-	fills := []Fill{{Price: 1, Size: 1000, Side: 0}}
+	fills := []Fill{{Price: fp(1), Size: 1000, Side: 0}}
 	h := newConservationHarness(t, fills)
 
 	taker := ids.GenerateTestShortID()

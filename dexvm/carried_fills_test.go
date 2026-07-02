@@ -26,9 +26,9 @@ import (
 // representative entry set (multiple txIndexes, multiple fills, a zero-fill entry).
 func TestCarriedFills_CodecRoundTrip(t *testing.T) {
 	in := []carriedFill{
-		{txIndex: 1, fills: []Fill{{Price: 2, Size: 50, Side: 0}, {Price: 2, Size: 50, Side: 0}}},
+		{txIndex: 1, fills: []Fill{{Price: fp(2), Size: 50, Side: 0}, {Price: fp(2), Size: 50, Side: 0}}},
 		{txIndex: 3, fills: nil}, // explicit zero-fill (a failed/empty submit)
-		{txIndex: 7, fills: []Fill{{Price: 1.5, Size: 4, Side: 1}}},
+		{txIndex: 7, fills: []Fill{{Price: fp(1.5), Size: 4, Side: 1}}},
 	}
 	enc := encodeCarriedFills(in, nil)
 	out, sig, consumed, err := decodeCarriedFills(enc)
@@ -72,7 +72,7 @@ func TestCarriedFills_CodecRoundTrip(t *testing.T) {
 // further wire-format change).
 func TestCarriedFills_ReservedSignatureRoundTrips(t *testing.T) {
 	sigIn := []byte("reserved-d-chain-fill-attestation-bytes")
-	enc := encodeCarriedFills([]carriedFill{{txIndex: 0, fills: []Fill{{Price: 1, Size: 1, Side: 0}}}}, sigIn)
+	enc := encodeCarriedFills([]carriedFill{{txIndex: 0, fills: []Fill{{Price: fp(1), Size: 1, Side: 0}}}}, sigIn)
 	_, sigOut, consumed, err := decodeCarriedFills(enc)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
@@ -90,7 +90,7 @@ func TestCarriedFills_ReservedSignatureRoundTrips(t *testing.T) {
 // on the ZAP wire) — so no impossible Fill ever reaches settlement and no
 // over-allocation is possible.
 func TestCarriedFills_RejectsMalformed(t *testing.T) {
-	good := encodeCarriedFills([]carriedFill{{txIndex: 0, fills: []Fill{{Price: 1, Size: 1, Side: 0}}}}, nil)
+	good := encodeCarriedFills([]carriedFill{{txIndex: 0, fills: []Fill{{Price: fp(1), Size: 1, Side: 0}}}}, nil)
 
 	t.Run("truncated_header", func(t *testing.T) {
 		if _, _, _, err := decodeCarriedFills([]byte{0, 0}); err == nil {
@@ -145,7 +145,7 @@ func TestBlock_CarriedFillsRoundTripAndIDBinding(t *testing.T) {
 		timestamp: time.Unix(1_700_000_000, 0),
 		txs:       [][]byte{[]byte("tx-a"), []byte("tx-bb")},
 		carriedFills: []carriedFill{
-			{txIndex: 1, fills: []Fill{{Price: 2, Size: 50, Side: 0}}},
+			{txIndex: 1, fills: []Fill{{Price: fp(2), Size: 50, Side: 0}}},
 		},
 	}
 	wire := b.Bytes()
@@ -165,7 +165,7 @@ func TestBlock_CarriedFillsRoundTripAndIDBinding(t *testing.T) {
 	// ID binding: change ONE carried fill and the block id (hash of bytes) must
 	// differ — the fills are committed, not malleable.
 	b2 := *b
-	b2.carriedFills = []carriedFill{{txIndex: 1, fills: []Fill{{Price: 2, Size: 999, Side: 0}}}}
+	b2.carriedFills = []carriedFill{{txIndex: 1, fills: []Fill{{Price: fp(2), Size: 999, Side: 0}}}}
 	p1, _ := parseBlock(cvm, b.Bytes())
 	p2, _ := parseBlock(cvm, b2.Bytes())
 	if p1.id == p2.id {
@@ -185,7 +185,7 @@ func TestVertex_CarriedFillsRoundTripAndIDBinding(t *testing.T) {
 		parents:   []ids.ID{{0x01}},
 		rawTxs:    [][]byte{[]byte("raw-tx-1")},
 		carriedFills: []carriedFill{
-			{txIndex: 0, fills: []Fill{{Price: 3, Size: 9, Side: 1}}},
+			{txIndex: 0, fills: []Fill{{Price: fp(3), Size: 9, Side: 1}}},
 		},
 		vm: cvm,
 	}
@@ -212,7 +212,7 @@ func TestVertex_CarriedFillsRoundTripAndIDBinding(t *testing.T) {
 		timestamp:    v.timestamp,
 		parents:      v.parents,
 		rawTxs:       v.rawTxs,
-		carriedFills: []carriedFill{{txIndex: 0, fills: []Fill{{Price: 3, Size: 9999, Side: 1}}}},
+		carriedFills: []carriedFill{{txIndex: 0, fills: []Fill{{Price: fp(3), Size: 9999, Side: 1}}}},
 	}
 	if tampered.computeID() == v.id {
 		t.Fatalf("vertex id does NOT commit to carried fills: different fills produced the same id %x", v.id[:8])

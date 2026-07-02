@@ -356,8 +356,9 @@ type RelayOrderTx struct {
 	// signature-bound (JSON-covered by SigningBytes); a wrong value can only break the
 	// taker's OWN liveness — ImportSettlement equality-rejects a mismatched asset (no
 	// theft, no mint), the same bounded surface as the carried-fills proposer-trust model.
-	// PriceLimit is the worst-acceptable CLOB price (quote-per-base, float64-bits) for a
-	// settling clob_submit, derived from the V4 SqrtPriceLimitX96. settleFromFills refuses
+	// PriceLimit is the worst-acceptable CLOB price (quote-per-base, uint64 FIXED-POINT
+	// ×PriceScale, the SAME grid as Fill.Price) for a settling clob_submit, derived from
+	// the V4 SqrtPriceLimitX96. settleFromFills refuses
 	// any carried fill WORSE than this (BUY: price above the limit; SELL: price below it),
 	// enforcing the taker's slippage floor against a sandwich/MEV move. Zero = no limit.
 	// LimitIsUpper records the direction the limit bounds (true: reject price ABOVE the

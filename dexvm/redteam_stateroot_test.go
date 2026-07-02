@@ -124,8 +124,8 @@ func TestRED_StateRoot_DivergentRelayOutcomeForksRoot(t *testing.T) {
 
 	// Node A settles a full 1000-base fill; node B settles a 600-base partial (the
 	// remaining 400 quote refunds). Same block bytes, DIFFERENT carried fills.
-	resA := runBlock([]Fill{{Price: 1, Size: 1000, Side: 0}})
-	resB := runBlock([]Fill{{Price: 1, Size: 600, Side: 0}})
+	resA := runBlock([]Fill{{Price: fp(1), Size: 1000, Side: 0}})
+	resB := runBlock([]Fill{{Price: fp(1), Size: 600, Side: 0}})
 
 	// Block hashes are identical, so the OLD blockHash-only root — a pure function
 	// of (blockHash, height) — necessarily collided on these divergent settlements.

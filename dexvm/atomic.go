@@ -7,7 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash"
-	"math"
+	"math/big"
 	"sort"
 
 	"github.com/luxfi/database"
@@ -413,102 +413,45 @@ func decodeExportedOutput(v []byte) (rail txs.Rail, owner ids.ShortID, asset ids
 	return rail, owner, asset, amount, spent, true
 }
 
-// float64FromBits reads a big-endian IEEE-754 float64 (the ZAP fill wire codec,
-// byte-identical with dex/pkg/api and the precompile).
-func float64FromBits(b []byte) float64 {
-	return math.Float64frombits(binary.BigEndian.Uint64(b))
-}
-
-// isFinitePositive reports whether f is a finite, strictly positive number — the
-// only values a real fill can carry. Rejects NaN/Inf/<=0.
-func isFinitePositive(f float64) bool {
-	return !math.IsNaN(f) && !math.IsInf(f, 0) && f > 0
-}
-
 // ---------------------------------------------------------------------------
-// Conservation-safe float->integer rounding for settlement.
+// Exact-integer settlement arithmetic.
 //
-// Fills cross the ZAP wire as float64 (price, size); on-chain value moves in
-// integer asset units (uint64). Converting a fractional notional to an integer
-// MUST round in the direction that protects the conservation invariant — the
-// proxy NEVER mints — so the rounding is asymmetric BY PURPOSE:
-//
-//   - quantToCredit (FLOOR): a quantity the taker RECEIVES (proceeds) or that
-//     REDUCES what we owe back. Round DOWN so the proxy never credits a unit it
-//     did not truly realize. Worst case the taker is under-credited by <1 unit;
-//     that sub-unit is conserved on the d-chain side (the maker's leg), never
-//     fabricated out of the proxy.
-//   - quantToCharge (CEIL): a quantity the taker SPENDS against locked escrow
-//     (so refund = locked - spent). Round UP so spent is never UNDERstated.
-//     Understating spent is exactly the escrow-truncation mint (RED): it inflates
-//     the refund, letting the taker walk away with proceeds PLUS more refund than
-//     the unspent remainder. Ceiling spent caps refund at the true unspent value.
-//
-// Both take an EXACT float aggregate (summed over fills once, not per-fill
-// truncated — per-fill truncation accumulates a directional leak) and apply the
-// rounding ONCE at the asset boundary. A small relative epsilon absorbs IEEE-754
-// representation error so an aggregate that is mathematically integral (e.g.
-// 1.5*3 + 2.5*3 == 12, but may evaluate to 12 ± 1e-13) snaps to that integer
-// instead of spuriously rounding to 11 or 13. epsilon is deterministic (a fixed
-// constant over deterministic float inputs) so every validator rounds identically.
+// Fills cross the ZAP wire as EXACT integers (price is uint64 fixed-point
+// ×PriceScale on the matcher's PriceInt grid; size is uint64 atomic base units),
+// and on-chain value moves in the same integer asset units. There is therefore NO
+// fractional notional to round and — critically — NO value-bearing float→int
+// conversion anywhere on the settlement path (that conversion's out-of-range
+// result is implementation-defined per the Go spec and differs by CPU
+// architecture; carrying and settling exact integers is what killed the cross-arch
+// consensus fork). The proxy derives base and quote from the fills with the SAME
+// per-fill floor the venue's matcher (quoteUnitsFor) and the precompile's
+// fillsToDelta apply, so the proxy moves EXACTLY what the venue moved — byte-for-
+// byte on every validator — and the conservation invariant (the proxy never mints)
+// is a direct integer identity, not a rounding argument.
 
-// settlementRoundEpsilon is the relative tolerance for snapping a float aggregate
-// to a neighboring integer before directional rounding. ~1e-9 dwarfs the ~1e-13
-// double-rounding error of summing realistic fill streams yet is far below one
-// asset unit, so it never moves a genuinely fractional notional across an integer.
-const settlementRoundEpsilon = 1e-9
+// priceScaleBig is PriceScale as a *big.Int (the fixed-point divisor for quote).
+var priceScaleBig = new(big.Int).SetUint64(PriceScale)
 
-// nearestIntWithin returns (n, true) when f is within a relative epsilon of the
-// integer n, else (0, false). Used to snap a mathematically-integral aggregate
-// back to its integer before floor/ceil.
-func nearestIntWithin(f float64) (float64, bool) {
-	r := math.Round(f)
-	tol := settlementRoundEpsilon * math.Max(1, math.Abs(f))
-	if math.Abs(f-r) <= tol {
-		return r, true
-	}
-	return 0, false
+// quoteUnits returns one fill's quote in exact integers: floor(size × price /
+// PriceScale), where size is atomic base units and price is fixed-point ×PriceScale.
+// The multiply is done in big.Int (size × price overflows uint64) and floored by
+// integer division, mirroring dex v1.14.0's v4BalanceDelta / the matcher's
+// quoteUnitsFor. Returned as *big.Int so the caller accumulates without overflow.
+func quoteUnits(size, price uint64) *big.Int {
+	q := new(big.Int).Mul(new(big.Int).SetUint64(size), new(big.Int).SetUint64(price))
+	return q.Quo(q, priceScaleBig)
 }
 
-// quantToCredit converts a proceeds aggregate to integer asset units, rounding
-// DOWN (never credit more than realized). Non-finite or negative input, or a
-// result exceeding uint64, is refused — the proxy must not settle a value it
-// cannot represent exactly.
-func quantToCredit(f float64) (uint64, error) {
-	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
-		return 0, fmt.Errorf("settle: non-finite proceeds %v", f)
+// settleUint64 narrows an exact aggregate (base or quote, summed in big.Int) to a
+// uint64 asset amount, refusing a value the proxy cannot represent exactly rather
+// than wrapping it. label names the leg for the error. Negative is impossible
+// (every summand is non-negative) but is refused defensively.
+func settleUint64(v *big.Int, label string) (uint64, error) {
+	if v.Sign() < 0 {
+		return 0, fmt.Errorf("settle: negative %s %s", label, v.String())
 	}
-	if r, ok := nearestIntWithin(f); ok {
-		f = r
-	} else {
-		f = math.Floor(f)
+	if !v.IsUint64() {
+		return 0, fmt.Errorf("settle: %s %s exceeds uint64", label, v.String())
 	}
-	if f > maxSettlementUnit {
-		return 0, fmt.Errorf("settle: proceeds %v exceeds uint64", f)
-	}
-	return uint64(f), nil
+	return v.Uint64(), nil
 }
-
-// quantToCharge converts a spent aggregate to integer asset units, rounding UP
-// (never charge less than consumed, so the refund is never inflated). Same
-// finiteness / range guards as quantToCredit.
-func quantToCharge(f float64) (uint64, error) {
-	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
-		return 0, fmt.Errorf("settle: non-finite notional %v", f)
-	}
-	if r, ok := nearestIntWithin(f); ok {
-		f = r
-	} else {
-		f = math.Ceil(f)
-	}
-	if f > maxSettlementUnit {
-		return 0, fmt.Errorf("settle: notional %v exceeds uint64", f)
-	}
-	return uint64(f), nil
-}
-
-// maxSettlementUnit is the largest float64 that converts to uint64 without
-// overflow on rounding. 2^64 is not exactly representable; the largest float64
-// strictly below it is 2^64 - 2048. Using <= against this constant keeps the
-// uint64() conversion in-range and deterministic.
-const maxSettlementUnit = float64(1<<64 - 2048)

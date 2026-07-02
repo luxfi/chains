@@ -35,7 +35,7 @@ func TestRED_FillAttestation_VerifyRejectsForgedFills(t *testing.T) {
 		t.Fatalf("keygen: %v", err)
 	}
 	blockHash := ids.GenerateTestID()
-	entries := []carriedFill{{txIndex: 0, fills: []Fill{{Price: 2, Size: 100, Side: 0}}}}
+	entries := []carriedFill{{txIndex: 0, fills: []Fill{{Price: fp(2), Size: 100, Side: 0}}}}
 
 	sig := signFillAttestation(priv, blockHash, entries)
 	if len(sig) == 0 {
@@ -60,7 +60,7 @@ func TestRED_FillAttestation_VerifyRejectsForgedFills(t *testing.T) {
 
 	// TAMPERED ENTRIES (the fabrication): the proposer keeps the venue's signature but
 	// swaps in fabricated fills. The message changes => the signature no longer verifies.
-	forged := []carriedFill{{txIndex: 0, fills: []Fill{{Price: 2, Size: 1_000_000, Side: 0}}}}
+	forged := []carriedFill{{txIndex: 0, fills: []Fill{{Price: fp(2), Size: 1_000_000, Side: 0}}}}
 	if err := verifyFillAttestation(pub, sig, blockHash, forged); err != ErrFillAttestationInvalid {
 		t.Fatalf("a fabricated fill set under the genuine signature must be ErrFillAttestationInvalid, got: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestRED_FillAttestation_EndToEnd_ValidAttestationSettles(t *testing.T) {
 	}
 	pubFromSeed := priv.Public().(ed25519.PublicKey)
 
-	fills := []Fill{{Price: 2, Size: 150, Side: 0}}
+	fills := []Fill{{Price: fp(2), Size: 150, Side: 0}}
 	cvm, matcher, cChainSM, proxyChain, _ := newCountingHarness(t, fills)
 	// Enforcement ON with the matching key pair (proposer signs with seed; validators
 	// verify with the derived pubkey).
@@ -154,7 +154,7 @@ func TestRED_FillAttestation_FabricatedFillsRefunded(t *testing.T) {
 	}
 
 	// A proposer carries a FABRICATED fill (200 base) but cannot attest it (no seed).
-	fills := []Fill{{Price: 2, Size: 200, Side: 0}}
+	fills := []Fill{{Price: fp(2), Size: 200, Side: 0}}
 	cvm, _, cChainSM, proxyChain, _ := newCountingHarness(t, fills)
 	cvm.inner.Config.FillAttestationPubKey = pub // enforcement ON
 	// NO FillAttestationSeed => the proposer's block carries an empty signature.
@@ -205,7 +205,7 @@ func TestRED_FillAttestation_FabricatedFillsRefunded(t *testing.T) {
 // settle exactly as the interim model — so the new gate is strictly opt-in and does not
 // regress existing deployments.
 func TestRED_FillAttestation_OffByDefaultSettlesInterim(t *testing.T) {
-	fills := []Fill{{Price: 2, Size: 100, Side: 0}}
+	fills := []Fill{{Price: fp(2), Size: 100, Side: 0}}
 	cvm, _, cChainSM, proxyChain, _ := newCountingHarness(t, fills)
 	// Default config: no FillAttestationPubKey => enforcement off.
 	ctx := context.Background()
