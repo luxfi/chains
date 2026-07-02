@@ -156,8 +156,8 @@ func TestRED_PerValidatorRelay_SplitsConsensus(t *testing.T) {
 
 	// The book moves: first relay fills 1000 base @1; a later relay fills only 600.
 	matcher := &movingBookMatcher{perCall: [][]Fill{
-		{{Price: 1, Size: 1000, Side: 0}},
-		{{Price: 1, Size: 600, Side: 0}},
+		{{Price: fp(1), Size: 1000, Side: 0}},
+		{{Price: fp(1), Size: 600, Side: 0}},
 	}}
 
 	// Fixed ids so the block is byte-identical across both validators — the ONLY
@@ -223,7 +223,7 @@ func TestRED_PerValidatorRelay_SplitsConsensus(t *testing.T) {
 // the split test above covers accept — this isolates the Verify leg.)
 func TestRED_VerifyDoesNotRelay(t *testing.T) {
 	ctx := context.Background()
-	matcher := &movingBookMatcher{perCall: [][]Fill{{{Price: 1, Size: 1000, Side: 0}}}}
+	matcher := &movingBookMatcher{perCall: [][]Fill{{{Price: fp(1), Size: 1000, Side: 0}}}}
 
 	taker := fixedShortID("verify-purity-taker")
 	asset := idFromByte(0xb2)

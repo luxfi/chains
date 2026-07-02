@@ -65,6 +65,7 @@ github.com/btcsuite/btcd/btcec/v2 v2.1.0/go.mod h1:2VzYrv4Gm4apmbVVsSq5bqf1Ec8v5
 github.com/btcsuite/btcd/btcec/v2 v2.1.3/go.mod h1:ctjw4H1kknNJmRN4iP1R7bTQ+v3GJkZBd6mui8ZsAZE=
 github.com/btcsuite/btcd/btcec/v2 v2.3.6 h1:IzlsEr9olcSRKB/n7c4351F3xHKxS2lma+1UFGCYd4E=
 github.com/btcsuite/btcd/btcec/v2 v2.3.6/go.mod h1:m22FrOAiuxl/tht9wIqAoGHcbnCCaPWyauO8y2LGGtQ=
+github.com/btcsuite/btcd/btcec/v2 v2.5.0/go.mod h1:+K/MYXcLBtHEQjRbjHuJChuybk4LCgjdjgRwil+e+Kk=
 github.com/btcsuite/btcd/btcutil v1.0.0/go.mod h1:Uoxwv0pqYWhD//tfTiipkxNfdhG9UrLwaeswfjfdF0A=
 github.com/btcsuite/btcd/btcutil v1.1.0/go.mod h1:5OapHB7A2hBBWLm48mmw4MOHNJCcUBTwmWH/0Jn8VHE=
 github.com/btcsuite/btcd/btcutil v1.1.5/go.mod h1:PSZZ4UitpLBWzxGd5VGOrLnmOjtPP/a6HaFo12zMs00=
@@ -321,6 +322,8 @@ github.com/luxfi/database v1.20.4 h1:WOt2GIGJxf8AFpg49odMz8DZ8RFSLDrozGhZtmorN70
 github.com/luxfi/database v1.20.4/go.mod h1:S/LvmfzNYWVNslcEcZwDrntqUO2ksaL8ql1nRmLUA/Q=
 github.com/luxfi/dex v1.5.20 h1:Vu3D0iS1QcAPs1DtPjjtQpd+8bclkf5nisVYqaoEbkA=
 github.com/luxfi/dex v1.5.20/go.mod h1:95k6Tl5HoyBRVd6IFzGlPOZE6SGqOyjnh4dSrJcplzM=
+github.com/luxfi/dex v1.14.0 h1:4PtorVbRmbD73S6YWPvgp5GRCb9jeuaedl7mo1CbzCI=
+github.com/luxfi/dex v1.14.0/go.mod h1:wYWQmwospvdKBWQ6OJMXb8I+kfgEtE46R1rD8H7vHCQ=
 github.com/luxfi/dkg v0.3.5 h1:s2L2mMQaz+n9m0b0ghvoV5VZNxiwb2z4WrGugvK0udY=
 github.com/luxfi/dkg v0.3.5/go.mod h1:M+WH7GFRN+YUD851Rlnumdp0Md98kplNN8pVx65U8I8=
 github.com/luxfi/evm v1.99.51 h1:Ai/++j0hK95YOrBGH/4ZWznO5C6yL9aRqwnaZ83BrbQ=

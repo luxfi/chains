@@ -135,7 +135,7 @@ func TestRED_GenesisAttestation_PubKeyReachesConfig(t *testing.T) {
 	}
 	// And the gate is now LIVE: verify rejects a missing signature (enforcement on).
 	bh := ids.GenerateTestID()
-	entries := []carriedFill{{txIndex: 0, fills: []Fill{{Price: 2, Size: 100, Side: 0}}}}
+	entries := []carriedFill{{txIndex: 0, fills: []Fill{{Price: fp(2), Size: 100, Side: 0}}}}
 	if verr := verifyFillAttestation(cvm.inner.Config.FillAttestationPubKey, nil, bh, entries); verr != ErrFillAttestationRequired {
 		t.Fatalf("with a genesis-pinned pubkey the gate must REQUIRE a signature, got: %v", verr)
 	}
@@ -154,7 +154,7 @@ func TestRED_GenesisAttestation_FabricatedBlockFullRefund(t *testing.T) {
 	}
 	// A proposer carries a FABRICATED fill (200 base) but cannot attest it (no seed in any
 	// config). Enforcement is on ONLY because the genesis blob pinned the pubkey.
-	fills := []Fill{{Price: 2, Size: 200, Side: 0}}
+	fills := []Fill{{Price: fp(2), Size: 200, Side: 0}}
 	cvm, cChainSM, proxyChain, _, initErr := newGenesisHarness(t, fills, genesisWithPubKey(pub), nil)
 	if initErr != nil {
 		t.Fatalf("Initialize: %v", initErr)

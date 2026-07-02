@@ -13,6 +13,7 @@ require (
 	github.com/luxfi/constants v1.5.8
 	github.com/luxfi/crypto v1.19.26
 	github.com/luxfi/database v1.20.4
+	github.com/luxfi/dex v1.14.0
 	github.com/luxfi/evm v1.99.51
 	github.com/luxfi/geth v1.17.12
 	github.com/luxfi/ids v1.2.15
@@ -64,7 +65,7 @@ require (
 	github.com/aws/smithy-go v1.24.2 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
-	github.com/btcsuite/btcd/btcec/v2 v2.3.6 // indirect
+	github.com/btcsuite/btcd/btcec/v2 v2.5.0 // indirect
 	github.com/btcsuite/btcd/btcutil v1.1.6 // indirect
 	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0 // indirect
 	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
@@ -141,7 +142,6 @@ require (
 	github.com/luxfi/container v0.0.4 // indirect
 	github.com/luxfi/corona v0.10.3 // indirect
 	github.com/luxfi/crypto/ipa v1.2.4 // indirect
-	github.com/luxfi/dex v1.5.20 // indirect
 	github.com/luxfi/dkg v0.3.5 // indirect
 	github.com/luxfi/fhe v1.8.2 // indirect
 	github.com/luxfi/filesystem v0.0.1 // indirect

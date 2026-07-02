@@ -99,21 +99,22 @@ func (cvm *ChainVM) FeePolicy() fee.Policy { return cvm.feePolicy }
 // swapNativeFeeToLUX converts a fee TENDERED in a non-LUX native asset into its
 // canonical-LUX settlement amount, swapping native -> LUX at a CONFIRMED matcher
 // fill price (the proxy's own swap path — eat-your-own-dogfood). luxPerNative is
-// the Fill.Price of a confirmed native->LUX fill (LUX quote per native base); it
-// is a consensus-agreed receipt, so every validator computes the identical LUX
-// amount from identical inputs — deterministic settlement.
+// the Fill.Price of a confirmed native->LUX fill: a uint64 FIXED-POINT ×PriceScale
+// value (LUX quote per native base). It is a consensus-agreed receipt, so every
+// validator computes the identical LUX amount from identical inputs — deterministic
+// settlement with NO float on the value path.
 //
-// The LUX output is the asset the fee sink RECEIVES, so it rounds DOWN via
-// quantToCredit — the SAME asymmetric proceeds rounding settleFromFills uses for
-// every credited leg (never credit a LUX unit the fill did not realize; the
-// proxy never mints LUX). Rounding DOWN is also the floor-SAFE direction: a
-// caller's floor check can never be passed by rounding error, only failed by it.
-// A non-finite or non-positive price is a malformed fill and is refused.
-func swapNativeFeeToLUX(nativeFee uint64, luxPerNative float64) (uint64, error) {
-	if !isFinitePositive(luxPerNative) {
-		return 0, fmt.Errorf("dexvm: fee swap: invalid LUX/native price %v", luxPerNative)
+// The LUX output is the asset the fee sink RECEIVES, so it is the exact quote the
+// fill realized: floor(nativeFee × luxPerNative / PriceScale) via quoteUnits — the
+// SAME per-fill floor settleFromFills uses for every credited leg (never credit a
+// LUX unit the fill did not realize; the proxy never mints LUX). Flooring is the
+// floor-SAFE direction: a caller's floor check can never be passed by rounding
+// error, only failed by it. A zero price is a malformed fill and is refused.
+func swapNativeFeeToLUX(nativeFee uint64, luxPerNative uint64) (uint64, error) {
+	if luxPerNative == 0 {
+		return 0, fmt.Errorf("dexvm: fee swap: invalid LUX/native price %d", luxPerNative)
 	}
-	return quantToCredit(float64(nativeFee) * luxPerNative)
+	return settleUint64(quoteUnits(nativeFee, luxPerNative), "fee-swap LUX")
 }
 
 // settleFeeInLUX sources the D-Chain tx fee in canonical LUX from a fee tendered
@@ -129,7 +130,7 @@ func swapNativeFeeToLUX(nativeFee uint64, luxPerNative float64) (uint64, error) 
 // confirmed fill). The floor therefore holds whether the fee is paid in LUX
 // directly or swapped from a native token — it cannot be bypassed by tendering
 // native.
-func (cvm *ChainVM) settleFeeInLUX(nativeFee uint64, luxPerNative float64) (uint64, error) {
+func (cvm *ChainVM) settleFeeInLUX(nativeFee uint64, luxPerNative uint64) (uint64, error) {
 	if cvm.feePolicy == nil {
 		return 0, fmt.Errorf("dexvm: fee policy not initialized")
 	}

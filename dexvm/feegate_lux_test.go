@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"math"
 	"testing"
 
 	"github.com/luxfi/chains/dexvm/txs"
@@ -141,13 +140,13 @@ func TestSwapNativeFeeToLUX_Deterministic(t *testing.T) {
 	cvm := newChainVMForNetwork(t, luxL2NetworkID)
 
 	// 1:1 parity — a native fee at the floor settles to exactly the floor in LUX.
-	if got, err := swapNativeFeeToLUX(fee.MinTxFeeFloor, 1.0); err != nil || got != fee.MinTxFeeFloor {
-		t.Fatalf("swapNativeFeeToLUX(floor, 1.0) = (%d, %v), want (%d, nil)", got, err, fee.MinTxFeeFloor)
+	if got, err := swapNativeFeeToLUX(fee.MinTxFeeFloor, fp(1.0)); err != nil || got != fee.MinTxFeeFloor {
+		t.Fatalf("swapNativeFeeToLUX(floor, fp(1.0)) = (%d, %v), want (%d, nil)", got, err, fee.MinTxFeeFloor)
 	}
 
 	// Determinism: the same native fee + fill price always yields the same LUX.
 	const nativeFee = uint64(20_000_000)
-	const price = 0.1 // LUX per native unit
+	price := fp(0.1) // LUX per native unit, fixed-point ×PriceScale
 	first, err := swapNativeFeeToLUX(nativeFee, price)
 	if err != nil {
 		t.Fatalf("swap: %v", err)
@@ -158,31 +157,29 @@ func TestSwapNativeFeeToLUX_Deterministic(t *testing.T) {
 			t.Fatalf("non-deterministic swap on iter %d: got (%d,%v), want (%d,nil)", i, got, err, first)
 		}
 	}
-	if first != 2_000_000 { // 20_000_000 * 0.1 = 2_000_000 LUX
-		t.Fatalf("swap(20e6, 0.1) = %d, want 2_000_000", first)
+	if first != 2_000_000 { // floor(20_000_000 * 0.1) = 2_000_000 LUX
+		t.Fatalf("swap(20e6, fp(0.1)) = %d, want 2_000_000", first)
 	}
 
 	// settleFeeInLUX enforces the LUX floor on the swapped output. 2_000_000 >= floor.
 	if got, err := cvm.settleFeeInLUX(nativeFee, price); err != nil || got != 2_000_000 {
-		t.Fatalf("settleFeeInLUX(20e6, 0.1) = (%d, %v), want (2_000_000, nil)", got, err)
+		t.Fatalf("settleFeeInLUX(20e6, fp(0.1)) = (%d, %v), want (2_000_000, nil)", got, err)
 	}
 
 	// An under-floor swap output is refused (native fee too small for the price):
-	// 1_000_000 native * 0.1 = 100_000 LUX < 1_000_000 floor.
-	if _, err := cvm.settleFeeInLUX(1_000_000, 0.1); !errors.Is(err, fee.ErrInsufficientFee) {
+	// floor(1_000_000 * 0.1) = 100_000 LUX < 1_000_000 floor.
+	if _, err := cvm.settleFeeInLUX(1_000_000, fp(0.1)); !errors.Is(err, fee.ErrInsufficientFee) {
 		t.Fatalf("settleFeeInLUX(under-floor output) = %v, want ErrInsufficientFee", err)
 	}
 
-	// Proceeds round DOWN (never credit LUX the fill did not realize, floor-safe):
-	// 3 native * 0.5 = 1.5 LUX -> 1 LUX.
-	if got, err := swapNativeFeeToLUX(3, 0.5); err != nil || got != 1 {
-		t.Fatalf("swapNativeFeeToLUX(3, 0.5) = (%d, %v), want (1, nil) [floor-safe round down]", got, err)
+	// Proceeds floor DOWN (never credit LUX the fill did not realize, floor-safe):
+	// floor(3 * 0.5) = floor(1.5) = 1 LUX.
+	if got, err := swapNativeFeeToLUX(3, fp(0.5)); err != nil || got != 1 {
+		t.Fatalf("swapNativeFeeToLUX(3, fp(0.5)) = (%d, %v), want (1, nil) [floor-safe round down]", got, err)
 	}
 
-	// Malformed fill prices are refused (no silent zero/garbage settlement).
-	for _, bad := range []float64{0, -1, math.NaN(), math.Inf(1), math.Inf(-1)} {
-		if _, err := swapNativeFeeToLUX(fee.MinTxFeeFloor, bad); err == nil {
-			t.Fatalf("swapNativeFeeToLUX with invalid price %v = nil err, want refusal", bad)
-		}
+	// A zero fill price is refused (no silent zero/garbage settlement).
+	if _, err := swapNativeFeeToLUX(fee.MinTxFeeFloor, 0); err == nil {
+		t.Fatalf("swapNativeFeeToLUX with zero price = nil err, want refusal")
 	}
 }

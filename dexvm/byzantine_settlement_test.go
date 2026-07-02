@@ -96,7 +96,7 @@ func settleByzantineFills(t *testing.T, fills []Fill, lockedQuote uint64) (taker
 func TestByzantineVenue_OverNotionalAttestedFillCannotMint(t *testing.T) {
 	const lockedQuote uint64 = 1000
 	// BUY: receives base = 600, spends quote = 600*2 = 1200 > 1000 locked (mint attempt).
-	fills := []Fill{{Price: 2, Size: 600, Side: 0}}
+	fills := []Fill{{Price: fp(2), Size: 600, Side: 0}}
 
 	_, baseAsset, quoteAsset, legs := settleByzantineFills(t, fills, lockedQuote)
 
@@ -127,7 +127,7 @@ func TestByzantineVenue_OverNotionalAttestedFillCannotMint(t *testing.T) {
 func TestByzantineVenue_WithinCollateralAttestedFillSettles(t *testing.T) {
 	const lockedQuote uint64 = 1000
 	// BUY: receives base = 400, spends quote = 400*2 = 800 <= 1000 locked.
-	fills := []Fill{{Price: 2, Size: 400, Side: 0}}
+	fills := []Fill{{Price: fp(2), Size: 400, Side: 0}}
 
 	_, baseAsset, quoteAsset, legs := settleByzantineFills(t, fills, lockedQuote)
 
@@ -153,7 +153,7 @@ func TestByzantineVenue_WithinCollateralAttestedFillSettles(t *testing.T) {
 func TestByzantineVenue_MixedSideAttestedFillRefused(t *testing.T) {
 	const lockedQuote uint64 = 1000
 	// A lying venue returns [BUY 100, SELL 300]: the mixed-side over-credit attempt.
-	fills := []Fill{{Price: 2, Size: 100, Side: 0}, {Price: 2, Size: 300, Side: 1}}
+	fills := []Fill{{Price: fp(2), Size: 100, Side: 0}, {Price: fp(2), Size: 300, Side: 1}}
 
 	_, baseAsset, quoteAsset, legs := settleByzantineFills(t, fills, lockedQuote)
 
@@ -181,8 +181,8 @@ func TestByzantineVenue_MixedSideAttestedFillRefused(t *testing.T) {
 func TestByzantineSettlement_DeterministicRegardlessOfFillOrder(t *testing.T) {
 	const lockedQuote uint64 = 1000
 	// Two same-side (BUY) fills; total spent = 3*100 + 2*150 = 600 <= 1000 locked.
-	fillsAB := []Fill{{Price: 3, Size: 100, Side: 0}, {Price: 2, Size: 150, Side: 0}}
-	fillsBA := []Fill{{Price: 2, Size: 150, Side: 0}, {Price: 3, Size: 100, Side: 0}}
+	fillsAB := []Fill{{Price: fp(3), Size: 100, Side: 0}, {Price: fp(2), Size: 150, Side: 0}}
+	fillsBA := []Fill{{Price: fp(2), Size: 150, Side: 0}, {Price: fp(3), Size: 100, Side: 0}}
 
 	_, baseA, quoteA, legsAB := settleByzantineFills(t, fillsAB, lockedQuote)
 	_, baseB, quoteB, legsBA := settleByzantineFills(t, fillsBA, lockedQuote)

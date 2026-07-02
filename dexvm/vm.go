@@ -11,7 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
+	"math/big"
 	"net/http"
 	"sync"
 	"time"
@@ -939,11 +939,11 @@ func (vm *VM) settleCarried(result *BlockResult, ar *atomicRequests) {
 // RECEIVES the opposite asset. The settle therefore exports TWO legs:
 //
 //	PROCEEDS leg — the received (opposite) asset:
-//	  - taker BUY  (side 0): receives base  = sum(size).
-//	  - taker SELL (side 1): receives quote = sum(price*size).
+//	  - taker BUY  (side 0): receives base  = Σ size.
+//	  - taker SELL (side 1): receives quote = Σ floor(size × price / PriceScale).
 //	REFUND leg — the unfilled remainder of the LOCKED asset:
-//	  - taker BUY  locked quote; spent = sum(price*size); refund = locked - spent.
-//	  - taker SELL locked base;  spent = sum(size);       refund = locked - spent.
+//	  - taker BUY  locked quote; spent = Σ floor(size×price/PriceScale); refund = locked - spent.
+//	  - taker SELL locked base;  spent = Σ size;                         refund = locked - spent.
 //
 // Crediting only the proceeds leg (the prior behavior) DESTROYED the unfilled
 // remainder on every partial/zero fill. The refund leg closes that leak: the
@@ -953,25 +953,18 @@ func (vm *VM) settleCarried(result *BlockResult, ar *atomicRequests) {
 // refunded twice. With no escrow (a relay not backed by a proxy-side import),
 // there is no locked collateral to refund — proceeds only.
 //
-// FRACTIONAL-NOTIONAL ROUNDING (RED escrow-truncation mint): fills cross the ZAP
-// wire as float64, so base = sum(size) and quote = sum(price*size) are generally
-// FRACTIONAL while on-chain value moves in integer asset units. The float->uint
-// conversion is ASYMMETRIC by purpose, to preserve "the proxy never mints"
-// (atomic.go quantToCredit/quantToCharge):
-//   - PROCEEDS (the opposite asset the taker RECEIVES) round DOWN — never credit
-//     a unit that was not realized.
-//   - SPENT (the locked asset consumed, which REDUCES the refund) round UP —
-//     never UNDERstate spend. Understating spend is exactly this bug: a BUY's
-//     spent = floor(notional) inflates refund = locked - spent, so the taker
-//     keeps the base proceeds AND a refund larger than the true unspent quote =>
-//     quote minted out of escrow.
-//
-// Totals are summed over the fills ONCE as exact floats, then rounded ONCE at the
-// asset boundary. The prior per-fill uint64(price*size) truncated DOWN on every
-// fill and summed the error: 100 fills of notional 0.99 recorded spent=0 and
-// refunded the entire lock. Aggregate ceiling gives spent=ceil(99.0)=99, so the
-// refund is capped at the true unspent value — no extraction. spent > locked is
-// still refused (minting against the proxy's own escrow).
+// EXACT-INTEGER NOTIONAL (no float, no mint): fills cross the ZAP wire as EXACT
+// integers — size is atomic base units, price is fixed-point ×PriceScale — so
+// base = Σ size and quote = Σ floor(size × price / PriceScale) are themselves exact
+// integers, computed with the SAME per-fill floor the venue matcher applied. The
+// proxy therefore moves EXACTLY what the venue matched: there is no fractional
+// notional to round, no asymmetric floor/ceil, and — decisively — no value-bearing
+// float→int conversion (whose out-of-range result is architecture-dependent and
+// was the cross-arch fork). The escrow-truncation mint is structurally impossible:
+// spent is the venue's own quote integer, refund = locked - spent, and spent >
+// locked is still refused (minting against the proxy's own escrow). The aggregates
+// are summed in big.Int and refused if they exceed uint64 — a value the proxy
+// cannot represent exactly is never settled.
 //
 // DETERMINISM (RED split): the export this settle constructs is reconstructed
 // independently on every validator, so its shared-memory UTXO keys MUST be a
@@ -1030,68 +1023,69 @@ func (vm *VM) settleFromFills(relaySender ids.ShortID, collateralRef ids.ID, fil
 		return fmt.Errorf("settle: invalid taker side %d", takerSide)
 	}
 
-	// Aggregate the fill totals ONCE as exact floats (base = sum(size), quote =
-	// sum(price*size)). Rounding to integer asset units happens later, in the
-	// direction proper to each leg — NOT per-fill, which would truncate DOWN on
-	// every fill and sum a directional leak (the escrow-truncation mint).
+	// Aggregate the fill totals as EXACT integers: base = Σ size (atomic base
+	// units), quote = Σ floor(size × price / PriceScale) — the SAME per-fill floor
+	// the venue's matcher (quoteUnitsFor) and the precompile's fillsToDelta apply,
+	// so the proxy settles EXACTLY the value the venue moved. There is no fractional
+	// notional and no float→int conversion on this path (the cross-arch fork the
+	// exact-integer wire eliminates); big.Int accumulation cannot overflow and the
+	// narrowing to uint64 refuses any aggregate the proxy cannot represent exactly.
 	//
-	// SINGLE-SIDE GUARD (RED mixed-side over-credit): the proceeds/spent split
-	// below applies ONE direction (takerSide) to the WHOLE aggregate, so a fill
-	// stream that mixes sides would be credited as if every fill took takerSide —
-	// minting the opposite-side volume (a lying/MITM backend returns [BUY 10,
-	// SELL 1000] and the proxy credits base = 1010). A submit cannot legitimately
-	// fill both sides; refuse the stream rather than over-credit.
+	// SINGLE-SIDE GUARD (RED mixed-side over-credit): the proceeds/spent split below
+	// applies ONE direction (takerSide) to the WHOLE aggregate, so a fill stream that
+	// mixes sides would be credited as if every fill took takerSide — minting the
+	// opposite-side volume (a lying/MITM backend returns [BUY 10, SELL 1000] and the
+	// proxy credits base = 1010). A submit cannot legitimately fill both sides; refuse
+	// the stream rather than over-credit.
 	//
 	// SLIPPAGE-LIMIT GUARD (MEDIUM — bounded sandwich/MEV): the taker carried a
-	// worst-acceptable CLOB price (priceLimit, derived from their V4 SqrtPriceLimitX96).
-	// A fill WORSE than that limit is refused before any value moves — so an adversary
-	// who sandwiches the order and moves the price beyond the taker's floor produces
-	// fills the proxy will not settle; the escrow stays intact and is reclaimable. The
-	// limit composes per-fill (it is a price bound, not a min-total-out), so each fill is
-	// checked independently. limitIsUpper governs the direction: an exact-input BUY caps
-	// the price ABOVE the limit (never pay more than `limit` quote per base); a SELL
-	// floors it BELOW (never receive less than `limit`). priceLimit==0 means no limit
-	// (the V4 sentinel min/max sqrt price, preserved as "unbounded").
-	var limit float64
-	if priceLimit != 0 {
-		limit = math.Float64frombits(priceLimit)
-	}
-	var baseFloat, quoteFloat float64
+	// worst-acceptable CLOB price (priceLimit, a uint64 fixed-point ×PriceScale value
+	// derived from their V4 SqrtPriceLimitX96, the SAME grid as Fill.Price). A fill
+	// WORSE than that limit is refused before any value moves — so an adversary who
+	// sandwiches the order and moves the price beyond the taker's floor produces fills
+	// the proxy will not settle; the escrow stays intact and is reclaimable. The limit
+	// composes per-fill (it is a price bound, not a min-total-out), so each fill is
+	// checked independently by EXACT integer comparison. limitIsUpper governs the
+	// direction: an exact-input BUY caps the price ABOVE the limit (never pay more than
+	// `limit` quote per base); a SELL floors it BELOW (never receive less than `limit`).
+	// priceLimit==0 means no limit (the V4 sentinel min/max sqrt price, "unbounded").
+	base := new(big.Int)
+	quote := new(big.Int)
 	for _, f := range fills {
 		if f.Side != takerSide {
 			return fmt.Errorf("settle: mixed-side fills (fill side %d != taker side %d)", f.Side, takerSide)
 		}
-		if limit > 0 {
-			if limitIsUpper && f.Price > limit {
-				return fmt.Errorf("settle: fill price %g exceeds slippage limit %g (sandwich/MEV guard)", f.Price, limit)
+		if priceLimit != 0 {
+			if limitIsUpper && f.Price > priceLimit {
+				return fmt.Errorf("settle: fill price %d exceeds slippage limit %d (sandwich/MEV guard)", f.Price, priceLimit)
 			}
-			if !limitIsUpper && f.Price < limit {
-				return fmt.Errorf("settle: fill price %g below slippage limit %g (sandwich/MEV guard)", f.Price, limit)
+			if !limitIsUpper && f.Price < priceLimit {
+				return fmt.Errorf("settle: fill price %d below slippage limit %d (sandwich/MEV guard)", f.Price, priceLimit)
 			}
 		}
-		baseFloat += f.Size
-		quoteFloat += f.Price * f.Size
+		base.Add(base, new(big.Int).SetUint64(f.Size))
+		quote.Add(quote, quoteUnits(f.Size, f.Price))
 	}
 
-	// Directional rounding by purpose (atomic.go): a RECEIVED quantity rounds DOWN
-	// (never over-credit); a SPENT quantity rounds UP (never inflate the refund).
-	// BUY  receives base, spends quote. SELL receives quote, spends base.
+	baseUnits, err := settleUint64(base, "base")
+	if err != nil {
+		return err
+	}
+	quoteTotal, err := settleUint64(quote, "quote")
+	if err != nil {
+		return err
+	}
+	// BUY receives base, spends quote. SELL receives quote, spends base. Both legs
+	// are the venue's own exact integers — the proxy moves precisely what the venue
+	// matched (no rounding, no mint); spent > locked is still refused below.
 	var proceeds uint64 // the opposite asset the taker receives
 	var spent uint64    // the locked asset consumed (reduces the refund)
-	if takerSide == 0 { // BUY
-		if proceeds, err = quantToCredit(baseFloat); err != nil {
-			return err
-		}
-		if spent, err = quantToCharge(quoteFloat); err != nil {
-			return err
-		}
+	if takerSide == 0 {  // BUY
+		proceeds = baseUnits
+		spent = quoteTotal
 	} else { // SELL
-		if proceeds, err = quantToCredit(quoteFloat); err != nil {
-			return err
-		}
-		if spent, err = quantToCharge(baseFloat); err != nil {
-			return err
-		}
+		proceeds = quoteTotal
+		spent = baseUnits
 	}
 
 	outs := make([]txs.AtomicOutput, 0, 2)
@@ -1499,22 +1493,22 @@ func (vm *VM) cChainID() ids.ID {
 }
 
 // encodeCLOBPlace builds a byte-identical clob_place frame from a thin place
-// envelope, mirroring the d-chain gateway's expected layout (poolId[32] |
-// side[1] | price[8] | size[8] | maker[16]).
+// envelope, mirroring the d-chain gateway's frozen exact-integer layout
+// (poolId[32] | side[1] | price[8:u64 fixed ×PriceScale] | size[8:u64 base units] |
+// maker[16]). tx.Price is a whole quote-per-base price scaled onto the matcher's
+// PriceInt grid (× PriceScale); tx.Size is already atomic base units. No float
+// touches the wire — the venue reads these exact integers directly (dex/pkg/zapwire
+// EncodePlace / DecodePlace), so no architecture-dependent float→int conversion
+// can fork the derived book state.
 func encodeCLOBPlace(tx *txs.PlaceOrderTx) []byte {
 	payload := make([]byte, 65)
 	copy(payload[0:32], tx.PoolID[:])
 	payload[32] = tx.Side
-	putZAPFloat(payload[33:41], float64(tx.Price))
-	putZAPFloat(payload[41:49], float64(tx.Size))
+	binary.BigEndian.PutUint64(payload[33:41], tx.Price*PriceScale)
+	binary.BigEndian.PutUint64(payload[41:49], tx.Size)
 	maker := tx.Sender()
 	copy(payload[49:65], maker[:16])
 	return payload
-}
-
-// putZAPFloat writes a ZAP float wire field (big-endian IEEE-754 float64 bits).
-func putZAPFloat(b []byte, f float64) {
-	binary.BigEndian.PutUint64(b, math.Float64bits(f))
 }
 
 // idHash is the canonical 32-byte hash used for derived ids.

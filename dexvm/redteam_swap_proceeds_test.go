@@ -26,7 +26,6 @@ package dexvm
 import (
 	"context"
 	"encoding/binary"
-	"math"
 	"testing"
 	"time"
 
@@ -70,7 +69,7 @@ func legsTo(ar *atomicRequests, owner ids.ShortID) map[ids.ID]uint64 {
 // assetID(currency_out); only an export under the real id can ever satisfy it.
 func TestRED_SwapProceeds_ExportedUnderRealOutputAsset(t *testing.T) {
 	// Taker BUY: 100 base @ price 2 => receives 100 base, spends 200 quote.
-	fills := []Fill{{Price: 2, Size: 100, Side: 0}}
+	fills := []Fill{{Price: fp(2), Size: 100, Side: 0}}
 	cvm, _, _, _, _ := newCountingHarness(t, fills)
 
 	taker := ids.GenerateTestShortID()
@@ -127,7 +126,7 @@ func TestRED_SwapProceeds_ExportedUnderRealOutputAsset(t *testing.T) {
 // the swap output. This is the proof that swaps actually complete.
 func TestRED_SwapProceeds_EndToEnd_TakerCreditedRealOutput(t *testing.T) {
 	// Taker BUY: book fills 150 base @ price 2 => 150 base received, 300 quote spent.
-	fills := []Fill{{Price: 2, Size: 150, Side: 0}}
+	fills := []Fill{{Price: fp(2), Size: 150, Side: 0}}
 	cvm, matcher, cChainSM, proxyChain, _ := newCountingHarness(t, fills)
 	ctx := context.Background()
 
@@ -217,9 +216,10 @@ type atomicShared interface {
 
 var _ = txs.RailSwap
 
-// floatBits packs a float64 price into the uint64 wire form the relay carries (the
-// same math.Float64bits the precompile's priceLimitToCLOB produces).
-func floatBits(p float64) uint64 { return math.Float64bits(p) }
+// limitUnits packs a human quote-per-base price limit into the uint64 fixed-point
+// ×PriceScale wire form the relay carries (the SAME grid as Fill.Price, the value
+// the precompile's priceLimitToCLOB now produces).
+func limitUnits(p float64) uint64 { return fp(p) }
 
 // TestRED_SwapSlippageLimit_RejectsWorseThanLimit is the MEDIUM (bounded sandwich/MEV)
 // proof. A taker BUY carries a worst-acceptable price limit (an UPPER bound: never pay
@@ -235,14 +235,14 @@ func TestRED_SwapSlippageLimit_RejectsWorseThanLimit(t *testing.T) {
 	const limit = 2.0 // BUY ceiling: never pay more than 2 quote per base.
 
 	// (a) WORSE fill: price 3 > limit 2 (a sandwich pushed the price up). Refused.
-	worse := []Fill{{Price: 3, Size: 100, Side: 0}}
+	worse := []Fill{{Price: fp(3), Size: 100, Side: 0}}
 	cvm, _, _, _, _ := newCountingHarness(t, worse)
 	ref := ids.GenerateTestID()
 	if err := cvm.inner.state.PutEscrow(ref, taker, quoteAsset, lockedQuote); err != nil {
 		t.Fatalf("PutEscrow: %v", err)
 	}
 	ar := newAtomicRequests()
-	err := cvm.inner.settleFromFills(taker, ref, worse, baseAsset, floatBits(limit), true, ids.GenerateTestID(), 0, ar)
+	err := cvm.inner.settleFromFills(taker, ref, worse, baseAsset, limitUnits(limit), true, ids.GenerateTestID(), 0, ar)
 	if err == nil {
 		t.Fatalf("MEV GUARD MISSING: a fill at price 3 (above the taker's limit 2) was settled — a "+
 			"sandwich could fill the taker beyond their slippage floor.")
@@ -257,14 +257,14 @@ func TestRED_SwapSlippageLimit_RejectsWorseThanLimit(t *testing.T) {
 	t.Logf("MEV GUARD: fill@3 rejected against BUY limit 2 (escrow intact): %v", err)
 
 	// (b) AT-LIMIT fill: price 2 == limit 2. Settles normally (100 base proceeds).
-	atLimit := []Fill{{Price: 2, Size: 100, Side: 0}}
+	atLimit := []Fill{{Price: fp(2), Size: 100, Side: 0}}
 	cvm2, _, _, _, _ := newCountingHarness(t, atLimit)
 	ref2 := ids.GenerateTestID()
 	if err := cvm2.inner.state.PutEscrow(ref2, taker, quoteAsset, lockedQuote); err != nil {
 		t.Fatalf("PutEscrow: %v", err)
 	}
 	ar2 := newAtomicRequests()
-	if err := cvm2.inner.settleFromFills(taker, ref2, atLimit, baseAsset, floatBits(limit), true, ids.GenerateTestID(), 0, ar2); err != nil {
+	if err := cvm2.inner.settleFromFills(taker, ref2, atLimit, baseAsset, limitUnits(limit), true, ids.GenerateTestID(), 0, ar2); err != nil {
 		t.Fatalf("an at-limit fill (price == limit) must settle, got: %v", err)
 	}
 	if legsTo(ar2, taker)[baseAsset] != 100 {
@@ -274,14 +274,14 @@ func TestRED_SwapSlippageLimit_RejectsWorseThanLimit(t *testing.T) {
 
 	// (c) SELL floor: a SELL carries a LOWER bound (never receive less than `limit` quote
 	// per base). A fill BELOW the floor is refused.
-	sellFloor := []Fill{{Price: 4, Size: 100, Side: 1}}
+	sellFloor := []Fill{{Price: fp(4), Size: 100, Side: 1}}
 	cvm3, _, _, _, _ := newCountingHarness(t, sellFloor)
 	ref3 := ids.GenerateTestID()
 	if err := cvm3.inner.state.PutEscrow(ref3, taker, baseAsset /*locked base for a sell*/, lockedQuote); err != nil {
 		t.Fatalf("PutEscrow: %v", err)
 	}
 	ar3 := newAtomicRequests()
-	if err := cvm3.inner.settleFromFills(taker, ref3, sellFloor, quoteAsset, floatBits(5.0), false, ids.GenerateTestID(), 0, ar3); err == nil {
+	if err := cvm3.inner.settleFromFills(taker, ref3, sellFloor, quoteAsset, limitUnits(5.0), false, ids.GenerateTestID(), 0, ar3); err == nil {
 		t.Fatalf("SELL floor MISSING: a fill at price 4 (below the floor 5) was settled.")
 	}
 	t.Logf("MEV GUARD: SELL fill@4 rejected against floor 5")

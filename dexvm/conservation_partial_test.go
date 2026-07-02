@@ -28,7 +28,7 @@ package dexvm
 
 import (
 	"context"
-	"math"
+	"math/big"
 	"testing"
 	"time"
 
@@ -96,31 +96,20 @@ func settledRound(t *testing.T, fills []Fill, collateral uint64, takerSide uint8
 // requires be refunded.
 //
 // It mirrors settleFromFills exactly: the spent quantity is aggregated over the
-// fills as an exact float and rounded UP (ceiling) ONCE — the conservation-safe
-// direction for a charge, so the refund (locked - spent) is never inflated. (The
-// prior per-fill uint64 truncation was the escrow-extraction bug.)
+// fills as EXACT integers — a BUY's quote consumed is Σ floor(size × price /
+// PriceScale) (the venue matcher's own per-fill quote), a SELL's base consumed is
+// Σ size. There is no float and no rounding seam: the proxy spends precisely what
+// the venue matched, so refund = locked - spent is exact and never inflated.
 func fillNotional(fills []Fill, takerSide uint8) uint64 {
-	var n float64
+	total := new(big.Int)
 	for _, f := range fills {
-		if takerSide == 0 { // BUY locked quote; quote consumed = price*size
-			n += f.Price * f.Size
-		} else { // SELL locked base; base consumed = size
-			n += f.Size
+		if takerSide == 0 { // BUY locked quote; quote consumed = Σ floor(size*price/PriceScale)
+			total.Add(total, quoteUnits(f.Size, f.Price))
+		} else { // SELL locked base; base consumed = Σ size
+			total.Add(total, new(big.Int).SetUint64(f.Size))
 		}
 	}
-	return ceilToUnit(n)
-}
-
-// ceilToUnit rounds a non-negative float aggregate UP to integer asset units,
-// snapping a mathematically-integral aggregate (e.g. 1.5*3+2.5*3 == 12, but may
-// evaluate to 12 ± 1e-13) to that integer first. It mirrors atomic.go's
-// quantToCharge so the tests reason in the SAME arithmetic the proxy uses.
-func ceilToUnit(f float64) uint64 {
-	r := math.Round(f)
-	if math.Abs(f-r) <= 1e-9*math.Max(1, math.Abs(f)) {
-		return uint64(r)
-	}
-	return uint64(math.Ceil(f))
+	return total.Uint64()
 }
 
 // TestConservationPartialFillBuy is the decisive partial-settlement proof. The
@@ -132,7 +121,7 @@ func ceilToUnit(f float64) uint64 {
 func TestConservationPartialFillBuy(t *testing.T) {
 	const lockedQuote uint64 = 1000
 	// One fill: 200 base @ price 2 => 400 quote spent, 600 quote should refund.
-	fills := []Fill{{Price: 2, Size: 200}}
+	fills := []Fill{{Price: fp(2), Size: 200}}
 	const takerSide uint8 = 0 // BUY
 
 	valueIn, valueOut := settledRound(t, fills, lockedQuote, takerSide)
@@ -192,7 +181,7 @@ func TestConservationZeroFill(t *testing.T) {
 // must be proceeds(1500 quote) + refund(700 base) = 2200.
 func TestConservationPartialFillSell(t *testing.T) {
 	const lockedBase uint64 = 1000
-	fills := []Fill{{Price: 5, Size: 300}} // 300 base sold, 1500 quote received
+	fills := []Fill{{Price: fp(5), Size: 300}} // 300 base sold, 1500 quote received
 	const takerSide uint8 = 1              // SELL
 
 	valueIn, valueOut := settledRound(t, fills, lockedBase, takerSide)
@@ -298,41 +287,40 @@ func TestFailedRelayCommitsNothing(t *testing.T) {
 	}
 }
 
-// TestConservationRoundingBoundary probes the float64->uint64 seam in the
-// spent/refund split. settleFromFills aggregates the quote notional over the
-// fills as an exact float and rounds the SPENT side UP (ceiling) ONCE — the
-// conservation-safe direction so the refund (locked - spent) is never inflated.
-// Two fractional fills (price 1.5 * size 3 = 4.5; price 2.5 * size 3 = 7.5) sum
-// to an aggregate quote notional of exactly 12.0, so spent = ceil(12.0) = 12
-// (NOT the old per-fill floor sum 4+7=11, which understated spend and over-
-// refunded by 1). Proceeds base rounds DOWN: floor(sum(size)) = floor(6.0) = 6.
-// The taker locked 1000 quote; refund = 1000-12 = 988, and value_out =
-// base-proceeds(6) + quote-refund(988) = 994.
+// TestConservationRoundingBoundary probes the exact-integer quote seam in the
+// spent/refund split. settleFromFills aggregates the quote notional over the fills
+// as EXACT integers, flooring EACH fill's quote = floor(size × price / PriceScale)
+// exactly as the venue matcher did — so the proxy spends precisely what the venue
+// moved, with no float and no directional rounding. Two fractional-priced fills
+// (price 1.5 × size 3 → floor(4.5)=4; price 2.5 × size 3 → floor(7.5)=7) sum to
+// spent = 4+7 = 11 (the venue's own per-fill quote, NOT the old float-aggregate
+// ceil of 12). Proceeds base = Σ size = 6 (whole base units). The taker locked 1000
+// quote; refund = 1000-11 = 989, and value_out = base-proceeds(6) +
+// quote-refund(989) = 995. The refund and proceeds legs agree on the SAME integer
+// notional the venue used, so no sub-unit value leaks in either direction.
 func TestConservationRoundingBoundary(t *testing.T) {
 	const lockedQuote uint64 = 1000
-	fills := []Fill{{Price: 1.5, Size: 3}, {Price: 2.5, Size: 3}} // BUY
+	fills := []Fill{{Price: fp(1.5), Size: 3}, {Price: fp(2.5), Size: 3}} // BUY
 	const takerSide uint8 = 0
 
 	valueIn, valueOut := settledRound(t, fills, lockedQuote, takerSide)
 
-	// SPENT quote = aggregate notional, rounded UP (the exact arithmetic
-	// settleFromFills uses via quantToCharge). Mirrors fillNotional.
+	// SPENT quote = Σ floor(size×price/PriceScale), the venue's own per-fill quote.
 	spent := fillNotional(fills, takerSide)
-	// PROCEEDS base = aggregate size, rounded DOWN (quantToCredit).
-	var baseAgg float64
+	// PROCEEDS base = Σ size (whole atomic base units).
+	var proceedsBase uint64
 	for _, f := range fills {
-		baseAgg += f.Size
+		proceedsBase += f.Size
 	}
-	proceedsBase := uint64(math.Floor(baseAgg))
 
 	wantRefund := lockedQuote - spent
 	wantOut := proceedsBase + wantRefund
 
-	t.Logf("CONSERVATION LEDGER (rounding): value_in=%d  spent(ceil)=%d  proceeds_base(floor)=%d  refund=%d  measured_value_out=%d  want=%d",
+	t.Logf("CONSERVATION LEDGER (integer quote): value_in=%d  spent(Σfloor)=%d  proceeds_base=%d  refund=%d  measured_value_out=%d  want=%d",
 		valueIn, spent, proceedsBase, wantRefund, valueOut, wantOut)
 
-	if spent != 12 || proceedsBase != 6 {
-		t.Fatalf("arithmetic anchor drifted: spent=%d (want 12) proceeds_base=%d (want 6)", spent, proceedsBase)
+	if spent != 11 || proceedsBase != 6 {
+		t.Fatalf("arithmetic anchor drifted: spent=%d (want 11) proceeds_base=%d (want 6)", spent, proceedsBase)
 	}
 	if valueOut != wantOut {
 		t.Fatalf("CONSERVATION VIOLATED at rounding boundary: value_out=%d, want %d. "+
