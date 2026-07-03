@@ -1,0 +1,50 @@
+# LLM context — `chains/mpcvm/`
+
+## What this is
+
+ThresholdVM is a **library substrate**, not a Lux chain. It is imported by:
+
+- `chains/mchain/` — MPC ceremonies (CGGMP21, FROST, Corona-general)
+- `chains/fchain/` — FHE compute (TFHE bootstrap, encrypted EVM)
+
+The substrate hosts the ceremony state machine, share envelope,
+QuasarCertLane registration, and certificate-subject binding logic
+shared by both chains.
+
+## What an agent must NOT do here
+
+- Do **not** turn this back into a chain. No `factory.go` exposed to
+  `chains.Manager`. No new VM ID. M-Chain and F-Chain are the chains.
+- Do **not** import M-Chain or F-Chain code from this package. The
+  dependency graph is `mchain → mpcvm` and `fchain → mpcvm`;
+  reverse edges are forbidden.
+- Do **not** add a protocol implementation here. Protocol packages
+  expose **interfaces only**; impls live in the chain that runs the
+  protocol (CGGMP21 in M-Chain, TFHE keygen straddles M-Chain →
+  F-Chain via the handoff envelope).
+- Do **not** introduce `t-chain` / `tchain` types here, and do **not**
+  reintroduce a "T-Chain" chain. Per LP-134 / LP-7050 T-Chain is removed
+  with zero remainder (it was never launched with live state — a clean
+  forward split, no migration window). The `vm.go`, `block.go`,
+  `factory.go`, `fhe/`, `cmd/` files are the shared **library** substrate
+  (the ceremony VM + FHE code) that M-Chain and F-Chain consume — not a
+  chain, no genesis, no validators.
+
+## Status
+
+- Substrate ships with Quasar 3.0 activation on **2025-12-25**.
+- LP-5013 (T-Chain MPC Custody) and the whole T-Chain concept are **removed** by LP-134; see LP-7050 for the full supersession map (MPC→M-Chain, FHE→F-Chain, teleport→B-Chain/bridgevm).
+- Cert-lane enums `MChainCGGMP21=5`, `MChainFROST=6`,
+  `MChainCoronaGen=7`, `FChainTFHE=8`, `FChainBootstrap=9`. Never
+  reorder; appends only.
+
+## Where to read next
+
+| File | Why |
+|---|---|
+| `DESIGN.md` | architecture, state machine, lane integration |
+| `docs/ARCHITECTURE.md` | how M-Chain / F-Chain plug in |
+| `docs/M_CHAIN_INTEGRATION.md` | M-Chain adapter contract |
+| `docs/F_CHAIN_INTEGRATION.md` | F-Chain adapter contract |
+| `types/ceremony.go` | the state machine in code |
+| `cert/subject.go` | how `certificate_subject` binds both roots |

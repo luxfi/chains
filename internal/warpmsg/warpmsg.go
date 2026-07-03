@@ -5,7 +5,7 @@
 // signs, and wraps a single-signer Warp message.
 //
 // Every VM that emits a cross-chain Warp message — bridgevm reshare gossip,
-// zkvm FHE task callbacks, thresholdvm decryption fulfillments — calls
+// zkvm FHE task callbacks, mpcvm decryption fulfillments — calls
 // BuildSigned. The build→sign→wrap sequence lives here and nowhere else, so
 // there is exactly one way to turn (networkID, sourceChainID, payload) into a
 // transmittable signed Warp envelope.

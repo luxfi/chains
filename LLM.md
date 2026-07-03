@@ -34,8 +34,8 @@ domain-execution chain that MUST consume UTXO settlement via the
 | `zkvm/` | **Z** | Rollup / private commitment + nullifier. Shielded supply is an X-escrow wrapper (LP-0130 §2, I-5) | LP-8000 |
 | `aivm/` | **A** | Inference receipt + attestation. Rides B's settlement engine (LP-0130 §9) | LP-5000 |
 | `bridgevm/` | **B** | Cross-chain message lifecycle. Fees deducted from bridged amount (LP-0130 §8) | LP-6000 |
-| `thresholdvm/` | **M** | MPC signing / custody. Service fees paid by originating chain (LP-0130 §7); no user M-balance | LP-7100 |
-| `thresholdvm/fhe/` | **F** | FHE runtime. Encrypted supply reconciles to X-escrow (LP-0130 §2, I-5) | LP-8200 |
+| `mpcvm/` | **M** | MPC signing / custody. Service fees paid by originating chain (LP-0130 §7); no user M-balance | LP-7100 |
+| `mpcvm/fhe/` | **F** | FHE runtime. Encrypted supply reconciles to X-escrow (LP-0130 §2, I-5) | LP-8200 |
 
 **Service VMs** (not canonical primary chains under LP-0130):
 
