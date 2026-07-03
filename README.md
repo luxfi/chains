@@ -39,6 +39,6 @@ Or copy binaries to `~/.lux/plugins/<vmid>`.
 | relayvm | R-Chain | Cross-chain relay |
 | servicenodevm | S-Chain | Service node registry |
 | teleportvm | T-Chain | Unified teleport (bridge + relay + oracle) |
-| thresholdvm (MPC) | M-Chain | MPC ceremonies (CGGMP21, FROST, Pulsar-general) — bridge custody for external wallets |
-| thresholdvm (FHE) | F-Chain | FHE compute + TFHE bootstrap-key generation (encrypted EVM) |
+| mpcvm (MPC) | M-Chain | MPC ceremonies (CGGMP21, FROST, Pulsar-general) — bridge custody for external wallets |
+| mpcvm (FHE) | F-Chain | FHE compute + TFHE bootstrap-key generation (encrypted EVM) |
 | zkvm | Z-Chain | Groth16 over BLS12-381 (rolls N × ML-DSA-65 sigs into 192-byte proof) |
