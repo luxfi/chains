@@ -249,10 +249,10 @@ func TestRPC_GetInfo(t *testing.T) {
 	if len(reply.SupportedChains) != 3 {
 		t.Errorf("SupportedChains len = %d, want 3", len(reply.SupportedChains))
 	}
-	// MPCReady is false because mpcKeyManager is nil in the rig — that
-	// is the correct state ("MPC pending"), not an error.
+	// MPCReady is false because mpcConfig is nil in the rig (M-Chain keygen
+	// not completed) — the correct "MPC pending" state, not an error.
 	if reply.MPCReady {
-		t.Error("MPCReady should be false without mpcKeyManager")
+		t.Error("MPCReady should be false without a custody group key")
 	}
 	if reply.TotalBridged != "0" {
 		t.Errorf("TotalBridged = %q, want 0", reply.TotalBridged)

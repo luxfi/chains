@@ -4,18 +4,16 @@
 package bridgevm
 
 import (
-	"context"
 	"errors"
 	"testing"
 
-	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/vms/types/fee"
 )
 
 // newBridgeVMWithPolicy wires a VM with the canonical FlatPolicy
-// directly, bypassing the full Initialize (which requires MPC
-// keygen, 1M LUX bond validation, etc.).
+// directly, bypassing the full Initialize (which requires the M-Chain
+// custody keygen handshake, 1M LUX bond validation, etc.).
 func newBridgeVMWithPolicy(networkID uint32) *VM {
 	v := &VM{log: log.NewNoOpLogger()}
 	v.networkID = networkID
@@ -36,31 +34,27 @@ func TestBridgeVM_FeePolicy_AttachedAtInit(t *testing.T) {
 	}
 }
 
-func TestBridgeVM_FeePolicy_RejectsZeroFee(t *testing.T) {
+// The fee gate (LP-0130 §8) refuses a zero-fee bridge transfer before any
+// M-Chain signing capacity is consumed.
+func TestBridgeVM_FeeGate_RejectsZeroFee(t *testing.T) {
 	v := newBridgeVMWithPolicy(96369)
-	msg := &BridgeMessage{ID: ids.GenerateTestID(), Fee: 0}
-	if err := v.gateUserBridgeMessage(msg); !errors.Is(err, fee.ErrInsufficientFee) {
-		t.Fatalf("gateUserBridgeMessage(zero-fee) = %v, want ErrInsufficientFee", err)
+	if err := v.gateUserBridgeFee(0); !errors.Is(err, fee.ErrInsufficientFee) {
+		t.Fatalf("gateUserBridgeFee(0) = %v, want ErrInsufficientFee", err)
 	}
 }
 
-func TestBridgeVM_FeePolicy_AcceptsMinFee(t *testing.T) {
+func TestBridgeVM_FeeGate_AcceptsMinFee(t *testing.T) {
 	v := newBridgeVMWithPolicy(96369)
-	msg := &BridgeMessage{ID: ids.GenerateTestID(), Fee: fee.MinTxFeeFloor}
-	if err := v.gateUserBridgeMessage(msg); err != nil {
-		t.Fatalf("gateUserBridgeMessage(min-fee) = %v, want nil", err)
+	if err := v.gateUserBridgeFee(fee.MinTxFeeFloor); err != nil {
+		t.Fatalf("gateUserBridgeFee(min) = %v, want nil", err)
 	}
 }
 
-// InitiateBridgeTransfer must reject zero-fee messages at the gate
-// before any MPC signing capacity (signerSet read, signer share
-// creation) is exercised. We feed a zero-fee message and assert on
-// ErrInsufficientFee without standing up the MPC pipeline.
-func TestBridgeVM_InitiateBridgeTransfer_RejectsZeroFee(t *testing.T) {
+// Custody group key is nil until M-Chain completes dealerless keygen —
+// B-Chain never generates key material itself.
+func TestBridgeVM_NoLocalCustodyKey(t *testing.T) {
 	v := newBridgeVMWithPolicy(96369)
-	msg := &BridgeMessage{ID: ids.GenerateTestID(), Fee: 0}
-	err := v.InitiateBridgeTransfer(context.Background(), msg)
-	if !errors.Is(err, fee.ErrInsufficientFee) {
-		t.Fatalf("InitiateBridgeTransfer(zero-fee) = %v, want ErrInsufficientFee", err)
+	if key := v.mpcGroupPublicKey(); key != nil {
+		t.Fatalf("mpcGroupPublicKey() = %x, want nil (no B-Chain keygen)", key)
 	}
 }
