@@ -31,8 +31,8 @@ func (vm *VM) InitializeMPCKeys(ctx context.Context) error {
 		log.Int("threshold", threshold),
 	)
 
-	// Generate threshold keys using trusted dealer
-	// In production, this would use proper DKG protocol
+	// Dealerless distributed key generation (Pedersen VSS) — no trusted
+	// dealer, no single party ever holds the group custody key.
 	if err := vm.mpcKeyManager.GenerateKeys(ctx, threshold, numSigners); err != nil {
 		return fmt.Errorf("failed to generate keys: %w", err)
 	}
