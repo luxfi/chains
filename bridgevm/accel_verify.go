@@ -5,6 +5,7 @@ package bridgevm
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 
 	"github.com/luxfi/accel"
@@ -13,6 +14,12 @@ import (
 	"github.com/luxfi/threshold/pkg/party"
 	"github.com/luxfi/threshold/protocols/cmp/config"
 )
+
+// ErrInvalidBridgeSignature is returned when CMP (CGGMP21) threshold
+// signature verification fails on a bridge request or block. Custody
+// signing itself runs on M-Chain (mpcvm) via dealerless FROST/CGGMP21;
+// B-Chain only VERIFIES the resulting threshold signatures here.
+var ErrInvalidBridgeSignature = errors.New("invalid bridge signature")
 
 // batchVerifyBlockSignatures verifies all MPC block signatures using GPU-accelerated
 // ECDSA batch verification when available. Falls back to sequential verification.

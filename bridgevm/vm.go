@@ -170,16 +170,13 @@ type VM struct {
 	toEngine chan<- vmcore.Message
 	log      log.Logger
 
-	// MPC components using threshold protocol
-	mpcKeyManager    *MPCKeyManager              // Threshold key management
-	mpcCoordinator   *MPCCoordinator             // Signing coordination
-	bridgeSigner     *BridgeSigner               // Bridge message signing
-	deliverySigner   *DeliveryConfirmationSigner // Delivery confirmation signing
-	messageValidator *BridgeMessageValidator     // Message validation
-
-	// Deprecated: Legacy MPC fields (kept for reference)
-	mpcConfig   *config.Config // CMP config for this party (after keygen)
-	mpcPartyID  party.ID       // This party's ID in MPC protocol
+	// Custody threshold signing runs on M-Chain (mpcvm) via dealerless
+	// CGGMP21/FROST DKG — no trusted dealer, secret never assembled by any
+	// validator. B-Chain requests keygen/reshare/sign from M-Chain over
+	// Warp (CrossChainMPCRequest) and VERIFIES the resulting CMP threshold
+	// signatures against this config. B-Chain never holds a custody key.
+	mpcConfig   *config.Config // CMP group config for verification (from M-Chain keygen)
+	mpcPartyID  party.ID       // This party's ID in the MPC group
 	mpcPartyIDs []party.ID     // All party IDs in the MPC group
 	mpcPool     *pool.Pool     // Worker pool for MPC operations
 
@@ -333,33 +330,9 @@ func (vm *VM) Initialize(
 	// Create worker pool for MPC operations (8 workers)
 	vm.mpcPool = pool.NewPool(8)
 
-	// Note: mpcConfig and mpcPartyIDs will be populated during keygen
-	// which happens when validators join the bridge network
-
-	// Initialize new MPC key manager
-	keyManager, err := NewMPCKeyManager(vm.log)
-	if err != nil {
-		return fmt.Errorf("failed to create MPC key manager: %w", err)
-	}
-	vm.mpcKeyManager = keyManager
-
-	// Initialize MPC coordinator
-	vm.mpcCoordinator = NewMPCCoordinator(vm.mpcKeyManager, vm.log)
-
-	// Initialize bridge signer
-	vm.bridgeSigner = NewBridgeSigner(vm.mpcKeyManager, vm.mpcCoordinator, vm.log)
-
-	// Initialize delivery confirmation signer
-	vm.deliverySigner = NewDeliveryConfirmationSigner(vm.mpcKeyManager, vm.mpcCoordinator, vm.log)
-
-	// Initialize message validator
-	vm.messageValidator = NewBridgeMessageValidator(
-		vm.bridgeSigner,
-		vm.deliverySigner,
-		vm.config.MinConfirmations,
-		true, // require delivery confirmations
-		vm.log,
-	)
+	// mpcConfig / mpcPartyIDs are populated from M-Chain's dealerless keygen
+	// when validators join the bridge signer set (CrossChainMPCRequest). No
+	// key material is generated on B-Chain.
 
 	// Initialize bridge registry
 	vm.bridgeRegistry = &BridgeRegistry{

@@ -507,8 +507,8 @@ type HealthReply struct {
 // balancers before routing traffic at this node.
 func (s *Service) Health(_ *http.Request, _ *HealthArgs, reply *HealthReply) error {
 	reply.Status = "healthy"
-	if s.vm != nil && s.vm.mpcKeyManager != nil {
-		reply.MPCReady = len(s.vm.mpcKeyManager.GetGroupPublicKey()) > 0
+	if s.vm != nil {
+		reply.MPCReady = len(s.vm.mpcGroupPublicKey()) > 0
 	}
 	return nil
 }
@@ -524,10 +524,10 @@ type GetMPCPublicKeyReply struct {
 // GetMPCPublicKey answers bridge_getMPCPublicKey with the active
 // threshold-signing group public key.
 func (s *Service) GetMPCPublicKey(_ *http.Request, _ *GetMPCPublicKeyArgs, reply *GetMPCPublicKeyReply) error {
-	if s.vm == nil || s.vm.mpcKeyManager == nil {
-		return errors.New("bridgevm: MPC key manager not configured")
+	if s.vm == nil {
+		return errors.New("bridgevm: VM not initialized")
 	}
-	key := s.vm.mpcKeyManager.GetGroupPublicKey()
+	key := s.vm.mpcGroupPublicKey()
 	if len(key) == 0 {
 		return errors.New("bridgevm: group public key not yet established")
 	}
@@ -583,12 +583,9 @@ func (s *Service) GetBridgeInfo(_ *http.Request, _ *GetBridgeInfoArgs, reply *Ge
 		reply.NodeID = s.vm.rt.NodeID.String()
 	}
 	reply.ChainID = "B"
-	if s.vm.mpcKeyManager != nil {
-		key := s.vm.mpcKeyManager.GetGroupPublicKey()
-		reply.MPCReady = len(key) > 0
-		if reply.MPCReady {
-			reply.MPCPublicKey = hexEncode(key)
-		}
+	if key := s.vm.mpcGroupPublicKey(); len(key) > 0 {
+		reply.MPCReady = true
+		reply.MPCPublicKey = hexEncode(key)
 	}
 	reply.Threshold = s.vm.config.MPCThreshold
 	reply.TotalParties = s.vm.config.MPCTotalParties
