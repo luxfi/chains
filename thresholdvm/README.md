@@ -2,18 +2,21 @@
 
 **ThresholdVM is a Go library, not a chain.**
 
-Per LP-134 (Lux Chain Topology), the legacy T-Chain custody monolith is
-split into two operational chains, both served by this substrate:
+Per LP-134 (Lux Chain Topology) and LP-7050 (Supersession Map), T-Chain is
+**fully removed** with zero remainder. Its concerns decompose onto existing
+chains, each of which consumes this library substrate:
 
-- `thresholdvm` in **MPC mode → M-Chain** — bridge custody for external
-  wallets, threshold signing ceremonies (CGGMP21 / FROST / Corona-gen).
-- `thresholdvm` in **FHE mode → F-Chain** — TFHE keygen, encrypted EVM,
-  confidential compute.
+- **M-Chain** (`mpcvm`, LP-7100) — bridge custody for external wallets,
+  threshold signing ceremonies (CGGMP21 / FROST / Pulsar-general). Owns
+  *all* threshold signing.
+- **F-Chain** (`fhevm`, LP-8200) — TFHE keygen, encrypted EVM, threshold
+  decrypt, confidential compute. Owns *all* encrypted computation.
 
-`chains/thresholdvm/` is the shared library; the runtime presence lives
-on M-Chain or F-Chain depending on which adapter the runtime registers.
-The legacy "T-Chain" name is retained **only** for `teleportvm`
-(LP-6332), an unrelated cross-chain teleport message bus.
+`chains/thresholdvm/` is the shared **library** these two chains import in
+process — it is not itself a chain and has no genesis, no validators, no
+block production. There is **no** `teleportvm` and **no** "T-Chain": teleport
+IS `bridgevm` (B-Chain, LP-6000). Any live identifier still naming "T-Chain",
+"ThresholdVM-as-a-chain", or "teleportvm" is stale.
 
 ```
                     +--------------------------------+

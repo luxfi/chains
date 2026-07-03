@@ -226,14 +226,17 @@ or boot-time failure, not a silent semantic bug.
 
 ## 11. References
 
-Per LP-134 (Lux Chain Topology), the legacy T-Chain monolith is split into
-two operational chains served by this same `thresholdvm` substrate:
+Per LP-134 (Lux Chain Topology) and LP-7050 (Supersession Map), T-Chain is
+fully removed. Its threshold concerns decompose onto two chains that import
+this same `thresholdvm` **library** substrate in process:
 
-- `thresholdvm` in **MPC mode → M-Chain** (CGGMP21, FROST, Corona-gen).
-- `thresholdvm` in **FHE mode → F-Chain** (TFHE keygen, encrypted EVM).
+- **M-Chain** (`mpcvm`, LP-7100) — CGGMP21, FROST, Pulsar-general threshold
+  signing for bridge custody. Owns all threshold signing.
+- **F-Chain** (`fhevm`, LP-8200) — TFHE keygen, encrypted EVM, threshold
+  decrypt. Owns all encrypted computation.
 
-The standalone `teleportvm` (LP-6332) is unrelated and retains its own
-"T-Chain" naming for the cross-chain teleport message bus.
+There is no `teleportvm` and no "T-Chain": teleport IS `bridgevm` (B-Chain,
+LP-6000). LP-6332 is superseded by LP-6000 (see LP-7050 §3).
 
 | LP | Topic |
 |---|---|
@@ -244,5 +247,5 @@ The standalone `teleportvm` (LP-6332) is unrelated and retains its own
 | LP-132 | QuasarGPU Execution Adapter |
 | LP-134 | Lux Chain Topology — defines the M/F-Chain split |
 | LP-020 | Quasar Consensus 3.0 |
-| LP-6332 | teleportvm cross-chain message bus (separate "T-Chain") |
+| LP-6332 | teleport bus — SUPERSEDED by LP-6000 (bridgevm / B-Chain) per LP-7050 |
 | LP-5013 | T-Chain MPC Custody (deprecated, superseded by LP-134) |

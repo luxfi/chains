@@ -1,9 +1,13 @@
 // Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
-// Package tvm implements the Threshold VM substrate (M-Chain MPC and F-Chain FHE per LP-134).
-// The legacy "T-Chain" label predates the LP-134 split; new code targets M-Chain (MPC ceremonies
-// for bridge custody of external wallets) or F-Chain (FHE compute). See ../README.md.
+// Package thresholdvm implements the shared threshold VM substrate — a LIBRARY,
+// not a chain — consumed by M-Chain (MPC: CGGMP21/FROST/Pulsar-general threshold
+// signing for bridge custody of external wallets, LP-7100) and F-Chain (FHE:
+// TFHE compute / threshold decrypt, LP-8200). Per LP-134 / LP-7050 there is NO
+// T-Chain and NO teleportvm; teleport IS bridgevm (B-Chain, LP-6000). Any live
+// identifier still naming "T-Chain" or "ThresholdVM-as-a-chain" is stale.
+// See ../README.md.
 package thresholdvm
 
 import (
