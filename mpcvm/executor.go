@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/luxfi/log"
+	"github.com/luxfi/threshold/pkg/ecdsa"
 	"github.com/luxfi/threshold/pkg/math/curve"
 	"github.com/luxfi/threshold/pkg/party"
 	"github.com/luxfi/threshold/pkg/pool"
@@ -254,7 +255,14 @@ func (pe *ProtocolExecutor) RunCMPSign(
 	messageRouter MessageRouter,
 ) (*ECDSASignature, error) {
 	startFunc := pe.CMPSignStartFunc(config, signers, messageHash)
-	return runProtocol[*ECDSASignature](ctx, pe, sessionID, startFunc, messageRouter)
+	// cmp.Sign yields *ecdsa.Signature (R point, S scalar). The prior code
+	// asserted the protocol result straight to *ECDSASignature, which never
+	// matches → "unexpected result type". Assert the real type, then convert.
+	sig, err := runProtocol[*ecdsa.Signature](ctx, pe, sessionID, startFunc, messageRouter)
+	if err != nil {
+		return nil, err
+	}
+	return ecdsaSigToWrapper(sig)
 }
 
 // RunCMPRefresh executes a complete CMP key refresh protocol.
@@ -357,6 +365,23 @@ type ECDSASignature struct {
 	R []byte
 	S []byte
 	V byte
+}
+
+// ecdsaSigToWrapper converts a threshold-library ECDSA signature into the wire
+// wrapper as canonical Ethereum r(32)‖s(32)‖v(1): low-S normalised, so it
+// verifies under luxfi/crypto secp256k1.VerifySignature and on-chain ecrecover.
+func ecdsaSigToWrapper(sig *ecdsa.Signature) (*ECDSASignature, error) {
+	if sig == nil {
+		return nil, fmt.Errorf("mpcvm: nil signature")
+	}
+	eth, err := sig.SigEthereum()
+	if err != nil {
+		return nil, fmt.Errorf("mpcvm: encode signature: %w", err)
+	}
+	if len(eth) != 65 {
+		return nil, fmt.Errorf("mpcvm: unexpected signature length %d (want 65)", len(eth))
+	}
+	return &ECDSASignature{R: eth[0:32], S: eth[32:64], V: eth[64]}, nil
 }
 
 // SchnorrSignature wraps Schnorr signature from FROST.

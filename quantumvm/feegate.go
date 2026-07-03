@@ -6,34 +6,32 @@ package quantumvm
 import (
 	"fmt"
 
-	"github.com/luxfi/constants"
+	"github.com/luxfi/ids"
 	"github.com/luxfi/node/vms/types/fee"
 )
 
-// newFeePolicy returns the canonical Q-Chain FeePolicy. Q-Chain accepts
-// user-submitted txs that exercise the quantum signing pipeline, so it
-// MUST charge a non-zero floor; see vms/types/fee/policy.go.
-func newFeePolicy(networkID uint32) fee.Policy {
-	return fee.FlatPolicy{
-		Fee:     fee.MinTxFeeFloor,
-		AssetID: constants.UTXOAssetIDFor(networkID),
-	}
+// newFeePolicy returns the canonical Q-Chain FeePolicy. Per LP-0130 §6,
+// Q-Chain has NO user-payable blockspace: finality-cert inclusion is a
+// validator obligation paid via P-Chain reward distribution, never a
+// user fee. A fee market on Q would make finality hostage to blockspace
+// pricing (the exact failure mode LP-0130 §6 eliminates), so the policy
+// is the explicit committee-only sentinel.
+func newFeePolicy(uint32) fee.Policy {
+	return fee.NoUserTxPolicy{}
 }
 
-// gateUserTx admits a tx iff its declared Fee satisfies the configured
-// FeePolicy. Called from VM.IssueTx (the canonical user-mempool entry).
-// Internal callers (consensus engine replay) reach txPool.AddTransaction
-// directly and bypass the gate.
+// gateUserTx refuses every user-submitted tx: Q-Chain state advances
+// only through consensus-internal cert aggregation, which reaches
+// txPool.AddTransaction directly and bypasses this gate.
 func (vm *VM) gateUserTx(tx Transaction) error {
 	if vm.feePolicy == nil {
 		return fmt.Errorf("quantumvm: fee policy not initialized")
 	}
-	asset := constants.UTXOAssetIDFor(vm.NetworkID)
-	return vm.feePolicy.ValidateFee(tx.Fee(), asset)
+	return vm.feePolicy.ValidateFee(tx.Fee(), ids.Empty)
 }
 
-// IssueTx is the canonical user-tx admission point on Q-Chain. The
-// FeePolicy gate refuses zero-fee txs before they touch the pool.
+// IssueTx is the user-tx admission point on Q-Chain. Under
+// NoUserTxPolicy it structurally refuses all user txs (LP-0130 §6).
 func (vm *VM) IssueTx(tx Transaction) error {
 	if err := vm.gateUserTx(tx); err != nil {
 		return err
