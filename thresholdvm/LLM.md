@@ -22,16 +22,18 @@ shared by both chains.
   expose **interfaces only**; impls live in the chain that runs the
   protocol (CGGMP21 in M-Chain, TFHE keygen straddles M-Chain →
   F-Chain via the handoff envelope).
-- Do **not** introduce `t-chain` / `tchain` types here. The legacy
-  `vm.go`, `block.go`, `factory.go`, `fhe/`, `cmd/` files in the
-  parent directory are the deprecated T-Chain shim from LP-5013.
-  They exist only for one-epoch grace-window migration, then are
-  removed.
+- Do **not** introduce `t-chain` / `tchain` types here, and do **not**
+  reintroduce a "T-Chain" chain. Per LP-134 / LP-7050 T-Chain is removed
+  with zero remainder (it was never launched with live state — a clean
+  forward split, no migration window). The `vm.go`, `block.go`,
+  `factory.go`, `fhe/`, `cmd/` files are the shared **library** substrate
+  (the ceremony VM + FHE code) that M-Chain and F-Chain consume — not a
+  chain, no genesis, no validators.
 
 ## Status
 
 - Substrate ships with Quasar 3.0 activation on **2025-12-25**.
-- LP-5013 (T-Chain) is **deprecated** by LP-134.
+- LP-5013 (T-Chain MPC Custody) and the whole T-Chain concept are **removed** by LP-134; see LP-7050 for the full supersession map (MPC→M-Chain, FHE→F-Chain, teleport→B-Chain/bridgevm).
 - Cert-lane enums `MChainCGGMP21=5`, `MChainFROST=6`,
   `MChainCoronaGen=7`, `FChainTFHE=8`, `FChainBootstrap=9`. Never
   reorder; appends only.

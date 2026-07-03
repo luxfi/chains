@@ -4,7 +4,7 @@ This document describes how `chains/mchain/` plugs into the
 `thresholdvm` substrate when running in **MPC mode** (per LP-134).
 The same substrate, running in FHE mode, serves F-Chain — see
 `F_CHAIN_INTEGRATION.md` for that side. The legacy "T-Chain" name is
-retained only for `teleportvm` (LP-6332), which is unrelated.
+removed entirely: teleport IS `bridgevm` (B-Chain, LP-6000), there is no `teleportvm` (LP-6332 superseded by LP-6000 per LP-7050).
 
 ## Boot sequence
 
