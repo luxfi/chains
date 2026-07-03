@@ -14,6 +14,65 @@ This file (`CLAUDE.md`) is the canonical agent-facing readme; `LLM.md` is a syml
 - `.github/workflows/` — CI surface
 - `docs/` — extended docs (if present)
 
+## Canonical chain roster (LP-0130)
+
+The topology, UTXO ownership rule, and cross-chain fee model are
+normatively specified by
+[**LP-0130** (Chain Topology, UTXO Ownership, and Fee Model)](https://github.com/luxfi/lps/blob/main/LPs/lp-0130-chain-topology-utxo-ownership-and-fee-model.md).
+Read that LP before touching any VM's fee/settlement path.
+
+Only **P** (in `node/vms/platformvm`) and **X** (in `node/vms/xvm`) are
+canonical UTXO state machines. Every VM in THIS repo is a
+domain-execution chain that MUST consume UTXO settlement via the
+`chains/fee` primitive funded from X.
+
+| Dir | Letter | Role | LP |
+|---|---|---|---|
+| `evm/` | **C** | Contract / EVM account state | LP-1200 |
+| `dexvm/` | **D** | DEX matching + settlement receipts | LP-9000 |
+| `quantumvm/` | **Q** | Finality-cert / Quasar aggregation. **No user-payable blockspace** (validator obligation, LP-0130 §6) | LP-1300 |
+| `zkvm/` | **Z** | Rollup / private commitment + nullifier. Shielded supply is an X-escrow wrapper (LP-0130 §2, I-5) | LP-8000 |
+| `aivm/` | **A** | Inference receipt + attestation. Rides B's settlement engine (LP-0130 §9) | LP-5000 |
+| `bridgevm/` | **B** | Cross-chain message lifecycle. Fees deducted from bridged amount (LP-0130 §8) | LP-6000 |
+| `thresholdvm/` | **M** | MPC signing / custody. Service fees paid by originating chain (LP-0130 §7); no user M-balance | LP-7100 |
+| `thresholdvm/fhe/` | **F** | FHE runtime. Encrypted supply reconciles to X-escrow (LP-0130 §2, I-5) | LP-8200 |
+
+**Service VMs** (not canonical primary chains under LP-0130):
+
+| Dir | Letter | Purpose |
+|---|---|---|
+| `schain/` | S | S3-style object storage (on-chain metadata, off-chain blob) |
+| `keyvm/` | K | Key registry / cryptographic algorithm addressing |
+| `identityvm/` | I | DID / identity |
+| `graphvm/` | G | Graph indexing / GraphQL surface |
+| `relayvm/` | R | Relay message queue |
+| `oraclevm/` | O | Oracle price / data feed |
+
+Service VMs MAY have domain state and MAY charge fees, but MUST fund
+their fee balance from X and MUST NOT hold canonical UTXO asset
+supply.
+
+### Fee settlement primitive — `chains/fee`
+
+`chains/fee/{balance,meter,settle,ledger}.go` is the shared
+admission → meter → burn primitive every non-P/X VM in this repo
+uses. Its `Burn` is a native LUX burn (no coinbase credit) that
+reconciles against X-side fee escrow at the epoch fee root ([LP-0130
+§4](https://github.com/luxfi/lps/blob/main/LPs/lp-0130-chain-topology-utxo-ownership-and-fee-model.md#4-fee-model-hybrid)).
+`chains/fee/doc.go` is the design intent.
+
+### Σ-escrow invariant
+
+At every Q checkpoint (LP-0130 I-8):
+
+```
+Σ (non-P/X fee balances)  ==  Σ (X-side fee escrow)
+```
+
+Drift is a finality-blocking fault. This is the audit invariant every
+VM's epoch-fee-root emission and reconciliation path exists to
+satisfy.
+
 ## VMs in this repo
 
 Each `*vm/` dir is a self-contained `block.ChainVM` plugin. `dexvm` is the
