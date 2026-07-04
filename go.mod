@@ -9,14 +9,14 @@ require (
 	github.com/holiman/uint256 v1.3.2
 	github.com/luxfi/accel v1.2.4
 	github.com/luxfi/ai v0.1.0
-	github.com/luxfi/consensus v1.25.35
+	github.com/luxfi/consensus v1.35.22
 	github.com/luxfi/constants v1.5.8
 	github.com/luxfi/crypto v1.19.26
 	github.com/luxfi/database v1.20.4
 	github.com/luxfi/dex v1.14.0
 	github.com/luxfi/evm v1.99.51
 	github.com/luxfi/geth v1.17.12
-	github.com/luxfi/ids v1.2.15
+	github.com/luxfi/ids v1.3.0
 	github.com/luxfi/lattice/v7 v7.1.4
 	github.com/luxfi/log v1.4.3
 	github.com/luxfi/metric v1.5.9
@@ -31,7 +31,7 @@ require (
 	github.com/luxfi/timer v1.0.2
 	github.com/luxfi/version v1.0.1
 	github.com/luxfi/vm v1.2.5
-	github.com/luxfi/warp v1.23.0
+	github.com/luxfi/warp v1.24.0
 	github.com/stretchr/testify v1.11.1
 	github.com/zeebo/blake3 v0.2.4
 	golang.org/x/crypto v0.52.0
@@ -163,7 +163,7 @@ require (
 	github.com/luxfi/p2p v1.21.1 // indirect
 	github.com/luxfi/pq v1.0.3 // indirect
 	github.com/luxfi/proto v1.3.5 // indirect
-	github.com/luxfi/pulsar v1.8.0 // indirect
+	github.com/luxfi/pulsar v1.9.0 // indirect
 	github.com/luxfi/resource v0.0.1 // indirect
 	github.com/luxfi/sampler v1.1.0 // indirect
 	github.com/luxfi/staking v1.5.1 // indirect
