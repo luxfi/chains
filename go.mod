@@ -14,7 +14,7 @@ require (
 	github.com/luxfi/crypto v1.19.26
 	github.com/luxfi/database v1.20.4
 	github.com/luxfi/dex v1.14.0
-	github.com/luxfi/evm v1.99.51
+	github.com/luxfi/evm v1.104.4
 	github.com/luxfi/geth v1.17.12
 	github.com/luxfi/ids v1.3.0
 	github.com/luxfi/lattice/v7 v7.1.4
@@ -22,7 +22,7 @@ require (
 	github.com/luxfi/metric v1.5.9
 	github.com/luxfi/node v1.30.6
 	github.com/luxfi/oracle v1.0.0
-	github.com/luxfi/precompile v0.16.0
+	github.com/luxfi/precompile v0.19.1
 	github.com/luxfi/relay v1.0.0
 	github.com/luxfi/rpc v1.1.0
 	github.com/luxfi/runtime v1.1.3
@@ -30,7 +30,7 @@ require (
 	github.com/luxfi/threshold v1.12.1
 	github.com/luxfi/timer v1.0.2
 	github.com/luxfi/version v1.0.1
-	github.com/luxfi/vm v1.2.5
+	github.com/luxfi/vm v1.2.6
 	github.com/luxfi/warp v1.24.0
 	github.com/stretchr/testify v1.11.1
 	github.com/zeebo/blake3 v0.2.4
@@ -67,7 +67,7 @@ require (
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/btcsuite/btcd/btcec/v2 v2.5.0 // indirect
 	github.com/btcsuite/btcd/btcutil v1.1.6 // indirect
-	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0 // indirect
+	github.com/btcsuite/btcd/chainhash/v2 v2.0.0 // indirect
 	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
