@@ -23,5 +23,6 @@ func (f *Factory) New(logger log.Logger) (interface{}, error) {
 		pendingBlocks:  make(map[ids.ID]*Block),
 		pendingBridges: make(map[ids.ID]*BridgeRequest),
 		chainClients:   make(map[string]ChainClient),
+		evmByChainID:   make(map[uint32]*evmChainClient),
 	}, nil
 }
