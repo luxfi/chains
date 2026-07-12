@@ -4,6 +4,7 @@
 package zkvm
 
 import (
+	"encoding/json"
 	"context"
 	"testing"
 
@@ -52,7 +53,7 @@ func TestVMInitialize(t *testing.T) {
 		},
 	}
 
-	genesisBytes, err := Codec.Marshal(codecVersion, genesis)
+	genesisBytes, err := json.Marshal(genesis)
 	require.NoError(err)
 
 	// Create config
@@ -66,7 +67,7 @@ func TestVMInitialize(t *testing.T) {
 		ProofCacheSize:              1000,
 	}
 
-	configBytes, err := Codec.Marshal(codecVersion, config)
+	configBytes, err := json.Marshal(config)
 	require.NoError(err)
 
 	// Create VM
@@ -187,14 +188,14 @@ func setupTestVM(t *testing.T) *VM {
 		Timestamp:  1607144400,
 		InitialTxs: []*Transaction{},
 	}
-	genesisBytes, _ := Codec.Marshal(codecVersion, genesis)
+	genesisBytes, _ := json.Marshal(genesis)
 
 	config := ZConfig{
 		ProofSystem:      "groth16",
 		MaxUTXOsPerBlock: 100,
 		ProofCacheSize:   1000,
 	}
-	configBytes, _ := Codec.Marshal(codecVersion, config)
+	configBytes, _ := json.Marshal(config)
 
 	vmImpl := &VM{}
 	toEngine := make(chan vm.Message, 1)
@@ -223,7 +224,7 @@ func setupTestVMWithPrivacy(t *testing.T) *VM {
 		Timestamp:  1607144400,
 		InitialTxs: []*Transaction{},
 	}
-	genesisBytes, _ := Codec.Marshal(codecVersion, genesis)
+	genesisBytes, _ := json.Marshal(genesis)
 
 	config := ZConfig{
 		EnablePrivateAddresses: true,
@@ -231,7 +232,7 @@ func setupTestVMWithPrivacy(t *testing.T) *VM {
 		MaxUTXOsPerBlock:       100,
 		ProofCacheSize:         1000,
 	}
-	configBytes, _ := Codec.Marshal(codecVersion, config)
+	configBytes, _ := json.Marshal(config)
 
 	vmImpl := &VM{}
 	toEngine := make(chan vm.Message, 1)
