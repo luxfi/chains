@@ -55,6 +55,13 @@ type BridgeConfig struct {
 	// Supported chains
 	SupportedChains []string `json:"supportedChains"` // Chain IDs that can be bridged
 
+	// ExternalChains configures the concrete EVM chains B releases to/from
+	// (Zoo 200201, Lux testnet C 96368). It carries endpoints, gateway + custody
+	// addresses, and KMS paths for the relayer keys — never key material. A
+	// relayer node reads this and calls EnableBridgeRelease with a KMS-backed
+	// KeyProvider and a Warp-backed AttestationClient.
+	ExternalChains []ExternalChainConfig `json:"externalChains,omitempty"`
+
 	// Security settings
 	MaxBridgeAmount      uint64 `json:"maxBridgeAmount"`      // Maximum amount per bridge transaction
 	DailyBridgeLimit     uint64 `json:"dailyBridgeLimit"`     // Daily limit for bridge operations
@@ -193,8 +200,18 @@ type VM struct {
 	quoteEngine *QuoteEngine
 	swapStore   SwapStore
 
-	// Chain connectivity
+	// Chain connectivity. chainClients is the name-keyed ChainClient map (the
+	// field the recon flagged as never populated); evmByChainID is the id-keyed
+	// routing index the release path uses. Both are populated by
+	// EnableBridgeRelease and point at the same *evmChainClient objects.
 	chainClients map[string]ChainClient
+	evmByChainID map[uint32]*evmChainClient
+
+	// EVM release plumbing (injected via EnableBridgeRelease; nil until a
+	// relayer node wires it). attestClient is B's boundary to M-Chain; releaser
+	// drives broadcasts off the consensus path.
+	attestClient AttestationClient
+	releaser     *releaser
 
 	// Block management
 	preferred      ids.ID
@@ -215,6 +232,13 @@ type BridgeRequest struct {
 	ID            ids.ID    `json:"id"`
 	SourceChain   string    `json:"sourceChain"`
 	DestChain     string    `json:"destChain"`
+	// SrcChainID / DstChainID are the numeric EVM chain ids (200201, 96368) that
+	// the canonical attestation digest binds; SourceChain / DestChain remain the
+	// human labels used to key clients. Nonce is the per-route replay guard
+	// assigned by the source lock and enforced by the destination gateway.
+	SrcChainID    uint32    `json:"srcChainId"`
+	DstChainID    uint32    `json:"dstChainId"`
+	Nonce         uint64    `json:"nonce"`
 	Asset         ids.ID    `json:"asset"`
 	Amount        uint64    `json:"amount"`
 	Recipient     []byte    `json:"recipient"`
@@ -279,6 +303,7 @@ func (vm *VM) Initialize(
 	vm.pendingBlocks = make(map[ids.ID]*Block)
 	vm.pendingBridges = make(map[ids.ID]*BridgeRequest)
 	vm.chainClients = make(map[string]ChainClient)
+	vm.evmByChainID = make(map[uint32]*evmChainClient)
 
 	// Pin fee policy. B-Chain accepts user-submitted bridge transfers
 	// so attach the canonical FlatPolicy at MinTxFeeFloor; fee.Validate
@@ -347,12 +372,15 @@ func (vm *VM) Initialize(
 	vm.quoteEngine = &QuoteEngine{Feed: defaultPriceFeed()}
 	vm.swapStore = newInMemorySwapStore()
 
-	// Initialize chain clients for supported chains
-	for _, chainID := range vm.config.SupportedChains {
-		// Initialize appropriate client based on chain type
-		// This would be implemented based on specific chain requirements
-		vm.log.Info("initializing chain client",
-			log.String("chainID", chainID),
+	// EVM chain clients are wired by EnableBridgeRelease (relayer nodes only),
+	// which needs the KMS-backed KeyProvider and the Warp-backed
+	// AttestationClient — runtime deps not available at consensus boot. Config
+	// carries the chain list; a relayer reads vm.config.ExternalChains and calls
+	// EnableBridgeRelease. Non-relayer nodes leave chainClients empty and never
+	// broadcast.
+	if len(vm.config.ExternalChains) > 0 {
+		vm.log.Info("bridgevm: external chains configured; awaiting EnableBridgeRelease",
+			log.Int("count", len(vm.config.ExternalChains)),
 		)
 	}
 
@@ -458,7 +486,7 @@ func (vm *VM) GetBlock(ctx context.Context, id ids.ID) (chain.Block, error) {
 // ParseBlock implements the chain.ChainVM interface
 func (vm *VM) ParseBlock(ctx context.Context, bytes []byte) (chain.Block, error) {
 	blk := &Block{vm: vm}
-	if _, err := Codec.Unmarshal(bytes, blk); err != nil {
+	if err := parseBlockBytes(bytes, blk); err != nil {
 		return nil, err
 	}
 
@@ -503,10 +531,9 @@ func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
 
 // Shutdown implements the common.VM interface
 func (vm *VM) Shutdown(ctx context.Context) error {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	// Clean up resources
+	// Stop the release worker first (it takes vm.mu internally); do NOT hold the
+	// lock across stop() or the worker's own vm.mu use would deadlock.
+	vm.stopReleaser()
 	return nil
 }
 
@@ -610,7 +637,7 @@ func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
 // Helper methods
 
 func (vm *VM) putBlock(blk *Block) error {
-	bytes, err := Codec.Marshal(codecVersion, blk)
+	bytes, err := blk.Marshal()
 	if err != nil {
 		return err
 	}
@@ -625,7 +652,7 @@ func (vm *VM) getBlock(id ids.ID) (*Block, error) {
 	}
 
 	blk := &Block{vm: vm}
-	if _, err := Codec.Unmarshal(bytes, blk); err != nil {
+	if err := parseBlockBytes(bytes, blk); err != nil {
 		return nil, err
 	}
 

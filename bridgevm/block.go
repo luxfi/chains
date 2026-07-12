@@ -109,6 +109,14 @@ func (b *Block) Accept(ctx context.Context) error {
 			log.String("destChain", req.DestChain),
 			log.Uint64("amount", req.Amount),
 		)
+
+		// Hand the confirmed transfer to the release worker (relayer nodes only).
+		// Non-blocking: the actual attestation + EVM broadcast happen off the
+		// consensus path so Accept never waits on network I/O. Every relayer
+		// broadcasts; the on-chain nonce replay-guard collapses duplicates.
+		if b.vm.releaser != nil {
+			b.vm.releaser.enqueue(req)
+		}
 	}
 
 	// Update state
@@ -313,7 +321,7 @@ func (b *Block) Bytes() []byte {
 		return b.bytes
 	}
 
-	bytes, err := Codec.Marshal(codecVersion, b)
+	bytes, err := b.Marshal()
 	if err != nil {
 		return nil
 	}
