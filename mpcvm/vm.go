@@ -31,6 +31,8 @@ import (
 	"github.com/luxfi/runtime"
 	"github.com/luxfi/threshold/pkg/party"
 	"github.com/luxfi/threshold/pkg/pool"
+	"github.com/luxfi/threshold/pkg/protocol"
+	cmpconfig "github.com/luxfi/threshold/protocols/cmp/config"
 	lssconfig "github.com/luxfi/threshold/protocols/lss/config"
 	vmcore "github.com/luxfi/vm"
 	"github.com/luxfi/warp"
@@ -111,6 +113,21 @@ type VM struct {
 	// Message Router for multi-party communication
 	messageRouter MessageRouter
 
+	// Cross-validator MPC transport.
+	//   sender           — the node's canonical warp sender (block.Init.Sender);
+	//                      nil on a node with no p2p (single-process dev/test).
+	//   sessionRouters   — per-ceremony gossip routers, keyed by ceremony id, so
+	//                      the Gossip handler can demultiplex an incoming envelope
+	//                      to the ceremony it belongs to.
+	//   pendingBySession — envelopes that arrived before our own router for that
+	//                      ceremony was registered (the peer started the round a
+	//                      hair before us); drained into the router on register so
+	//                      no round-one broadcast is ever dropped. Bounded.
+	sender           warp.Sender
+	routerMu         sync.Mutex
+	sessionRouters   map[string]*gossipRouter
+	pendingBySession map[string][]*protocol.Message
+
 	// LSS MPC Protocol Components (default protocol)
 	lssConfig *lssconfig.Config // LSS config for this party (after keygen)
 	partyID   party.ID          // This party's ID
@@ -161,6 +178,7 @@ type ManagedKey struct {
 	SignCount    uint64            `json:"signCount"` // Total signatures made
 	Status       string            `json:"status"`    // active, rotating, expired
 	Config       *lssconfig.Config `json:"-"`         // LSS configuration (not serialized)
+	CMPConfig    *cmpconfig.Config `json:"-"`         // CGGMP21 (threshold-ECDSA) configuration (not serialized)
 	PartyIDs     []party.ID        `json:"partyIds"`
 }
 
@@ -223,6 +241,7 @@ func (vm *VM) Initialize(
 	vm.rt = init.Runtime
 	vm.db = init.DB
 	vm.toEngine = init.ToEngine
+	vm.sender = init.Sender
 	// Use init.Log if provided, otherwise fallback to Runtime.Log
 	if init.Log != nil {
 		vm.log = init.Log
@@ -239,6 +258,8 @@ func (vm *VM) Initialize(
 	vm.keygenSessions = make(map[string]*KeygenSession)
 	vm.signingSessions = make(map[string]*SigningSession)
 	vm.sessionsByChain = make(map[string][]string)
+	vm.sessionRouters = make(map[string]*gossipRouter)
+	vm.pendingBySession = make(map[string][]*protocol.Message)
 	vm.dailySigningCount = make(map[string]uint64)
 	vm.quotaResetTime = time.Now().Add(24 * time.Hour)
 	vm.stats = &vmStats{
@@ -387,7 +408,7 @@ func (vm *VM) parseConfig(configBytes []byte) error {
 		return nil
 	}
 
-	if _, err := Codec.Unmarshal(configBytes, &vm.config); err != nil {
+	if err := json.Unmarshal(configBytes, &vm.config); err != nil {
 		return err
 	}
 
@@ -549,10 +570,23 @@ func (vm *VM) runKeygenWithProtocol(session *KeygenSession, handler ProtocolHand
 		PartyIDs:     session.PartyIDs,
 	}
 
-	// Store protocol-specific config if LSS
-	if lssShare, ok := share.(*lssKeyShare); ok {
-		key.Config = lssShare.config
-		vm.lssConfig = lssShare.config
+	// Store protocol-specific config so the signing path can reconstruct the
+	// party's share. Each protocol keeps its own typed config slot (orthogonal;
+	// no shared union) — LSS and CGGMP21 are independently complete.
+	switch s := share.(type) {
+	case *lssKeyShare:
+		key.Config = s.config
+		vm.lssConfig = s.config
+	case *cmpKeyShare:
+		key.CMPConfig = s.config
+		if s.config != nil {
+			// The CMP handler leaves pubKey nil at keygen; derive the canonical
+			// compressed group key from the config so B can verify releases.
+			if pub, err := s.config.PublicPoint().MarshalBinary(); err == nil {
+				key.PublicKey = pub
+				key.Address = publicKeyToAddress(pub)
+			}
+		}
 	}
 
 	vm.keys[session.KeyID] = key
@@ -901,7 +935,9 @@ func (vm *VM) RequestSignature(
 		}
 	}
 
-	if key.Config == nil {
+	// The key must carry a usable share for SOME protocol: LSS (Config) or
+	// CGGMP21 (CMPConfig). Each protocol keeps its own typed slot.
+	if key.Config == nil && key.CMPConfig == nil {
 		return nil, ErrNotInitialized
 	}
 
@@ -941,45 +977,27 @@ func (vm *VM) runSigning(session *SigningSession, key *ManagedKey) {
 
 	startTime := time.Now()
 
-	// Get the protocol handler for this key type
-	handler, err := vm.protocolRegistry.Get(Protocol(key.KeyType))
-	if err != nil {
-		// Fall back to LSS
-		handler, err = vm.protocolRegistry.Get(ProtocolLSS)
-		if err != nil {
-			vm.mu.Lock()
-			session.Status = "failed"
-			session.Error = err.Error()
-			vm.mu.Unlock()
-			return
-		}
-	}
-
-	// Create a KeyShare from the managed key for signing
-	var share KeyShare
-	if key.Config != nil {
-		share = &lssKeyShare{
-			config:  key.Config,
-			pubKey:  key.PublicKey,
-			partyID: vm.partyID,
-			thresh:  key.Threshold,
-			total:   key.TotalParties,
-			gen:     key.Generation,
-		}
-	} else {
-		vm.mu.Lock()
-		session.Status = "failed"
-		session.Error = "no key share available for signing"
-		vm.mu.Unlock()
-		return
-	}
-
-	// Create context with timeout based on session expiration
-	// Use SessionTimeout from config for signing operations
+	// Bound the ceremony by the session timeout.
 	ctx, cancel := context.WithTimeout(context.Background(), vm.config.SessionTimeout)
 	defer cancel()
 
-	sig, err := handler.Sign(ctx, share, session.MessageHash, key.PartyIDs)
+	// Compute the threshold signature. Threshold ECDSA (CGGMP21) is the
+	// bridge-custody path: the committee runs the sign across the native
+	// MessageRouter transport and each honest validator derives the SAME
+	// standard secp256k1 signature, which B (or any chain holding the group
+	// key) verifies non-interactively. Other protocols (LSS, ...) still route
+	// through the registry handler — each protocol stays in its own lane.
+	var (
+		sig     *ecdsaSignature
+		signers []party.ID
+		err     error
+	)
+	switch {
+	case key.CMPConfig != nil:
+		sig, signers, err = vm.thresholdSignCMP(ctx, key, session)
+	default:
+		sig, signers, err = vm.signViaHandler(ctx, key, session)
+	}
 
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
@@ -996,13 +1014,8 @@ func (vm *VM) runSigning(session *SigningSession, key *ManagedKey) {
 		return
 	}
 
-	// Convert signature to components
-	session.Signature = &ecdsaSignature{
-		R: sig.R().Bytes(),
-		S: sig.S().Bytes(),
-		V: sig.V(),
-	}
-	session.SignerParties = key.PartyIDs
+	session.Signature = sig
+	session.SignerParties = signers
 	session.Status = "completed"
 	session.CompletedAt = time.Now()
 
@@ -1331,7 +1344,7 @@ func (vm *VM) GetBlock(ctx context.Context, id ids.ID) (chain.Block, error) {
 // ParseBlock implements the chain.ChainVM interface
 func (vm *VM) ParseBlock(ctx context.Context, bytes []byte) (chain.Block, error) {
 	blk := &Block{vm: vm}
-	if _, err := Codec.Unmarshal(bytes, blk); err != nil {
+	if err := parseBlockBytes(bytes, blk); err != nil {
 		return nil, err
 	}
 	blk.ID_ = blk.computeID()
@@ -1428,8 +1441,20 @@ func (vm *VM) RequestFailed(ctx context.Context, nodeID ids.NodeID, requestID ui
 	return nil
 }
 
-// Gossip implements the common.VM interface
+// Gossip implements the common.VM interface. It is the single receive path for
+// cross-validator MPC: every ceremony message (broadcast or directed) arrives
+// here as app-gossip, is decoded to (sessionID, protocol.Message) and handed to
+// the ceremony's router. Messages that arrive before our own router for that
+// ceremony is registered are buffered and drained on register, so no round-one
+// broadcast is lost to a start-order race.
 func (vm *VM) Gossip(ctx context.Context, nodeID ids.NodeID, msg []byte) error {
+	sessionID, ceremonyMsg, err := unmarshalEnvelope(msg)
+	if err != nil {
+		// Not an MPC ceremony envelope (or corrupt) — ignore, never fault
+		// consensus on a peer's malformed gossip.
+		return nil
+	}
+	vm.deliverCeremonyMessage(sessionID, ceremonyMsg)
 	return nil
 }
 
@@ -1443,7 +1468,7 @@ func (vm *VM) Version(ctx context.Context) (string, error) {
 func (vm *VM) CrossChainRequest(ctx context.Context, chainID ids.ID, requestID uint32, deadline time.Time, request []byte) error {
 	// Parse cross-chain MPC request
 	var req CrossChainMPCRequest
-	if _, err := Codec.Unmarshal(request, &req); err != nil {
+	if err := parseCrossChainMPCRequest(request, &req); err != nil {
 		return err
 	}
 
@@ -1524,7 +1549,7 @@ func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
 // Helper methods
 
 func (vm *VM) putBlock(blk *Block) error {
-	bytes, err := Codec.Marshal(codecVersion, blk)
+	bytes, err := blk.Marshal()
 	if err != nil {
 		return err
 	}
@@ -1539,7 +1564,7 @@ func (vm *VM) getBlock(id ids.ID) (*Block, error) {
 	}
 
 	blk := &Block{vm: vm}
-	if _, err := Codec.Unmarshal(bytes, blk); err != nil {
+	if err := parseBlockBytes(bytes, blk); err != nil {
 		return nil, err
 	}
 
@@ -1548,7 +1573,7 @@ func (vm *VM) getBlock(id ids.ID) (*Block, error) {
 }
 
 func (vm *VM) persistKey(key *ManagedKey) error {
-	bytes, err := Codec.Marshal(codecVersion, key)
+	bytes, err := key.Marshal()
 	if err != nil {
 		return err
 	}
@@ -1564,7 +1589,7 @@ func (vm *VM) loadKeys() error {
 
 	for iter.Next() {
 		key := &ManagedKey{}
-		if _, err := Codec.Unmarshal(iter.Value(), key); err != nil {
+		if err := parseManagedKey(iter.Value(), key); err != nil {
 			continue
 		}
 		vm.keys[key.KeyID] = key

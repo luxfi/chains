@@ -84,7 +84,7 @@ func (b *Block) ChoicesStatus() choices.Status {
 
 // Bytes returns the block's serialized bytes
 func (b *Block) Bytes() []byte {
-	bytes, _ := Codec.Marshal(codecVersion, b)
+	bytes, _ := b.Marshal()
 	return bytes
 }
 
@@ -175,7 +175,7 @@ func (b *Block) SetStatus(status choices.Status) {
 
 // computeID computes the block's ID
 func (b *Block) computeID() ids.ID {
-	bytes, _ := Codec.Marshal(codecVersion, b)
+	bytes, _ := b.Marshal()
 	hash := sha256.Sum256(bytes)
 	return ids.ID(hash)
 }

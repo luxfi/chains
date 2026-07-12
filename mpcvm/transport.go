@@ -33,8 +33,10 @@ import (
 	"sync"
 
 	"github.com/luxfi/ids"
+	"github.com/luxfi/math/set"
 	"github.com/luxfi/threshold/pkg/party"
 	"github.com/luxfi/threshold/pkg/protocol"
+	"github.com/luxfi/warp"
 )
 
 // =============================================================================
@@ -195,6 +197,11 @@ type gossipRouter struct {
 	// a directed (To != "") ceremony message becomes an app-request to one peer.
 	peers map[party.ID]ids.NodeID
 	inbox chan *protocol.Message
+
+	// mu guards closed so a late Deliver (from a peer still gossiping as the
+	// session tears down) can never send on a closed inbox.
+	mu     sync.Mutex
+	closed bool
 }
 
 // newGossipRouter builds the cross-validator router for one session.
@@ -240,9 +247,15 @@ func (r *gossipRouter) Receive() <-chan *protocol.Message { return r.inbox }
 
 // Deliver hands an incoming ceremony message (already demultiplexed to this
 // session) to the local handler. Called by the VM's app-message handler; drops
-// on a full inbox rather than blocking consensus.
+// on a full inbox rather than blocking consensus, and is a no-op once the
+// session is closed (never sends on a closed channel).
 func (r *gossipRouter) Deliver(msg *protocol.Message) {
 	if msg == nil || msg.From == r.self {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
 		return
 	}
 	select {
@@ -251,11 +264,80 @@ func (r *gossipRouter) Deliver(msg *protocol.Message) {
 	}
 }
 
-// Close releases the receive channel when the session ends.
-func (r *gossipRouter) Close() { close(r.inbox) }
+// Close releases the receive channel when the session ends. Idempotent.
+func (r *gossipRouter) Close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	r.closed = true
+	close(r.inbox)
+}
 
 // Compile-time checks that both routers satisfy MessageRouter.
 var (
 	_ MessageRouter = (*inProcRouter)(nil)
 	_ MessageRouter = (*gossipRouter)(nil)
 )
+
+// =============================================================================
+// warp.Sender-backed AppNetwork (the production send side)
+// =============================================================================
+
+// warpAppNetwork adapts the node's canonical warp.Sender (handed to the VM at
+// Initialize as block.Init.Sender) to the AppNetwork the gossipRouter sends
+// over. It is constructed PER CEREMONY with the exact set of committee node IDs
+// that must receive the ceremony's messages: an MPC round is only sound if
+// EVERY listed signer receives EVERY broadcast, so "Broadcast" here is an
+// explicit multicast to the committee — never a validator SAMPLE (sampling a
+// subset would silently starve a signer and stall the round). Both Broadcast
+// and SendTo travel as app-gossip so they arrive at the receiver's single
+// Gossip handler, which demultiplexes by session and calls the router's
+// Deliver — one receive path, one demux point.
+//
+// Delivery is best-effort at the p2p layer: a dropped gossip datagram stalls a
+// round until the threshold handler's RoundTimeout fires. Production hardening
+// (reliable delivery via acks/retransmit, or SendAppRequest with retry) is
+// tracked separately; the in-memory fabric used by the transport tests delivers
+// synchronously so the ceremony is deterministic under test.
+type warpAppNetwork struct {
+	sender    warp.Sender
+	self      ids.NodeID
+	committee set.Set[ids.NodeID] // every committee node (self included; excluded on send)
+}
+
+// newWarpAppNetwork binds a ceremony's committee to the node's warp sender.
+func newWarpAppNetwork(sender warp.Sender, self ids.NodeID, committee []ids.NodeID) *warpAppNetwork {
+	s := set.NewSet[ids.NodeID](len(committee))
+	s.Add(committee...)
+	return &warpAppNetwork{sender: sender, self: self, committee: s}
+}
+
+// Broadcast multicasts msg to every committee node except self.
+func (n *warpAppNetwork) Broadcast(ctx context.Context, msg []byte) error {
+	if n.sender == nil {
+		return fmt.Errorf("mpcvm: no warp sender configured")
+	}
+	targets := set.NewSet[ids.NodeID](n.committee.Len())
+	targets.Add(n.committee.List()...)
+	targets.Remove(n.self)
+	if targets.Len() == 0 {
+		return nil
+	}
+	return n.sender.SendGossip(ctx, warp.SendConfig{NodeIDs: targets}, msg)
+}
+
+// SendTo delivers msg to a single committee node.
+func (n *warpAppNetwork) SendTo(ctx context.Context, nodeID ids.NodeID, msg []byte) error {
+	if n.sender == nil {
+		return fmt.Errorf("mpcvm: no warp sender configured")
+	}
+	if nodeID == n.self {
+		return nil
+	}
+	return n.sender.SendGossip(ctx, warp.SendConfig{NodeIDs: set.Of(nodeID)}, msg)
+}
+
+// Compile-time check that warpAppNetwork satisfies AppNetwork.
+var _ AppNetwork = (*warpAppNetwork)(nil)

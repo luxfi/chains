@@ -87,6 +87,50 @@ type BridgeTransferAttestation struct {
 	CreatedAt   int64          `json:"createdAt"`
 }
 
+// BridgeReleaseRequest is the clean, self-contained request B hands M to
+// authorise a cross-chain release. It carries exactly the fields that bind the
+// release (both chain ids, asset, amount, recipient, per-route nonce) plus the
+// M-Chain routing context (which authorised chain is asking, and which custody
+// key must sign). Everything the digest commits to travels here; nothing else
+// can be minted from the resulting attestation.
+type BridgeReleaseRequest struct {
+	RequestingChain string   `json:"requestingChain"` // authorised chain id in M's permission table (e.g. "B-Chain")
+	KeyID           string   `json:"keyId"`           // custody key to sign with; empty => M's active custody key
+	SrcChainID      uint32   `json:"srcChainId"`
+	DstChainID      uint32   `json:"dstChainId"`
+	Asset           [32]byte `json:"asset"`
+	Amount          uint64   `json:"amount"`
+	Recipient       [20]byte `json:"recipient"`
+	Nonce           uint64   `json:"nonce"`
+}
+
+// RequestBridgeRelease is THE B→M seam: B calls this with a release request and
+// gets back a threshold-signed, self-describing attestation. M computes the
+// domain-bound digest, threshold-signs it across the committee, and returns the
+// signature plus the group key and quorum B needs to verify — no callback to M.
+// B's gate on the return value is VerifyBridgeAttestation.
+//
+// The signature is a standard secp256k1 ECDSA signature over the domain-bound
+// digest, so a destination-chain gateway contract verifies it exactly like a
+// single-key signature (ecrecover to the custody address).
+func (vm *VM) RequestBridgeRelease(req BridgeReleaseRequest) (*BridgeTransferAttestation, error) {
+	keyID := req.KeyID
+	if keyID == "" {
+		vm.mu.RLock()
+		keyID = vm.activeKeyID
+		vm.mu.RUnlock()
+	}
+	bt := BridgeTransfer{
+		SrcChainID: req.SrcChainID,
+		DstChainID: req.DstChainID,
+		Asset:      req.Asset,
+		Amount:     req.Amount,
+		Recipient:  req.Recipient,
+		Nonce:      req.Nonce,
+	}
+	return vm.AttestBridgeTransfer(req.RequestingChain, keyID, bt)
+}
+
 // AttestBridgeTransfer produces a threshold attestation over a bridge transfer.
 // It mirrors AttestOracleCommit: compute the domain-bound digest, request a
 // threshold signature from the committee, and return the self-describing
@@ -115,7 +159,13 @@ func (vm *VM) AttestBridgeTransfer(
 			return nil, fmt.Errorf("mpcvm: bridge attestation timed out")
 		case <-time.After(100 * time.Millisecond):
 			s, err := vm.GetSignature(session.SessionID)
-			if err != nil || s.Status != "completed" {
+			if err != nil {
+				continue
+			}
+			if s.Status == "failed" {
+				return nil, fmt.Errorf("mpcvm: bridge attestation signing failed: %s", s.Error)
+			}
+			if s.Status != "completed" {
 				continue
 			}
 			pub, err := vm.GetPublicKey(keyID)
