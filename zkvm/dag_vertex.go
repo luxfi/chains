@@ -244,7 +244,7 @@ func (v *Vertex) serialize() []byte {
 	binary.BigEndian.PutUint32(b4, uint32(len(v.txs)))
 	buf = append(buf, b4...)
 	for _, tx := range v.txs {
-		txBytes, _ := Codec.Marshal(codecVersion, tx)
+		txBytes, _ := tx.Marshal()
 		binary.BigEndian.PutUint32(b4, uint32(len(txBytes)))
 		buf = append(buf, b4...)
 		buf = append(buf, txBytes...)
@@ -294,8 +294,8 @@ func deserializeVertex(data []byte, vm *VM) (*Vertex, error) {
 		if pos+int(txLen) > len(data) {
 			return nil, errInvalidBlock
 		}
-		tx := &Transaction{}
-		if _, err := Codec.Unmarshal(data[pos:pos+int(txLen)], tx); err != nil {
+		tx, err := parseTransaction(data[pos:pos+int(txLen)])
+		if err != nil {
 			return nil, err
 		}
 		if tx.ID == ids.Empty {

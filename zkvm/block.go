@@ -261,7 +261,7 @@ func (b *Block) Bytes() []byte {
 		return b.bytes
 	}
 
-	bytes, err := Codec.Marshal(codecVersion, b)
+	bytes, err := b.Marshal()
 	if err != nil {
 		// Log error and return nil
 		return nil
@@ -299,10 +299,7 @@ func ParseGenesis(genesisBytes []byte) (*Genesis, error) {
 	if len(genesisBytes) > 0 {
 		// Try JSON first (simple genesis)
 		if err := json.Unmarshal(genesisBytes, &genesis); err != nil {
-			// Fall back to Codec (complex genesis with binary data)
-			if _, err := Codec.Unmarshal(genesisBytes, &genesis); err != nil {
-				return nil, err
-			}
+			return nil, err
 		}
 	}
 

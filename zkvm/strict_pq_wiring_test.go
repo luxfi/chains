@@ -4,6 +4,7 @@
 package zkvm
 
 import (
+	"encoding/json"
 	"context"
 	"testing"
 
@@ -134,7 +135,7 @@ func TestZChain_ExplicitNonStrictGenesisOptsOut(t *testing.T) {
 		MaxUTXOsPerBlock:            100,
 		ProofCacheSize:              1000,
 	}
-	cfgBytes, err := Codec.Marshal(0, &cfg)
+	cfgBytes, err := json.Marshal(cfg)
 	if err != nil {
 		t.Fatalf("marshal ZConfig: %v", err)
 	}
