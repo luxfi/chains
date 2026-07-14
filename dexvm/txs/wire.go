@@ -48,7 +48,7 @@ const (
 	bsEnd       = 60
 )
 
-func setBase(ob *zap.ObjectBuilder, b *BaseTx) {
+func setBase(ob zap.ObjectBuilder, b *BaseTx) {
 	ob.SetBytesFixed(bsFrom, b.From[:])
 	ob.SetUint64(bsNonce, b.Nonce)
 	ob.SetUint64(bsGasPrice, b.GasPrice)

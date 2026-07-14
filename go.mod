@@ -21,7 +21,7 @@ require (
 	github.com/luxfi/log v1.4.3
 	github.com/luxfi/math v1.4.1
 	github.com/luxfi/metric v1.6.0
-	github.com/luxfi/node v1.36.4
+	github.com/luxfi/node v1.36.9
 	github.com/luxfi/oracle v1.0.0
 	github.com/luxfi/precompile v0.19.1
 	github.com/luxfi/relay v1.0.0
@@ -33,7 +33,7 @@ require (
 	github.com/luxfi/version v1.0.1
 	github.com/luxfi/vm v1.2.7
 	github.com/luxfi/warp v1.24.0
-	github.com/luxfi/zap v1.2.0
+	github.com/luxfi/zap v1.2.5
 	github.com/stretchr/testify v1.11.1
 	github.com/zeebo/blake3 v0.2.4
 	golang.org/x/crypto v0.52.0
@@ -174,7 +174,7 @@ require (
 	github.com/luxfi/trace v1.1.0 // indirect
 	github.com/luxfi/upgrade v1.0.1 // indirect
 	github.com/luxfi/utils v1.2.0 // indirect
-	github.com/luxfi/utxo v0.5.1 // indirect
+	github.com/luxfi/utxo v0.5.7 // indirect
 	github.com/luxfi/validators v1.2.0 // indirect
 	github.com/luxfi/zapdb v1.10.1 // indirect
 	github.com/luxfi/zwing v0.5.2 // indirect
