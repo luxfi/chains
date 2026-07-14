@@ -25,7 +25,6 @@ package txs
 
 import (
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"time"
 
@@ -364,8 +363,8 @@ type RelayOrderTx struct {
 	// LimitIsUpper records the direction the limit bounds (true: reject price ABOVE the
 	// limit, the BUY/exact-input ceiling; false: reject price BELOW it, the SELL floor).
 	// Empty/zero for place/cancel (non-settling) relays.
-	AssetOut    ids.ID  `json:"assetOut,omitempty"`
-	PriceLimit  uint64  `json:"priceLimit,omitempty"`
+	AssetOut     ids.ID `json:"assetOut,omitempty"`
+	PriceLimit   uint64 `json:"priceLimit,omitempty"`
 	LimitIsUpper bool   `json:"limitIsUpper,omitempty"`
 }
 
@@ -433,8 +432,8 @@ func (tx *RelayOrderTx) Verify() error {
 
 // SigningBytes is the canonical message a RelayOrderTx signature commits to: the
 // wire bytes with the Signature field cleared (so the signature binds From, Method,
-// Payload, CollateralRef, Nonce — but never itself). Deterministic (the struct has
-// no maps; encoding/json emits fields in declaration order).
+// Payload, CollateralRef, Nonce — but never itself). Deterministic (native ZAP
+// fixed-offset wire; no maps, list order preserved).
 func (tx *RelayOrderTx) SigningBytes() ([]byte, error) {
 	unsigned := *tx
 	unsigned.BaseTx.Signature = nil
@@ -578,30 +577,18 @@ func (p *TxParser) Parse(data []byte) (Tx, error) {
 	txType := TxType(data[0])
 	switch txType {
 	case TxImport:
-		return parse[ImportTx](data, TxImport)
+		return parseImportTx(data)
 	case TxExport:
-		return parse[ExportTx](data, TxExport)
+		return parseExportTx(data)
 	case TxRelayOrder:
-		return parse[RelayOrderTx](data, TxRelayOrder)
+		return parseRelayOrderTx(data)
 	case TxPlaceOrder:
-		return parse[PlaceOrderTx](data, TxPlaceOrder)
+		return parsePlaceOrderTx(data)
 	case TxCancelOrder:
-		return parse[CancelOrderTx](data, TxCancelOrder)
+		return parseCancelOrderTx(data)
 	default:
 		return nil, ErrInvalidTxType
 	}
-}
-
-// parse decodes the JSON body into a concrete tx, stamps its type, wire bytes,
-// and the deterministic TxID. One codec for every type — there is exactly one
-// way to read a transaction off the wire.
-func parse[T any](data []byte, txType TxType) (*T, error) {
-	tx := new(T)
-	if err := unmarshalBody(data, tx); err != nil {
-		return nil, err
-	}
-	stampBase(tx, txType, data)
-	return tx, nil
 }
 
 // stampBase sets the embedded BaseTx's type, wire bytes, and checksum TxID via
@@ -619,38 +606,37 @@ func stampBase(tx any, txType TxType, data []byte) {
 
 func (tx *BaseTx) base() *BaseTx { return tx }
 
-// Wire format for every transaction is a single type byte followed by the JSON
-// encoding of the concrete transaction struct:
+// Wire format for every transaction is a single TxType discriminator byte
+// followed by a native ZAP message (one root object per tx, fixed field
+// offsets — see wire.go):
 //
 //	[0]      = TxType
-//	[1:]     = json.Marshal(tx)
+//	[1:]     = ZAP message
 //
-// The encoding is deterministic (Go's encoding/json emits struct fields in
-// declaration order and these types contain no maps), so the same logical
-// transaction always serializes to identical bytes and therefore the same
-// TxID. This is the single codec used by both the constructors and the parser.
+// The encoding is deterministic (fixed offsets, no maps, list order preserved),
+// so the same logical transaction always serializes to identical bytes and
+// therefore the same TxID. This is the single codec used by both the
+// constructors and the parser.
 
-// Marshal serializes a concrete transaction struct into wire bytes:
-// type byte + JSON body.
+// Marshal serializes a concrete transaction struct into wire bytes: TxType
+// discriminator byte + ZAP body. It dispatches on the concrete type; the
+// txType argument is retained for call-site stability and always matches the
+// discriminator the per-type encoder emits.
 func Marshal[T any](tx *T, txType TxType) ([]byte, error) {
-	body, err := json.Marshal(tx)
-	if err != nil {
-		return nil, err
+	switch v := any(tx).(type) {
+	case *ImportTx:
+		return marshalImportTx(v), nil
+	case *ExportTx:
+		return marshalExportTx(v), nil
+	case *RelayOrderTx:
+		return marshalRelayOrderTx(v), nil
+	case *PlaceOrderTx:
+		return marshalPlaceOrderTx(v), nil
+	case *CancelOrderTx:
+		return marshalCancelOrderTx(v), nil
+	default:
+		return nil, ErrInvalidTxType
 	}
-	out := make([]byte, 1+len(body))
-	out[0] = byte(txType)
-	copy(out[1:], body)
-	return out, nil
-}
-
-// unmarshalBody decodes the JSON body (everything after the type byte) into the
-// supplied transaction struct. The type byte itself is validated by the caller
-// (TxParser.Parse) before dispatch.
-func unmarshalBody(data []byte, v any) error {
-	if len(data) < 1 {
-		return ErrInvalidTxType
-	}
-	return json.Unmarshal(data[1:], v)
 }
 
 // finalize serializes the constructed transaction and stamps its wire bytes and
@@ -659,8 +645,9 @@ func unmarshalBody(data []byte, v any) error {
 func finalize[T any](tx *T, base *BaseTx) *T {
 	wire, err := Marshal(tx, base.TxType)
 	if err != nil {
-		// JSON encoding of these plain structs cannot fail; treat as a
-		// programmer error rather than silently returning a half-built tx.
+		// The only error path is an unregistered concrete tx type — a
+		// programmer error, not a runtime condition. Fail loud rather than
+		// silently returning a half-built tx.
 		panic("txs: failed to marshal transaction: " + err.Error())
 	}
 	base.TxID = ids.Checksum256(wire)
