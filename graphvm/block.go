@@ -5,7 +5,6 @@ package graphvm
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"time"
 
@@ -13,6 +12,7 @@ import (
 	"github.com/luxfi/consensus/engine/chain/block"
 	"github.com/luxfi/crypto/hash"
 	"github.com/luxfi/ids"
+	"github.com/luxfi/zap"
 )
 
 // The consensus engine requires every ChainVM to resolve a real last-accepted
@@ -210,14 +210,53 @@ func (b *Block) Bytes() []byte {
 // genesis block ID diverge across validators and break consensus agreement.
 var genesisTimestamp = time.Unix(0, 0).UTC()
 
-// blockWire is the deterministic on-wire encoding of a G-Chain block. The block
-// ID is hash.ComputeHash256 of these bytes, so marshal/parse round-trips a
+// G-Chain block wire — native ZAP (fixed offsets), no reflection codec. The
+// block ID is hash.ComputeHash256 of these bytes, so marshal/parse round-trips a
 // byte-identical ID across nodes and restarts.
-type blockWire struct {
-	ParentID  ids.ID `json:"parentID"`
-	Height    uint64 `json:"height"`
-	Timestamp int64  `json:"timestamp"`
-	Payload   []byte `json:"payload,omitempty"`
+//
+//	ParentID  32B   @ 0
+//	Height    u64   @ 32
+//	Timestamp i64   @ 40
+//	Payload   bytes @ 48
+const (
+	gblkParentID  = 0
+	gblkHeight    = 32
+	gblkTimestamp = 40
+	gblkPayload   = 48
+	gblkSize      = 56
+)
+
+var errGBlockTrailing = errors.New("graphvm block: trailing bytes after canonical wire")
+
+// marshalGBlock encodes a block into its canonical ZAP wire bytes.
+func marshalGBlock(parentID ids.ID, height uint64, timestamp int64, payload []byte) []byte {
+	b := zap.NewBuilder(zap.HeaderSize + gblkSize + len(payload) + 16)
+	ob := b.StartObject(gblkSize)
+	ob.SetBytesFixed(gblkParentID, parentID[:])
+	ob.SetUint64(gblkHeight, height)
+	ob.SetInt64(gblkTimestamp, timestamp)
+	ob.SetBytes(gblkPayload, payload)
+	ob.FinishAsRoot()
+	return b.Finish()
+}
+
+// parseGBlock decodes canonical ZAP block wire; rejects trailing bytes.
+func parseGBlock(raw []byte) (parentID ids.ID, height uint64, timestamp int64, payload []byte, err error) {
+	msg, perr := zap.Parse(raw)
+	if perr != nil {
+		err = perr
+		return
+	}
+	if msg.Size() != len(raw) {
+		err = errGBlockTrailing
+		return
+	}
+	o := msg.Root()
+	parentID = ids.ID(o.BytesFixedSlice(gblkParentID, 32))
+	height = o.Uint64(gblkHeight)
+	timestamp = o.Int64(gblkTimestamp)
+	payload = o.Bytes(gblkPayload)
+	return
 }
 
 // newGenesisBlock builds the G-Chain genesis block (height 0) deterministically
@@ -231,15 +270,7 @@ func newGenesisBlock(vm *VM, genesisBytes []byte) (*Block, error) {
 // newBlock constructs a block, computes its canonical bytes and content-
 // addressed ID, and returns it ready to serve.
 func newBlock(vm *VM, parentID ids.ID, height uint64, timestamp time.Time, payload []byte) (*Block, error) {
-	raw, err := json.Marshal(blockWire{
-		ParentID:  parentID,
-		Height:    height,
-		Timestamp: timestamp.Unix(),
-		Payload:   payload,
-	})
-	if err != nil {
-		return nil, err
-	}
+	raw := marshalGBlock(parentID, height, timestamp.Unix(), payload)
 	return &Block{
 		vm:        vm,
 		id:        ids.ID(hash.ComputeHash256(raw)),
@@ -254,16 +285,16 @@ func newBlock(vm *VM, parentID ids.ID, height uint64, timestamp time.Time, paylo
 // parseBlock decodes the canonical wire bytes produced by newBlock back into a
 // Block whose ID is recomputed from those exact bytes.
 func parseBlock(vm *VM, raw []byte) (*Block, error) {
-	var wire blockWire
-	if err := json.Unmarshal(raw, &wire); err != nil {
+	parentID, height, timestamp, _, err := parseGBlock(raw)
+	if err != nil {
 		return nil, err
 	}
 	return &Block{
 		vm:        vm,
 		id:        ids.ID(hash.ComputeHash256(raw)),
-		parentID:  wire.ParentID,
-		height:    wire.Height,
-		timestamp: time.Unix(wire.Timestamp, 0).UTC(),
+		parentID:  parentID,
+		height:    height,
+		timestamp: time.Unix(timestamp, 0).UTC(),
 		status:    choices.Accepted,
 		bytes:     raw,
 	}, nil
