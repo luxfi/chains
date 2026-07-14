@@ -113,53 +113,53 @@ const (
 // Config contains AIVM configuration
 type Config struct {
 	// Network settings
-	MaxProvidersPerNode int `serialize:"true" json:"maxProvidersPerNode"`
-	MaxTasksPerProvider int `serialize:"true" json:"maxTasksPerProvider"`
+	MaxProvidersPerNode int `json:"maxProvidersPerNode"`
+	MaxTasksPerProvider int `json:"maxTasksPerProvider"`
 
 	// HostChainID identifies which Lux L1/L2 this AIVM instance runs on.
 	// "primary" = primary network (mainnet/testnet/devnet); anchor to
 	// Q-Chain for cross-chain settlement. Any other value = white-label
 	// L1/L2 (Hanzo, Zoo, Pars, Liquidity); anchor to the host chain's
 	// own finality. AIVM is chain-agnostic — same code runs everywhere.
-	HostChainID string `serialize:"true" json:"hostChainID"`
+	HostChainID string `json:"hostChainID"`
 
 	// VerificationMode selects the result-verification strategy.
 	// Default: ModeOptimistic (public-BFT-safe).
-	VerificationMode VerificationMode `serialize:"true" json:"verificationMode"`
+	VerificationMode VerificationMode `json:"verificationMode"`
 
 	// ChallengeWindowBlocks is the number of L1/L2 blocks during which
 	// any party can submit a fraud proof against a posted result. Only
 	// used by ModeOptimistic. Default 100 blocks (~5-10 minutes on
 	// most Lux L1/L2 instances).
-	ChallengeWindowBlocks uint64 `serialize:"true" json:"challengeWindowBlocks"`
+	ChallengeWindowBlocks uint64 `json:"challengeWindowBlocks"`
 
 	// RedundancyFactor is M (signatures required) for
 	// ModeMultiPartyRedundant. Total providers N is committed in the
 	// task spec; M-of-N must produce the same result hash for
 	// acceptance. Default 3-of-5.
-	RedundancyFactor int `serialize:"true" json:"redundancyFactor"`
+	RedundancyFactor int `json:"redundancyFactor"`
 
 	// MinProviderBond is the minimum stake (in host-chain native tokens,
 	// wei-equivalent) a provider must lock to register. Forfeited on
 	// successful fraud proof or majority-divergence. Default 1000 LUX.
-	MinProviderBond uint64 `serialize:"true" json:"minProviderBond"`
+	MinProviderBond uint64 `json:"minProviderBond"`
 
 	// Attestation settings — TEE is OPT-IN, NOT required by default.
 	// On public chains keep RequireTEEAttestation=false; setting it true
 	// restricts the provider set to TEE-equipped operators only, which
 	// is a permissioned-subnet policy choice.
-	RequireTEEAttestation bool   `serialize:"true" json:"requireTEEAttestation"`
-	MinTrustScore         uint8  `serialize:"true" json:"minTrustScore"`
-	AttestationTimeout    string `serialize:"true" json:"attestationTimeout"`
+	RequireTEEAttestation bool   `json:"requireTEEAttestation"`
+	MinTrustScore         uint8  `json:"minTrustScore"`
+	AttestationTimeout    string `json:"attestationTimeout"`
 
 	// Task settings
-	MaxTaskQueueSize int    `serialize:"true" json:"maxTaskQueueSize"`
-	TaskTimeout      string `serialize:"true" json:"taskTimeout"`
+	MaxTaskQueueSize int    `json:"maxTaskQueueSize"`
+	TaskTimeout      string `json:"taskTimeout"`
 
 	// Reward settings
-	BaseReward       uint64 `serialize:"true" json:"baseReward"`
-	EpochDuration    string `serialize:"true" json:"epochDuration"`
-	MerkleAnchorFreq int    `serialize:"true" json:"merkleAnchorFreq"` // Blocks between Q-Chain anchors
+	BaseReward       uint64 `json:"baseReward"`
+	EpochDuration    string `json:"epochDuration"`
+	MerkleAnchorFreq int    `json:"merkleAnchorFreq"` // Blocks between Q-Chain anchors
 }
 
 // DefaultConfig returns default AIVM configuration suitable for ANY
@@ -226,11 +226,11 @@ type VM struct {
 	// stateless handle bound to the deployment's chain ids.
 	quorum         *Engine
 	qstate         QuorumState
-	qdb            *versiondb.Database               // engine-state staging layer over vm.db; committed at Block.Accept
+	qdb            *versiondb.Database // engine-state staging layer over vm.db; committed at Block.Accept
 	qledger        QuorumLedger
-	qledgerSnap    map[common.Address]*uint256.Int   // last committed ledger balances (for abort rollback)
-	ccv            CCommitVerifier // proves a C intent is committed before it can create a task
-	pendingIntents []CIntent       // committed intents buffered for consensus-gated import
+	qledgerSnap    map[common.Address]*uint256.Int // last committed ledger balances (for abort rollback)
+	ccv            CCommitVerifier                 // proves a C intent is committed before it can create a task
+	pendingIntents []CIntent                       // committed intents buffered for consensus-gated import
 
 	// Attestation verifier (local nvtrust - no cloud dependency)
 	verifier *attestation.Verifier

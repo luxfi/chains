@@ -44,22 +44,22 @@ var (
 // GConfig contains VM configuration
 type GConfig struct {
 	// DGraph configuration
-	DgraphEndpoint   string `serialize:"true" json:"dgraphEndpoint"`
-	SchemaVersion    string `serialize:"true" json:"schemaVersion"`
-	EnableFederation bool   `serialize:"true" json:"enableFederation"`
+	DgraphEndpoint   string `json:"dgraphEndpoint"`
+	SchemaVersion    string `json:"schemaVersion"`
+	EnableFederation bool   `json:"enableFederation"`
 
 	// Query configuration
-	MaxQueryDepth  int `serialize:"true" json:"maxQueryDepth"`
-	QueryTimeoutMs int `serialize:"true" json:"queryTimeoutMs"`
-	MaxResultSize  int `serialize:"true" json:"maxResultSize"`
+	MaxQueryDepth  int `json:"maxQueryDepth"`
+	QueryTimeoutMs int `json:"queryTimeoutMs"`
+	MaxResultSize  int `json:"maxResultSize"`
 
 	// Index configuration
-	AutoIndex      bool `serialize:"true" json:"autoIndex"`
-	IndexBatchSize int  `serialize:"true" json:"indexBatchSize"`
+	AutoIndex      bool `json:"autoIndex"`
+	IndexBatchSize int  `json:"indexBatchSize"`
 
 	// Authentication configuration
-	RequireAuth bool     `serialize:"true" json:"requireAuth"`
-	APIKeys     []string `serialize:"true" json:"apiKeys"`
+	RequireAuth bool     `json:"requireAuth"`
+	APIKeys     []string `json:"apiKeys"`
 }
 
 // VM implements the chain.ChainVM interface for the Graph Chain (G-Chain)

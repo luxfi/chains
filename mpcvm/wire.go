@@ -16,7 +16,7 @@ import (
 // over a zap object. Re-genesis authorized, so the on-disk/wire format is
 // these offsets (canonical: parse rejects trailing bytes).
 //
-// The legacy pcodecs LinearCodec keyed on `serialize:"true"` struct tags;
+// The legacy pcodecs LinearCodec keyed on struct tags;
 // every type here carries only `json:` tags, so the old codec marshaled ZERO
 // fields (a Block round-tripped to all-zero — a latent corruption bug). This
 // wire is the correct, field-preserving replacement.
