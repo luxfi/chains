@@ -6,8 +6,6 @@ package identityvm
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"time"
 
@@ -18,13 +16,13 @@ import (
 
 // Block represents a block in the IdentityVM chain
 type Block struct {
-	ParentID_      ids.ID          `json:"parentId"`
-	BlockHeight    uint64          `json:"height"`
-	BlockTimestamp int64           `json:"timestamp"`
-	Credentials    []*Credential   `json:"credentials"`
+	ParentID_      ids.ID             `json:"parentId"`
+	BlockHeight    uint64             `json:"height"`
+	BlockTimestamp int64              `json:"timestamp"`
+	Credentials    []*Credential      `json:"credentials"`
 	Revocations    []*RevocationEntry `json:"revocations,omitempty"`
-	Identities     []*Identity     `json:"identities,omitempty"`
-	StateRoot      []byte          `json:"stateRoot"`
+	Identities     []*Identity        `json:"identities,omitempty"`
+	StateRoot      []byte             `json:"stateRoot"`
 
 	// Cached values
 	ID_    ids.ID
@@ -41,33 +39,11 @@ func (b *Block) ID() ids.ID {
 	return b.ID_
 }
 
-// computeID computes the block ID
+// computeID computes the block ID as the hash of the canonical ZAP wire.
+// The wire commits to every block field, so identical logical blocks yield
+// identical IDs and any field change moves the ID.
 func (b *Block) computeID() ids.ID {
-	h := sha256.New()
-	h.Write(b.ParentID_[:])
-	binary.Write(h, binary.BigEndian, b.BlockHeight)
-	binary.Write(h, binary.BigEndian, b.BlockTimestamp)
-
-	// Include credential IDs
-	for _, cred := range b.Credentials {
-		credID := cred.ID
-		h.Write(credID[:])
-	}
-
-	// Include revocation IDs
-	for _, rev := range b.Revocations {
-		h.Write(rev.CredentialID[:])
-	}
-
-	// Include identity IDs
-	for _, identity := range b.Identities {
-		h.Write(identity.ID[:])
-	}
-
-	// Include state root
-	h.Write(b.StateRoot)
-
-	return ids.ID(h.Sum(nil))
+	return ids.ID(sha256.Sum256(b.Bytes()))
 }
 
 // ParentID returns the parent block ID
@@ -184,8 +160,8 @@ func (b *Block) Accept(ctx context.Context) error {
 	for _, cred := range b.Credentials {
 		b.vm.credentials[cred.ID] = cred
 
-		// Persist credential
-		credBytes, _ := json.Marshal(cred)
+		// Persist credential (native ZAP wire)
+		credBytes := marshalCredential(cred)
 		credKey := append(credentialPrefix, cred.ID[:]...)
 		b.vm.db.Put(credKey, credBytes)
 
@@ -244,7 +220,7 @@ func (b *Block) Bytes() []byte {
 		return b.bytes
 	}
 
-	bytes, err := json.Marshal(b)
+	bytes, err := b.Marshal()
 	if err != nil {
 		return nil
 	}
