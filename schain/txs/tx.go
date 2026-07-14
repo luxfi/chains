@@ -7,25 +7,33 @@
 // exist elsewhere (the S-Chain does NOT carry blobs in M0; it carries the
 // content manifest that names them).
 //
-// Wire format mirrors dexvm/txs exactly — a single type byte followed by the
-// JSON body of the concrete struct (dexvm/txs/tx.go:621). The encoding is
-// deterministic (encoding/json emits struct fields in declaration order and
-// these types contain no maps), so the same logical transaction always
-// serializes to identical bytes and therefore the same TxID. One codec, one way
-// to read a transaction off the wire.
+// Wire format is native ZAP: a single type byte (the discriminator the parser
+// dispatches on) followed by the ZAP wire object of the concrete struct — no
+// reflection codec, no JSON. Each tx type owns its marshal/parse over a zap
+// object at fixed field offsets (the same struct-is-wire idiom as chains/mpcvm
+// and chains/bridgevm). The encoding is deterministic — the builder writes the
+// fixed section then the variable tails in a fixed field order, and these types
+// contain no maps — so the same logical transaction always serializes to
+// identical bytes and therefore the same TxID. Re-genesis is authorized, so the
+// wire format is these offsets (canonical: parse rejects trailing bytes). One
+// codec, one way to read a transaction off the wire.
 package txs
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/luxfi/ids"
+	"github.com/luxfi/zap"
 )
 
 var (
 	// ErrInvalidTxType is returned when the leading type byte names no known tx.
 	ErrInvalidTxType = errors.New("invalid transaction type")
+	// ErrTrailingBytes rejects a wire object whose ZAP body is shorter than the
+	// bytes supplied — a canonical codec consumes its input exactly.
+	ErrTrailingBytes = errors.New("transaction: trailing bytes after wire object")
 	// ErrEmptyBucket / ErrEmptyObject reject a manifest with no addressable key.
 	ErrEmptyBucket = errors.New("manifest: empty bucket")
 	ErrEmptyObject = errors.New("manifest: empty object")
@@ -71,7 +79,7 @@ type Tx interface {
 	ID() ids.ID
 	// Type returns the transaction type.
 	Type() TxType
-	// Bytes returns the serialized transaction (type byte + JSON body).
+	// Bytes returns the serialized transaction (type byte + ZAP wire object).
 	Bytes() []byte
 	// Verify validates the transaction in isolation (no state access).
 	Verify() error
@@ -154,34 +162,34 @@ func (tx *PutManifestTx) Verify() error {
 // cryptographically verifiable inside the pure, local block apply:
 //
 //   - Signer       — the claimed HRW owner's NodeID. Verify recomputes
-//                    pinning.Owner(Range, V@Epoch) and requires Signer == owner.
+//     pinning.Owner(Range, V@Epoch) and requires Signer == owner.
 //   - SignerScheme — the NodeIDScheme byte (0x42 ML-DSA-65 / 0x43 ML-DSA-87) the
-//                    NodeID was derived under.
+//     NodeID was derived under.
 //   - SignerPubKey — the signer's ML-DSA public key. Verify RE-DERIVES the NodeID
-//                    from this key (NodeID = SHAKE256-384(domain‖chainID‖scheme‖
-//                    pubkey)[:20]) and requires it to equal Signer. The NodeID is
-//                    thus a binding commitment to the key — a forger cannot supply
-//                    a different key for the owner's NodeID (~2^160 second-preimage
-//                    on the truncated SHAKE; the same bound the identity system
-//                    already rests on).
+//     from this key (NodeID = SHAKE256-384(domain‖chainID‖scheme‖
+//     pubkey)[:20]) and requires it to equal Signer. The NodeID is
+//     thus a binding commitment to the key — a forger cannot supply
+//     a different key for the owner's NodeID (~2^160 second-preimage
+//     on the truncated SHAKE; the same bound the identity system
+//     already rests on).
 //   - Sig          — an ML-DSA signature over SigningBytes() (the canonical,
-//                    SP 800-185-framed encoding of Range‖Count‖Epoch‖Nonce‖
-//                    Fingerprint — NOT over the Sig/Signer/PubKey fields, which
-//                    would be circular). Only the holder of the owner's secret key
-//                    can produce it.
+//     SP 800-185-framed encoding of Range‖Count‖Epoch‖Nonce‖
+//     Fingerprint — NOT over the Sig/Signer/PubKey fields, which
+//     would be circular). Only the holder of the owner's secret key
+//     can produce it.
 //   - Epoch        — the P-Chain height the validator set was frozen at. Verify
-//                    requires it to equal the block's epoch so ownership is
-//                    resolved against the agreed set, and binding it into the
-//                    signature stops cross-epoch replay where ownership differs.
+//     requires it to equal the block's epoch so ownership is
+//     resolved against the agreed set, and binding it into the
+//     signature stops cross-epoch replay where ownership differs.
 //   - Nonce        — a per-emission uniquifier (the proposer stamps the block
-//                    height) so two allocations of the same Range/Count in
-//                    different blocks sign distinct messages.
+//     height) so two allocations of the same Range/Count in
+//     different blocks sign distinct messages.
 //   - Fingerprint  — pinning.EpochFingerprint(Epoch, members): the signer's
-//                    commitment to the EXACT validator set it pinned against.
-//                    Verify recomputes it from its OWN local snapshot and rejects
-//                    a mismatch (DESIGN §6.4) — so a proposer that pinned against a
-//                    set the verifier does not hold cannot get its block accepted,
-//                    and Verify never has to fetch a set over the network.
+//     commitment to the EXACT validator set it pinned against.
+//     Verify recomputes it from its OWN local snapshot and rejects
+//     a mismatch (DESIGN §6.4) — so a proposer that pinned against a
+//     set the verifier does not hold cannot get its block accepted,
+//     and Verify never has to fetch a set over the network.
 //
 // An AllocateTx enters the mempool as an UNSIGNED intent (Range+Count only); the
 // owning proposer stamps Epoch/Nonce/Fingerprint and signs it at BuildBlock with
@@ -329,30 +337,21 @@ func leftEncode(x uint64) []byte {
 // TxParser parses raw transaction bytes off the wire.
 type TxParser struct{}
 
-// Parse decodes a transaction from its wire bytes (type byte + JSON body).
+// Parse decodes a transaction from its wire bytes (type byte + ZAP wire object).
+// It dispatches on the leading type byte and hands the ZAP body to the concrete
+// type's parser — one dispatch, one codec.
 func (p *TxParser) Parse(data []byte) (Tx, error) {
 	if len(data) < 1 {
 		return nil, ErrInvalidTxType
 	}
 	switch TxType(data[0]) {
 	case TxPutManifest:
-		return parse[PutManifestTx](data, TxPutManifest)
+		return parsePutManifest(data)
 	case TxAllocate:
-		return parse[AllocateTx](data, TxAllocate)
+		return parseAllocate(data)
 	default:
 		return nil, ErrInvalidTxType
 	}
-}
-
-// parse decodes the JSON body into a concrete tx and stamps its type, wire
-// bytes, and deterministic TxID. One codec for every type.
-func parse[T any](data []byte, txType TxType) (*T, error) {
-	tx := new(T)
-	if err := json.Unmarshal(data[1:], tx); err != nil {
-		return nil, err
-	}
-	stampBase(tx, txType, data)
-	return tx, nil
 }
 
 // stampBase sets the embedded BaseTx's type, wire bytes, and checksum TxID. It
@@ -367,29 +366,213 @@ func stampBase(tx any, txType TxType, data []byte) {
 	}
 }
 
-// Marshal serializes a concrete transaction into wire bytes: type byte + JSON
-// body. The single codec used by both constructors and the parser.
-func Marshal[T any](tx *T, txType TxType) ([]byte, error) {
-	body, err := json.Marshal(tx)
-	if err != nil {
-		return nil, err
+// marshalTx serializes a concrete transaction into wire bytes: type byte + ZAP
+// wire object. The single codec used by both constructors and the parser. A tx
+// type with no ZAP encoder is a programmer error (an unhandled type byte would
+// be undecodable), so it panics rather than returning a swallowed error.
+func marshalTx(tx any, txType TxType) []byte {
+	var body []byte
+	switch v := tx.(type) {
+	case *PutManifestTx:
+		body = marshalPutManifest(v)
+	case *AllocateTx:
+		body = marshalAllocate(v)
+	default:
+		panic(fmt.Sprintf("txs: cannot marshal unknown transaction type %T", tx))
 	}
 	out := make([]byte, 1+len(body))
 	out[0] = byte(txType)
 	copy(out[1:], body)
-	return out, nil
+	return out
 }
 
 // finalize serializes the constructed transaction and stamps its wire bytes and
 // deterministic TxID, so a freshly built tx is immediately wire-ready and
-// Parse-round-trippable. JSON encoding of these plain structs cannot fail; a
-// failure is a programmer error, not a recoverable condition.
+// Parse-round-trippable. ZAP encoding of these plain structs cannot fail; an
+// unknown type is a programmer error, not a recoverable condition.
 func finalize[T any](tx *T, base *BaseTx) *T {
-	wire, err := Marshal(tx, base.TxType)
-	if err != nil {
-		panic("txs: failed to marshal transaction: " + err.Error())
-	}
+	wire := marshalTx(tx, base.TxType)
 	base.TxID = ids.Checksum256(wire)
 	base.bytes = wire
 	return tx
+}
+
+// ---- PutManifestTx wire object ----
+//
+//	Bucket   bytes @ 0
+//	Object   bytes @ 8
+//	FileLens list  @ 16  (u32 per FileID string length)
+//	FileBlob bytes @ 24  (concatenated FileID strings)
+//	Size     i64   @ 32
+//	ETag     bytes @ 40
+const (
+	pmBucket   = 0
+	pmObject   = 8
+	pmFileLens = 16
+	pmFileBlob = 24
+	pmSize     = 32
+	pmETag     = 40
+	pmObjSize  = 48
+)
+
+func marshalPutManifest(tx *PutManifestTx) []byte {
+	fileLens, fileBlob := packStrings(tx.FileIDs)
+	b := zap.NewBuilder(zap.HeaderSize + pmObjSize + len(tx.Bucket) + len(tx.Object) +
+		len(fileBlob) + 4*len(fileLens) + len(tx.ETag) + 64)
+	fileLensOff := writeU32List(b, fileLens)
+
+	ob := b.StartObject(pmObjSize)
+	ob.SetBytes(pmBucket, []byte(tx.Bucket))
+	ob.SetBytes(pmObject, []byte(tx.Object))
+	ob.SetList(pmFileLens, fileLensOff, len(fileLens))
+	ob.SetBytes(pmFileBlob, fileBlob)
+	ob.SetInt64(pmSize, tx.Size)
+	ob.SetBytes(pmETag, []byte(tx.ETag))
+	ob.FinishAsRoot()
+	return b.Finish()
+}
+
+func parsePutManifest(data []byte) (*PutManifestTx, error) {
+	msg, err := zap.Parse(data[1:])
+	if err != nil {
+		return nil, err
+	}
+	if msg.Size() != len(data)-1 {
+		return nil, ErrTrailingBytes
+	}
+	o := msg.Root()
+	tx := &PutManifestTx{
+		Bucket:  string(o.Bytes(pmBucket)),
+		Object:  string(o.Bytes(pmObject)),
+		FileIDs: unpackStrings(readU32List(o, pmFileLens), o.Bytes(pmFileBlob)),
+		Size:    o.Int64(pmSize),
+		ETag:    string(o.Bytes(pmETag)),
+	}
+	stampBase(tx, TxPutManifest, data)
+	return tx, nil
+}
+
+// ---- AllocateTx wire object ----
+//
+//	Range        bytes @ 0
+//	Count        u32   @ 8
+//	SignerScheme u8    @ 12
+//	Epoch        u64   @ 16
+//	Nonce        u64   @ 24
+//	Fingerprint  32B   @ 32  (ids.ID, in place)
+//	Signer       20B   @ 64  (ids.NodeID, in place)
+//	SignerPubKey bytes @ 88
+//	Sig          bytes @ 96
+const (
+	alRange   = 0
+	alCount   = 8
+	alScheme  = 12
+	alEpoch   = 16
+	alNonce   = 24
+	alFinger  = 32
+	alSigner  = 64
+	alPubKey  = 88
+	alSig     = 96
+	alObjSize = 104
+)
+
+func marshalAllocate(tx *AllocateTx) []byte {
+	b := zap.NewBuilder(zap.HeaderSize + alObjSize + len(tx.Range) +
+		len(tx.SignerPubKey) + len(tx.Sig) + 64)
+	ob := b.StartObject(alObjSize)
+	ob.SetBytes(alRange, []byte(tx.Range))
+	ob.SetUint32(alCount, tx.Count)
+	ob.SetUint8(alScheme, tx.SignerScheme)
+	ob.SetUint64(alEpoch, tx.Epoch)
+	ob.SetUint64(alNonce, tx.Nonce)
+	ob.SetBytesFixed(alFinger, tx.Fingerprint[:])
+	ob.SetBytesFixed(alSigner, tx.Signer[:])
+	ob.SetBytes(alPubKey, tx.SignerPubKey)
+	ob.SetBytes(alSig, tx.Sig)
+	ob.FinishAsRoot()
+	return b.Finish()
+}
+
+func parseAllocate(data []byte) (*AllocateTx, error) {
+	msg, err := zap.Parse(data[1:])
+	if err != nil {
+		return nil, err
+	}
+	if msg.Size() != len(data)-1 {
+		return nil, ErrTrailingBytes
+	}
+	o := msg.Root()
+	tx := &AllocateTx{
+		Range:        string(o.Bytes(alRange)),
+		Count:        o.Uint32(alCount),
+		Epoch:        o.Uint64(alEpoch),
+		Nonce:        o.Uint64(alNonce),
+		SignerScheme: o.Uint8(alScheme),
+		SignerPubKey: appendBytes(o.Bytes(alPubKey)),
+		Sig:          appendBytes(o.Bytes(alSig)),
+	}
+	copy(tx.Fingerprint[:], o.BytesFixedSlice(alFinger, ids.IDLen))
+	copy(tx.Signer[:], o.BytesFixedSlice(alSigner, ids.NodeIDLen))
+	stampBase(tx, TxAllocate, data)
+	return tx, nil
+}
+
+// ---- shared ZAP helpers (mirror chains/mpcvm + chains/bridgevm) ----
+
+// writeU32List tails a u32 list into the builder and returns its offset.
+func writeU32List(b *zap.Builder, xs []uint32) int {
+	lb := b.StartList(4)
+	for _, x := range xs {
+		lb.AddUint32(x)
+	}
+	off, _ := lb.Finish()
+	return off
+}
+
+// readU32List reads the u32 list at ptrOff.
+func readU32List(o zap.Object, ptrOff int) []uint32 {
+	l := o.ListStride(ptrOff, 4)
+	n := l.Len()
+	out := make([]uint32, n)
+	for i := 0; i < n; i++ {
+		out[i] = l.Uint32(i)
+	}
+	return out
+}
+
+// packStrings returns per-string byte lengths and the concatenated blob.
+func packStrings(ss []string) ([]uint32, []byte) {
+	lens := make([]uint32, len(ss))
+	var blob []byte
+	for i, s := range ss {
+		lens[i] = uint32(len(s))
+		blob = append(blob, s...)
+	}
+	return lens, blob
+}
+
+// unpackStrings re-splits blob by lens. Returns nil (not empty) for no entries.
+func unpackStrings(lens []uint32, blob []byte) []string {
+	if len(lens) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(lens))
+	pos := 0
+	for _, l := range lens {
+		if pos+int(l) > len(blob) {
+			break
+		}
+		out = append(out, string(blob[pos:pos+int(l)]))
+		pos += int(l)
+	}
+	return out
+}
+
+// appendBytes returns a defensive copy of b (nil for empty), so a parsed tx does
+// not alias the caller's wire buffer.
+func appendBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	return append([]byte(nil), b...)
 }
