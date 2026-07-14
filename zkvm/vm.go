@@ -4,8 +4,8 @@
 package zkvm
 
 import (
-	"encoding/json"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -42,14 +42,14 @@ var (
 // ZConfig contains VM configuration
 type ZConfig struct {
 	// Privacy configuration
-	EnableConfidentialTransfers bool `serialize:"true" json:"enableConfidentialTransfers"`
-	EnablePrivateAddresses      bool `serialize:"true" json:"enablePrivateAddresses"`
+	EnableConfidentialTransfers bool `json:"enableConfidentialTransfers"`
+	EnablePrivateAddresses      bool `json:"enablePrivateAddresses"`
 
 	// ZK proof configuration
-	ProofSystem      string `serialize:"true" json:"proofSystem"` // groth16, plonk, etc.
-	CircuitType      string `serialize:"true" json:"circuitType"` // transfer, mint, burn
-	VerifyingKeyPath string `serialize:"true" json:"verifyingKeyPath"`
-	TrustedSetupPath string `serialize:"true" json:"trustedSetupPath"`
+	ProofSystem      string `json:"proofSystem"` // groth16, plonk, etc.
+	CircuitType      string `json:"circuitType"` // transfer, mint, burn
+	VerifyingKeyPath string `json:"verifyingKeyPath"`
+	TrustedSetupPath string `json:"trustedSetupPath"`
 
 	// VerifyingKeys supplies real (non-dummy) verifying keys per circuit
 	// type (keyed by the TransactionType string), in-memory at genesis.
@@ -57,7 +57,7 @@ type ZConfig struct {
 	// verification disabled, fail-closed). On a strict-PQ chain, supplying
 	// a real bn254 verifying key here is REFUSED at construction
 	// (errStrictPQRealVKForbidden) — shielded value uses STARK/FRI only.
-	VerifyingKeys map[string][]byte `serialize:"true" json:"verifyingKeys"`
+	VerifyingKeys map[string][]byte `json:"verifyingKeys"`
 
 	// StrictPQ HARD-DISABLES the classical (bn254 pairing-based) shielded
 	// proof systems on this chain. When true, the shielded-tx ProofVerifier
@@ -67,17 +67,17 @@ type ZConfig struct {
 	// bn254 verifying key on a strict-PQ chain is an ERROR. This is the
 	// Lux primary-network posture: a CRQC that breaks bn254 cannot forge a
 	// shield/unshield proof to mint or steal shielded value.
-	StrictPQ bool `serialize:"true" json:"strictPQ"`
+	StrictPQ bool `json:"strictPQ"`
 
 	// FHE configuration
-	EnableFHE     bool   `serialize:"true" json:"enableFHE"`
-	FHEScheme     string `serialize:"true" json:"fheScheme"`     // BFV, CKKS, etc.
-	SecurityLevel uint32 `serialize:"true" json:"securityLevel"` // 128, 192, 256
+	EnableFHE     bool   `json:"enableFHE"`
+	FHEScheme     string `json:"fheScheme"`     // BFV, CKKS, etc.
+	SecurityLevel uint32 `json:"securityLevel"` // 128, 192, 256
 
 	// Performance
-	MaxUTXOsPerBlock         uint32        `serialize:"true" json:"maxUtxosPerBlock"`
-	ProofVerificationTimeout time.Duration `serialize:"true" json:"proofVerificationTimeout"`
-	ProofCacheSize           uint32        `serialize:"true" json:"proofCacheSize"`
+	MaxUTXOsPerBlock         uint32        `json:"maxUtxosPerBlock"`
+	ProofVerificationTimeout time.Duration `json:"proofVerificationTimeout"`
+	ProofCacheSize           uint32        `json:"proofCacheSize"`
 }
 
 // VM implements the Zero-Knowledge UTXO Chain VM
