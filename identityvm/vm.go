@@ -280,7 +280,7 @@ func (vm *VM) loadLastAccepted() error {
 	}
 
 	var block Block
-	if err := json.Unmarshal(blockBytes, &block); err != nil {
+	if err := parseBlock(blockBytes, &block); err != nil {
 		return err
 	}
 
@@ -385,7 +385,7 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 // ParseBlock implements chain.ChainVM
 func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (chain.Block, error) {
 	var block Block
-	if err := json.Unmarshal(blockBytes, &block); err != nil {
+	if err := parseBlock(blockBytes, &block); err != nil {
 		return nil, err
 	}
 
@@ -413,7 +413,7 @@ func (vm *VM) GetBlock(ctx context.Context, blockID ids.ID) (chain.Block, error)
 	}
 
 	var block Block
-	if err := json.Unmarshal(blockBytes, &block); err != nil {
+	if err := parseBlock(blockBytes, &block); err != nil {
 		return nil, err
 	}
 
@@ -464,8 +464,8 @@ func (vm *VM) CreateIdentity(publicKey []byte, metadata map[string]string) (*Ide
 
 	vm.identities[identityID] = identity
 
-	// Persist
-	identityBytes, _ := json.Marshal(identity)
+	// Persist (native ZAP wire)
+	identityBytes := marshalIdentity(identity)
 	key := append(identityPrefix, identityID[:]...)
 	if err := vm.db.Put(key, identityBytes); err != nil {
 		return nil, err
@@ -605,8 +605,8 @@ func (vm *VM) RevokeCredential(credID ids.ID, revokerID ids.ID, reason string) e
 
 	vm.revocations[credID] = revocation
 
-	// Persist revocation
-	revBytes, _ := json.Marshal(revocation)
+	// Persist revocation (native ZAP wire)
+	revBytes := marshalRevocation(revocation)
 	key := append(revocationPrefix, credID[:]...)
 	return vm.db.Put(key, revBytes)
 }
