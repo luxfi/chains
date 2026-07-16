@@ -200,3 +200,120 @@ func TestRED_DAGVertex_TimestampRoundTripAndIDBinding(t *testing.T) {
 			"time produced the same id %x — the time is malleable", pv.id[:8])
 	}
 }
+
+// TestRED_DAGVertex_SubSecondCadenceAndMonotonicClamp proves the D-Chain block
+// cadence is genuinely SUB-SECOND and that the proposer's monotonicity guard
+// (BuildVertex/BuildBlock: newTimestamp clamped non-decreasing vs GetLastBlockTime)
+// operates at NANOSECOND resolution — dexvm has NO whole-second truncation like the
+// C-Chain EVM's integer-seconds targetBlockRate floor. Regression lock: if anyone
+// ever floors/rounds the proposer time to whole seconds, (a) and (d) FAIL.
+//
+// Three proposals from ONE proxy (state carries, so the clamp sees the real prior
+// block time):
+//  1. clock = T            (T has a non-zero .5s sub-second component)
+//  2. clock = T + 1ms      (advances sub-second, SAME wall second as T)
+//  3. clock = T - 1ms      (BACKWARD — must be clamped, never go back)
+//
+// Locks four properties the order-book's fairness/determinism depends on:
+//
+//	(a) NO whole-second truncation: ts2-ts1 == exactly 1ms and ts1 keeps its .5s.
+//	(b) sub-second monotonic advance: ts2 strictly after ts1.
+//	(c) monotonicity clamp at ns resolution: backward clock yields ts3 == ts2
+//	    (non-decreasing), never earlier than the last block.
+//	(d) ordering integrity: distinct sub-second times at the SAME height derive
+//	    DISTINCT block hashes (deriveBlockHash keys relay-receipt idempotency),
+//	    so two sub-second blocks never alias.
+func TestRED_DAGVertex_SubSecondCadenceAndMonotonicClamp(t *testing.T) {
+	ctx := context.Background()
+	cvm, _, _, _, _ := newCountingHarness(t, nil)
+
+	// A wall-clock instant with a deliberately non-zero sub-second (.5s) part, so a
+	// whole-second truncation would be observable as a lost fractional second.
+	base := time.Unix(1_700_000_000, 500_000_000)
+	tsAt := func(at time.Time) time.Time {
+		maker := ids.GenerateTestShortID()
+		relayTx := newRelayTxBytes(t, maker, ids.GenerateTestID(), clobSubmitPayload(ids.GenerateTestID(), 1))
+		vtx := buildVertexAt(t, cvm, at, [][]byte{relayTx})
+		v, err := cvm.ParseVertex(ctx, vtx)
+		if err != nil {
+			t.Fatalf("ParseVertex: %v", err)
+		}
+		return v.(*DexVertex).Timestamp()
+	}
+
+	ts1 := tsAt(base)                        // clock = T
+	ts2 := tsAt(base.Add(time.Millisecond))  // clock = T + 1ms
+	ts3 := tsAt(base.Add(-time.Millisecond)) // clock = T - 1ms (backward)
+
+	// (a) NO whole-second truncation: the 1ms advance survives byte-exactly, and the
+	// sub-second component of the first block is preserved (would be 0 if truncated).
+	if d := ts2.Sub(ts1); d != time.Millisecond {
+		t.Fatalf("sub-second cadence lost: ts2-ts1 = %v, want exactly 1ms "+
+			"(a whole-second floor would collapse this to 0)", d)
+	}
+	if ns := ts1.Nanosecond(); ns != 500_000_000 {
+		t.Fatalf("sub-second component truncated: ts1.Nanosecond()=%d, want 500000000", ns)
+	}
+
+	// (b) sub-second monotonic advance.
+	if !ts2.After(ts1) {
+		t.Fatalf("block time did not advance sub-second: ts1=%v ts2=%v", ts1, ts2)
+	}
+
+	// (c) monotonicity clamp at ns resolution: the backward clock is pinned to the
+	// last block time, never earlier. Non-decreasing block time is the DEX fairness
+	// invariant under clock skew / re-proposal.
+	if ts3.Before(ts2) {
+		t.Fatalf("MONOTONICITY VIOLATION: backward clock produced ts3=%v < ts2=%v", ts3, ts2)
+	}
+	if !ts3.Equal(ts2) {
+		t.Fatalf("clamp expected ts3==ts2 (%v), got %v", ts2, ts3)
+	}
+
+	// (d) ordering integrity: two DISTINCT sub-second times at the SAME height derive
+	// DISTINCT block hashes (deriveBlockHash binds the block + keys relay-receipt
+	// idempotency), so sub-second blocks never alias.
+	if deriveBlockHash(1, ts1) == deriveBlockHash(1, ts2) {
+		t.Fatalf("sub-second block-hash collision: two 1ms-apart blocks share a hash — " +
+			"relay idempotency keys would alias")
+	}
+}
+
+// TestRED_LinearBlock_SubSecondCadenceAndMonotonicClamp pins the SAME sub-second +
+// non-decreasing guard on the linear chain.ChainVM.BuildBlock proposer path
+// (chainvm.go), which carries the identical clamp as the DAG BuildVertex path. Two
+// proposals: forward by 1ms, then a backward clock. ts advances by exactly 1ms
+// (no whole-second floor) and the backward clock is clamped to the prior block time.
+func TestRED_LinearBlock_SubSecondCadenceAndMonotonicClamp(t *testing.T) {
+	ctx := context.Background()
+	cvm, _, _, _, _ := newCountingHarness(t, nil)
+
+	buildAt := func(at time.Time) time.Time {
+		cvm.inner.clock.Set(at)
+		relayTx := newRelayTxBytes(t, ids.GenerateTestShortID(), ids.GenerateTestID(), clobSubmitPayload(ids.GenerateTestID(), 1))
+		cvm.pendingTxs = append(cvm.pendingTxs, relayTx)
+		blk, err := cvm.BuildBlock(ctx)
+		if err != nil {
+			t.Fatalf("BuildBlock: %v", err)
+		}
+		return blk.(*Block).Timestamp()
+	}
+
+	base := time.Unix(1_700_000_000, 250_000_000) // .25s sub-second component
+	b1 := buildAt(base)
+	b2 := buildAt(base.Add(time.Millisecond))  // +1ms, same wall second
+	b3 := buildAt(base.Add(-time.Millisecond)) // backward clock
+
+	if d := b2.Sub(b1); d != time.Millisecond {
+		t.Fatalf("linear path lost sub-second cadence: b2-b1 = %v, want 1ms", d)
+	}
+	if ns := b1.Nanosecond(); ns != 250_000_000 {
+		t.Fatalf("linear path truncated sub-second component: b1.Nanosecond()=%d, want 250000000", ns)
+	}
+	if b3.Before(b2) {
+		t.Fatalf("linear MONOTONICITY VIOLATION: backward clock produced b3=%v < b2=%v", b3, b2)
+	}
+	if !b3.Equal(b2) {
+		t.Fatalf("linear clamp expected b3==b2 (%v), got %v", b2, b3)
+	}
+}

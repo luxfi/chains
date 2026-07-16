@@ -60,9 +60,6 @@ type ChainVM struct {
 	// Pending transactions for next block
 	pendingTxs [][]byte
 
-	// Block building interval
-	blockInterval time.Duration
-
 	// Channel to notify consensus of new blocks
 	toEngine chan<- vm.Message
 
@@ -80,13 +77,17 @@ type ChainVM struct {
 	networkID uint32
 }
 
-// NewChainVM creates a new ChainVM that wraps a functional DEX VM
+// NewChainVM creates a new ChainVM that wraps a functional DEX VM. The block
+// cadence is NOT set here: it is driven by the consensus engine and bounded only
+// by config.Config.BlockInterval (default 1ms, HFT), the single source of truth.
+// dexvm imposes NO min-block-time / whole-second floor of its own — block times
+// carry sub-second (UnixNano) on the wire and the proposer clamps them merely
+// non-decreasing (see BuildBlock / BuildVertex).
 func NewChainVM(logger log.Logger) *ChainVM {
 	return &ChainVM{
-		inner:         &VM{},
-		log:           logger,
-		blocks:        make(map[ids.ID]*Block),
-		blockInterval: 100 * time.Millisecond, // Default 100ms blocks
+		inner:  &VM{},
+		log:    logger,
+		blocks: make(map[ids.ID]*Block),
 	}
 }
 
