@@ -630,10 +630,11 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 // ParseBlock implements chain.ChainVM interface
 func (vm *VM) ParseBlock(ctx context.Context, bytes []byte) (chain.Block, error) {
 	blk := &Block{vm: vm}
-	if err := json.Unmarshal(bytes, blk); err != nil {
+	if err := parseBlock(bytes, blk); err != nil {
 		return nil, err
 	}
 	blk.ID_ = blk.computeID()
+	blk.bytes = bytes
 	return blk, nil
 }
 
@@ -661,9 +662,11 @@ func (vm *VM) GetBlock(ctx context.Context, id ids.ID) (chain.Block, error) {
 	}
 
 	blk := &Block{vm: vm}
-	if err := json.Unmarshal(bytes, blk); err != nil {
+	if err := parseBlock(bytes, blk); err != nil {
 		return nil, err
 	}
+	blk.ID_ = id
+	blk.bytes = bytes
 	return blk, nil
 }
 
@@ -728,9 +731,9 @@ func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
 // Block Methods (implements chain.Block interface)
 // =============================================================================
 
-// computeID computes the block ID from its contents
+// computeID computes the block ID from its canonical ZAP wire (ID_ excluded).
 func (blk *Block) computeID() ids.ID {
-	bytes, _ := json.Marshal(blk)
+	bytes, _ := blk.Marshal()
 	hash := sha256.Sum256(bytes)
 	return ids.ID(hash)
 }
@@ -804,7 +807,7 @@ func (blk *Block) Accept(ctx context.Context) error {
 
 	// Store the block bytes (commitEngine already flushed engine slots; the block
 	// key is disjoint from the av/state/ keyspace).
-	bytes, err := json.Marshal(blk)
+	bytes, err := blk.Marshal()
 	if err != nil {
 		return err
 	}
@@ -837,7 +840,7 @@ func (blk *Block) Reject(ctx context.Context) error {
 // Bytes returns the serialized block
 func (blk *Block) Bytes() []byte {
 	if blk.bytes == nil {
-		blk.bytes, _ = json.Marshal(blk)
+		blk.bytes, _ = blk.Marshal()
 	}
 	return blk.bytes
 }

@@ -10,9 +10,10 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/gorilla/rpc/v2"
+	"github.com/luxfi/chains/quantumvm/config"
+	"github.com/luxfi/chains/quantumvm/quantum"
 	consensuschain "github.com/luxfi/consensus/engine/chain"
 	"github.com/luxfi/consensus/protocol/quasar"
 	"github.com/luxfi/database"
@@ -23,10 +24,8 @@ import (
 	"github.com/luxfi/node/cache"
 	"github.com/luxfi/node/utils/json"
 	"github.com/luxfi/node/vms/types/fee"
-	"github.com/luxfi/version"
-	"github.com/luxfi/chains/quantumvm/config"
-	"github.com/luxfi/chains/quantumvm/quantum"
 	"github.com/luxfi/timer/mockable"
+	"github.com/luxfi/version"
 	luxvm "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
 )
@@ -264,24 +263,18 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		return nil, fmt.Errorf("failed to process transactions: %w", err)
 	}
 
-	// Create new block with valid transactions
-	// Generate block ID from block data
-	blockData := make([]byte, 0, 100)
-	lastAccepted := vm.getLastAcceptedID()
-	blockData = append(blockData, lastAccepted[:]...)
-	heightBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(heightBytes, vm.getHeight()+1)
-	blockData = append(blockData, heightBytes...)
-
-	blockID, _ := ids.ToID(blockData)
+	// Create new block with valid transactions. The id is the content hash of
+	// the canonical wire (computeID = sha256(Bytes())); it is derived AFTER the
+	// structural fields are set, and the wire does not carry the id, so
+	// Bytes()/id are independent of ordering.
 	block := &Block{
-		id:           blockID,
 		timestamp:    vm.clock.Time(),
 		height:       vm.getHeight() + 1,
 		parentID:     vm.getLastAcceptedID(),
 		transactions: validTxs,
 		vm:           vm,
 	}
+	block.id = block.computeID()
 
 	// Sign block with quantum signature if enabled
 	if vm.Config.QuantumStampEnabled {
@@ -481,34 +474,11 @@ func (vm *VM) parseGenesis(genesisBytes []byte) error {
 	return nil
 }
 
-// parseBlock parses a block from bytes
+// parseBlock parses a block from its ZAP wire (see wire.go). The transaction set
+// is not reconstructed — the concrete Transaction is an interface with no
+// on-chain deserializer; the raw wire is retained for signature re-verification.
 func (vm *VM) parseBlock(blockBytes []byte) (*Block, error) {
-	// Block format: id(32) + timestamp(8) + height(8) + parentID(32) + txCount(4) + txs...
-	minSize := 32 + 8 + 8 + 32 + 4
-	if len(blockBytes) < minSize {
-		return nil, fmt.Errorf("block bytes too short: got %d, need at least %d", len(blockBytes), minSize)
-	}
-
-	var id ids.ID
-	copy(id[:], blockBytes[:32])
-
-	timestamp := binary.BigEndian.Uint64(blockBytes[32:40])
-	height := binary.BigEndian.Uint64(blockBytes[40:48])
-
-	var parentID ids.ID
-	copy(parentID[:], blockBytes[48:80])
-
-	txCount := binary.BigEndian.Uint32(blockBytes[80:84])
-	_ = txCount // Transaction parsing would go here
-
-	return &Block{
-		id:        id,
-		timestamp: time.Unix(int64(timestamp), 0),
-		height:    height,
-		parentID:  parentID,
-		vm:        vm,
-		bytes:     blockBytes,
-	}, nil
+	return parseBlockBytes(vm, blockBytes)
 }
 
 // initializeHTTPHandlers sets up HTTP handlers
@@ -580,10 +550,10 @@ func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
 	return chain.HealthResult{
 		Healthy: !vm.isShuttingDown(),
 		Details: map[string]string{
-			"version":         Version,
-			"quantumEnabled":  fmt.Sprintf("%v", vm.Config.QuantumStampEnabled),
-			"coronaEnabled": fmt.Sprintf("%v", vm.Config.CoronaEnabled),
-			"pendingTxs":      fmt.Sprintf("%d", vm.txPool.PendingCount()),
+			"version":        Version,
+			"quantumEnabled": fmt.Sprintf("%v", vm.Config.QuantumStampEnabled),
+			"coronaEnabled":  fmt.Sprintf("%v", vm.Config.CoronaEnabled),
+			"pendingTxs":     fmt.Sprintf("%d", vm.txPool.PendingCount()),
 		},
 	}, nil
 }

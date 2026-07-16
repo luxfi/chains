@@ -9,8 +9,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/luxfi/ids"
 	"github.com/luxfi/chains/quantumvm/quantum"
+	"github.com/luxfi/ids"
 )
 
 var (
@@ -167,43 +167,6 @@ func (b *Block) TimestampUnix() int64 {
 // so we return 0 (Unknown) until a status field is added.
 func (b *Block) Status() uint8 {
 	return 0
-}
-
-// Bytes returns the block bytes
-func (b *Block) Bytes() []byte {
-	if b.bytes != nil {
-		return b.bytes
-	}
-
-	// Serialize block
-	size := 32 + 8 + 8 + 32 + 4 // id + timestamp + height + parentID + tx count
-	for _, tx := range b.transactions {
-		size += len(tx.Bytes())
-	}
-
-	bytes := make([]byte, 0, size)
-	bytes = append(bytes, b.id[:]...)
-
-	timestampBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestampBytes, uint64(b.timestamp.Unix()))
-	bytes = append(bytes, timestampBytes...)
-
-	heightBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(heightBytes, b.height)
-	bytes = append(bytes, heightBytes...)
-
-	bytes = append(bytes, b.parentID[:]...)
-
-	txCountBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(txCountBytes, uint32(len(b.transactions)))
-	bytes = append(bytes, txCountBytes...)
-
-	for _, tx := range b.transactions {
-		bytes = append(bytes, tx.Bytes()...)
-	}
-
-	b.bytes = bytes
-	return bytes
 }
 
 // String returns a string representation of the block

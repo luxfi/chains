@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 
 	"github.com/luxfi/consensus/core/choices"
@@ -36,12 +35,12 @@ type AIVertex struct {
 	vm      *VM
 }
 
-func (v *AIVertex) ID() ids.ID          { return v.id }
-func (v *AIVertex) Bytes() []byte        { return v.bytes }
-func (v *AIVertex) Height() uint64       { return v.height }
-func (v *AIVertex) Epoch() uint32        { return v.epoch }
-func (v *AIVertex) Parents() []ids.ID    { return v.parents }
-func (v *AIVertex) Txs() []ids.ID        { return v.txIDs }
+func (v *AIVertex) ID() ids.ID             { return v.id }
+func (v *AIVertex) Bytes() []byte          { return v.bytes }
+func (v *AIVertex) Height() uint64         { return v.height }
+func (v *AIVertex) Epoch() uint32          { return v.epoch }
+func (v *AIVertex) Parents() []ids.ID      { return v.parents }
+func (v *AIVertex) Txs() []ids.ID          { return v.txIDs }
 func (v *AIVertex) Status() choices.Status { return v.status }
 
 func (v *AIVertex) Verify(ctx context.Context) error {
@@ -59,10 +58,7 @@ func (v *AIVertex) Accept(ctx context.Context) error {
 	v.vm.mu.Lock()
 	defer v.vm.mu.Unlock()
 
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
+	b := marshalVertex(v)
 	if err := v.vm.db.Put(v.id[:], b); err != nil {
 		return err
 	}
@@ -171,14 +167,14 @@ func (vm *VM) BuildVertex(ctx context.Context) (vertex.Vertex, error) {
 		vm:      vm,
 	}
 	v.id = v.computeID()
-	v.bytes, _ = json.Marshal(v)
+	v.bytes = marshalVertex(v)
 	return v, nil
 }
 
 // ParseVertex deserializes a vertex from bytes.
 func (vm *VM) ParseVertex(ctx context.Context, b []byte) (vertex.Vertex, error) {
 	v := &AIVertex{vm: vm}
-	if err := json.Unmarshal(b, v); err != nil {
+	if err := parseVertex(b, v); err != nil {
 		return nil, err
 	}
 	v.id = v.computeID()
