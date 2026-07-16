@@ -52,64 +52,6 @@ func (b *Block) Parent() ids.ID       { return b.parentID }
 func (b *Block) Height() uint64       { return b.height }
 func (b *Block) Timestamp() time.Time { return b.timestamp }
 
-// Bytes serializes the block (parent, height, timestamp, transactions).
-func (b *Block) Bytes() []byte {
-	data := make([]byte, 0, 256)
-	data = append(data, b.parentID[:]...)
-	var u8 [8]byte
-	binary.BigEndian.PutUint64(u8[:], b.height)
-	data = append(data, u8[:]...)
-	binary.BigEndian.PutUint64(u8[:], uint64(b.timestamp.Unix()))
-	data = append(data, u8[:]...)
-	var u4 [4]byte
-	binary.BigEndian.PutUint32(u4[:], uint32(len(b.transactions)))
-	data = append(data, u4[:]...)
-	for _, tx := range b.transactions {
-		txb := tx.Bytes()
-		binary.BigEndian.PutUint32(u4[:], uint32(len(txb)))
-		data = append(data, u4[:]...)
-		data = append(data, txb...)
-	}
-	return data
-}
-
-func parseBlock(vm *VM, data []byte) (*Block, error) {
-	c := &cursor{b: data}
-	b := &Block{vm: vm}
-	parent, err := c.fixed(32)
-	if err != nil {
-		return nil, err
-	}
-	copy(b.parentID[:], parent)
-	if b.height, err = c.u64(); err != nil {
-		return nil, err
-	}
-	ts, err := c.u64()
-	if err != nil {
-		return nil, err
-	}
-	b.timestamp = time.Unix(int64(ts), 0)
-	cnt, err := c.fixed(4)
-	if err != nil {
-		return nil, err
-	}
-	n := int(binary.BigEndian.Uint32(cnt))
-	b.transactions = make([]*Transaction, 0, n)
-	for i := 0; i < n; i++ {
-		txb, err := c.bytes()
-		if err != nil {
-			return nil, err
-		}
-		tx, err := ParseTransaction(txb)
-		if err != nil {
-			return nil, err
-		}
-		b.transactions = append(b.transactions, tx)
-	}
-	b.id = b.computeID()
-	return b, nil
-}
-
 // Verify checks the block can be accepted WITHOUT mutating state: the parent
 // exists, every transaction is well-formed and authenticated, and every payer
 // can afford its fee — including the cumulative fees of multiple transactions

@@ -6,11 +6,11 @@ package dexvm
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"time"
 
-	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/ids"
+	"github.com/luxfi/vm/chain"
+	"github.com/luxfi/zap"
 )
 
 // Ensure Block implements chain.Block
@@ -83,55 +83,52 @@ func (b *Block) Timestamp() time.Time {
 	return b.timestamp
 }
 
+// Block wire (native ZAP, object offsets; RED finding #9). The block carries the
+// proposer's confirmed d-chain fills so every validator settles from bytes
+// instead of relaying per-validator:
+//
+//	Height    u64   @ 0
+//	Timestamp i64   @ 8    (UnixNano — sub-second cadence preserved, no floor)
+//	ParentID  32B   @ 16
+//	TxLens    list  @ 48   (u32 per tx; ORDER is the DEX fairness invariant)
+//	TxBlob    bytes @ 56   (concatenated raw tx bytes, order preserved)
+//	Fills     bytes @ 64   (carried-fills section: encodeCarriedFills output)
+//
+// blockID = sha256(Bytes()); the fills ride in the bytes, so the id commits to
+// them (a peer cannot swap the proposer's fills and keep the same id). Changing
+// this wire is a network-upgrade-gated, lockstep validator change.
+const (
+	blkHeight = 0
+	blkTime   = 8
+	blkParent = 16
+	blkTxLens = 48
+	blkTxBlob = 56
+	blkFills  = 64
+	blkSize   = 72
+)
+
 // Bytes returns the serialized block.
-//
-// WIRE FORMAT (NETWORK-UPGRADE-GATED, LOCKSTEP — RED finding #9). The block now
-// carries the proposer's confirmed d-chain fills so every validator settles from
-// bytes instead of relaying per-validator. The layout is:
-//
-//	height[8] | timestamp[8] | parentID[32] |
-//	txCount[4] | txCount × ( txLen[4] | txBytes ) |
-//	carried-fills section (carried_fills.go encodeCarriedFills):
-//	  entryCount[4] | entryCount × ( txIndex[4] | fillCount[4] | fillCount×17 ) |
-//	  sigLen[4] | sig[sigLen]   // reserved fill-attestation, empty today
-//
-// The txCount prefix (NEW) makes the txs self-delimiting so the carried-fills
-// section can follow unambiguously; the prior format ran txs to end-of-buffer.
-// This is a consensus-breaking change activated in lockstep across the validator
-// set behind a network upgrade.
 func (b *Block) Bytes() []byte {
-	size := 8 + 8 + 32 + 4 // header + txCount
-	for _, tx := range b.txs {
-		size += 4 + len(tx) // length prefix + tx
+	txLens := make([]uint32, len(b.txs))
+	var txBlob []byte
+	for i, tx := range b.txs {
+		txLens[i] = uint32(len(tx))
+		txBlob = append(txBlob, tx...)
 	}
 	fillsSection := encodeCarriedFills(b.carriedFills, b.fillSig)
-	size += len(fillsSection)
 
-	data := make([]byte, size)
-	offset := 0
+	bld := zap.NewBuilder(zap.HeaderSize + blkSize + len(txBlob) + 4*len(txLens) + len(fillsSection) + 128)
+	txLensOff := writeU32List(bld, txLens)
 
-	binary.BigEndian.PutUint64(data[offset:], b.height)
-	offset += 8
-
-	binary.BigEndian.PutUint64(data[offset:], uint64(b.timestamp.UnixNano()))
-	offset += 8
-
-	copy(data[offset:], b.parentID[:])
-	offset += 32
-
-	binary.BigEndian.PutUint32(data[offset:], uint32(len(b.txs)))
-	offset += 4
-	for _, tx := range b.txs {
-		binary.BigEndian.PutUint32(data[offset:], uint32(len(tx)))
-		offset += 4
-		copy(data[offset:], tx)
-		offset += len(tx)
-	}
-
-	copy(data[offset:], fillsSection)
-	offset += len(fillsSection)
-
-	return data
+	ob := bld.StartObject(blkSize)
+	ob.SetUint64(blkHeight, b.height)
+	ob.SetInt64(blkTime, b.timestamp.UnixNano())
+	ob.SetBytesFixed(blkParent, b.parentID[:])
+	ob.SetList(blkTxLens, txLensOff, len(txLens))
+	ob.SetBytes(blkTxBlob, txBlob)
+	ob.SetBytes(blkFills, fillsSection)
+	ob.FinishAsRoot()
+	return bld.Finish()
 }
 
 // Verify verifies the block is valid by processing it deterministically, then
@@ -193,53 +190,42 @@ func (b *Block) Status() uint8 {
 // section (RED #9). Every length is bounds-checked so a malformed block is
 // rejected as errInvalidBlock rather than panicking or over-allocating.
 func parseBlock(vm *ChainVM, data []byte) (*Block, error) {
-	if len(data) < 8+8+32+4 { // header + txCount
+	msg, err := zap.Parse(data)
+	if err != nil {
 		return nil, errInvalidBlock
 	}
+	if msg.Size() != len(data) {
+		return nil, errInvalidBlock
+	}
+	o := msg.Root()
 
 	b := &Block{
 		vm:     vm,
 		status: StatusUnknown,
 	}
+	b.height = o.Uint64(blkHeight)
+	b.timestamp = time.Unix(0, o.Int64(blkTime))
+	copy(b.parentID[:], o.BytesFixedSlice(blkParent, 32))
 
-	offset := 0
-
-	b.height = binary.BigEndian.Uint64(data[offset:])
-	offset += 8
-
-	ts := binary.BigEndian.Uint64(data[offset:])
-	b.timestamp = time.Unix(0, int64(ts))
-	offset += 8
-
-	copy(b.parentID[:], data[offset:offset+32])
-	offset += 32
-
-	// txCount-delimited transactions (the prefix makes the carried-fills section
-	// that follows unambiguous).
-	txCount := binary.BigEndian.Uint32(data[offset:])
-	offset += 4
-	for i := uint32(0); i < txCount; i++ {
-		if offset+4 > len(data) {
+	// txs in wire order — the DEX fairness/determinism invariant.
+	lens := readU32List(o, blkTxLens)
+	blob := o.Bytes(blkTxBlob)
+	pos := 0
+	for _, l := range lens {
+		if pos+int(l) > len(blob) {
 			return nil, errInvalidBlock
 		}
-		txLen := binary.BigEndian.Uint32(data[offset:])
-		offset += 4
-		if offset+int(txLen) > len(data) {
-			return nil, errInvalidBlock
-		}
-		tx := make([]byte, txLen)
-		copy(tx, data[offset:offset+int(txLen)])
+		tx := make([]byte, l)
+		copy(tx, blob[pos:pos+int(l)])
 		b.txs = append(b.txs, tx)
-		offset += int(txLen)
+		pos += int(l)
 	}
 
 	// Carried-fills section: the proposer's confirmed fills every validator settles
-	// from. Must be exactly consumed to end-of-block (no trailing garbage).
-	entries, sig, consumed, err := decodeCarriedFills(data[offset:])
-	if err != nil {
-		return nil, errInvalidBlock
-	}
-	if offset+consumed != len(data) {
+	// from. Must be exactly consumed within its field (no trailing garbage).
+	fills := o.Bytes(blkFills)
+	entries, sig, consumed, err := decodeCarriedFills(fills)
+	if err != nil || consumed != len(fills) {
 		return nil, errInvalidBlock
 	}
 	b.carriedFills = entries
@@ -250,4 +236,23 @@ func parseBlock(vm *ChainVM, data []byte) (*Block, error) {
 	copy(b.id[:], hash[:])
 
 	return b, nil
+}
+
+func writeU32List(b *zap.Builder, xs []uint32) int {
+	lb := b.StartList(4)
+	for _, x := range xs {
+		lb.AddUint32(x)
+	}
+	off, _ := lb.Finish()
+	return off
+}
+
+func readU32List(o zap.Object, ptrOff int) []uint32 {
+	l := o.ListStride(ptrOff, 4)
+	n := l.Len()
+	out := make([]uint32, n)
+	for i := 0; i < n; i++ {
+		out[i] = l.Uint32(i)
+	}
+	return out
 }

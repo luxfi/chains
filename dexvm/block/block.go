@@ -6,13 +6,13 @@ package block
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"time"
 
-	"github.com/luxfi/ids"
 	"github.com/luxfi/chains/dexvm/txs"
+	"github.com/luxfi/ids"
+	"github.com/luxfi/zap"
 )
 
 var (
@@ -206,68 +206,56 @@ func (b *Block) computeID() ids.ID {
 	return id
 }
 
-// serialize serializes the block to bytes.
+// Block wire (native ZAP, object offsets). timestamp is nanoseconds; the
+// transaction list preserves proposer order.
+//
+//	ParentID  32B   @ 0
+//	Height    u64   @ 32
+//	Timestamp i64   @ 40   (nanoseconds)
+//	TxRoot    32B   @ 48
+//	StateRoot 32B   @ 80
+//	Producer  20B   @ 112
+//	Signature bytes @ 132
+//	TxLens    list  @ 140  (u32 per tx; order preserved)
+//	TxBlob    bytes @ 148  (concatenated tx wire bytes)
+const (
+	sbParent = 0
+	sbHeight = 32
+	sbTime   = 40
+	sbTxRoot = 48
+	sbState  = 80
+	sbProd   = 112
+	sbSig    = 132
+	sbTxLens = 140
+	sbTxBlob = 148
+	sbSize   = 156
+)
+
+// serialize serializes the block to its canonical ZAP wire.
 func (b *Block) serialize() []byte {
-	// Calculate size
-	// Header: parentID (32) + height (8) + timestamp (8) + txRoot (32) + stateRoot (32) + producer (20) + sigLen (4) + sig
-	// Txs: numTxs (4) + [txLen (4) + txBytes]...
-
-	sigLen := len(b.signature)
-	txsSize := 4
-	for _, tx := range b.transactions {
-		txsSize += 4 + len(tx.Bytes())
+	txLens := make([]uint32, len(b.transactions))
+	var txBlob []byte
+	for i, tx := range b.transactions {
+		tb := tx.Bytes()
+		txLens[i] = uint32(len(tb))
+		txBlob = append(txBlob, tb...)
 	}
 
-	headerSize := 32 + 8 + 8 + 32 + 32 + 20 + 4 + sigLen
-	totalSize := headerSize + txsSize
+	bld := zap.NewBuilder(zap.HeaderSize + sbSize + len(b.signature) + len(txBlob) + 4*len(txLens) + 128)
+	txLensOff := writeU32List(bld, txLens)
 
-	data := make([]byte, totalSize)
-	offset := 0
-
-	// Parent ID
-	copy(data[offset:], b.parentID[:])
-	offset += 32
-
-	// Height
-	binary.BigEndian.PutUint64(data[offset:], b.height)
-	offset += 8
-
-	// Timestamp
-	binary.BigEndian.PutUint64(data[offset:], uint64(b.timestamp))
-	offset += 8
-
-	// TX Root
-	copy(data[offset:], b.txRoot[:])
-	offset += 32
-
-	// State Root
-	copy(data[offset:], b.stateRoot[:])
-	offset += 32
-
-	// Producer
-	copy(data[offset:], b.producer[:])
-	offset += 20
-
-	// Signature length and signature
-	binary.BigEndian.PutUint32(data[offset:], uint32(sigLen))
-	offset += 4
-	copy(data[offset:], b.signature)
-	offset += sigLen
-
-	// Number of transactions
-	binary.BigEndian.PutUint32(data[offset:], uint32(len(b.transactions)))
-	offset += 4
-
-	// Transactions
-	for _, tx := range b.transactions {
-		txBytes := tx.Bytes()
-		binary.BigEndian.PutUint32(data[offset:], uint32(len(txBytes)))
-		offset += 4
-		copy(data[offset:], txBytes)
-		offset += len(txBytes)
-	}
-
-	return data
+	ob := bld.StartObject(sbSize)
+	ob.SetBytesFixed(sbParent, b.parentID[:])
+	ob.SetUint64(sbHeight, b.height)
+	ob.SetInt64(sbTime, b.timestamp)
+	ob.SetBytesFixed(sbTxRoot, b.txRoot[:])
+	ob.SetBytesFixed(sbState, b.stateRoot[:])
+	ob.SetBytesFixed(sbProd, b.producer[:])
+	ob.SetBytes(sbSig, b.signature)
+	ob.SetList(sbTxLens, txLensOff, len(txLens))
+	ob.SetBytes(sbTxBlob, txBlob)
+	ob.FinishAsRoot()
+	return bld.Finish()
 }
 
 // BlockParser parses blocks from bytes.
@@ -282,89 +270,71 @@ func NewBlockParser() *BlockParser {
 	}
 }
 
-// Parse parses a block from bytes.
+// Parse parses a block from its ZAP wire (the inverse of serialize). Every
+// length is bounds-checked; a malformed block is rejected rather than panicking.
 func (p *BlockParser) Parse(data []byte) (*Block, error) {
-	if len(data) < 136 { // Minimum header size
-		return nil, errors.New("block data too short")
+	msg, err := zap.Parse(data)
+	if err != nil {
+		return nil, err
 	}
-
-	b := &Block{
-		bytes: data,
+	if msg.Size() != len(data) {
+		return nil, errors.New("invalid block: trailing bytes")
 	}
+	o := msg.Root()
 
-	offset := 0
+	b := &Block{bytes: data}
+	copy(b.parentID[:], o.BytesFixedSlice(sbParent, 32))
+	b.height = o.Uint64(sbHeight)
+	b.timestamp = o.Int64(sbTime)
+	copy(b.txRoot[:], o.BytesFixedSlice(sbTxRoot, 32))
+	copy(b.stateRoot[:], o.BytesFixedSlice(sbState, 32))
+	copy(b.producer[:], o.BytesFixedSlice(sbProd, 20))
+	b.signature = appendBytes(o.Bytes(sbSig))
 
-	// Parent ID
-	copy(b.parentID[:], data[offset:offset+32])
-	offset += 32
-
-	// Height
-	b.height = binary.BigEndian.Uint64(data[offset:])
-	offset += 8
-
-	// Timestamp
-	b.timestamp = int64(binary.BigEndian.Uint64(data[offset:]))
-	offset += 8
-
-	// TX Root
-	copy(b.txRoot[:], data[offset:offset+32])
-	offset += 32
-
-	// State Root
-	copy(b.stateRoot[:], data[offset:offset+32])
-	offset += 32
-
-	// Producer
-	copy(b.producer[:], data[offset:offset+20])
-	offset += 20
-
-	// Signature length and signature
-	if offset+4 > len(data) {
-		return nil, errors.New("invalid block: missing signature length")
-	}
-	sigLen := binary.BigEndian.Uint32(data[offset:])
-	offset += 4
-
-	if offset+int(sigLen) > len(data) {
-		return nil, errors.New("invalid block: signature truncated")
-	}
-	b.signature = make([]byte, sigLen)
-	copy(b.signature, data[offset:offset+int(sigLen)])
-	offset += int(sigLen)
-
-	// Number of transactions
-	if offset+4 > len(data) {
-		return nil, errors.New("invalid block: missing tx count")
-	}
-	numTxs := binary.BigEndian.Uint32(data[offset:])
-	offset += 4
-
-	// Parse transactions
-	b.transactions = make([]txs.Tx, 0, numTxs)
-	for i := uint32(0); i < numTxs; i++ {
-		if offset+4 > len(data) {
-			return nil, errors.New("invalid block: tx length truncated")
+	lens := readU32List(o, sbTxLens)
+	blob := o.Bytes(sbTxBlob)
+	b.transactions = make([]txs.Tx, 0, len(lens))
+	pos := 0
+	for i, l := range lens {
+		if pos+int(l) > len(blob) {
+			return nil, fmt.Errorf("invalid block: tx %d truncated", i)
 		}
-		txLen := binary.BigEndian.Uint32(data[offset:])
-		offset += 4
-
-		if offset+int(txLen) > len(data) {
-			return nil, errors.New("invalid block: tx data truncated")
-		}
-		txBytes := data[offset : offset+int(txLen)]
-		offset += int(txLen)
-
-		tx, err := p.txParser.Parse(txBytes)
+		tx, err := p.txParser.Parse(blob[pos : pos+int(l)])
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse tx %d: %w", i, err)
 		}
 		b.transactions = append(b.transactions, tx)
+		pos += int(l)
 	}
 
-	// Compute ID
 	b.id = b.computeID()
-
 	return b, nil
+}
+
+func writeU32List(b *zap.Builder, xs []uint32) int {
+	lb := b.StartList(4)
+	for _, x := range xs {
+		lb.AddUint32(x)
+	}
+	off, _ := lb.Finish()
+	return off
+}
+
+func readU32List(o zap.Object, ptrOff int) []uint32 {
+	l := o.ListStride(ptrOff, 4)
+	n := l.Len()
+	out := make([]uint32, n)
+	for i := 0; i < n; i++ {
+		out[i] = l.Uint32(i)
+	}
+	return out
+}
+
+func appendBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	return append([]byte(nil), b...)
 }
 
 // Builder builds new blocks.

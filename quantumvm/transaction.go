@@ -4,14 +4,14 @@
 package quantumvm
 
 import (
-	"encoding/binary"
+	"crypto/sha256"
 	"errors"
 	"sync"
 	"time"
 
+	"github.com/luxfi/chains/quantumvm/quantum"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/chains/quantumvm/quantum"
 )
 
 // Transaction represents a QVM transaction
@@ -37,30 +37,15 @@ type BaseTransaction struct {
 	quantumSignature *quantum.QuantumSignature
 }
 
-// ID returns the transaction ID
+// ID returns the transaction ID — the content hash of the canonical ZAP wire
+// (sha256(Bytes())), matching the other VMs in this repo. The prior
+// ids.ToID(Bytes()) required an exactly-32-byte input and silently yielded
+// ids.Empty for the always-≥32-byte wire, collapsing every tx to one pool slot.
 func (tx *BaseTransaction) ID() ids.ID {
 	if tx.id == ids.Empty {
-		tx.id, _ = ids.ToID(tx.Bytes())
+		tx.id = ids.ID(sha256.Sum256(tx.Bytes()))
 	}
 	return tx.id
-}
-
-// Bytes returns the transaction bytes
-func (tx *BaseTransaction) Bytes() []byte {
-	size := 8 + 8 + len(tx.data) // timestamp + nonce + data
-	bytes := make([]byte, 0, size)
-
-	timestampBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestampBytes, uint64(tx.timestamp.Unix()))
-	bytes = append(bytes, timestampBytes...)
-
-	nonceBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(nonceBytes, tx.nonce)
-	bytes = append(bytes, nonceBytes...)
-
-	bytes = append(bytes, tx.data...)
-
-	return bytes
 }
 
 // GetQuantumSignature returns the quantum signature
