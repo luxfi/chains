@@ -15,16 +15,16 @@ import (
 type CertLane uint8
 
 const (
-	LaneBLS              CertLane = 0
-	LaneCorona         CertLane = 1
-	LaneMLDSAGroth16     CertLane = 2
-	LaneAChainAttest     CertLane = 3
-	LaneBChainBridge     CertLane = 4
-	LaneMChainCGGMP21    CertLane = 5
-	LaneMChainFROST      CertLane = 6
+	LaneBLS             CertLane = 0
+	LaneCorona          CertLane = 1
+	LaneMLDSAGroth16    CertLane = 2
+	LaneAChainAttest    CertLane = 3
+	LaneBChainBridge    CertLane = 4
+	LaneMChainCGGMP21   CertLane = 5
+	LaneMChainFROST     CertLane = 6
 	LaneMChainCoronaGen CertLane = 7
-	LaneFChainTFHE       CertLane = 8
-	LaneFChainBootstrap  CertLane = 9
+	LaneFChainTFHE      CertLane = 8
+	LaneFChainBootstrap CertLane = 9
 )
 
 // IsMChain reports whether the lane is owned by M-Chain.

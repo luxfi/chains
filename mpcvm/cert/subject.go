@@ -17,16 +17,16 @@ import (
 // value is still a value, and the chain that owns the root is
 // expected to provide its current root on every round.
 type Roots struct {
-	ParentBlock        [32]byte
-	StateRoot          [32]byte
-	ExecRoot           [32]byte
-	PChainValidator    [32]byte
-	QChainCeremony     [32]byte
-	ZChainVK           [32]byte
-	AChainAttestation  [32]byte
-	BChainBridge       [32]byte
-	MChainCeremony     [32]byte
-	FChainFHE          [32]byte
+	ParentBlock       [32]byte
+	StateRoot         [32]byte
+	ExecRoot          [32]byte
+	PChainValidator   [32]byte
+	QChainCeremony    [32]byte
+	ZChainVK          [32]byte
+	AChainAttestation [32]byte
+	BChainBridge      [32]byte
+	MChainCeremony    [32]byte
+	FChainFHE         [32]byte
 }
 
 // BindSubject computes certificate_subject = H(... all roots ...).

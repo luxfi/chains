@@ -23,10 +23,8 @@ package mpcvm
 // threshold protocol" (executor.go). None interprets another's layer.
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"sort"
 
@@ -126,81 +124,8 @@ func (vm *VM) deliverCeremonyMessage(sessionID string, msg *protocol.Message) {
 	router.Deliver(msg)
 }
 
-// thresholdSignCMP runs the CGGMP21 threshold-ECDSA sign for a custody key
-// across the committee over the gossip transport, returning this validator's
-// copy of the (canonical, low-S) secp256k1 signature. Every honest signer
-// returns the same R‖S.
-func (vm *VM) thresholdSignCMP(
-	ctx context.Context,
-	key *ManagedKey,
-	session *SigningSession,
-) (*ecdsaSignature, []party.ID, error) {
-	if key.CMPConfig == nil {
-		return nil, nil, errors.New("mpcvm: CGGMP21 custody key has no config")
-	}
-	if vm.sender == nil {
-		return nil, nil, errors.New("mpcvm: no warp sender; cross-validator signing unavailable")
-	}
-
-	// The signer set is the key's full party set. Every committee member
-	// participates. (Dynamic T+1 quorum selection under partial availability —
-	// pick the minimal online subset — is a documented follow-up; it does not
-	// affect signature validity, only liveness under faults.)
-	signers := key.PartyIDs
-	if len(signers) == 0 {
-		for id := range key.CMPConfig.Public {
-			signers = append(signers, id)
-		}
-	}
-
-	nodes, peers, err := resolveCommittee(signers)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	cid := ceremonyID(key.KeyID, session.MessageHash, signers)
-	appNet := newWarpAppNetwork(vm.sender, vm.rt.NodeID, nodes)
-	router := newGossipRouter(ctx, cid, vm.partyID, appNet, peers)
-
-	vm.registerSessionRouter(cid, router)
-	defer vm.unregisterSessionRouter(cid)
-
-	sig, err := vm.protocolExecutor.RunCMPSign(ctx, cid, key.CMPConfig, signers, session.MessageHash, router)
-	if err != nil {
-		return nil, nil, err
-	}
-	return &ecdsaSignature{R: sig.R, S: sig.S, V: sig.V}, signers, nil
-}
-
-// signViaHandler is the legacy registry-handler signing path (LSS and any other
-// protocol whose share is carried in ManagedKey.Config). Kept intact and in its
-// own lane; the CGGMP21 bridge-custody path does not touch it.
-func (vm *VM) signViaHandler(
-	ctx context.Context,
-	key *ManagedKey,
-	session *SigningSession,
-) (*ecdsaSignature, []party.ID, error) {
-	handler, err := vm.protocolRegistry.Get(Protocol(key.KeyType))
-	if err != nil {
-		handler, err = vm.protocolRegistry.Get(ProtocolLSS)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-	if key.Config == nil {
-		return nil, nil, errors.New("mpcvm: no key share available for signing")
-	}
-	share := &lssKeyShare{
-		config:  key.Config,
-		pubKey:  key.PublicKey,
-		partyID: vm.partyID,
-		thresh:  key.Threshold,
-		total:   key.TotalParties,
-		gen:     key.Generation,
-	}
-	sig, err := handler.Sign(ctx, share, session.MessageHash, key.PartyIDs)
-	if err != nil {
-		return nil, nil, err
-	}
-	return &ecdsaSignature{R: sig.R().Bytes(), S: sig.S().Bytes(), V: sig.V()}, key.PartyIDs, nil
-}
+// There is exactly one signing path: custody.go's thresholdSign, driven by
+// RunSign. The VM previously carried two more — a CGGMP21 path keyed off an
+// in-memory ManagedKey and a registry-handler fallback — and a key could be
+// signed under whichever one the caller happened to reach, with different
+// quorum rules on each. Fan-in at the router, not at the caller.
