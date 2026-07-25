@@ -13,6 +13,7 @@ package mpcvm
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,7 +22,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/luxfi/vm/chain"
+	"github.com/luxfi/constants"
+	luxcrypto "github.com/luxfi/crypto"
 	"github.com/luxfi/crypto/secp256k1"
 	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
@@ -32,9 +34,9 @@ import (
 	"github.com/luxfi/threshold/pkg/party"
 	"github.com/luxfi/threshold/pkg/pool"
 	"github.com/luxfi/threshold/pkg/protocol"
-	cmpconfig "github.com/luxfi/threshold/protocols/cmp/config"
-	lssconfig "github.com/luxfi/threshold/protocols/lss/config"
+	"github.com/luxfi/threshold/pkg/quorum"
 	vmcore "github.com/luxfi/vm"
+	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/warp"
 )
 
@@ -47,30 +49,33 @@ var (
 		Patch: 0,
 	}
 
-	// Error definitions
-	ErrNotInitialized      = errors.New("MPC not initialized")
-	ErrKeygenInProgress    = errors.New("keygen already in progress")
-	ErrSigningInProgress   = errors.New("signing session already in progress")
-	ErrInvalidThreshold    = errors.New("invalid threshold configuration")
-	ErrInsufficientParties = errors.New("insufficient parties for operation")
-	ErrSessionNotFound     = errors.New("session not found")
-	ErrSessionExpired      = errors.New("session expired")
-	ErrUnauthorizedChain   = errors.New("unauthorized chain")
-	ErrQuotaExceeded       = errors.New("signing quota exceeded")
-	ErrInvalidSignature    = errors.New("invalid signature")
-	ErrKeyNotFound         = errors.New("key not found")
+	// Errors this VM owns. Everything about a KEY (unknown, already registered,
+	// share not held) is state.go's vocabulary and is not restated here: two
+	// spellings of "no such key" is one spelling too many.
+	ErrInvalidThreshold  = errors.New("mpcvm: invalid threshold configuration")
+	ErrUnauthorizedChain = errors.New("mpcvm: unauthorized chain")
+	ErrQuotaExceeded     = errors.New("mpcvm: signing quota exceeded")
 )
 
-// ThresholdConfig contains VM configuration
+// ThresholdConfig contains VM configuration.
 type ThresholdConfig struct {
-	// MPC Configuration
-	Threshold    int `json:"threshold"`    // t: Threshold (t+1 parties needed)
-	TotalParties int `json:"totalParties"` // n: Total number of MPC nodes
+	// Policy is the default signing policy for keys created on this chain,
+	// written the way operators say it: "7-of-10" — seven of ten parties must
+	// cooperate to produce one signature.
+	//
+	// It is deliberately NOT a bare number. A field called `threshold: 7` is
+	// read as the signer count by operators and as the polynomial degree by
+	// every threshold library, and those differ by one; a config that meant
+	// 7-of-10 and was read as a degree produces an 8-of-10 key, silently. The
+	// operator form cannot be misread, and the degree is derived from it at one
+	// place (quorum.Policy.Degree) at the keygen boundary.
+	Policy quorum.Policy `json:"policy"`
 
 	// Session Configuration
-	SessionTimeout      time.Duration `json:"sessionTimeout"`      // Max time for a signing session
-	MaxActiveSessions   int           `json:"maxActiveSessions"`   // Max concurrent signing sessions
-	MaxSessionsPerChain int           `json:"maxSessionsPerChain"` // Max sessions per requesting chain
+	SessionTimeout      time.Duration `json:"sessionTimeout"`      // Max wall-clock for one ceremony
+	MaxActiveSessions   int           `json:"maxActiveSessions"`   // Max concurrent ceremonies
+	MaxSessionsPerChain int           `json:"maxSessionsPerChain"` // Max concurrent ceremonies per requesting chain
+	MaxOpsPerBlock      int           `json:"maxOpsPerBlock"`      // Max operations in one block
 
 	// Quota Configuration (daily limits)
 	DailySigningQuota map[string]uint64 `json:"dailySigningQuota"` // ChainID -> daily signing limit
@@ -104,14 +109,10 @@ type VM struct {
 	toEngine chan<- vmcore.Message
 	log      log.Logger
 
-	// Protocol Registry - supports multiple threshold protocols
-	protocolRegistry *ProtocolRegistry
-
-	// Protocol Executor - handles actual protocol execution with timeouts
+	// protocolExecutor drives one threshold protocol to completion over a
+	// router. It is the only part of this VM that knows the threshold library
+	// exists; everything above it speaks in ceremonies.
 	protocolExecutor *ProtocolExecutor
-
-	// Message Router for multi-party communication
-	messageRouter MessageRouter
 
 	// Cross-validator MPC transport.
 	//   sender           — the node's canonical warp sender (block.Init.Sender);
@@ -128,21 +129,34 @@ type VM struct {
 	sessionRouters   map[string]*gossipRouter
 	pendingBySession map[string][]*protocol.Message
 
-	// LSS MPC Protocol Components (default protocol)
-	lssConfig *lssconfig.Config // LSS config for this party (after keygen)
-	partyID   party.ID          // This party's ID
-	partyIDs  []party.ID        // All party IDs in the MPC group
-	pool      *pool.Pool        // Worker pool for MPC operations
-	mpcReady  bool              // Whether MPC is ready for signing
+	// Identity within the MPC committee. party.ID is the NodeID string, so the
+	// committee and the peer set are the same value in two spellings, with no
+	// side table to drift.
+	partyID party.ID
+	netID   ids.ID     // network whose validator set forms the committee
+	pool    *pool.Pool // worker pool for MPC operations
 
-	// Key Management
-	keys           map[string]*ManagedKey // KeyID -> Key configuration
-	activeKeyID    string                 // Currently active key for signing
-	keygenSessions map[string]*KeygenSession
+	// state is the persisted, replicated chain state: the custody-key registry,
+	// the ceremony log, the block store and the state root. It is the authority
+	// on what M-Chain knows — there is no second in-memory copy that could
+	// disagree with it or vanish on restart.
+	state *State
 
-	// Signing Sessions
-	signingSessions map[string]*SigningSession
-	sessionsByChain map[string][]string // ChainID -> SessionIDs
+	// shares is this node's secret key material, keyed by key id. Loaded from
+	// node-private state at Initialize. NOT replicated and NOT in the state
+	// root; another validator legitimately holds different bytes.
+	shares map[string]*heldShare
+
+	// Completed ceremonies awaiting inclusion in a block, and their staging
+	// order. Every participant stages the same operations, so whichever node
+	// proposes produces a block the others can verify.
+	inflight      map[string]*Operation
+	order         []string
+	buildRequests chan struct{}
+
+	// localMesh is the in-process ceremony transport used when the VM has no
+	// p2p sender (single-process dev and tests). Nil on a networked node.
+	localMesh *localMesh
 
 	// Quota Tracking
 	dailySigningCount map[string]uint64 // ChainID -> count today
@@ -152,7 +166,6 @@ type VM struct {
 	preferred      ids.ID
 	lastAcceptedID ids.ID
 	pendingBlocks  map[ids.ID]*Block
-	heightIndex    map[uint64]ids.ID
 
 	// Network Stats
 	stats *vmStats
@@ -164,73 +177,14 @@ type VM struct {
 	mu sync.RWMutex
 }
 
-// ManagedKey represents a threshold key managed by the T-Chain
-type ManagedKey struct {
-	KeyID        string            `json:"keyId"`
-	KeyType      string            `json:"keyType"`      // secp256k1, ed25519
-	PublicKey    []byte            `json:"publicKey"`    // Compressed public key
-	Address      []byte            `json:"address"`      // Ethereum-style address (for secp256k1)
-	Threshold    int               `json:"threshold"`    // t value
-	TotalParties int               `json:"totalParties"` // n value
-	Generation   uint64            `json:"generation"`   // Key generation number
-	CreatedAt    time.Time         `json:"createdAt"`
-	LastUsedAt   time.Time         `json:"lastUsedAt"`
-	SignCount    uint64            `json:"signCount"` // Total signatures made
-	Status       string            `json:"status"`    // active, rotating, expired
-	Config       *lssconfig.Config `json:"-"`         // LSS configuration (not serialized)
-	CMPConfig    *cmpconfig.Config `json:"-"`         // CGGMP21 (threshold-ECDSA) configuration (not serialized)
-	PartyIDs     []party.ID        `json:"partyIds"`
-}
-
-// KeygenSession tracks a key generation in progress
-type KeygenSession struct {
-	SessionID    string     `json:"sessionId"`
-	KeyID        string     `json:"keyId"`
-	KeyType      string     `json:"keyType"`
-	Threshold    int        `json:"threshold"`
-	TotalParties int        `json:"totalParties"`
-	PartyIDs     []party.ID `json:"partyIds"`
-	Status       string     `json:"status"` // pending, running, completed, failed
-	RequestedBy  string     `json:"requestedBy"`
-	StartedAt    time.Time  `json:"startedAt"`
-	CompletedAt  time.Time  `json:"completedAt,omitempty"`
-	Error        string     `json:"error,omitempty"`
-	ProtocolName Protocol   `json:"-"` // Our local Protocol type
-}
-
-// SigningSession tracks a signing operation in progress
-type SigningSession struct {
-	SessionID       string          `json:"sessionId"`
-	KeyID           string          `json:"keyId"`
-	RequestingChain string          `json:"requestingChain"`
-	MessageHash     []byte          `json:"messageHash"`
-	MessageType     string          `json:"messageType"` // raw, eth_sign, typed_data
-	Status          string          `json:"status"`      // pending, signing, completed, failed
-	Signature       *ecdsaSignature `json:"signature,omitempty"`
-	SignerParties   []party.ID      `json:"signerParties"`
-	CreatedAt       time.Time       `json:"createdAt"`
-	ExpiresAt       time.Time       `json:"expiresAt"`
-	CompletedAt     time.Time       `json:"completedAt,omitempty"`
-	Error           string          `json:"error,omitempty"`
-	ProtocolName    Protocol        `json:"-"` // Our local Protocol type
-}
-
-// ecdsaSignature holds the signature components
-type ecdsaSignature struct {
-	R []byte `json:"r"`
-	S []byte `json:"s"`
-	V byte   `json:"v"` // Recovery ID
-}
-
-// vmStats tracks internal T-Chain statistics (with mutex for thread safety)
+// vmStats counts what this node actually did. Every field here is incremented
+// at the moment the thing happens; a counter that is only ever reported and
+// never written is a number that reads as evidence and is not.
 type vmStats struct {
-	TotalSignatures    uint64
-	TotalKeygens       uint64
-	ActiveSessions     int
-	SignaturesByChain  map[string]uint64
-	AverageSigningTime time.Duration
-	SuccessRate        float64
-	mu                 sync.RWMutex
+	TotalSignatures   uint64
+	TotalKeygens      uint64
+	SignaturesByChain map[string]uint64
+	mu                sync.RWMutex
 }
 
 // Initialize implements the chain.ChainVM interface
@@ -253,15 +207,14 @@ func (vm *VM) Initialize(
 
 	// Initialize maps
 	vm.pendingBlocks = make(map[ids.ID]*Block)
-	vm.heightIndex = make(map[uint64]ids.ID)
-	vm.keys = make(map[string]*ManagedKey)
-	vm.keygenSessions = make(map[string]*KeygenSession)
-	vm.signingSessions = make(map[string]*SigningSession)
-	vm.sessionsByChain = make(map[string][]string)
+	vm.shares = make(map[string]*heldShare)
+	vm.inflight = make(map[string]*Operation)
+	vm.buildRequests = make(chan struct{}, 1)
 	vm.sessionRouters = make(map[string]*gossipRouter)
 	vm.pendingBySession = make(map[string][]*protocol.Message)
 	vm.dailySigningCount = make(map[string]uint64)
 	vm.quotaResetTime = time.Now().Add(24 * time.Hour)
+	vm.netID = constants.PrimaryNetworkID
 	vm.stats = &vmStats{
 		SignaturesByChain: make(map[string]uint64),
 	}
@@ -288,17 +241,6 @@ func (vm *VM) Initialize(
 	// Initialize protocol executor for handling protocol execution with proper timeouts
 	vm.protocolExecutor = NewProtocolExecutor(vm.pool, vm.log)
 
-	// Initialize protocol registry with all supported protocols
-	vm.protocolRegistry = NewProtocolRegistry(vm.pool)
-
-	// Wire the protocol executor to handlers that need it (CMP, LSS)
-	if cmpHandler, err := vm.protocolRegistry.Get(ProtocolCGGMP21); err == nil {
-		if h, ok := cmpHandler.(*CGGMP21Handler); ok {
-			h.SetExecutor(vm.protocolExecutor)
-			// Message router will be set when multi-party communication is established
-		}
-	}
-
 	// Parse genesis - use JSON for simple genesis configuration
 	genesis := &Genesis{}
 	if len(init.Genesis) > 0 {
@@ -306,35 +248,121 @@ func (vm *VM) Initialize(
 			return fmt.Errorf("failed to parse genesis: %w", err)
 		}
 	}
-
-	// Create genesis block
-	genesisBlock := &Block{
-		BlockHeight:    0,
-		BlockTimestamp: genesis.Timestamp,
-		ParentID_:      ids.Empty,
-		Operations:     []*Operation{},
-		vm:             vm,
+	// A genesis policy overrides the config default, so the chain's quorum is
+	// fixed by the thing every validator agrees on rather than by each node's
+	// local config file.
+	if genesis.Policy.Valid() {
+		vm.config.Policy = genesis.Policy
 	}
 
-	genesisBlock.ID_ = genesisBlock.computeID()
-	vm.lastAcceptedID = genesisBlock.ID()
-	vm.heightIndex[0] = genesisBlock.ID()
+	// Open persisted state, resuming whatever this node already knows.
+	state, err := NewState(vm.db, vm.rt.ChainID)
+	if err != nil {
+		return err
+	}
+	vm.state = state
 
-	if err := vm.putBlock(genesisBlock); err != nil {
-		return fmt.Errorf("failed to store genesis block: %w", err)
+	// Resume from the accepted tip, or install genesis on a fresh database.
+	// This is the difference between a chain and a cache: a node that restarts
+	// must come back at the height it left, not at zero. Recomputing genesis
+	// unconditionally (as this VM previously did) discards every accepted block
+	// and re-runs history from an empty registry.
+	tip, found, err := vm.state.LastAccepted()
+	if err != nil {
+		return fmt.Errorf("mpcvm: read accepted tip: %w", err)
+	}
+	root := vm.state.Root()
+	if found {
+		blk, err := vm.loadBlock(tip)
+		if err != nil {
+			return fmt.Errorf("mpcvm: accepted tip %s is not readable: %w", tip, err)
+		}
+		vm.lastAcceptedID = tip
+		vm.preferred = tip
+		vm.log.Info("M-Chain resumed",
+			log.Stringer("tip", tip),
+			log.Uint64("height", blk.BlockHeight),
+			log.String("stateRoot", fmt.Sprintf("%x", root[:8])),
+		)
+	} else {
+		genesisBlock := &Block{
+			BlockHeight:    0,
+			BlockTimestamp: genesis.Timestamp,
+			ParentID_:      ids.Empty,
+			StateRoot:      root,
+			vm:             vm,
+		}
+		genesisBlock.ID_ = genesisBlock.computeID()
+		raw, err := genesisBlock.Marshal()
+		if err != nil {
+			return err
+		}
+		if err := vm.state.PutBlock(genesisBlock.ID(), 0, raw); err != nil {
+			return fmt.Errorf("mpcvm: store genesis block: %w", err)
+		}
+		if err := vm.state.SetLastAccepted(genesisBlock.ID(), root); err != nil {
+			return err
+		}
+		vm.lastAcceptedID = genesisBlock.ID()
+		vm.preferred = genesisBlock.ID()
+		vm.log.Info("M-Chain genesis installed",
+			log.Stringer("blockID", genesisBlock.ID()),
+			log.String("stateRoot", fmt.Sprintf("%x", root[:8])),
+		)
 	}
 
-	// Load existing keys from database
-	if err := vm.loadKeys(); err != nil {
-		vm.log.Warn("failed to load existing keys", log.String("error", err.Error()))
+	// Load this node's own key shares. Without them a restarted validator is a
+	// registry reader that cannot sign — it would still be counted as a
+	// committee member while being unable to contribute a partial signature.
+	if err := vm.loadShares(); err != nil {
+		return fmt.Errorf("mpcvm: load key shares: %w", err)
 	}
 
-	vm.log.Info("ThresholdVM initialized",
-		log.Int("threshold", vm.config.Threshold),
-		log.Int("totalParties", vm.config.TotalParties),
+	vm.log.Info("M-Chain initialized",
+		log.String("policy", vm.config.Policy.String()),
+		log.String("party", string(vm.partyID)),
+		log.Int("sharesHeld", len(vm.shares)),
 		log.Int("authorizedChains", len(vm.config.AuthorizedChains)),
 	)
 
+	return nil
+}
+
+// loadShares repopulates this node's secret shares from node-private state for
+// every custody key it participates in.
+func (vm *VM) loadShares() error {
+	keys, err := vm.state.Keys()
+	if err != nil {
+		return err
+	}
+	for _, rec := range keys {
+		raw, err := vm.state.GetShare(rec.KeyID)
+		if errors.Is(err, ErrShareNotHeld) {
+			continue // not a participant in this key; normal
+		}
+		if err != nil {
+			return err
+		}
+		share, err := parseHeldShare(rec.Kind, raw)
+		if err != nil {
+			return fmt.Errorf("mpcvm: share for %s: %w", rec.KeyID, err)
+		}
+		// A share that does not match the registry it is filed under is a
+		// corrupted store, not a recoverable state: signing with it would
+		// produce signatures that fail against the registered group key.
+		pub, degree, err := share.groupKeyAndDegree()
+		if err != nil {
+			return err
+		}
+		if string(pub) != string(rec.GroupPublicKey) {
+			return fmt.Errorf("mpcvm: stored share for %s belongs to a different group key", rec.KeyID)
+		}
+		if degree != rec.Degree() {
+			return fmt.Errorf("mpcvm: stored share for %s has degree %d, registry says policy %s (degree %d)",
+				rec.KeyID, degree, rec.Policy, rec.Degree())
+		}
+		vm.shares[rec.KeyID] = share
+	}
 	return nil
 }
 
@@ -342,11 +370,13 @@ func (vm *VM) parseConfig(configBytes []byte) error {
 	if len(configBytes) == 0 {
 		// Default configuration
 		vm.config = ThresholdConfig{
-			Threshold:           2,
-			TotalParties:        3,
+			// 2-of-3: the smallest policy that is actually a threshold policy.
+			// Degree 1, so one party may be corrupt or offline.
+			Policy:              quorum.MustNew(2, 3),
 			SessionTimeout:      5 * time.Minute,
 			MaxActiveSessions:   100,
 			MaxSessionsPerChain: 10,
+			MaxOpsPerBlock:      64,
 			KeyRotationPeriod:   30 * 24 * time.Hour,
 			MaxKeyAge:           90 * 24 * time.Hour,
 			DailySigningQuota:   make(map[string]uint64),
@@ -412,852 +442,183 @@ func (vm *VM) parseConfig(configBytes []byte) error {
 		return err
 	}
 
-	// Validate configuration
-	if vm.config.Threshold < 1 {
-		return ErrInvalidThreshold
+	// A policy that does not decode is a hard failure, not a default. Falling
+	// back to a built-in quorum for a chain that holds bridged funds would mean
+	// the operator's intent and the deployed key silently differ.
+	if !vm.config.Policy.Valid() {
+		return fmt.Errorf("%w: %q is not a deployable policy (want the form \"3-of-5\")",
+			ErrInvalidThreshold, vm.config.Policy)
 	}
-	if vm.config.TotalParties < vm.config.Threshold+1 {
-		return ErrInsufficientParties
+	if vm.config.MaxOpsPerBlock <= 0 {
+		vm.config.MaxOpsPerBlock = 64
 	}
-
 	return nil
 }
 
-// InitializeMPC sets up the MPC group with party IDs
-func (vm *VM) InitializeMPC(partyIDs []party.ID) error {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
+// =============================================================================
+// Custody API — the one way in
+// =============================================================================
+//
+// Every entry point below delegates to the ceremony lifecycle in custody.go.
+// There is no second path that reaches a key or a signature: the legacy
+// in-memory session machinery this VM used to carry (keygenSessions,
+// signingSessions, an activeKeyID, a `keys` map persisted only at shutdown) was
+// a parallel, unreplicated copy of state that could and did disagree with the
+// chain. It is gone.
 
-	if len(partyIDs) < vm.config.Threshold+1 {
-		return ErrInsufficientParties
-	}
-
-	vm.partyIDs = partyIDs
-
-	// Check if we have an existing key
-	if vm.activeKeyID != "" {
-		if key, ok := vm.keys[vm.activeKeyID]; ok && key.Config != nil {
-			vm.lssConfig = key.Config
-			vm.mpcReady = true
-			vm.log.Info("MPC initialized with existing key",
-				log.String("keyID", vm.activeKeyID),
-				log.Uint64("generation", key.Generation),
-			)
-			return nil
-		}
-	}
-
-	vm.log.Info("MPC initialized without active key - keygen required",
-		log.Int("parties", len(partyIDs)),
-	)
-
-	return nil
+// StartKeygen generates a custody key using the chain's default policy.
+func (vm *VM) StartKeygen(ctx context.Context, keyID, requestedBy string) (*Operation, error) {
+	return vm.StartKeygenWithPolicy(ctx, keyID, vm.Policy(), requestedBy)
 }
 
-// StartKeygenWithProtocol initiates distributed key generation with a specific protocol
-func (vm *VM) StartKeygenWithProtocol(keyID, protocol, requestedBy string, threshold, totalParties int) (*KeygenSession, error) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	// Check if requestor is authorized
-	perms, ok := vm.config.AuthorizedChains[requestedBy]
+// StartKeygenWithPolicy generates a custody key under an explicit k-of-n policy.
+//
+// The policy is a quorum.Policy, not a pair of ints, so a caller cannot express
+// the quorum ambiguously: "3-of-5" is the only spelling, and the polynomial
+// degree is derived from it inside RunKeygen.
+func (vm *VM) StartKeygenWithPolicy(ctx context.Context, keyID string, policy quorum.Policy, requestedBy string) (*Operation, error) {
+	perms, ok := vm.permissions(requestedBy)
 	if !ok || !perms.CanKeygen {
-		return nil, ErrUnauthorizedChain
+		return nil, fmt.Errorf("%w: %s may not request key generation", ErrUnauthorizedChain, requestedBy)
 	}
-
-	// Validate protocol
-	handler, err := vm.protocolRegistry.Get(Protocol(protocol))
+	ctx, cancel := context.WithTimeout(ctx, vm.sessionTimeout())
+	defer cancel()
+	op, err := vm.RunKeygen(ctx, keyID, policy, requestedBy)
 	if err != nil {
-		return nil, fmt.Errorf("unsupported protocol: %s", protocol)
+		return nil, err
 	}
-
-	// Check if protocol is allowed for this chain
-	curves := handler.SupportedCurves()
-	allowed := false
-	for _, kt := range perms.AllowedKeyTypes {
-		for _, curve := range curves {
-			if kt == curve || kt == protocol {
-				allowed = true
-				break
-			}
-		}
-	}
-	if !allowed {
-		return nil, fmt.Errorf("protocol %s not allowed for chain %s", protocol, requestedBy)
-	}
-
-	// Check if there's already a keygen in progress for this key
-	for _, session := range vm.keygenSessions {
-		if session.KeyID == keyID && (session.Status == "pending" || session.Status == "running") {
-			return nil, ErrKeygenInProgress
-		}
-	}
-
-	// Use provided values or defaults
-	if threshold == 0 {
-		threshold = vm.config.Threshold
-	}
-	if totalParties == 0 {
-		totalParties = vm.config.TotalParties
-	}
-
-	// Create keygen session
-	sessionID := ids.GenerateTestID().String()
-	session := &KeygenSession{
-		SessionID:    sessionID,
-		KeyID:        keyID,
-		KeyType:      protocol,
-		Threshold:    threshold,
-		TotalParties: totalParties,
-		PartyIDs:     vm.partyIDs,
-		Status:       "pending",
-		RequestedBy:  requestedBy,
-		StartedAt:    time.Now(),
-	}
-
-	vm.keygenSessions[sessionID] = session
-
-	// Start keygen in background with the specified protocol
-	go vm.runKeygenWithProtocol(session, handler)
-
-	vm.log.Info("started keygen session with protocol",
-		log.String("sessionID", sessionID),
-		log.String("keyID", keyID),
-		log.String("protocol", protocol),
-		log.String("requestedBy", requestedBy),
-	)
-
-	return session, nil
-}
-
-func (vm *VM) runKeygenWithProtocol(session *KeygenSession, handler ProtocolHandler) {
-	vm.mu.Lock()
-	session.Status = "running"
-	vm.mu.Unlock()
-
-	ctx := context.Background()
-
-	// Run keygen using the protocol handler
-	share, err := handler.Keygen(ctx, vm.partyID, session.PartyIDs, session.Threshold)
-
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	if err != nil {
-		session.Status = "failed"
-		session.Error = err.Error()
-		vm.log.Error("keygen failed",
-			log.String("sessionID", session.SessionID),
-			log.String("error", err.Error()),
-		)
-		return
-	}
-
-	// Create managed key
-	pubKey := share.PublicKey()
-	address := publicKeyToAddress(pubKey)
-
-	key := &ManagedKey{
-		KeyID:        session.KeyID,
-		KeyType:      session.KeyType,
-		PublicKey:    pubKey,
-		Address:      address,
-		Threshold:    session.Threshold,
-		TotalParties: session.TotalParties,
-		Generation:   share.Generation(),
-		CreatedAt:    time.Now(),
-		Status:       "active",
-		PartyIDs:     session.PartyIDs,
-	}
-
-	// Store protocol-specific config so the signing path can reconstruct the
-	// party's share. Each protocol keeps its own typed config slot (orthogonal;
-	// no shared union) — LSS and CGGMP21 are independently complete.
-	switch s := share.(type) {
-	case *lssKeyShare:
-		key.Config = s.config
-		vm.lssConfig = s.config
-	case *cmpKeyShare:
-		key.CMPConfig = s.config
-		if s.config != nil {
-			// The CMP handler leaves pubKey nil at keygen; derive the canonical
-			// compressed group key from the config so B can verify releases.
-			if pub, err := s.config.PublicPoint().MarshalBinary(); err == nil {
-				key.PublicKey = pub
-				key.Address = publicKeyToAddress(pub)
-			}
-		}
-	}
-
-	vm.keys[session.KeyID] = key
-	vm.activeKeyID = session.KeyID
-	vm.mpcReady = true
-
-	session.Status = "completed"
-	session.CompletedAt = time.Now()
-
-	// Persist key to database
-	if err := vm.persistKey(key); err != nil {
-		vm.log.Error("failed to persist key",
-			log.String("keyID", session.KeyID),
-			log.String("error", err.Error()),
-		)
-	}
-
 	vm.stats.mu.Lock()
 	vm.stats.TotalKeygens++
 	vm.stats.mu.Unlock()
-
-	vm.log.Info("keygen completed",
-		log.String("sessionID", session.SessionID),
-		log.String("keyID", session.KeyID),
-		log.String("protocol", session.KeyType),
-		log.String("publicKey", hex.EncodeToString(pubKey)),
-	)
+	return op, nil
 }
 
-// RefreshKey refreshes key shares without changing the public key
-func (vm *VM) RefreshKey(keyID string, requestedBy string) (*KeygenSession, error) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	// Check if requestor is authorized
-	perms, ok := vm.config.AuthorizedChains[requestedBy]
-	if !ok || !perms.CanReshare {
-		return nil, ErrUnauthorizedChain
-	}
-
-	key, ok := vm.keys[keyID]
-	if !ok {
-		return nil, ErrKeyNotFound
-	}
-
-	// Create refresh session
-	sessionID := ids.GenerateTestID().String()
-	session := &KeygenSession{
-		SessionID:    sessionID,
-		KeyID:        keyID,
-		KeyType:      key.KeyType,
-		Threshold:    key.Threshold,
-		TotalParties: key.TotalParties,
-		PartyIDs:     key.PartyIDs,
-		Status:       "pending",
-		RequestedBy:  requestedBy,
-		StartedAt:    time.Now(),
-	}
-
-	vm.keygenSessions[sessionID] = session
-
-	// Start refresh in background
-	go vm.runRefresh(session, key)
-
-	vm.log.Info("started refresh session",
-		log.String("sessionID", sessionID),
-		log.String("keyID", keyID),
-	)
-
-	return session, nil
-}
-
-func (vm *VM) runRefresh(session *KeygenSession, existingKey *ManagedKey) {
-	vm.mu.Lock()
-	session.Status = "running"
-	vm.mu.Unlock()
-
-	ctx := context.Background()
-
-	// Get protocol handler
-	handler, err := vm.protocolRegistry.Get(Protocol(existingKey.KeyType))
-	if err != nil {
-		vm.mu.Lock()
-		session.Status = "failed"
-		session.Error = err.Error()
-		vm.mu.Unlock()
-		return
-	}
-
-	// Need to reconstruct KeyShare from ManagedKey
-	// This is protocol-specific
-	var share KeyShare
-	if existingKey.Config != nil {
-		share = &lssKeyShare{config: existingKey.Config}
-	} else {
-		vm.mu.Lock()
-		session.Status = "failed"
-		session.Error = "no key share available for refresh"
-		vm.mu.Unlock()
-		return
-	}
-
-	// Run refresh
-	newShare, err := handler.Refresh(ctx, share)
-
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	if err != nil {
-		session.Status = "failed"
-		session.Error = err.Error()
-		vm.log.Error("refresh failed",
-			log.String("sessionID", session.SessionID),
-			log.String("error", err.Error()),
-		)
-		return
-	}
-
-	// Update key with refreshed share
-	if lssShare, ok := newShare.(*lssKeyShare); ok {
-		existingKey.Config = lssShare.config
-		existingKey.Generation = lssShare.Generation()
-		if existingKey.KeyID == vm.activeKeyID {
-			vm.lssConfig = lssShare.config
-		}
-	}
-
-	existingKey.LastUsedAt = time.Now()
-
-	session.Status = "completed"
-	session.CompletedAt = time.Now()
-
-	// Persist updated key
-	if err := vm.persistKey(existingKey); err != nil {
-		vm.log.Error("failed to persist refreshed key",
-			log.String("keyID", session.KeyID),
-			log.String("error", err.Error()),
-		)
-	}
-
-	vm.log.Info("refresh completed",
-		log.String("sessionID", session.SessionID),
-		log.String("keyID", session.KeyID),
-		log.Uint64("newGeneration", existingKey.Generation),
-	)
-}
-
-// StartKeygen initiates distributed key generation (uses default LSS protocol)
-func (vm *VM) StartKeygen(keyID, keyType, requestedBy string) (*KeygenSession, error) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	// Check if requestor is authorized
-	perms, ok := vm.config.AuthorizedChains[requestedBy]
-	if !ok || !perms.CanKeygen {
-		return nil, ErrUnauthorizedChain
-	}
-
-	// Check if keytype is allowed
-	allowed := false
-	for _, kt := range perms.AllowedKeyTypes {
-		if kt == keyType {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
-		return nil, fmt.Errorf("key type %s not allowed for chain %s", keyType, requestedBy)
-	}
-
-	// Check if there's already a keygen in progress for this key
-	for _, session := range vm.keygenSessions {
-		if session.KeyID == keyID && (session.Status == "pending" || session.Status == "running") {
-			return nil, ErrKeygenInProgress
-		}
-	}
-
-	// Create keygen session
-	sessionID := ids.GenerateTestID().String()
-	session := &KeygenSession{
-		SessionID:    sessionID,
-		KeyID:        keyID,
-		KeyType:      keyType,
-		Threshold:    vm.config.Threshold,
-		TotalParties: vm.config.TotalParties,
-		PartyIDs:     vm.partyIDs,
-		Status:       "pending",
-		RequestedBy:  requestedBy,
-		StartedAt:    time.Now(),
-	}
-
-	vm.keygenSessions[sessionID] = session
-
-	// Start keygen in background
-	go vm.runKeygen(session)
-
-	vm.log.Info("started keygen session",
-		log.String("sessionID", sessionID),
-		log.String("keyID", keyID),
-		log.String("keyType", keyType),
-		log.String("requestedBy", requestedBy),
-	)
-
-	return session, nil
-}
-
-func (vm *VM) runKeygen(session *KeygenSession) {
-	vm.mu.Lock()
-	session.Status = "running"
-	vm.mu.Unlock()
-
-	// The LSS library returns protocol.StartFunc for async execution
-	// For now, we'll use the protocol handler abstraction which wraps this
-	handler, err := vm.protocolRegistry.Get(ProtocolLSS)
-	if err != nil {
-		vm.mu.Lock()
-		session.Status = "failed"
-		session.Error = err.Error()
-		vm.mu.Unlock()
-		return
-	}
-
-	ctx := context.Background()
-	share, err := handler.Keygen(ctx, vm.partyID, session.PartyIDs, session.Threshold)
-
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	if err != nil {
-		session.Status = "failed"
-		session.Error = err.Error()
-		vm.log.Error("keygen failed",
-			log.String("sessionID", session.SessionID),
-			log.String("error", err.Error()),
-		)
-		return
-	}
-
-	// Create managed key from share
-	pubKeyBytes := share.PublicKey()
-	address := publicKeyToAddress(pubKeyBytes)
-
-	key := &ManagedKey{
-		KeyID:        session.KeyID,
-		KeyType:      session.KeyType,
-		PublicKey:    pubKeyBytes,
-		Address:      address,
-		Threshold:    session.Threshold,
-		TotalParties: session.TotalParties,
-		Generation:   share.Generation(),
-		CreatedAt:    time.Now(),
-		Status:       "active",
-		PartyIDs:     session.PartyIDs,
-	}
-
-	// Store protocol-specific config if LSS
-	if lssShare, ok := share.(*lssKeyShare); ok && lssShare.config != nil {
-		key.Config = lssShare.config
-		vm.lssConfig = lssShare.config
-	}
-
-	vm.keys[session.KeyID] = key
-	vm.activeKeyID = session.KeyID
-	vm.mpcReady = true
-
-	session.Status = "completed"
-	session.CompletedAt = time.Now()
-
-	// Persist key to database
-	if err := vm.persistKey(key); err != nil {
-		vm.log.Error("failed to persist key",
-			log.String("keyID", session.KeyID),
-			log.String("error", err.Error()),
-		)
-	}
-
-	vm.stats.mu.Lock()
-	vm.stats.TotalKeygens++
-	vm.stats.mu.Unlock()
-
-	vm.log.Info("keygen completed",
-		log.String("sessionID", session.SessionID),
-		log.String("keyID", session.KeyID),
-		log.String("publicKey", hex.EncodeToString(pubKeyBytes)),
-	)
-}
-
-// RequestSignature requests a threshold signature from the T-Chain
-func (vm *VM) RequestSignature(
-	requestingChain string,
-	keyID string,
-	messageHash []byte,
-	messageType string,
-) (*SigningSession, error) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	// Check if chain is authorized
-	perms, ok := vm.config.AuthorizedChains[requestingChain]
+// RequestSignature produces a threshold signature over messageHash with a
+// registered custody key and stages it for the next block.
+func (vm *VM) RequestSignature(ctx context.Context, requestingChain, keyID string, messageHash []byte) (*Operation, error) {
+	perms, ok := vm.permissions(requestingChain)
 	if !ok || !perms.CanSign {
-		return nil, ErrUnauthorizedChain
+		return nil, fmt.Errorf("%w: %s may not request signatures", ErrUnauthorizedChain, requestingChain)
 	}
-
-	// Check message size
-	if len(messageHash) > perms.MaxSigningSize {
+	if perms.MaxSigningSize > 0 && len(messageHash) > perms.MaxSigningSize {
 		return nil, fmt.Errorf("message too large: %d > %d", len(messageHash), perms.MaxSigningSize)
 	}
 
-	// Check quota
+	vm.mu.Lock()
 	vm.checkQuotaReset()
-	count := vm.dailySigningCount[requestingChain]
 	limit := perms.DailySigningLimit
-	if vm.config.DailySigningQuota[requestingChain] > 0 {
-		limit = vm.config.DailySigningQuota[requestingChain]
+	if override := vm.config.DailySigningQuota[requestingChain]; override > 0 {
+		limit = override
 	}
-	if count >= limit {
+	if limit > 0 && vm.dailySigningCount[requestingChain] >= limit {
+		vm.mu.Unlock()
 		return nil, ErrQuotaExceeded
 	}
-
-	// Check max active sessions
-	if len(vm.signingSessions) >= vm.config.MaxActiveSessions {
-		return nil, fmt.Errorf("max active sessions reached")
-	}
-
-	// Check max sessions per chain
-	chainSessions := vm.sessionsByChain[requestingChain]
-	activeSessions := 0
-	for _, sid := range chainSessions {
-		if s, ok := vm.signingSessions[sid]; ok && s.Status == "signing" {
-			activeSessions++
-		}
-	}
-	if activeSessions >= vm.config.MaxSessionsPerChain {
-		return nil, fmt.Errorf("max sessions per chain reached")
-	}
-
-	// Get the key
-	key, ok := vm.keys[keyID]
-	if !ok {
-		// Use active key if keyID is empty
-		if keyID == "" && vm.activeKeyID != "" {
-			key = vm.keys[vm.activeKeyID]
-			keyID = vm.activeKeyID
-		} else {
-			return nil, ErrKeyNotFound
-		}
-	}
-
-	// The key must carry a usable share for SOME protocol: LSS (Config) or
-	// CGGMP21 (CMPConfig). Each protocol keeps its own typed slot.
-	if key.Config == nil && key.CMPConfig == nil {
-		return nil, ErrNotInitialized
-	}
-
-	// Create signing session
-	sessionID := ids.GenerateTestID().String()
-	session := &SigningSession{
-		SessionID:       sessionID,
-		KeyID:           keyID,
-		RequestingChain: requestingChain,
-		MessageHash:     messageHash,
-		MessageType:     messageType,
-		Status:          "pending",
-		CreatedAt:       time.Now(),
-		ExpiresAt:       time.Now().Add(vm.config.SessionTimeout),
-	}
-
-	vm.signingSessions[sessionID] = session
-	vm.sessionsByChain[requestingChain] = append(vm.sessionsByChain[requestingChain], sessionID)
-
-	// Start signing in background
-	go vm.runSigning(session, key)
-
-	vm.log.Info("started signing session",
-		log.String("sessionID", sessionID),
-		log.String("keyID", keyID),
-		log.String("requestingChain", requestingChain),
-		log.String("messageHash", hex.EncodeToString(messageHash)),
-	)
-
-	return session, nil
-}
-
-func (vm *VM) runSigning(session *SigningSession, key *ManagedKey) {
-	vm.mu.Lock()
-	session.Status = "signing"
 	vm.mu.Unlock()
 
-	startTime := time.Now()
-
-	// Bound the ceremony by the session timeout.
-	ctx, cancel := context.WithTimeout(context.Background(), vm.config.SessionTimeout)
+	ctx, cancel := context.WithTimeout(ctx, vm.sessionTimeout())
 	defer cancel()
-
-	// Compute the threshold signature. Threshold ECDSA (CGGMP21) is the
-	// bridge-custody path: the committee runs the sign across the native
-	// MessageRouter transport and each honest validator derives the SAME
-	// standard secp256k1 signature, which B (or any chain holding the group
-	// key) verifies non-interactively. Other protocols (LSS, ...) still route
-	// through the registry handler — each protocol stays in its own lane.
-	var (
-		sig     *ecdsaSignature
-		signers []party.ID
-		err     error
-	)
-	switch {
-	case key.CMPConfig != nil:
-		sig, signers, err = vm.thresholdSignCMP(ctx, key, session)
-	default:
-		sig, signers, err = vm.signViaHandler(ctx, key, session)
+	op, err := vm.RunSign(ctx, keyID, messageHash, requestingChain)
+	if err != nil {
+		return nil, err
 	}
 
 	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	signingTime := time.Since(startTime)
-
-	if err != nil {
-		session.Status = "failed"
-		session.Error = err.Error()
-		vm.log.Error("signing failed",
-			log.String("sessionID", session.SessionID),
-			log.String("error", err.Error()),
-		)
-		return
-	}
-
-	session.Signature = sig
-	session.SignerParties = signers
-	session.Status = "completed"
-	session.CompletedAt = time.Now()
-
-	// Update key usage
-	key.LastUsedAt = time.Now()
-	key.SignCount++
-
-	// Update quota
-	vm.dailySigningCount[session.RequestingChain]++
-
-	// Update stats
+	vm.dailySigningCount[requestingChain]++
 	vm.stats.mu.Lock()
 	vm.stats.TotalSignatures++
-	vm.stats.SignaturesByChain[session.RequestingChain]++
-	// Update average signing time
-	if vm.stats.AverageSigningTime == 0 {
-		vm.stats.AverageSigningTime = signingTime
-	} else {
-		vm.stats.AverageSigningTime = (vm.stats.AverageSigningTime + signingTime) / 2
-	}
+	vm.stats.SignaturesByChain[requestingChain]++
 	vm.stats.mu.Unlock()
-
-	vm.log.Info("signing completed",
-		log.String("sessionID", session.SessionID),
-		log.Duration("duration", signingTime),
-		log.Int("signers", len(key.PartyIDs)),
-	)
-}
-
-// GetSignature retrieves a completed signature
-func (vm *VM) GetSignature(sessionID string) (*SigningSession, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-
-	session, ok := vm.signingSessions[sessionID]
-	if !ok {
-		return nil, ErrSessionNotFound
-	}
-
-	if session.Status == "signing" && time.Now().After(session.ExpiresAt) {
-		return nil, ErrSessionExpired
-	}
-
-	return session, nil
-}
-
-// GetPublicKey returns the public key for a key ID
-func (vm *VM) GetPublicKey(keyID string) ([]byte, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-
-	if keyID == "" {
-		keyID = vm.activeKeyID
-	}
-
-	key, ok := vm.keys[keyID]
-	if !ok {
-		return nil, ErrKeyNotFound
-	}
-
-	return key.PublicKey, nil
-}
-
-// GetAddress returns the Ethereum-style address for a key
-func (vm *VM) GetAddress(keyID string) ([]byte, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-
-	if keyID == "" {
-		keyID = vm.activeKeyID
-	}
-
-	key, ok := vm.keys[keyID]
-	if !ok {
-		return nil, ErrKeyNotFound
-	}
-
-	return key.Address, nil
-}
-
-// ReshareKey triggers key resharing (for adding/removing parties)
-func (vm *VM) ReshareKey(keyID string, newPartyIDs []party.ID, requestedBy string) (*KeygenSession, error) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	// Check if requestor is authorized
-	perms, ok := vm.config.AuthorizedChains[requestedBy]
-	if !ok || !perms.CanReshare {
-		return nil, ErrUnauthorizedChain
-	}
-
-	key, ok := vm.keys[keyID]
-	if !ok {
-		return nil, ErrKeyNotFound
-	}
-
-	if len(newPartyIDs) < vm.config.Threshold+1 {
-		return nil, ErrInsufficientParties
-	}
-
-	// Create reshare session
-	sessionID := ids.GenerateTestID().String()
-	session := &KeygenSession{
-		SessionID:    sessionID,
-		KeyID:        keyID,
-		KeyType:      key.KeyType,
-		Threshold:    vm.config.Threshold,
-		TotalParties: len(newPartyIDs),
-		PartyIDs:     newPartyIDs,
-		Status:       "pending",
-		RequestedBy:  requestedBy,
-		StartedAt:    time.Now(),
-	}
-
-	vm.keygenSessions[sessionID] = session
-
-	// Start resharing in background
-	go vm.runReshare(session, key)
-
-	vm.log.Info("started reshare session",
-		log.String("sessionID", sessionID),
-		log.String("keyID", keyID),
-		log.Int("newParties", len(newPartyIDs)),
-	)
-
-	return session, nil
-}
-
-func (vm *VM) runReshare(session *KeygenSession, existingKey *ManagedKey) {
-	vm.mu.Lock()
-	session.Status = "running"
 	vm.mu.Unlock()
-
-	ctx := context.Background()
-
-	// Get the protocol handler
-	handler, err := vm.protocolRegistry.Get(Protocol(existingKey.KeyType))
-	if err != nil {
-		handler, err = vm.protocolRegistry.Get(ProtocolLSS)
-		if err != nil {
-			vm.mu.Lock()
-			session.Status = "failed"
-			session.Error = err.Error()
-			vm.mu.Unlock()
-			return
-		}
-	}
-
-	// Create KeyShare from existing key
-	var share KeyShare
-	if existingKey.Config != nil {
-		share = &lssKeyShare{
-			config:  existingKey.Config,
-			pubKey:  existingKey.PublicKey,
-			partyID: vm.partyID,
-			thresh:  existingKey.Threshold,
-			total:   existingKey.TotalParties,
-			gen:     existingKey.Generation,
-		}
-	} else {
-		vm.mu.Lock()
-		session.Status = "failed"
-		session.Error = "no key share available for reshare"
-		vm.mu.Unlock()
-		return
-	}
-
-	// Run reshare protocol
-	newShare, err := handler.Reshare(ctx, share, session.PartyIDs, vm.config.Threshold)
-
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	if err != nil {
-		session.Status = "failed"
-		session.Error = err.Error()
-		vm.log.Error("reshare failed",
-			log.String("sessionID", session.SessionID),
-			log.String("error", err.Error()),
-		)
-		return
-	}
-
-	// Update key with new share
-	if lssShare, ok := newShare.(*lssKeyShare); ok && lssShare.config != nil {
-		existingKey.Config = lssShare.config
-		existingKey.Generation = lssShare.Generation()
-		if existingKey.KeyID == vm.activeKeyID {
-			vm.lssConfig = lssShare.config
-		}
-	}
-	existingKey.PartyIDs = session.PartyIDs
-	existingKey.TotalParties = len(session.PartyIDs)
-	existingKey.LastUsedAt = time.Now()
-
-	// Update active partyIDs if this is the active key
-	if existingKey.KeyID == vm.activeKeyID {
-		vm.partyIDs = session.PartyIDs
-	}
-
-	session.Status = "completed"
-	session.CompletedAt = time.Now()
-
-	// Persist updated key
-	if err := vm.persistKey(existingKey); err != nil {
-		vm.log.Error("failed to persist reshared key",
-			log.String("keyID", session.KeyID),
-			log.String("error", err.Error()),
-		)
-	}
-
-	vm.log.Info("reshare completed",
-		log.String("sessionID", session.SessionID),
-		log.String("keyID", session.KeyID),
-		log.Uint64("newGeneration", existingKey.Generation),
-	)
+	return op, nil
 }
 
+// Policy returns the chain's default signing policy.
+func (vm *VM) Policy() quorum.Policy {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+	return vm.config.Policy
+}
+
+// Key returns a registered custody key's public record.
+func (vm *VM) Key(keyID string) (*KeyRecord, error) {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+	return vm.state.GetKey(keyID)
+}
+
+// Keys returns every registered custody key.
+func (vm *VM) Keys() ([]*KeyRecord, error) {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+	return vm.state.Keys()
+}
+
+// Ceremony returns a recorded ceremony — the durable, replicated evidence that
+// a signature was produced, including the signature itself.
+func (vm *VM) Ceremony(id string) (*CeremonyRecord, error) {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+	return vm.state.GetCeremony(id)
+}
+
+// Ceremonies returns the whole ceremony log.
+func (vm *VM) Ceremonies() ([]*CeremonyRecord, error) {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+	return vm.state.Ceremonies()
+}
+
+// StateRoot returns the current state root — the value two validators compare
+// to know whether they agree about custody.
+func (vm *VM) StateRoot() [32]byte {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+	return vm.state.Root()
+}
+
+// PublicKey returns a custody key's compressed group public key.
+func (vm *VM) PublicKey(keyID string) ([]byte, error) {
+	rec, err := vm.Key(keyID)
+	if err != nil {
+		return nil, err
+	}
+	return rec.GroupPublicKey, nil
+}
+
+// Address returns a custody key's external-chain address.
+func (vm *VM) Address(keyID string) ([]byte, error) {
+	rec, err := vm.Key(keyID)
+	if err != nil {
+		return nil, err
+	}
+	return rec.Address, nil
+}
+
+// permissions resolves a requesting chain's permissions.
+func (vm *VM) permissions(chain string) (*ChainPermissions, bool) {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+	p, ok := vm.config.AuthorizedChains[chain]
+	return p, ok
+}
+
+func (vm *VM) sessionTimeout() time.Duration {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+	if vm.config.SessionTimeout <= 0 {
+		return 5 * time.Minute
+	}
+	return vm.config.SessionTimeout
+}
+
+// checkQuotaReset rolls the daily signing counters over. Caller holds vm.mu.
 func (vm *VM) checkQuotaReset() {
-	if time.Now().After(vm.quotaResetTime) {
-		vm.dailySigningCount = make(map[string]uint64)
-		vm.quotaResetTime = time.Now().Add(24 * time.Hour)
+	if time.Now().Before(vm.quotaResetTime) {
+		return
 	}
-}
-
-// Cleanup expired sessions
-func (vm *VM) cleanupExpiredSessions() {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	now := time.Now()
-	for sessionID, session := range vm.signingSessions {
-		if session.Status == "signing" && now.After(session.ExpiresAt) {
-			session.Status = "failed"
-			session.Error = "session expired"
-		}
-		// Keep completed/failed sessions for 1 hour for retrieval
-		if (session.Status == "completed" || session.Status == "failed") &&
-			now.Sub(session.CompletedAt) > time.Hour {
-			delete(vm.signingSessions, sessionID)
-		}
-	}
+	vm.dailySigningCount = make(map[string]uint64)
+	vm.quotaResetTime = time.Now().Add(24 * time.Hour)
 }
 
 // BuildBlock implements the chain.ChainVM interface
@@ -1265,80 +626,92 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 
-	// Get parent block
 	parentID := vm.preferred
 	if parentID == ids.Empty {
 		parentID = vm.lastAcceptedID
 	}
-
-	parent, err := vm.getBlock(parentID)
+	parent, err := vm.loadBlock(parentID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get parent block: %w", err)
+		return nil, fmt.Errorf("mpcvm: parent %s: %w", parentID, err)
 	}
 
-	// Collect operations from completed sessions
-	var operations []*Operation
-	for _, session := range vm.keygenSessions {
-		if session.Status == "completed" {
-			operations = append(operations, &Operation{
-				Type:      OpTypeKeygen,
-				SessionID: session.SessionID,
-				KeyID:     session.KeyID,
-				Timestamp: session.CompletedAt.Unix(),
-			})
+	staged := vm.drain(vm.config.MaxOpsPerBlock)
+	if len(staged) == 0 {
+		return nil, errors.New("mpcvm: no completed ceremonies to include")
+	}
+
+	// Only include operations that still verify against current state. A
+	// ceremony can be staged and then invalidated by a block that landed first
+	// (the same key registered, the same ceremony recorded); proposing it
+	// anyway would build a block every peer rejects.
+	root := vm.state.Root()
+	pending := make(map[string]*KeyRecord, len(staged))
+	operations := make([]*Operation, 0, len(staged))
+	for _, op := range staged {
+		if err := vm.verifyOperation(op, pending); err != nil {
+			vm.log.Debug("dropping staged ceremony",
+				log.String("ceremony", op.CeremonyID),
+				log.String("reason", err.Error()),
+			)
+			delete(vm.inflight, op.CeremonyID)
+			continue
 		}
-	}
-
-	for _, session := range vm.signingSessions {
-		if session.Status == "completed" {
-			operations = append(operations, &Operation{
-				Type:            OpTypeSign,
-				SessionID:       session.SessionID,
-				KeyID:           session.KeyID,
-				RequestingChain: session.RequestingChain,
-				Timestamp:       session.CompletedAt.Unix(),
-			})
+		if op.Type == OpTypeKeygen {
+			pending[op.Key.KeyID] = op.Key
 		}
+		operations = append(operations, op)
+		root = advance(root, op.digest())
 	}
-
+	vm.order = retainOrder(vm.order, vm.inflight)
 	if len(operations) == 0 {
-		return nil, errors.New("no operations to include")
+		return nil, errors.New("mpcvm: no completed ceremonies to include")
 	}
 
-	// Create new block
+	// The block timestamp never precedes its parent's; Verify enforces the same
+	// bound, so a clock that ran backwards must not produce an unverifiable
+	// block on the proposer's own machine.
+	ts := time.Now().Unix()
+	if ts < parent.BlockTimestamp {
+		ts = parent.BlockTimestamp
+	}
+
 	blk := &Block{
 		ParentID_:      parentID,
-		BlockHeight:    parent.Height() + 1,
-		BlockTimestamp: time.Now().Unix(),
+		BlockHeight:    parent.BlockHeight + 1,
+		BlockTimestamp: ts,
+		StateRoot:      root,
 		Operations:     operations,
 		vm:             vm,
 	}
-
 	blk.ID_ = blk.computeID()
 	vm.pendingBlocks[blk.ID()] = blk
-	vm.heightIndex[blk.BlockHeight] = blk.ID()
 
-	vm.log.Info("built threshold block",
+	vm.log.Info("built M-Chain block",
 		log.Stringer("blockID", blk.ID()),
-		log.Int("numOperations", len(operations)),
+		log.Uint64("height", blk.BlockHeight),
+		log.Int("operations", len(operations)),
+		log.String("stateRoot", fmt.Sprintf("%x", root[:8])),
 	)
-
 	return blk, nil
+}
+
+// retainOrder drops staging-order entries whose operation is gone, so the slice
+// cannot grow without bound across a long-running node.
+func retainOrder(order []string, live map[string]*Operation) []string {
+	out := order[:0]
+	for _, cid := range order {
+		if _, ok := live[cid]; ok {
+			out = append(out, cid)
+		}
+	}
+	return out
 }
 
 // GetBlock implements the chain.ChainVM interface
 func (vm *VM) GetBlock(ctx context.Context, id ids.ID) (chain.Block, error) {
 	vm.mu.RLock()
 	defer vm.mu.RUnlock()
-
-	// Check pending blocks (nil-safe for early calls before initialization)
-	if vm.pendingBlocks != nil {
-		if blk, exists := vm.pendingBlocks[id]; exists {
-			return blk, nil
-		}
-	}
-
-	return vm.getBlock(id)
+	return vm.loadBlock(id)
 }
 
 // ParseBlock implements the chain.ChainVM interface
@@ -1375,38 +748,47 @@ func (vm *VM) CreateHandlers(ctx context.Context) (map[string]http.Handler, erro
 	return handlers, nil
 }
 
-// HealthCheck implements the common.VM interface
+// HealthCheck implements the common.VM interface.
+//
+// Health is "can this node read its own state", not "does this node hold a
+// key". M-Chain is a custody REGISTRY first and a signer second: a validator
+// that holds no share still serves reads and still verifies every block, so
+// gating health on key material would take healthy nodes out of rotation for
+// doing their job correctly. What a share-less node cannot do — contribute a
+// partial signature — is visible in sharesHeld.
 func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
 	vm.mu.RLock()
 	defer vm.mu.RUnlock()
 
+	keys, err := vm.state.Keys()
+	if err != nil {
+		return chain.HealthResult{}, fmt.Errorf("mpcvm: read custody registry: %w", err)
+	}
+	root := vm.state.Root()
 	return chain.HealthResult{
-		Healthy: vm.mpcReady,
+		Healthy: true,
 		Details: map[string]string{
-			"status":         "healthy",
-			"mpcReady":       fmt.Sprintf("%t", vm.mpcReady),
-			"activeKey":      vm.activeKeyID,
-			"activeSessions": fmt.Sprintf("%d", len(vm.signingSessions)),
-			"totalKeys":      fmt.Sprintf("%d", len(vm.keys)),
+			"custodyKeys":      fmt.Sprintf("%d", len(keys)),
+			"sharesHeld":       fmt.Sprintf("%d", len(vm.shares)),
+			"stagedCeremonies": fmt.Sprintf("%d", len(vm.inflight)),
+			"stateRoot":        hex.EncodeToString(root[:]),
 		},
 	}, nil
 }
 
-// Shutdown implements the common.VM interface
+// Shutdown implements the common.VM interface.
+//
+// Nothing is flushed here. Every durable fact — registered keys, recorded
+// ceremonies, key shares, the accepted tip — is written at the moment it
+// becomes true, not at shutdown. A VM that persists its registry only on a
+// clean shutdown loses it to any crash, kill or power cut, which for a custody
+// chain means losing the record of who holds the funds.
 func (vm *VM) Shutdown(ctx context.Context) error {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
-
-	// Persist all keys before shutdown
-	for _, key := range vm.keys {
-		if err := vm.persistKey(key); err != nil {
-			vm.log.Error("failed to persist key on shutdown",
-				log.String("keyID", key.KeyID),
-				log.String("error", err.Error()),
-			)
-		}
+	if vm.pool != nil {
+		vm.pool.TearDown()
 	}
-
 	return nil
 }
 
@@ -1463,10 +845,13 @@ func (vm *VM) Version(ctx context.Context) (string, error) {
 	return Version.String(), nil
 }
 
-// CrossChainRequest implements the common.VM interface
-// This is how other chains request MPC services
+// CrossChainRequest implements the common.VM interface. This is how another
+// chain (B-Chain for bridge custody) asks M-Chain for a ceremony.
+//
+// The ceremony runs to completion here and its result is staged for the next
+// block; the requester reads the outcome from the ceremony log, which is
+// replicated, rather than from a reply that only this node would remember.
 func (vm *VM) CrossChainRequest(ctx context.Context, chainID ids.ID, requestID uint32, deadline time.Time, request []byte) error {
-	// Parse cross-chain MPC request
 	var req CrossChainMPCRequest
 	if err := parseCrossChainMPCRequest(request, &req); err != nil {
 		return err
@@ -1474,36 +859,14 @@ func (vm *VM) CrossChainRequest(ctx context.Context, chainID ids.ID, requestID u
 
 	switch req.Type {
 	case "sign":
-		session, err := vm.RequestSignature(
-			req.RequestingChain,
-			req.KeyID,
-			req.MessageHash,
-			req.MessageType,
-		)
-		if err != nil {
-			return err
-		}
-		// Store request ID for response routing
-		vm.mu.Lock()
-		if session.SessionID != "" {
-			// Map Lux requestID to our session
-		}
-		vm.mu.Unlock()
-
+		_, err := vm.RequestSignature(ctx, req.RequestingChain, req.KeyID, req.MessageHash)
+		return err
 	case "keygen":
-		_, err := vm.StartKeygen(req.KeyID, req.KeyType, req.RequestingChain)
-		if err != nil {
-			return err
-		}
-
-	case "reshare":
-		_, err := vm.ReshareKey(req.KeyID, nil, req.RequestingChain)
-		if err != nil {
-			return err
-		}
+		_, err := vm.StartKeygen(ctx, req.KeyID, req.RequestingChain)
+		return err
+	default:
+		return fmt.Errorf("mpcvm: unknown cross-chain request type %q", req.Type)
 	}
-
-	return nil
 }
 
 // CrossChainResponse implements the common.VM interface
@@ -1516,16 +879,13 @@ func (vm *VM) CrossChainRequestFailed(ctx context.Context, chainID ids.ID, reque
 	return nil
 }
 
-// GetBlockIDAtHeight implements the chain.HeightIndexedChainVM interface
+// GetBlockIDAtHeight implements the chain.HeightIndexedChainVM interface. The
+// index is persisted, so it survives a restart — a purely in-memory height map
+// answers "not found" for every accepted block after a reboot.
 func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
 	vm.mu.RLock()
 	defer vm.mu.RUnlock()
-
-	id, ok := vm.heightIndex[height]
-	if !ok {
-		return ids.Empty, errors.New("block not found at height")
-	}
-	return id, nil
+	return vm.state.BlockIDAtHeight(height)
 }
 
 // SetState implements the common.VM interface
@@ -1538,75 +898,59 @@ func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
 	return vm.createRPCHandler(), nil
 }
 
-// WaitForEvent blocks until an event occurs
+// WaitForEvent blocks until this VM has work for the engine.
+//
+// M-Chain is demand-driven: it builds a block only when a ceremony has
+// completed and staged an operation. Returning eagerly would spin the engine
+// (the flood loop in chains/manager.go); blocking forever would mean a
+// completed ceremony never reaches a block unless some other chain happened to
+// wake the builder.
 func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
-	// Block until context is cancelled - this VM doesn't proactively build blocks
-	// CRITICAL: Must block here to avoid notification flood loop in chains/manager.go
-	<-ctx.Done()
-	return vmcore.Message{}, ctx.Err()
+	select {
+	case <-vm.buildRequests:
+		return vmcore.Message{Type: vmcore.PendingTxs}, nil
+	case <-ctx.Done():
+		return vmcore.Message{}, ctx.Err()
+	}
 }
 
 // Helper methods
 
-func (vm *VM) putBlock(blk *Block) error {
-	bytes, err := blk.Marshal()
-	if err != nil {
-		return err
+// loadBlock reads a block from the pending set or from persisted state. Both
+// Verify and BuildBlock resolve parents through here, so an accepted ancestor
+// is found after a restart rather than only while it happens to be in memory.
+func (vm *VM) loadBlock(id ids.ID) (*Block, error) {
+	if blk, ok := vm.pendingBlocks[id]; ok {
+		return blk, nil
 	}
-	id := blk.ID()
-	return vm.db.Put(id[:], bytes)
-}
-
-func (vm *VM) getBlock(id ids.ID) (*Block, error) {
-	bytes, err := vm.db.Get(id[:])
+	raw, err := vm.state.GetBlock(id)
 	if err != nil {
 		return nil, err
 	}
-
 	blk := &Block{vm: vm}
-	if err := parseBlockBytes(bytes, blk); err != nil {
+	if err := parseBlockBytes(raw, blk); err != nil {
 		return nil, err
 	}
-
 	blk.ID_ = id
 	return blk, nil
 }
 
-func (vm *VM) persistKey(key *ManagedKey) error {
-	bytes, err := key.Marshal()
-	if err != nil {
-		return err
-	}
-	keyPrefix := []byte("key:")
-	dbKey := append(keyPrefix, []byte(key.KeyID)...)
-	return vm.db.Put(dbKey, bytes)
-}
-
-func (vm *VM) loadKeys() error {
-	keyPrefix := []byte("key:")
-	iter := vm.db.NewIteratorWithPrefix(keyPrefix)
-	defer iter.Release()
-
-	for iter.Next() {
-		key := &ManagedKey{}
-		if err := parseManagedKey(iter.Value(), key); err != nil {
-			continue
-		}
-		vm.keys[key.KeyID] = key
-		if key.Status == "active" && (vm.activeKeyID == "" || key.CreatedAt.After(vm.keys[vm.activeKeyID].CreatedAt)) {
-			vm.activeKeyID = key.KeyID
-		}
-	}
-
-	return iter.Error()
-}
-
+// handleHealth serves the same result HealthCheck reports to the engine. One
+// source of truth: an HTTP probe that computed health separately could say
+// "healthy" while the engine was being told otherwise.
 func (vm *VM) handleHealth(w http.ResponseWriter, r *http.Request) {
-	_, _ = vm.HealthCheck(nil) // Call for side effects; we use mpcReady directly
 	w.Header().Set("Content-Type", "application/json")
+	health, err := vm.HealthCheck(r.Context())
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	w.WriteHeader(http.StatusOK)
-	// JSON encode health
-	fmt.Fprintf(w, `{"status":"healthy","mpcReady":%t}`, vm.mpcReady)
+	_ = json.NewEncoder(w).Encode(struct {
+		Healthy bool              `json:"healthy"`
+		Details map[string]string `json:"details"`
+	}{health.Healthy, health.Details})
 }
 
 // CrossChainMPCRequest is the request format for cross-chain MPC operations
@@ -1619,40 +963,62 @@ type CrossChainMPCRequest struct {
 	MessageType     string `json:"messageType,omitempty"`
 }
 
-// Genesis represents the genesis state
+// Genesis represents the genesis state.
+//
+// Policy is here rather than only in each node's config file because the
+// chain's quorum must be the same value on every validator: a policy that
+// lives per-node can differ per-node, and the first symptom is a key whose
+// declared quorum is not the quorum it was generated with. An absent or
+// malformed policy leaves the config default in place (see Initialize).
 type Genesis struct {
-	Timestamp int64 `json:"timestamp"`
+	Timestamp int64         `json:"timestamp"`
+	Policy    quorum.Policy `json:"policy,omitempty"`
 }
 
 // Helper functions
 
+// publicKeyToAddress derives the 20-byte external-chain custody address of a
+// secp256k1 group key: keccak256(uncompressed X‖Y)[12:].
+//
+// This MUST be Keccak-256, not SHA-256. It is the address that actually holds
+// bridged funds on Ethereum and every EVM chain, and it is what an external
+// `ecrecover` produces from a signature by this key. Deriving it with SHA-256
+// yields an address that no external chain associates with the group key: funds
+// sent to it are unspendable, and a withdrawal signed by the group key appears
+// to come from a different account than the one M-Chain published. There is no
+// recovery from publishing the wrong custody address.
+//
+// Returns nil for an unparseable key; callers must treat nil as a hard failure
+// rather than registering an empty address.
 func publicKeyToAddress(pubKey []byte) []byte {
-	// Decompress public key if needed
-	x, y := secp256k1.DecompressPubkey(pubKey)
-	if x == nil || y == nil {
-		// Already uncompressed or invalid
-		if len(pubKey) >= 64 {
-			// Hash uncompressed key (minus prefix if 65 bytes)
-			toHash := pubKey
-			if len(pubKey) == 65 {
-				toHash = pubKey[1:]
-			}
-			hash := sha256.Sum256(toHash)
-			return hash[12:] // Last 20 bytes
-		}
+	uncompressed := uncompressedXY(pubKey)
+	if uncompressed == nil {
 		return nil
 	}
+	return luxcrypto.Keccak256(uncompressed)[12:]
+}
 
-	// Build uncompressed public key (64 bytes, no prefix)
-	xBytes := x.Bytes()
-	yBytes := y.Bytes()
-	uncompressed := make([]byte, 64)
-	copy(uncompressed[32-len(xBytes):32], xBytes)
-	copy(uncompressed[64-len(yBytes):64], yBytes)
-
-	// Hash uncompressed public key (should use Keccak256 for Ethereum compatibility)
-	hash := sha256.Sum256(uncompressed)
-	return hash[12:] // Last 20 bytes
+// uncompressedXY normalises any accepted secp256k1 public-key encoding to the
+// bare 64-byte X‖Y form that address derivation hashes.
+func uncompressedXY(pubKey []byte) []byte {
+	if x, y := secp256k1.DecompressPubkey(pubKey); x != nil && y != nil {
+		xb, yb := x.Bytes(), y.Bytes()
+		out := make([]byte, 64)
+		copy(out[32-len(xb):32], xb)
+		copy(out[64-len(yb):64], yb)
+		return out
+	}
+	switch len(pubKey) {
+	case 65:
+		if pubKey[0] != 0x04 {
+			return nil
+		}
+		return pubKey[1:]
+	case 64:
+		return pubKey
+	default:
+		return nil
+	}
 }
 
 // computeRecoveryID is no longer needed - we use sig.V() from the Signature interface
@@ -1688,7 +1054,7 @@ var domainSeparators = map[AttestationDomain][]byte{
 	DomainEpochBeacon:     []byte("LUX:QuantumAttest:epoch/beacon:v1"),
 }
 
-// QuantumAttestation represents a threshold attestation over a commitment
+// QuantumAttestation represents a threshold attestation over a commitment.
 type QuantumAttestation struct {
 	// Domain specifies what is being attested (oracle/write, session/complete, etc.)
 	Domain AttestationDomain `json:"domain"`
@@ -1708,20 +1074,25 @@ type QuantumAttestation struct {
 	// Timestamp when attestation was created
 	Timestamp time.Time `json:"timestamp"`
 
-	// KeyID of the threshold key used for signing
+	// KeyID of the custody key that signed.
 	KeyID string `json:"keyId"`
 
-	// Threshold used for this attestation
-	Threshold int `json:"threshold"`
+	// CeremonyID is the ceremony that produced Signature — the primary key of
+	// the replicated ceremony log, so an attestation handed to another chain
+	// can be looked up and re-checked against M-Chain state.
+	CeremonyID string `json:"ceremonyId"`
 
-	// SignerCount is the number of parties that signed
-	SignerCount int `json:"signerCount"`
+	// Policy is the key's quorum in operator form ("3-of-5"). It is what
+	// VerifyAttestation checks Signers against; a bare threshold number would
+	// be ambiguous between signer count and polynomial degree.
+	Policy quorum.Policy `json:"policy"`
 
-	// Signature is the threshold signature over the attestation payload
-	Signature *ecdsaSignature `json:"signature"`
+	// Signers are the parties that participated, canonically ordered.
+	Signers []party.ID `json:"signers"`
 
-	// SigningParties are the party IDs that participated
-	SigningParties []party.ID `json:"signingParties"`
+	// Signature is the 65-byte r‖s‖v threshold signature over the attestation
+	// payload — the same encoding every ceremony artifact uses.
+	Signature []byte `json:"signature"`
 }
 
 // OracleCommitAttestation contains details for oracle commit attestations
@@ -1766,108 +1137,95 @@ func ComputeAttestationPayload(domain AttestationDomain, subjectID, commitmentRo
 	h.Write(commitmentRoot[:])
 
 	// Epoch for temporal binding
-	epochBytes := make([]byte, 8)
-	epochBytes[0] = byte(epoch >> 56)
-	epochBytes[1] = byte(epoch >> 48)
-	epochBytes[2] = byte(epoch >> 40)
-	epochBytes[3] = byte(epoch >> 32)
-	epochBytes[4] = byte(epoch >> 24)
-	epochBytes[5] = byte(epoch >> 16)
-	epochBytes[6] = byte(epoch >> 8)
-	epochBytes[7] = byte(epoch)
-	h.Write(epochBytes)
+	var epochBytes [8]byte
+	binary.BigEndian.PutUint64(epochBytes[:], epoch)
+	h.Write(epochBytes[:])
 
 	var result [32]byte
 	copy(result[:], h.Sum(nil))
 	return result
 }
 
-// AttestOracleCommit creates a threshold attestation for an oracle commitment
-func (vm *VM) AttestOracleCommit(
+// attest is the ONE path from a domain-bound payload to an attestation: run
+// the ceremony, then describe what it produced.
+//
+// There is no polling here and no "status" to interpret. RequestSignature
+// returns when the ceremony has finished and the signature is in hand, so the
+// three Attest* entry points below differ only in how they compute their
+// subject and commitment — which is the only thing that actually differs
+// between an oracle commit, a session completion and an epoch beacon.
+func (vm *VM) attest(
+	ctx context.Context,
 	requestingChain string,
+	keyID string,
+	domain AttestationDomain,
+	subjectID [32]byte,
+	commitRoot [32]byte,
+	epoch uint64,
+) (*QuantumAttestation, error) {
+	payload := ComputeAttestationPayload(domain, subjectID, commitRoot, epoch)
+
+	op, err := vm.RequestSignature(ctx, requestingChain, keyID, payload[:])
+	if err != nil {
+		return nil, fmt.Errorf("mpcvm: attest %s: %w", domain, err)
+	}
+	rec, err := vm.Key(keyID)
+	if err != nil {
+		return nil, err
+	}
+
+	vm.log.Info("created attestation",
+		log.String("domain", string(domain)),
+		log.String("subject", hex.EncodeToString(subjectID[:])),
+		log.Uint64("epoch", epoch),
+		log.String("ceremony", op.CeremonyID),
+	)
+	return &QuantumAttestation{
+		Domain: domain,
+		// The id binds the payload to the ceremony that signed it, so two
+		// attestations over the same payload by different quorums are
+		// distinguishable.
+		AttestationID:  sha256.Sum256(append(payload[:], op.CeremonyID...)),
+		SubjectID:      subjectID,
+		CommitmentRoot: commitRoot,
+		Epoch:          epoch,
+		Timestamp:      time.Now(),
+		KeyID:          keyID,
+		CeremonyID:     op.CeremonyID,
+		Policy:         rec.Policy,
+		Signers:        op.Signers,
+		Signature:      op.Artifact,
+	}, nil
+}
+
+// AttestOracleCommit creates a threshold attestation for an oracle commitment.
+func (vm *VM) AttestOracleCommit(
+	ctx context.Context,
+	requestingChain string,
+	keyID string,
 	requestID [32]byte,
 	kind uint8, // 0 = write, 1 = read
 	commitRoot [32]byte,
 	epoch uint64,
 ) (*QuantumAttestation, error) {
-	// Determine domain based on kind
-	var domain AttestationDomain
-	if kind == 0 {
-		domain = DomainOracleWrite
-	} else {
+	domain := DomainOracleWrite
+	if kind != 0 {
 		domain = DomainOracleRead
 	}
-
-	// Compute the payload to sign
-	payload := ComputeAttestationPayload(domain, requestID, commitRoot, epoch)
-
-	// Request threshold signature
-	session, err := vm.RequestSignature(requestingChain, "", payload[:], "raw")
-	if err != nil {
-		return nil, fmt.Errorf("failed to request attestation signature: %w", err)
-	}
-
-	// Wait for signature completion (with timeout)
-	ctx, cancel := context.WithTimeout(context.Background(), vm.config.SessionTimeout)
-	defer cancel()
-
-	var completedSession *SigningSession
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("attestation signing timed out")
-		case <-time.After(100 * time.Millisecond):
-			s, err := vm.GetSignature(session.SessionID)
-			if err != nil {
-				continue
-			}
-			if s.Status == "completed" {
-				completedSession = s
-				goto done
-			}
-			if s.Status == "failed" {
-				return nil, fmt.Errorf("attestation signing failed: %s", s.Error)
-			}
-		}
-	}
-done:
-
-	// Generate attestation ID
-	attestID := sha256.Sum256(append(payload[:], []byte(completedSession.SessionID)...))
-
-	attestation := &QuantumAttestation{
-		Domain:         domain,
-		AttestationID:  attestID,
-		SubjectID:      requestID,
-		CommitmentRoot: commitRoot,
-		Epoch:          epoch,
-		Timestamp:      time.Now(),
-		KeyID:          completedSession.KeyID,
-		Threshold:      vm.config.Threshold,
-		SignerCount:    len(completedSession.SignerParties),
-		Signature:      completedSession.Signature,
-		SigningParties: completedSession.SignerParties,
-	}
-
-	vm.log.Info("created oracle commit attestation",
-		log.String("domain", string(domain)),
-		log.String("requestID", hex.EncodeToString(requestID[:])),
-		log.Uint64("epoch", epoch),
-	)
-
-	return attestation, nil
+	return vm.attest(ctx, requestingChain, keyID, domain, requestID, commitRoot, epoch)
 }
 
-// AttestSessionComplete creates a threshold attestation for session completion
+// AttestSessionComplete creates a threshold attestation for session completion.
 func (vm *VM) AttestSessionComplete(
+	ctx context.Context,
 	requestingChain string,
+	keyID string,
 	sessionID [32]byte,
 	outputHash [32]byte,
 	oracleRoot [32]byte,
 	receiptsRoot [32]byte,
 	epoch uint64,
 ) (*QuantumAttestation, error) {
-	// Compute combined commitment root
 	h := sha256.New()
 	h.Write(outputHash[:])
 	h.Write(oracleRoot[:])
@@ -1875,241 +1233,66 @@ func (vm *VM) AttestSessionComplete(
 	var commitRoot [32]byte
 	copy(commitRoot[:], h.Sum(nil))
 
-	// Compute the payload to sign
-	payload := ComputeAttestationPayload(DomainSessionComplete, sessionID, commitRoot, epoch)
-
-	// Request threshold signature
-	session, err := vm.RequestSignature(requestingChain, "", payload[:], "raw")
-	if err != nil {
-		return nil, fmt.Errorf("failed to request session attestation: %w", err)
-	}
-
-	// Wait for signature completion
-	ctx, cancel := context.WithTimeout(context.Background(), vm.config.SessionTimeout)
-	defer cancel()
-
-	var completedSession *SigningSession
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("session attestation signing timed out")
-		case <-time.After(100 * time.Millisecond):
-			s, err := vm.GetSignature(session.SessionID)
-			if err != nil {
-				continue
-			}
-			if s.Status == "completed" {
-				completedSession = s
-				goto done
-			}
-			if s.Status == "failed" {
-				return nil, fmt.Errorf("session attestation signing failed: %s", s.Error)
-			}
-		}
-	}
-done:
-
-	attestID := sha256.Sum256(append(payload[:], []byte(completedSession.SessionID)...))
-
-	attestation := &QuantumAttestation{
-		Domain:         DomainSessionComplete,
-		AttestationID:  attestID,
-		SubjectID:      sessionID,
-		CommitmentRoot: commitRoot,
-		Epoch:          epoch,
-		Timestamp:      time.Now(),
-		KeyID:          completedSession.KeyID,
-		Threshold:      vm.config.Threshold,
-		SignerCount:    len(completedSession.SignerParties),
-		Signature:      completedSession.Signature,
-		SigningParties: completedSession.SignerParties,
-	}
-
-	vm.log.Info("created session complete attestation",
-		log.String("sessionID", hex.EncodeToString(sessionID[:])),
-		log.Uint64("epoch", epoch),
-	)
-
-	return attestation, nil
+	return vm.attest(ctx, requestingChain, keyID, DomainSessionComplete, sessionID, commitRoot, epoch)
 }
 
-// AttestEpochBeacon creates a threshold attestation for epoch beacon randomness
+// AttestEpochBeacon creates a threshold attestation for epoch beacon randomness.
 func (vm *VM) AttestEpochBeacon(
+	ctx context.Context,
 	requestingChain string,
+	keyID string,
 	epoch uint64,
 	previousRef [32]byte,
 ) (*QuantumAttestation, error) {
-	// Compute epoch subject ID
-	var subjectID [32]byte
-	epochBytes := make([]byte, 8)
-	epochBytes[0] = byte(epoch >> 56)
-	epochBytes[1] = byte(epoch >> 48)
-	epochBytes[2] = byte(epoch >> 40)
-	epochBytes[3] = byte(epoch >> 32)
-	epochBytes[4] = byte(epoch >> 24)
-	epochBytes[5] = byte(epoch >> 16)
-	epochBytes[6] = byte(epoch >> 8)
-	epochBytes[7] = byte(epoch)
+	var epochBytes [8]byte
+	binary.BigEndian.PutUint64(epochBytes[:], epoch)
+
 	h := sha256.New()
 	h.Write([]byte("LUX:EpochBeacon:"))
-	h.Write(epochBytes)
+	h.Write(epochBytes[:])
+	var subjectID [32]byte
 	copy(subjectID[:], h.Sum(nil))
 
-	// The commitment root for beacon is hash of previous ref (chain the beacons)
-	var commitRoot [32]byte
+	// Chaining each beacon to its predecessor is what makes the sequence
+	// unforgeable as a sequence rather than as isolated signatures.
 	h2 := sha256.New()
 	h2.Write(previousRef[:])
-	h2.Write(epochBytes)
+	h2.Write(epochBytes[:])
+	var commitRoot [32]byte
 	copy(commitRoot[:], h2.Sum(nil))
 
-	// Compute the payload to sign
-	payload := ComputeAttestationPayload(DomainEpochBeacon, subjectID, commitRoot, epoch)
-
-	// Request threshold signature
-	session, err := vm.RequestSignature(requestingChain, "", payload[:], "raw")
-	if err != nil {
-		return nil, fmt.Errorf("failed to request beacon attestation: %w", err)
-	}
-
-	// Wait for signature completion
-	ctx, cancel := context.WithTimeout(context.Background(), vm.config.SessionTimeout)
-	defer cancel()
-
-	var completedSession *SigningSession
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("beacon attestation signing timed out")
-		case <-time.After(100 * time.Millisecond):
-			s, err := vm.GetSignature(session.SessionID)
-			if err != nil {
-				continue
-			}
-			if s.Status == "completed" {
-				completedSession = s
-				goto done
-			}
-			if s.Status == "failed" {
-				return nil, fmt.Errorf("beacon attestation signing failed: %s", s.Error)
-			}
-		}
-	}
-done:
-
-	attestID := sha256.Sum256(append(payload[:], []byte(completedSession.SessionID)...))
-
-	attestation := &QuantumAttestation{
-		Domain:         DomainEpochBeacon,
-		AttestationID:  attestID,
-		SubjectID:      subjectID,
-		CommitmentRoot: commitRoot,
-		Epoch:          epoch,
-		Timestamp:      time.Now(),
-		KeyID:          completedSession.KeyID,
-		Threshold:      vm.config.Threshold,
-		SignerCount:    len(completedSession.SignerParties),
-		Signature:      completedSession.Signature,
-		SigningParties: completedSession.SignerParties,
-	}
-
-	vm.log.Info("created epoch beacon attestation",
-		log.Uint64("epoch", epoch),
-	)
-
-	return attestation, nil
+	return vm.attest(ctx, requestingChain, keyID, DomainEpochBeacon, subjectID, commitRoot, epoch)
 }
 
-// VerifyAttestation verifies a QuantumAttestation is valid
-func (vm *VM) VerifyAttestation(attestation *QuantumAttestation) error {
-	if attestation == nil {
-		return errors.New("nil attestation")
+// VerifyAttestation checks an attestation against this node's registry: the
+// domain is one M-Chain issues, the quorum satisfies the key's policy, and the
+// signature verifies under the registered group key over the recomputed
+// payload.
+//
+// It uses the same verifyGroupSignature that block.go uses to admit a ceremony
+// to state, so an attestation cannot pass here under a rule that a block would
+// have rejected.
+func (vm *VM) VerifyAttestation(a *QuantumAttestation) error {
+	if a == nil {
+		return errors.New("mpcvm: nil attestation")
 	}
-
-	// Verify domain is valid
-	if _, ok := domainSeparators[attestation.Domain]; !ok {
-		return fmt.Errorf("invalid attestation domain: %s", attestation.Domain)
+	if _, ok := domainSeparators[a.Domain]; !ok {
+		return fmt.Errorf("mpcvm: unknown attestation domain %q", a.Domain)
 	}
-
-	// Verify threshold requirements
-	if attestation.SignerCount < attestation.Threshold+1 {
-		return fmt.Errorf("insufficient signers: %d < %d required", attestation.SignerCount, attestation.Threshold+1)
+	// K signers, not K-1: a set the size of the polynomial degree cannot
+	// produce a signature, so a claim that it did is a wrong-degree key.
+	if len(a.Signers) < a.Policy.K {
+		return fmt.Errorf("%w: %d signers for policy %s", ErrQuorumTooSmall, len(a.Signers), a.Policy)
 	}
-
-	// Recompute payload
-	payload := ComputeAttestationPayload(
-		attestation.Domain,
-		attestation.SubjectID,
-		attestation.CommitmentRoot,
-		attestation.Epoch,
-	)
-
-	// Get the public key for verification
-	pubKey, err := vm.GetPublicKey(attestation.KeyID)
+	pubKey, err := vm.PublicKey(a.KeyID)
 	if err != nil {
-		return fmt.Errorf("failed to get public key: %w", err)
+		return err
 	}
-
-	// Verify signature
-	if attestation.Signature == nil {
-		return errors.New("missing signature")
+	payload := ComputeAttestationPayload(a.Domain, a.SubjectID, a.CommitmentRoot, a.Epoch)
+	if err := verifyGroupSignature(pubKey, payload[:], a.Signature); err != nil {
+		return fmt.Errorf("%w: %w", ErrBadArtifact, err)
 	}
-
-	// Reconstruct signature bytes for verification
-	sigBytes := make([]byte, 65)
-	copy(sigBytes[0:32], attestation.Signature.R)
-	copy(sigBytes[32:64], attestation.Signature.S)
-	sigBytes[64] = attestation.Signature.V
-
-	// Use secp256k1 to verify
-	recoveredPub, err := secp256k1.RecoverPubkey(payload[:], sigBytes)
-	if err != nil {
-		return fmt.Errorf("signature recovery failed: %w", err)
-	}
-
-	// Compare recovered public key with stored key
-	// The threshold signature should recover to the group public key
-	if !bytesEqual(recoveredPub, pubKey) && !bytesEqualCompressed(recoveredPub, pubKey) {
-		return ErrInvalidSignature
-	}
-
 	return nil
-}
-
-// bytesEqual compares two byte slices
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// bytesEqualCompressed handles comparing compressed vs uncompressed pubkeys
-func bytesEqualCompressed(uncompressed, compressed []byte) bool {
-	if len(compressed) != 33 || len(uncompressed) < 64 {
-		return false
-	}
-	// Compress the uncompressed key and compare
-	x, y := secp256k1.DecompressPubkey(compressed)
-	if x == nil || y == nil {
-		return false
-	}
-	// Build uncompressed from compressed
-	xBytes := x.Bytes()
-	yBytes := y.Bytes()
-	rebuilt := make([]byte, 65)
-	rebuilt[0] = 0x04
-	copy(rebuilt[33-len(xBytes):33], xBytes)
-	copy(rebuilt[65-len(yBytes):65], yBytes)
-	// Compare against provided uncompressed (might be 64 or 65 bytes)
-	if len(uncompressed) == 64 {
-		return bytesEqual(rebuilt[1:], uncompressed)
-	}
-	return bytesEqual(rebuilt, uncompressed)
 }
 
 // DetectEquivocation checks if two attestations represent equivocation (slashable)

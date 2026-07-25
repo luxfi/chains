@@ -142,6 +142,59 @@ func (r *inProcRouter) Send(msg *protocol.Message) error {
 func (r *inProcRouter) Receive() <-chan *protocol.Message { return r.net.inbox(r.self) }
 
 // =============================================================================
+// Multi-ceremony in-process mesh
+// =============================================================================
+
+// localMesh is a process-wide ceremony bus shared by several VMs running in one
+// process — the committee of an in-process devnet, and the harness that proves
+// the ceremony path end to end.
+//
+// It exists so that a single-process committee runs the SAME executor and the
+// SAME MessageRouter boundary as a networked one; only the bytes underneath
+// differ (channels instead of app-gossip). A test that stubbed the ceremony
+// would prove nothing about the code that signs real custody transactions.
+//
+// Routing is by (ceremony, party): concurrent ceremonies get disjoint meshes,
+// which is exactly the property a single global router cannot provide.
+type localMesh struct {
+	mu      sync.Mutex
+	parties []party.ID
+	nets    map[string]*inProcNetwork
+}
+
+// NewLocalMesh builds an in-process bus over a fixed committee.
+func NewLocalMesh(parties []party.ID) *localMesh {
+	return &localMesh{
+		parties: append([]party.ID(nil), parties...),
+		nets:    make(map[string]*inProcNetwork),
+	}
+}
+
+// routerFor returns self's router for one ceremony, creating the ceremony's
+// mesh on first use. Every party in the committee gets a view onto the same
+// mesh regardless of which one arrives first.
+func (m *localMesh) routerFor(ceremony string, self party.ID) MessageRouter {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	net, ok := m.nets[ceremony]
+	if !ok {
+		net = newInProcNetwork(m.parties)
+		m.nets[ceremony] = net
+	}
+	return &inProcRouter{self: self, net: net}
+}
+
+// release drops a finished ceremony's mesh. It does NOT close the inboxes: the
+// other parties in this process may still be draining the last round, and
+// closing under them would race their receive loops. Dropping the reference is
+// enough — the mesh is garbage once every party's router is gone.
+func (m *localMesh) release(ceremony string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.nets, ceremony)
+}
+
+// =============================================================================
 // Cross-validator gossip transport (production)
 // =============================================================================
 

@@ -28,7 +28,7 @@ require (
 	github.com/luxfi/rpc v1.1.0
 	github.com/luxfi/runtime v1.3.1
 	github.com/luxfi/sys v0.1.0
-	github.com/luxfi/threshold v1.12.3
+	github.com/luxfi/threshold v1.12.6
 	github.com/luxfi/timer v1.1.1
 	github.com/luxfi/version v1.0.1
 	github.com/luxfi/vm v1.3.1

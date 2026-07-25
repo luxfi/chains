@@ -19,9 +19,9 @@
 // Layering mirrors the primitive-library stack that already exists upstream
 // (github.com/luxfi/threshold is consumed by github.com/luxfi/mpc; FHE ⊥ MPC):
 //
-//   - ThresholdService — PURE threshold primitives: DKG, committee lifecycle
-//     (keygen / refresh / reshare), key/committee lookup. The substrate the
-//     other two consume. Owns no custody, no bridge business logic, no FHE.
+//   - ThresholdService — PURE threshold primitives: DKG, committee formation,
+//     key/committee lookup. The substrate the other two consume. Owns no
+//     custody, no bridge business logic, no FHE.
 //   - MPCService — threshold SIGNING, bridge-custody attestation. CONSUMES
 //     ThresholdService committees to produce signatures/attestations over
 //     cross-chain subjects. This is M-Chain's surface (LP-7100).
@@ -32,38 +32,51 @@
 // mpcvm itself remains a LIBRARY: there is no T-Chain, no teleportvm.
 package mpcvm
 
-import "github.com/luxfi/threshold/pkg/party"
+import (
+	"context"
+
+	"github.com/luxfi/threshold/pkg/party"
+	"github.com/luxfi/threshold/pkg/quorum"
+)
 
 // ThresholdService is the pure threshold-primitive surface — the substrate
 // M-Chain (MPC) and F-Chain (FHE) both consume. It is distributed key
-// generation, committee formation and rotation (resharing), and lookup of the
-// artifacts those ceremonies produce. It deliberately excludes signing-for-
-// custody (MPCService) and FHE execution (FHEService).
+// generation, committee formation, and lookup of the artifacts those ceremonies
+// produce. It deliberately excludes signing-for-custody (MPCService) and FHE
+// execution (FHEService).
+//
+// Every ceremony method takes a context and returns the COMPLETED ceremony's
+// operation: a ceremony either finished (and its verifiable artifact is in
+// hand) or it failed. There is no third "in progress" state to poll, because a
+// handle to an unfinished ceremony is a handle to state that only one node has.
 type ThresholdService interface {
-	// InitializeMPC establishes the threshold party set for the substrate.
-	InitializeMPC(partyIDs []party.ID) error
+	// StartKeygen runs a distributed key-generation ceremony for keyID under
+	// the chain's default policy, attributed to requestedBy.
+	StartKeygen(ctx context.Context, keyID, requestedBy string) (*Operation, error)
 
-	// StartKeygen runs a distributed key-generation ceremony for keyID of the
-	// given keyType, attributed to requestedBy.
-	StartKeygen(keyID, keyType, requestedBy string) (*KeygenSession, error)
+	// StartKeygenWithPolicy runs DKG under an explicit k-of-n policy. The
+	// polynomial degree is derived from the policy, never passed alongside it.
+	StartKeygenWithPolicy(ctx context.Context, keyID string, policy quorum.Policy, requestedBy string) (*Operation, error)
 
-	// StartKeygenWithProtocol runs DKG under an explicit protocol
-	// (e.g. CGGMP21 / FROST / Corona-general) with an explicit (t, n).
-	StartKeygenWithProtocol(keyID, protocol, requestedBy string, threshold, totalParties int) (*KeygenSession, error)
+	// Policy returns the chain's default signing policy.
+	Policy() quorum.Policy
 
-	// RefreshKey re-randomizes the shares of an existing key without changing
-	// its public key (proactive-security refresh).
-	RefreshKey(keyID, requestedBy string) (*KeygenSession, error)
+	// Committee returns the ceremony party set at a P-Chain height: this
+	// chain's validators. Joining the signing ring is joining the validator
+	// set — there is no separate operator registry.
+	Committee(ctx context.Context, height uint64) ([]party.ID, error)
 
-	// ReshareKey rotates the signer committee for keyID to a new party set
-	// (LSS resharing), preserving the public key.
-	ReshareKey(keyID string, newPartyIDs []party.ID, requestedBy string) (*KeygenSession, error)
+	// Key returns one custody key's replicated public record; Keys returns all
+	// of them.
+	Key(keyID string) (*KeyRecord, error)
+	Keys() ([]*KeyRecord, error)
 
-	// GetPublicKey returns the group public key for keyID.
-	GetPublicKey(keyID string) ([]byte, error)
+	// PublicKey returns the compressed group public key for keyID.
+	PublicKey(keyID string) ([]byte, error)
 
-	// GetAddress returns the chain address derived from keyID's public key.
-	GetAddress(keyID string) ([]byte, error)
+	// Address returns the external-chain custody address derived from keyID's
+	// group public key.
+	Address(keyID string) ([]byte, error)
 }
 
 // MPCService is the M-Chain surface: threshold signing and bridge-custody
@@ -73,24 +86,37 @@ type MPCService interface {
 	ThresholdService
 
 	// RequestSignature asks the custody committee for keyID to threshold-sign
-	// messageHash on behalf of requestingChain.
-	RequestSignature(requestingChain, keyID string, messageHash []byte, messageType string) (*SigningSession, error)
+	// messageHash on behalf of requestingChain. It returns when the ceremony
+	// has produced a signature that verifies under the registered group key.
+	RequestSignature(ctx context.Context, requestingChain, keyID string, messageHash []byte) (*Operation, error)
 
-	// GetSignature returns the (possibly in-progress) signing session.
-	GetSignature(sessionID string) (*SigningSession, error)
+	// Ceremony returns one recorded ceremony — the replicated, durable evidence
+	// that a signature was produced, including the signature. Ceremonies
+	// returns the whole log.
+	Ceremony(id string) (*CeremonyRecord, error)
+	Ceremonies() ([]*CeremonyRecord, error)
+
+	// StateRoot is the value two validators compare to know whether they agree
+	// about custody.
+	StateRoot() [32]byte
+
+	// RequestBridgeRelease is the B→M seam: a bridge release request in, a
+	// threshold-signed self-describing attestation out.
+	RequestBridgeRelease(ctx context.Context, req BridgeReleaseRequest) (*BridgeTransferAttestation, error)
 
 	// AttestOracleCommit produces a threshold attestation over an oracle
 	// read/write commitment for requestingChain.
-	AttestOracleCommit(requestingChain string, requestID [32]byte, kind uint8, commitRoot [32]byte, epoch uint64) (*QuantumAttestation, error)
+	AttestOracleCommit(ctx context.Context, requestingChain, keyID string, requestID [32]byte, kind uint8, commitRoot [32]byte, epoch uint64) (*QuantumAttestation, error)
 
 	// AttestSessionComplete attests that a bridge/custody session finished with
 	// the given output/oracle/receipts roots.
-	AttestSessionComplete(requestingChain string, sessionID [32]byte, outputHash, oracleRoot, receiptsRoot [32]byte, epoch uint64) (*QuantumAttestation, error)
+	AttestSessionComplete(ctx context.Context, requestingChain, keyID string, sessionID [32]byte, outputHash, oracleRoot, receiptsRoot [32]byte, epoch uint64) (*QuantumAttestation, error)
 
 	// AttestEpochBeacon produces the per-epoch beacon attestation.
-	AttestEpochBeacon(requestingChain string, epoch uint64, previousRef [32]byte) (*QuantumAttestation, error)
+	AttestEpochBeacon(ctx context.Context, requestingChain, keyID string, epoch uint64, previousRef [32]byte) (*QuantumAttestation, error)
 
-	// VerifyAttestation verifies a QuantumAttestation this service produced.
+	// VerifyAttestation verifies a QuantumAttestation against this node's
+	// custody registry.
 	VerifyAttestation(attestation *QuantumAttestation) error
 }
 

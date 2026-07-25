@@ -5,9 +5,9 @@ package mpcvm
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/luxfi/threshold/pkg/party"
+	"github.com/luxfi/threshold/pkg/quorum"
 	"github.com/luxfi/zap"
 )
 
@@ -27,62 +27,81 @@ import (
 
 // ---- Operation (nested in Block) ----
 //
-//	Type        bytes @ 0
-//	SessionID   bytes @ 8
-//	KeyID       bytes @ 16
-//	Protocol    bytes @ 24
-//	ReqChain    bytes @ 32
-//	MessageHash bytes @ 40
-//	Signature   bytes @ 48
-//	Error       bytes @ 56
-//	Timestamp   i64   @ 64
-//	Success     u8    @ 72
+//	Type       bytes @ 0
+//	CeremonyID bytes @ 8
+//	KeyID      bytes @ 16
+//	ReqChain   bytes @ 24
+//	Digest     bytes @ 32
+//	Artifact   bytes @ 40
+//	Timestamp  i64   @ 48
+//	SignerLens list  @ 56
+//	SignerBlob bytes @ 64
+//	KeyPresent u8    @ 72   (1 iff a KeyRecord follows — keygen operations)
+//	KeyBlob    bytes @ 80   (marshalled KeyRecord)
 const (
-	opType    = 0
-	opSession = 8
-	opKeyID   = 16
-	opProto   = 24
-	opReqChn  = 32
-	opMsgHash = 40
-	opSig     = 48
-	opErr     = 56
-	opTS      = 64
-	opSuccess = 72
-	opSize    = 73
+	opType       = 0
+	opCeremony   = 8
+	opKeyID      = 16
+	opReqChn     = 24
+	opDigest     = 32
+	opArtifact   = 40
+	opTS         = 48
+	opSignerLens = 56
+	opSignerBlob = 64
+	opKeyPresent = 72
+	opKeyBlob    = 80
+	opSize       = 88
 )
 
-func marshalOperation(op *Operation) []byte {
-	b := zap.NewBuilder(zap.HeaderSize + opSize + len(op.Type) + len(op.SessionID) +
-		len(op.KeyID) + len(op.Protocol) + len(op.RequestingChain) + len(op.MessageHash) +
-		len(op.Signature) + len(op.Error) + 64)
+func marshalOperation(op *Operation) ([]byte, error) {
+	signerLens, signerBlob := packStrings(partyIDsToStrings(op.Signers))
+	var keyBlob []byte
+	if op.Key != nil {
+		var err error
+		if keyBlob, err = marshalKeyRecord(op.Key); err != nil {
+			return nil, err
+		}
+	}
+	b := zap.NewBuilder(zap.HeaderSize + opSize + len(op.Type) + len(op.CeremonyID) +
+		len(op.KeyID) + len(op.RequestingChain) + len(op.Digest) + len(op.Artifact) +
+		len(signerBlob) + 4*len(signerLens) + len(keyBlob) + 128)
+	signerLensOff := writeU32List(b, signerLens)
+
 	ob := b.StartObject(opSize)
 	ob.SetBytes(opType, []byte(op.Type))
-	ob.SetBytes(opSession, []byte(op.SessionID))
+	ob.SetBytes(opCeremony, []byte(op.CeremonyID))
 	ob.SetBytes(opKeyID, []byte(op.KeyID))
-	ob.SetBytes(opProto, []byte(op.Protocol))
 	ob.SetBytes(opReqChn, []byte(op.RequestingChain))
-	ob.SetBytes(opMsgHash, op.MessageHash)
-	ob.SetBytes(opSig, op.Signature)
-	ob.SetBytes(opErr, []byte(op.Error))
+	ob.SetBytes(opDigest, op.Digest)
+	ob.SetBytes(opArtifact, op.Artifact)
 	ob.SetInt64(opTS, op.Timestamp)
-	ob.SetUint8(opSuccess, boolByte(op.Success))
+	ob.SetList(opSignerLens, signerLensOff, len(signerLens))
+	ob.SetBytes(opSignerBlob, signerBlob)
+	ob.SetUint8(opKeyPresent, boolByte(op.Key != nil))
+	ob.SetBytes(opKeyBlob, keyBlob)
 	ob.FinishAsRoot()
-	return b.Finish()
+	return b.Finish(), nil
 }
 
-func readOperation(o zap.Object) *Operation {
-	return &Operation{
+func readOperation(o zap.Object) (*Operation, error) {
+	op := &Operation{
 		Type:            string(o.Bytes(opType)),
-		SessionID:       string(o.Bytes(opSession)),
+		CeremonyID:      string(o.Bytes(opCeremony)),
 		KeyID:           string(o.Bytes(opKeyID)),
-		Protocol:        string(o.Bytes(opProto)),
 		RequestingChain: string(o.Bytes(opReqChn)),
-		MessageHash:     appendBytes(o.Bytes(opMsgHash)),
-		Signature:       appendBytes(o.Bytes(opSig)),
-		Error:           string(o.Bytes(opErr)),
+		Digest:          appendBytes(o.Bytes(opDigest)),
+		Artifact:        appendBytes(o.Bytes(opArtifact)),
 		Timestamp:       o.Int64(opTS),
-		Success:         o.Uint8(opSuccess) != 0,
+		Signers:         stringsToPartyIDs(unpackStrings(readU32List(o, opSignerLens), o.Bytes(opSignerBlob))),
 	}
+	if o.Uint8(opKeyPresent) != 0 {
+		rec, err := parseKeyRecord(o.Bytes(opKeyBlob))
+		if err != nil {
+			return nil, fmt.Errorf("mpcvm operation: key record: %w", err)
+		}
+		op.Key = rec
+	}
+	return op, nil
 }
 
 // ---- Block ----
@@ -90,15 +109,17 @@ func readOperation(o zap.Object) *Operation {
 //	ParentID  32B   @ 0    (ID_ is derived: computeID = sha256(Marshal); excluded)
 //	Height    u64   @ 32
 //	Timestamp i64   @ 40
-//	OpLens    list  @ 48   (u32 per Operation wire length)
-//	OpBlob    bytes @ 56   (concatenated Operation wire objects)
+//	StateRoot 32B   @ 48   (post-application root; commits the transition)
+//	OpLens    list  @ 80   (u32 per Operation wire length)
+//	OpBlob    bytes @ 88   (concatenated Operation wire objects)
 const (
 	blkParent = 0
 	blkHeight = 32
 	blkTime   = 40
-	blkOpLens = 48
-	blkOpBlob = 56
-	blkSize   = 64
+	blkRoot   = 48
+	blkOpLens = 80
+	blkOpBlob = 88
+	blkSize   = 96
 )
 
 // Marshal encodes the block (excluding the derived ID_) to canonical wire.
@@ -106,7 +127,10 @@ func (b *Block) Marshal() ([]byte, error) {
 	var opBlob []byte
 	opLens := make([]uint32, 0, len(b.Operations))
 	for _, op := range b.Operations {
-		ob := marshalOperation(op)
+		ob, err := marshalOperation(op)
+		if err != nil {
+			return nil, err
+		}
 		opLens = append(opLens, uint32(len(ob)))
 		opBlob = append(opBlob, ob...)
 	}
@@ -117,6 +141,7 @@ func (b *Block) Marshal() ([]byte, error) {
 	ob.SetBytesFixed(blkParent, b.ParentID_[:])
 	ob.SetUint64(blkHeight, b.BlockHeight)
 	ob.SetInt64(blkTime, b.BlockTimestamp)
+	ob.SetBytesFixed(blkRoot, b.StateRoot[:])
 	ob.SetList(blkOpLens, opLensOff, len(opLens))
 	ob.SetBytes(blkOpBlob, opBlob)
 	ob.FinishAsRoot()
@@ -135,6 +160,7 @@ func parseBlockBytes(data []byte, blk *Block) error {
 	copy(blk.ParentID_[:], o.BytesFixedSlice(blkParent, 32))
 	blk.BlockHeight = o.Uint64(blkHeight)
 	blk.BlockTimestamp = o.Int64(blkTime)
+	copy(blk.StateRoot[:], o.BytesFixedSlice(blkRoot, 32))
 
 	opLens := readU32List(o, blkOpLens)
 	if len(opLens) == 0 {
@@ -152,91 +178,13 @@ func parseBlockBytes(data []byte, blk *Block) error {
 		if err != nil {
 			return err
 		}
-		blk.Operations = append(blk.Operations, readOperation(omsg.Root()))
+		op, err := readOperation(omsg.Root())
+		if err != nil {
+			return err
+		}
+		blk.Operations = append(blk.Operations, op)
 		pos += int(l)
 	}
-	return nil
-}
-
-// ---- ManagedKey ----
-//
-//	KeyID     bytes @ 0
-//	KeyType   bytes @ 8
-//	PublicKey bytes @ 16
-//	Address   bytes @ 24
-//	Status    bytes @ 32
-//	Threshold i64   @ 40
-//	Total     i64   @ 48
-//	Generation u64  @ 56
-//	CreatedAt i64   @ 64   (UnixNano)
-//	LastUsedAt i64  @ 72   (UnixNano)
-//	SignCount u64   @ 80
-//	PartyLens list  @ 88   (u32 per partyID string length)
-//	PartyBlob bytes @ 96   (concatenated partyID strings)
-//
-// Config/CMPConfig (json:"-") are reconstructed off-wire and excluded.
-const (
-	mkKeyID     = 0
-	mkKeyType   = 8
-	mkPubKey    = 16
-	mkAddr      = 24
-	mkStatus    = 32
-	mkThreshold = 40
-	mkTotal     = 48
-	mkGen       = 56
-	mkCreated   = 64
-	mkLastUsed  = 72
-	mkSignCnt   = 80
-	mkPartyLens = 88
-	mkPartyBlob = 96
-	mkSize      = 104
-)
-
-func (k *ManagedKey) Marshal() ([]byte, error) {
-	partyLens, partyBlob := packStrings(partyIDsToStrings(k.PartyIDs))
-	bld := zap.NewBuilder(zap.HeaderSize + mkSize + len(k.KeyID) + len(k.KeyType) +
-		len(k.PublicKey) + len(k.Address) + len(k.Status) + len(partyBlob) + 4*len(partyLens) + 128)
-	partyLensOff := writeU32List(bld, partyLens)
-
-	ob := bld.StartObject(mkSize)
-	ob.SetBytes(mkKeyID, []byte(k.KeyID))
-	ob.SetBytes(mkKeyType, []byte(k.KeyType))
-	ob.SetBytes(mkPubKey, k.PublicKey)
-	ob.SetBytes(mkAddr, k.Address)
-	ob.SetBytes(mkStatus, []byte(k.Status))
-	ob.SetInt64(mkThreshold, int64(k.Threshold))
-	ob.SetInt64(mkTotal, int64(k.TotalParties))
-	ob.SetUint64(mkGen, k.Generation)
-	ob.SetInt64(mkCreated, k.CreatedAt.UnixNano())
-	ob.SetInt64(mkLastUsed, k.LastUsedAt.UnixNano())
-	ob.SetUint64(mkSignCnt, k.SignCount)
-	ob.SetList(mkPartyLens, partyLensOff, len(partyLens))
-	ob.SetBytes(mkPartyBlob, partyBlob)
-	ob.FinishAsRoot()
-	return bld.Finish(), nil
-}
-
-func parseManagedKey(data []byte, k *ManagedKey) error {
-	msg, err := zap.Parse(data)
-	if err != nil {
-		return err
-	}
-	if msg.Size() != len(data) {
-		return fmt.Errorf("mpcvm managed key: trailing bytes")
-	}
-	o := msg.Root()
-	k.KeyID = string(o.Bytes(mkKeyID))
-	k.KeyType = string(o.Bytes(mkKeyType))
-	k.PublicKey = appendBytes(o.Bytes(mkPubKey))
-	k.Address = appendBytes(o.Bytes(mkAddr))
-	k.Status = string(o.Bytes(mkStatus))
-	k.Threshold = int(o.Int64(mkThreshold))
-	k.TotalParties = int(o.Int64(mkTotal))
-	k.Generation = o.Uint64(mkGen)
-	k.CreatedAt = time.Unix(0, o.Int64(mkCreated)).UTC()
-	k.LastUsedAt = time.Unix(0, o.Int64(mkLastUsed)).UTC()
-	k.SignCount = o.Uint64(mkSignCnt)
-	k.PartyIDs = stringsToPartyIDs(unpackStrings(readU32List(o, mkPartyLens), o.Bytes(mkPartyBlob)))
 	return nil
 }
 
@@ -288,6 +236,143 @@ func parseCrossChainMPCRequest(data []byte, r *CrossChainMPCRequest) error {
 	r.MessageHash = appendBytes(o.Bytes(ccMsgHash))
 	r.MessageType = string(o.Bytes(ccMsgType))
 	return nil
+}
+
+// ---- KeyRecord (replicated custody-key registry entry) ----
+//
+//	KeyID      bytes @ 0
+//	Kind       bytes @ 8
+//	PolicyK    i64   @ 16
+//	PolicyN    i64   @ 24
+//	GroupPub   bytes @ 32
+//	Address    bytes @ 40
+//	Generation u64   @ 48
+//	CreatedHt  u64   @ 56
+//	PartyLens  list  @ 64
+//	PartyBlob  bytes @ 72
+//
+// The polynomial degree is NOT a field: it is Policy.Degree(). Storing both a
+// policy and a degree invites them to disagree, and a stored disagreement in a
+// custody record is a wrong-degree key.
+const (
+	krKeyID     = 0
+	krKind      = 8
+	krPolicyK   = 16
+	krPolicyN   = 24
+	krGroupPub  = 32
+	krAddr      = 40
+	krGen       = 48
+	krCreatedHt = 56
+	krPartyLens = 64
+	krPartyBlob = 72
+	krSize      = 80
+)
+
+func marshalKeyRecord(r *KeyRecord) ([]byte, error) {
+	partyLens, partyBlob := packStrings(partyIDsToStrings(r.Participants))
+	bld := zap.NewBuilder(zap.HeaderSize + krSize + len(r.KeyID) + len(r.Kind) +
+		len(r.GroupPublicKey) + len(r.Address) + len(partyBlob) + 4*len(partyLens) + 128)
+	partyLensOff := writeU32List(bld, partyLens)
+
+	ob := bld.StartObject(krSize)
+	ob.SetBytes(krKeyID, []byte(r.KeyID))
+	ob.SetBytes(krKind, []byte(r.Kind))
+	ob.SetInt64(krPolicyK, int64(r.Policy.K))
+	ob.SetInt64(krPolicyN, int64(r.Policy.N))
+	ob.SetBytes(krGroupPub, r.GroupPublicKey)
+	ob.SetBytes(krAddr, r.Address)
+	ob.SetUint64(krGen, r.Generation)
+	ob.SetUint64(krCreatedHt, r.CreatedHeight)
+	ob.SetList(krPartyLens, partyLensOff, len(partyLens))
+	ob.SetBytes(krPartyBlob, partyBlob)
+	ob.FinishAsRoot()
+	return bld.Finish(), nil
+}
+
+func parseKeyRecord(data []byte) (*KeyRecord, error) {
+	msg, err := zap.Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	if msg.Size() != len(data) {
+		return nil, fmt.Errorf("mpcvm key record: trailing bytes")
+	}
+	o := msg.Root()
+	return &KeyRecord{
+		KeyID:          string(o.Bytes(krKeyID)),
+		Kind:           string(o.Bytes(krKind)),
+		Policy:         quorum.Policy{K: int(o.Int64(krPolicyK)), N: int(o.Int64(krPolicyN))},
+		GroupPublicKey: appendBytes(o.Bytes(krGroupPub)),
+		Address:        appendBytes(o.Bytes(krAddr)),
+		Generation:     o.Uint64(krGen),
+		CreatedHeight:  o.Uint64(krCreatedHt),
+		Participants:   stringsToPartyIDs(unpackStrings(readU32List(o, krPartyLens), o.Bytes(krPartyBlob))),
+	}, nil
+}
+
+// ---- CeremonyRecord (replicated ceremony log entry) ----
+//
+//	ID         bytes @ 0
+//	Kind       bytes @ 8
+//	KeyID      bytes @ 16
+//	Digest     bytes @ 24
+//	Artifact   bytes @ 32
+//	ReqChain   bytes @ 40
+//	Height     u64   @ 48
+//	SignerLens list  @ 56
+//	SignerBlob bytes @ 64
+const (
+	crID         = 0
+	crKind       = 8
+	crKeyID      = 16
+	crDigest     = 24
+	crArtifact   = 32
+	crReqChain   = 40
+	crHeight     = 48
+	crSignerLens = 56
+	crSignerBlob = 64
+	crSize       = 72
+)
+
+func marshalCeremonyRecord(c *CeremonyRecord) ([]byte, error) {
+	signerLens, signerBlob := packStrings(partyIDsToStrings(c.Signers))
+	bld := zap.NewBuilder(zap.HeaderSize + crSize + len(c.ID) + len(c.Kind) + len(c.KeyID) +
+		len(c.Digest) + len(c.Artifact) + len(c.RequestingChain) + len(signerBlob) + 4*len(signerLens) + 128)
+	signerLensOff := writeU32List(bld, signerLens)
+
+	ob := bld.StartObject(crSize)
+	ob.SetBytes(crID, []byte(c.ID))
+	ob.SetBytes(crKind, []byte(c.Kind))
+	ob.SetBytes(crKeyID, []byte(c.KeyID))
+	ob.SetBytes(crDigest, c.Digest)
+	ob.SetBytes(crArtifact, c.Artifact)
+	ob.SetBytes(crReqChain, []byte(c.RequestingChain))
+	ob.SetUint64(crHeight, c.Height)
+	ob.SetList(crSignerLens, signerLensOff, len(signerLens))
+	ob.SetBytes(crSignerBlob, signerBlob)
+	ob.FinishAsRoot()
+	return bld.Finish(), nil
+}
+
+func parseCeremonyRecord(data []byte) (*CeremonyRecord, error) {
+	msg, err := zap.Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	if msg.Size() != len(data) {
+		return nil, fmt.Errorf("mpcvm ceremony record: trailing bytes")
+	}
+	o := msg.Root()
+	return &CeremonyRecord{
+		ID:              string(o.Bytes(crID)),
+		Kind:            string(o.Bytes(crKind)),
+		KeyID:           string(o.Bytes(crKeyID)),
+		Digest:          appendBytes(o.Bytes(crDigest)),
+		Artifact:        appendBytes(o.Bytes(crArtifact)),
+		RequestingChain: string(o.Bytes(crReqChain)),
+		Height:          o.Uint64(crHeight),
+		Signers:         stringsToPartyIDs(unpackStrings(readU32List(o, crSignerLens), o.Bytes(crSignerBlob))),
+	}, nil
 }
 
 // ---- shared helpers ----

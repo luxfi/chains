@@ -4,12 +4,14 @@
 package mpcvm
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
-	"github.com/luxfi/threshold/pkg/party"
+	"github.com/luxfi/threshold/pkg/quorum"
 )
 
 // RPCRequest represents a JSON-RPC request
@@ -40,20 +42,19 @@ func (e *RPCError) Error() string {
 	return fmt.Sprintf("RPC error %d: %s", e.Code, e.Message)
 }
 
-// Error codes
+// Error codes. Only codes this server can actually return are declared: a
+// published code that nothing emits reads as a contract to callers who then
+// write dead branches against it.
 const (
 	RPCErrorInvalidRequest   = -32600
 	RPCErrorMethodNotFound   = -32601
 	RPCErrorInvalidParams    = -32602
 	RPCErrorInternal         = -32603
-	RPCErrorMPCNotReady      = -32001
 	RPCErrorUnauthorized     = -32002
 	RPCErrorQuotaExceeded    = -32003
-	RPCErrorSessionNotFound  = -32004
+	RPCErrorCeremonyNotFound = -32004
 	RPCErrorKeyNotFound      = -32005
 	RPCErrorProtocolNotFound = -32006
-	RPCErrorKeygenInProgress = -32007
-	RPCErrorInvalidProtocol  = -32008
 )
 
 // createRPCHandler creates the JSON-RPC handler
@@ -72,7 +73,7 @@ func (vm *VM) createRPCHandler() http.Handler {
 			return
 		}
 
-		result, err := vm.handleRPCMethod(req.Method, req.Params)
+		result, err := vm.handleRPCMethod(r.Context(), req.Method, req.Params)
 		if err != nil {
 			rpcErr, ok := err.(*RPCError)
 			if !ok {
@@ -100,36 +101,39 @@ func writeRPCError(w http.ResponseWriter, id interface{}, code int, message stri
 	writeRPCResponse(w, id, nil, &RPCError{Code: code, Message: message, Data: data})
 }
 
-// handleRPCMethod dispatches RPC method calls
-func (vm *VM) handleRPCMethod(method string, params json.RawMessage) (interface{}, error) {
+// handleRPCMethod dispatches RPC method calls.
+//
+// Two families, one per noun: threshold_* runs ceremonies and reports on the
+// node, mpc_* reads the replicated custody state (keys, ceremonies, root).
+// Nothing is reachable under two names — a capability with two spellings is a
+// capability whose two spellings will eventually disagree.
+func (vm *VM) handleRPCMethod(ctx context.Context, method string, params json.RawMessage) (interface{}, error) {
 	switch method {
-	// Key Generation
+	// Ceremonies. Both run to completion before returning: keygen yields a
+	// registered key, sign yields the signature itself.
 	case "threshold_keygen":
-		return vm.rpcKeygen(params)
-	case "threshold_getKeygenStatus":
-		return vm.rpcGetKeygenStatus(params)
-
-	// Signing
+		return vm.rpcKeygen(ctx, params)
 	case "threshold_sign":
-		return vm.rpcSign(params)
-	case "threshold_getSignature":
-		return vm.rpcGetSignature(params)
-	case "threshold_batchSign":
-		return vm.rpcBatchSign(params)
+		return vm.rpcSign(ctx, params)
 
-	// Key Management
-	case "threshold_reshare":
-		return vm.rpcReshare(params)
-	case "threshold_refresh":
-		return vm.rpcRefresh(params)
-	case "threshold_listKeys":
-		return vm.rpcListKeys()
-	case "threshold_getKey":
+	// Custody registry (replicated state)
+	case "mpc_getKey":
 		return vm.rpcGetKey(params)
+	case "mpc_listKeys":
+		return vm.rpcListKeys()
 	case "threshold_getPublicKey":
 		return vm.rpcGetPublicKey(params)
 	case "threshold_getAddress":
 		return vm.rpcGetAddress(params)
+
+	// Ceremony log (replicated state) — where a produced signature is read back
+	// from durably, and the root that says two validators agree.
+	case "mpc_getCeremony":
+		return vm.rpcGetCeremony(params)
+	case "mpc_listCeremonies":
+		return vm.rpcListCeremonies()
+	case "mpc_getStateRoot":
+		return vm.rpcGetStateRoot()
 
 	// Protocol Information
 	case "threshold_getProtocols":
@@ -137,19 +141,13 @@ func (vm *VM) handleRPCMethod(method string, params json.RawMessage) (interface{
 	case "threshold_getProtocolInfo":
 		return vm.rpcGetProtocolInfo(params)
 
-	// Session Management
-	case "threshold_getSessions":
-		return vm.rpcGetSessions(params)
-	case "threshold_cancelSession":
-		return vm.rpcCancelSession(params)
-
 	// Network Information
 	case "threshold_getInfo":
 		return vm.rpcGetInfo()
 	case "threshold_getStats":
 		return vm.rpcGetStats()
 	case "threshold_getParties":
-		return vm.rpcGetParties()
+		return vm.rpcGetParties(ctx)
 	case "threshold_getQuota":
 		return vm.rpcGetQuota(params)
 
@@ -161,466 +159,262 @@ func (vm *VM) handleRPCMethod(method string, params json.RawMessage) (interface{
 
 	// Health
 	case "threshold_health":
-		return vm.rpcHealthCheck()
+		return vm.rpcHealthCheck(ctx)
 
 	default:
 		return nil, &RPCError{Code: RPCErrorMethodNotFound, Message: fmt.Sprintf("method not found: %s", method)}
 	}
 }
 
+// asRPCError maps a VM error to its JSON-RPC code. Written once so every method
+// classifies the same failure the same way, and matched with errors.Is because
+// the VM wraps its errors with context.
+func asRPCError(err error) *RPCError {
+	switch {
+	case errors.Is(err, ErrUnauthorizedChain):
+		return &RPCError{Code: RPCErrorUnauthorized, Message: err.Error()}
+	case errors.Is(err, ErrQuotaExceeded):
+		return &RPCError{Code: RPCErrorQuotaExceeded, Message: err.Error()}
+	case errors.Is(err, ErrUnknownKey), errors.Is(err, ErrShareNotHeld):
+		return &RPCError{Code: RPCErrorKeyNotFound, Message: err.Error()}
+	default:
+		return &RPCError{Code: RPCErrorInternal, Message: err.Error()}
+	}
+}
+
 // =============================================================================
-// Key Generation RPCs
+// Ceremony RPCs
 // =============================================================================
 
-// KeygenParams contains parameters for key generation
+// KeygenParams contains parameters for key generation.
 type KeygenParams struct {
-	KeyID        string `json:"keyId"`
-	Protocol     string `json:"protocol"`     // lss, cggmp21, bls, corona
-	RequestedBy  string `json:"requestedBy"`  // Chain ID
-	Threshold    int    `json:"threshold"`    // Optional override
-	TotalParties int    `json:"totalParties"` // Optional override
+	KeyID       string `json:"keyId"`
+	RequestedBy string `json:"requestedBy"` // Chain ID; must be authorised to keygen
+	// Policy is the quorum in operator form, "3-of-5". Omit it to use the
+	// chain's default. It is deliberately not a pair of numbers: a caller
+	// cannot express the quorum ambiguously, and the polynomial degree is
+	// derived from it inside the ceremony rather than passed alongside it.
+	Policy quorum.Policy `json:"policy,omitempty"`
 }
 
-// KeygenResult contains the result of key generation
+// KeygenResult is a COMPLETED key generation: the ceremony that ran and the
+// key it registered. There is no status to poll — a keygen that returns has a
+// key, and one that fails returns an error.
 type KeygenResult struct {
-	SessionID    string `json:"sessionId"`
-	KeyID        string `json:"keyId"`
-	Protocol     string `json:"protocol"`
-	Status       string `json:"status"`
-	Threshold    int    `json:"threshold"`
-	TotalParties int    `json:"totalParties"`
-	StartedAt    int64  `json:"startedAt"`
+	Ceremony CeremonyInfo `json:"ceremony"`
+	Key      KeyInfo      `json:"key"`
 }
 
-func (vm *VM) rpcKeygen(params json.RawMessage) (*KeygenResult, error) {
+func (vm *VM) rpcKeygen(ctx context.Context, params json.RawMessage) (*KeygenResult, error) {
 	var p KeygenParams
 	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
+		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: err.Error()}
 	}
 
-	// Default protocol
-	protocol := Protocol(p.Protocol)
-	if protocol == "" {
-		protocol = ProtocolLSS
+	var (
+		op  *Operation
+		err error
+	)
+	if p.Policy.Valid() {
+		op, err = vm.StartKeygenWithPolicy(ctx, p.KeyID, p.Policy, p.RequestedBy)
+	} else {
+		op, err = vm.StartKeygen(ctx, p.KeyID, p.RequestedBy)
 	}
-
-	// Validate protocol
-	if _, err := vm.protocolRegistry.Get(protocol); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidProtocol, Message: err.Error()}
-	}
-
-	// Use configured values if not overridden
-	threshold := p.Threshold
-	if threshold == 0 {
-		threshold = vm.config.Threshold
-	}
-	totalParties := p.TotalParties
-	if totalParties == 0 {
-		totalParties = vm.config.TotalParties
-	}
-
-	session, err := vm.StartKeygenWithProtocol(p.KeyID, string(protocol), p.RequestedBy, threshold, totalParties)
 	if err != nil {
-		switch err {
-		case ErrUnauthorizedChain:
-			return nil, &RPCError{Code: RPCErrorUnauthorized, Message: err.Error()}
-		case ErrKeygenInProgress:
-			return nil, &RPCError{Code: RPCErrorKeygenInProgress, Message: err.Error()}
-		default:
-			return nil, &RPCError{Code: RPCErrorInternal, Message: err.Error()}
-		}
+		return nil, asRPCError(err)
 	}
 
 	return &KeygenResult{
-		SessionID:    session.SessionID,
-		KeyID:        session.KeyID,
-		Protocol:     session.KeyType,
-		Status:       session.Status,
-		Threshold:    session.Threshold,
-		TotalParties: session.TotalParties,
-		StartedAt:    session.StartedAt.Unix(),
+		Ceremony: ceremonyInfoOf(pendingRecord(op)),
+		Key:      keyInfoOf(op.Key),
 	}, nil
 }
 
-// GetKeygenStatusParams contains parameters for getting keygen status
-type GetKeygenStatusParams struct {
-	SessionID string `json:"sessionId"`
-}
-
-func (vm *VM) rpcGetKeygenStatus(params json.RawMessage) (*KeygenResult, error) {
-	var p GetKeygenStatusParams
-	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
-	}
-
-	vm.mu.RLock()
-	session, ok := vm.keygenSessions[p.SessionID]
-	vm.mu.RUnlock()
-
-	if !ok {
-		return nil, &RPCError{Code: RPCErrorSessionNotFound, Message: "session not found"}
-	}
-
-	result := &KeygenResult{
-		SessionID:    session.SessionID,
-		KeyID:        session.KeyID,
-		Protocol:     session.KeyType,
-		Status:       session.Status,
-		Threshold:    session.Threshold,
-		TotalParties: session.TotalParties,
-		StartedAt:    session.StartedAt.Unix(),
-	}
-
-	return result, nil
-}
-
-// =============================================================================
-// Signing RPCs
-// =============================================================================
-
-// SignParams contains parameters for signing
+// SignParams contains parameters for signing.
 type SignParams struct {
-	KeyID           string `json:"keyId"`
-	MessageHash     string `json:"messageHash"`     // Hex encoded
-	MessageType     string `json:"messageType"`     // raw, eth_sign, typed_data
-	RequestingChain string `json:"requestingChain"` // Chain ID requesting signature
-}
-
-// SignResult contains the signing session info
-type SignResult struct {
-	SessionID       string `json:"sessionId"`
-	KeyID           string `json:"keyId"`
-	Status          string `json:"status"`
+	KeyID string `json:"keyId"`
+	// MessageHash is the exact 32 bytes to sign, hex encoded. M-Chain does not
+	// hash on the caller's behalf: the caller owns its signing domain, and a
+	// chain that re-hashed would sign a preimage nobody authorised.
+	MessageHash     string `json:"messageHash"`
 	RequestingChain string `json:"requestingChain"`
-	CreatedAt       int64  `json:"createdAt"`
-	ExpiresAt       int64  `json:"expiresAt"`
 }
 
-func (vm *VM) rpcSign(params json.RawMessage) (*SignResult, error) {
+func (vm *VM) rpcSign(ctx context.Context, params json.RawMessage) (*CeremonyInfo, error) {
 	var p SignParams
 	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
+		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: err.Error()}
 	}
-
 	messageHash, err := hex.DecodeString(stripHexPrefix(p.MessageHash))
 	if err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid message hash"}
+		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "messageHash is not hex"}
 	}
 
-	session, err := vm.RequestSignature(p.RequestingChain, p.KeyID, messageHash, p.MessageType)
+	op, err := vm.RequestSignature(ctx, p.RequestingChain, p.KeyID, messageHash)
 	if err != nil {
-		switch err {
-		case ErrUnauthorizedChain:
-			return nil, &RPCError{Code: RPCErrorUnauthorized, Message: err.Error()}
-		case ErrQuotaExceeded:
-			return nil, &RPCError{Code: RPCErrorQuotaExceeded, Message: err.Error()}
-		case ErrKeyNotFound:
-			return nil, &RPCError{Code: RPCErrorKeyNotFound, Message: err.Error()}
-		case ErrNotInitialized:
-			return nil, &RPCError{Code: RPCErrorMPCNotReady, Message: err.Error()}
-		default:
-			return nil, &RPCError{Code: RPCErrorInternal, Message: err.Error()}
-		}
+		return nil, asRPCError(err)
 	}
-
-	return &SignResult{
-		SessionID:       session.SessionID,
-		KeyID:           session.KeyID,
-		Status:          session.Status,
-		RequestingChain: session.RequestingChain,
-		CreatedAt:       session.CreatedAt.Unix(),
-		ExpiresAt:       session.ExpiresAt.Unix(),
-	}, nil
-}
-
-// GetSignatureParams contains parameters for getting a signature
-type GetSignatureParams struct {
-	SessionID string `json:"sessionId"`
-}
-
-// SignatureResult contains the completed signature
-type SignatureResult struct {
-	SessionID     string   `json:"sessionId"`
-	Status        string   `json:"status"`
-	Signature     string   `json:"signature,omitempty"` // Hex encoded
-	R             string   `json:"r,omitempty"`         // Hex encoded
-	S             string   `json:"s,omitempty"`         // Hex encoded
-	V             int      `json:"v,omitempty"`         // Recovery ID
-	SignerParties []string `json:"signerParties,omitempty"`
-	CompletedAt   int64    `json:"completedAt,omitempty"`
-	Error         string   `json:"error,omitempty"`
-}
-
-func (vm *VM) rpcGetSignature(params json.RawMessage) (*SignatureResult, error) {
-	var p GetSignatureParams
-	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
-	}
-
-	session, err := vm.GetSignature(p.SessionID)
-	if err != nil {
-		switch err {
-		case ErrSessionNotFound:
-			return nil, &RPCError{Code: RPCErrorSessionNotFound, Message: err.Error()}
-		case ErrSessionExpired:
-			return nil, &RPCError{Code: RPCErrorSessionNotFound, Message: err.Error()}
-		default:
-			return nil, &RPCError{Code: RPCErrorInternal, Message: err.Error()}
-		}
-	}
-
-	result := &SignatureResult{
-		SessionID: session.SessionID,
-		Status:    session.Status,
-		Error:     session.Error,
-	}
-
-	if session.Status == "completed" && session.Signature != nil {
-		result.Signature = "0x" + hex.EncodeToString(append(session.Signature.R, session.Signature.S...))
-		result.R = "0x" + hex.EncodeToString(session.Signature.R)
-		result.S = "0x" + hex.EncodeToString(session.Signature.S)
-		result.V = int(session.Signature.V)
-		result.CompletedAt = session.CompletedAt.Unix()
-
-		signerParties := make([]string, len(session.SignerParties))
-		for i, p := range session.SignerParties {
-			signerParties[i] = string(p)
-		}
-		result.SignerParties = signerParties
-	}
-
-	return result, nil
-}
-
-// BatchSignParams contains parameters for batch signing
-type BatchSignParams struct {
-	KeyID           string   `json:"keyId"`
-	MessageHashes   []string `json:"messageHashes"` // Hex encoded
-	RequestingChain string   `json:"requestingChain"`
-}
-
-// BatchSignResult contains batch signing results
-type BatchSignResult struct {
-	SessionIDs []string `json:"sessionIds"`
-	Status     string   `json:"status"`
-}
-
-func (vm *VM) rpcBatchSign(params json.RawMessage) (*BatchSignResult, error) {
-	var p BatchSignParams
-	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
-	}
-
-	sessionIDs := make([]string, 0, len(p.MessageHashes))
-	for _, hashHex := range p.MessageHashes {
-		messageHash, err := hex.DecodeString(stripHexPrefix(hashHex))
-		if err != nil {
-			continue
-		}
-
-		session, err := vm.RequestSignature(p.RequestingChain, p.KeyID, messageHash, "raw")
-		if err != nil {
-			continue
-		}
-		sessionIDs = append(sessionIDs, session.SessionID)
-	}
-
-	return &BatchSignResult{
-		SessionIDs: sessionIDs,
-		Status:     "submitted",
-	}, nil
+	info := ceremonyInfoOf(pendingRecord(op))
+	return &info, nil
 }
 
 // =============================================================================
-// Key Management RPCs
+// Custody registry RPCs (replicated state)
 // =============================================================================
 
-// ReshareParams contains parameters for key resharing
-type ReshareParams struct {
-	KeyID        string   `json:"keyId"`
-	NewPartyIDs  []string `json:"newPartyIds"`
-	NewThreshold int      `json:"newThreshold"`
-	RequestedBy  string   `json:"requestedBy"`
-}
-
-func (vm *VM) rpcReshare(params json.RawMessage) (*KeygenResult, error) {
-	var p ReshareParams
-	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
-	}
-
-	newPartyIDs := make([]party.ID, len(p.NewPartyIDs))
-	for i, pid := range p.NewPartyIDs {
-		newPartyIDs[i] = party.ID(pid)
-	}
-
-	session, err := vm.ReshareKey(p.KeyID, newPartyIDs, p.RequestedBy)
-	if err != nil {
-		switch err {
-		case ErrUnauthorizedChain:
-			return nil, &RPCError{Code: RPCErrorUnauthorized, Message: err.Error()}
-		case ErrKeyNotFound:
-			return nil, &RPCError{Code: RPCErrorKeyNotFound, Message: err.Error()}
-		default:
-			return nil, &RPCError{Code: RPCErrorInternal, Message: err.Error()}
-		}
-	}
-
-	return &KeygenResult{
-		SessionID:    session.SessionID,
-		KeyID:        session.KeyID,
-		Protocol:     session.KeyType,
-		Status:       session.Status,
-		TotalParties: session.TotalParties,
-		StartedAt:    session.StartedAt.Unix(),
-	}, nil
-}
-
-// RefreshParams contains parameters for key refresh
-type RefreshParams struct {
-	KeyID       string `json:"keyId"`
-	RequestedBy string `json:"requestedBy"`
-}
-
-func (vm *VM) rpcRefresh(params json.RawMessage) (*KeygenResult, error) {
-	var p RefreshParams
-	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
-	}
-
-	session, err := vm.RefreshKey(p.KeyID, p.RequestedBy)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrorInternal, Message: err.Error()}
-	}
-
-	return &KeygenResult{
-		SessionID: session.SessionID,
-		KeyID:     session.KeyID,
-		Status:    session.Status,
-		StartedAt: session.StartedAt.Unix(),
-	}, nil
-}
-
-// Note: KeyInfo type is defined in client.go
-
-func (vm *VM) rpcListKeys() ([]KeyInfo, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-
-	keys := make([]KeyInfo, 0, len(vm.keys))
-	for _, key := range vm.keys {
-		partyIDs := make([]string, len(key.PartyIDs))
-		for i, p := range key.PartyIDs {
-			partyIDs[i] = string(p)
-		}
-
-		info := KeyInfo{
-			KeyID:        key.KeyID,
-			Protocol:     key.KeyType,
-			PublicKey:    "0x" + hex.EncodeToString(key.PublicKey),
-			Threshold:    key.Threshold,
-			TotalParties: key.TotalParties,
-			Generation:   key.Generation,
-			Status:       key.Status,
-			SignCount:    key.SignCount,
-			CreatedAt:    key.CreatedAt.Unix(),
-			PartyIDs:     partyIDs,
-		}
-
-		if len(key.Address) > 0 {
-			info.Address = "0x" + hex.EncodeToString(key.Address)
-		}
-		if !key.LastUsedAt.IsZero() {
-			info.LastUsedAt = key.LastUsedAt.Unix()
-		}
-
-		keys = append(keys, info)
-	}
-
-	return keys, nil
-}
-
-// GetKeyParams contains parameters for getting a key
+// GetKeyParams contains parameters for getting a key.
 type GetKeyParams struct {
 	KeyID string `json:"keyId"`
+}
+
+func (vm *VM) rpcListKeys() ([]KeyInfo, error) {
+	recs, err := vm.Keys()
+	if err != nil {
+		return nil, asRPCError(err)
+	}
+	keys := make([]KeyInfo, 0, len(recs))
+	for _, rec := range recs {
+		keys = append(keys, keyInfoOf(rec))
+	}
+	return keys, nil
 }
 
 func (vm *VM) rpcGetKey(params json.RawMessage) (*KeyInfo, error) {
 	var p GetKeyParams
 	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
+		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: err.Error()}
 	}
-
-	vm.mu.RLock()
-	key, ok := vm.keys[p.KeyID]
-	vm.mu.RUnlock()
-
-	if !ok {
-		return nil, &RPCError{Code: RPCErrorKeyNotFound, Message: "key not found"}
+	rec, err := vm.Key(p.KeyID)
+	if err != nil {
+		return nil, asRPCError(err)
 	}
-
-	partyIDs := make([]string, len(key.PartyIDs))
-	for i, pid := range key.PartyIDs {
-		partyIDs[i] = string(pid)
-	}
-
-	info := &KeyInfo{
-		KeyID:        key.KeyID,
-		Protocol:     key.KeyType,
-		PublicKey:    "0x" + hex.EncodeToString(key.PublicKey),
-		Threshold:    key.Threshold,
-		TotalParties: key.TotalParties,
-		Generation:   key.Generation,
-		Status:       key.Status,
-		SignCount:    key.SignCount,
-		CreatedAt:    key.CreatedAt.Unix(),
-		PartyIDs:     partyIDs,
-	}
-
-	if len(key.Address) > 0 {
-		info.Address = "0x" + hex.EncodeToString(key.Address)
-	}
-	if !key.LastUsedAt.IsZero() {
-		info.LastUsedAt = key.LastUsedAt.Unix()
-	}
-
-	return info, nil
+	info := keyInfoOf(rec)
+	return &info, nil
 }
 
 func (vm *VM) rpcGetPublicKey(params json.RawMessage) (map[string]string, error) {
 	var p GetKeyParams
-	if len(params) > 0 {
-		if err := json.Unmarshal(params, &p); err != nil {
-			return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
-		}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: err.Error()}
 	}
-
-	pubKey, err := vm.GetPublicKey(p.KeyID)
+	pubKey, err := vm.PublicKey(p.KeyID)
 	if err != nil {
-		return nil, &RPCError{Code: RPCErrorKeyNotFound, Message: err.Error()}
+		return nil, asRPCError(err)
 	}
-
-	return map[string]string{
-		"publicKey": "0x" + hex.EncodeToString(pubKey),
-	}, nil
+	return map[string]string{"publicKey": "0x" + hex.EncodeToString(pubKey)}, nil
 }
 
 func (vm *VM) rpcGetAddress(params json.RawMessage) (map[string]string, error) {
 	var p GetKeyParams
-	if len(params) > 0 {
-		if err := json.Unmarshal(params, &p); err != nil {
-			return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
-		}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: err.Error()}
 	}
-
-	address, err := vm.GetAddress(p.KeyID)
+	address, err := vm.Address(p.KeyID)
 	if err != nil {
-		return nil, &RPCError{Code: RPCErrorKeyNotFound, Message: err.Error()}
+		return nil, asRPCError(err)
 	}
+	return map[string]string{"address": "0x" + hex.EncodeToString(address)}, nil
+}
 
-	return map[string]string{
-		"address": "0x" + hex.EncodeToString(address),
-	}, nil
+// =============================================================================
+// Ceremony log RPCs (replicated state)
+// =============================================================================
+
+// GetCeremonyParams contains parameters for reading one ceremony.
+type GetCeremonyParams struct {
+	CeremonyID string `json:"ceremonyId"`
+}
+
+func (vm *VM) rpcGetCeremony(params json.RawMessage) (*CeremonyInfo, error) {
+	var p GetCeremonyParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: err.Error()}
+	}
+	rec, err := vm.Ceremony(p.CeremonyID)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrorCeremonyNotFound, Message: err.Error()}
+	}
+	info := ceremonyInfoOf(rec)
+	return &info, nil
+}
+
+func (vm *VM) rpcListCeremonies() ([]CeremonyInfo, error) {
+	recs, err := vm.Ceremonies()
+	if err != nil {
+		return nil, asRPCError(err)
+	}
+	out := make([]CeremonyInfo, 0, len(recs))
+	for _, rec := range recs {
+		out = append(out, ceremonyInfoOf(rec))
+	}
+	return out, nil
+}
+
+func (vm *VM) rpcGetStateRoot() (map[string]string, error) {
+	root := vm.StateRoot()
+	return map[string]string{"stateRoot": "0x" + hex.EncodeToString(root[:])}, nil
+}
+
+// keyInfoOf projects a custody key's replicated record onto the wire. One
+// conversion in one place: every RPC that returns a key returns the same shape,
+// so a field cannot mean one thing under mpc_getKey and another under
+// threshold_keygen.
+func keyInfoOf(rec *KeyRecord) KeyInfo {
+	participants := make([]string, len(rec.Participants))
+	for i, p := range rec.Participants {
+		participants[i] = string(p)
+	}
+	return KeyInfo{
+		KeyID:          rec.KeyID,
+		Kind:           rec.Kind,
+		Policy:         rec.Policy.String(),
+		Degree:         rec.Degree(),
+		GroupPublicKey: "0x" + hex.EncodeToString(rec.GroupPublicKey),
+		Address:        "0x" + hex.EncodeToString(rec.Address),
+		Participants:   participants,
+		Generation:     rec.Generation,
+		CreatedHeight:  rec.CreatedHeight,
+	}
+}
+
+// ceremonyInfoOf projects a ceremony record onto the wire, splitting the
+// 65-byte artifact into r‖s‖v for callers whose verifier wants the parts.
+func ceremonyInfoOf(c *CeremonyRecord) CeremonyInfo {
+	signers := make([]string, len(c.Signers))
+	for i, s := range c.Signers {
+		signers[i] = string(s)
+	}
+	info := CeremonyInfo{
+		CeremonyID:      c.ID,
+		Kind:            c.Kind,
+		KeyID:           c.KeyID,
+		Digest:          "0x" + hex.EncodeToString(c.Digest),
+		Signature:       "0x" + hex.EncodeToString(c.Artifact),
+		Signers:         signers,
+		RequestingChain: c.RequestingChain,
+		Height:          c.Height,
+	}
+	if len(c.Artifact) == 65 {
+		info.R = "0x" + hex.EncodeToString(c.Artifact[0:32])
+		info.S = "0x" + hex.EncodeToString(c.Artifact[32:64])
+		info.V = int(c.Artifact[64])
+	}
+	return info
+}
+
+// pendingRecord is the ceremony record a completed operation WILL be written
+// as, once the block carrying it is accepted. Height is zero until then: the
+// ceremony has happened, but the chain has not yet placed it at a height.
+func pendingRecord(op *Operation) *CeremonyRecord {
+	return &CeremonyRecord{
+		ID:              op.CeremonyID,
+		Kind:            op.Type,
+		KeyID:           op.KeyID,
+		Digest:          op.Digest,
+		Signers:         op.Signers,
+		Artifact:        op.Artifact,
+		RequestingChain: op.RequestingChain,
+	}
 }
 
 // =============================================================================
@@ -653,215 +447,89 @@ func (vm *VM) rpcGetProtocolInfo(params json.RawMessage) (*ProtocolInfo, error) 
 }
 
 // =============================================================================
-// Session Management RPCs
-// =============================================================================
-
-// GetSessionsParams contains parameters for listing sessions
-type GetSessionsParams struct {
-	ChainID string `json:"chainId,omitempty"`
-	Status  string `json:"status,omitempty"`
-	Limit   int    `json:"limit,omitempty"`
-}
-
-// SessionInfo contains session information
-type SessionInfo struct {
-	SessionID       string `json:"sessionId"`
-	Type            string `json:"type"` // keygen, sign, reshare
-	KeyID           string `json:"keyId"`
-	Status          string `json:"status"`
-	RequestingChain string `json:"requestingChain,omitempty"`
-	CreatedAt       int64  `json:"createdAt"`
-	ExpiresAt       int64  `json:"expiresAt,omitempty"`
-	CompletedAt     int64  `json:"completedAt,omitempty"`
-	Error           string `json:"error,omitempty"`
-}
-
-func (vm *VM) rpcGetSessions(params json.RawMessage) ([]SessionInfo, error) {
-	var p GetSessionsParams
-	if len(params) > 0 {
-		if err := json.Unmarshal(params, &p); err != nil {
-			return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
-		}
-	}
-
-	if p.Limit == 0 {
-		p.Limit = 50
-	}
-
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-
-	sessions := make([]SessionInfo, 0)
-
-	// Add signing sessions
-	for _, session := range vm.signingSessions {
-		if p.ChainID != "" && session.RequestingChain != p.ChainID {
-			continue
-		}
-		if p.Status != "" && session.Status != p.Status {
-			continue
-		}
-
-		info := SessionInfo{
-			SessionID:       session.SessionID,
-			Type:            "sign",
-			KeyID:           session.KeyID,
-			Status:          session.Status,
-			RequestingChain: session.RequestingChain,
-			CreatedAt:       session.CreatedAt.Unix(),
-			ExpiresAt:       session.ExpiresAt.Unix(),
-			Error:           session.Error,
-		}
-		if !session.CompletedAt.IsZero() {
-			info.CompletedAt = session.CompletedAt.Unix()
-		}
-		sessions = append(sessions, info)
-
-		if len(sessions) >= p.Limit {
-			break
-		}
-	}
-
-	// Add keygen sessions
-	for _, session := range vm.keygenSessions {
-		if p.Status != "" && session.Status != p.Status {
-			continue
-		}
-
-		info := SessionInfo{
-			SessionID:       session.SessionID,
-			Type:            "keygen",
-			KeyID:           session.KeyID,
-			Status:          session.Status,
-			RequestingChain: session.RequestedBy,
-			CreatedAt:       session.StartedAt.Unix(),
-			Error:           session.Error,
-		}
-		if !session.CompletedAt.IsZero() {
-			info.CompletedAt = session.CompletedAt.Unix()
-		}
-		sessions = append(sessions, info)
-
-		if len(sessions) >= p.Limit {
-			break
-		}
-	}
-
-	return sessions, nil
-}
-
-// CancelSessionParams contains parameters for canceling a session
-type CancelSessionParams struct {
-	SessionID string `json:"sessionId"`
-}
-
-func (vm *VM) rpcCancelSession(params json.RawMessage) (map[string]bool, error) {
-	var p CancelSessionParams
-	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
-	}
-
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	// Try signing sessions
-	if session, ok := vm.signingSessions[p.SessionID]; ok {
-		if session.Status == "signing" || session.Status == "pending" {
-			session.Status = "cancelled"
-			session.Error = "cancelled by user"
-			return map[string]bool{"cancelled": true}, nil
-		}
-	}
-
-	// Try keygen sessions
-	if session, ok := vm.keygenSessions[p.SessionID]; ok {
-		if session.Status == "running" || session.Status == "pending" {
-			session.Status = "cancelled"
-			session.Error = "cancelled by user"
-			return map[string]bool{"cancelled": true}, nil
-		}
-	}
-
-	return nil, &RPCError{Code: RPCErrorSessionNotFound, Message: "session not found or not cancellable"}
-}
-
-// =============================================================================
 // Network Information RPCs
 // =============================================================================
 
 // Note: ThresholdInfo type is defined in client.go
 
 func (vm *VM) rpcGetInfo() (*ThresholdInfo, error) {
+	keys, err := vm.Keys()
+	if err != nil {
+		return nil, asRPCError(err)
+	}
+	root := vm.StateRoot()
+
 	vm.mu.RLock()
 	defer vm.mu.RUnlock()
-
-	protocols := make([]string, 0)
-	for _, p := range vm.protocolRegistry.Available() {
-		protocols = append(protocols, string(p))
-	}
-
 	chains := make([]string, 0, len(vm.config.AuthorizedChains))
 	for chainID := range vm.config.AuthorizedChains {
 		chains = append(chains, chainID)
 	}
 
 	return &ThresholdInfo{
-		Version:            Version.String(),
-		NodeID:             vm.rt.NodeID.String(),
-		ChainID:            vm.rt.ChainID.String(),
-		MPCReady:           vm.mpcReady,
-		ActiveKeyID:        vm.activeKeyID,
-		Threshold:          vm.config.Threshold,
-		TotalParties:       vm.config.TotalParties,
-		SupportedProtocols: protocols,
-		AuthorizedChains:   chains,
-		TotalKeys:          len(vm.keys),
-		ActiveSessions:     len(vm.signingSessions),
+		Version:          Version.String(),
+		NodeID:           vm.rt.NodeID.String(),
+		ChainID:          vm.rt.ChainID.String(),
+		PartyID:          string(vm.partyID),
+		Policy:           vm.config.Policy.String(),
+		AuthorizedChains: chains,
+		TotalKeys:        len(keys),
+		SharesHeld:       len(vm.shares),
+		StagedCeremonies: len(vm.inflight),
+		StateRoot:        "0x" + hex.EncodeToString(root[:]),
 	}, nil
 }
 
 func (vm *VM) rpcGetStats() (*NetworkStats, error) {
+	vm.mu.RLock()
+	staged := len(vm.inflight)
+	vm.mu.RUnlock()
+
 	vm.stats.mu.RLock()
 	defer vm.stats.mu.RUnlock()
-
-	// Make a copy, converting time.Duration to int64 nanoseconds
 	stats := &NetworkStats{
-		TotalSignatures:    vm.stats.TotalSignatures,
-		TotalKeygens:       vm.stats.TotalKeygens,
-		ActiveSessions:     len(vm.signingSessions),
-		SignaturesByChain:  make(map[string]uint64),
-		AverageSigningTime: int64(vm.stats.AverageSigningTime), // Convert Duration to nanoseconds
-		SuccessRate:        vm.stats.SuccessRate,
+		TotalSignatures:   vm.stats.TotalSignatures,
+		TotalKeygens:      vm.stats.TotalKeygens,
+		StagedCeremonies:  staged,
+		SignaturesByChain: make(map[string]uint64, len(vm.stats.SignaturesByChain)),
 	}
-
 	for k, v := range vm.stats.SignaturesByChain {
 		stats.SignaturesByChain[k] = v
 	}
-
 	return stats, nil
 }
 
-// PartyInfo contains party information
+// PartyInfo contains party information.
 type PartyInfo struct {
+	// PartyID and NodeID are the same value in two spellings — party.ID IS the
+	// NodeID string — and both are reported so a caller reading either column
+	// needs no side table to join them.
 	PartyID string `json:"partyId"`
 	NodeID  string `json:"nodeId"`
 	IsLocal bool   `json:"isLocal"`
-	Active  bool   `json:"active"`
 }
 
-func (vm *VM) rpcGetParties() ([]PartyInfo, error) {
+// rpcGetParties reports the ceremony committee: this chain's validator set.
+// There is no separate MPC party roster to drift from it — joining the signing
+// ring IS joining the validator set.
+func (vm *VM) rpcGetParties(ctx context.Context) ([]PartyInfo, error) {
 	vm.mu.RLock()
-	defer vm.mu.RUnlock()
+	height := vm.rt.PChainHeight
+	self := vm.partyID
+	vm.mu.RUnlock()
 
-	parties := make([]PartyInfo, len(vm.partyIDs))
-	for i, pid := range vm.partyIDs {
+	committee, err := vm.Committee(ctx, height)
+	if err != nil {
+		return nil, asRPCError(err)
+	}
+	parties := make([]PartyInfo, len(committee))
+	for i, pid := range committee {
 		parties[i] = PartyInfo{
 			PartyID: string(pid),
-			IsLocal: pid == vm.partyID,
-			Active:  true, // Would need connection tracking
+			NodeID:  string(pid),
+			IsLocal: pid == self,
 		}
 	}
-
 	return parties, nil
 }
 
@@ -875,7 +543,7 @@ type GetQuotaParams struct {
 func (vm *VM) rpcGetQuota(params json.RawMessage) (*QuotaInfo, error) {
 	var p GetQuotaParams
 	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
+		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: err.Error()}
 	}
 
 	vm.mu.RLock()
@@ -926,7 +594,7 @@ type GetChainPermissionsParams struct {
 func (vm *VM) rpcGetChainPermissions(params json.RawMessage) (*ChainPermissions, error) {
 	var p GetChainPermissionsParams
 	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
+		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: err.Error()}
 	}
 
 	perms, ok := vm.config.AuthorizedChains[p.ChainID]
@@ -941,13 +609,12 @@ func (vm *VM) rpcGetChainPermissions(params json.RawMessage) (*ChainPermissions,
 // Health RPCs
 // =============================================================================
 
-func (vm *VM) rpcHealthCheck() (map[string]interface{}, error) {
-	health, err := vm.HealthCheck(nil)
+func (vm *VM) rpcHealthCheck(ctx context.Context) (map[string]interface{}, error) {
+	health, err := vm.HealthCheck(ctx)
 	if err != nil {
-		return nil, &RPCError{Code: RPCErrorInternal, Message: err.Error()}
+		return nil, asRPCError(err)
 	}
-	// Convert chain.HealthResult to map[string]interface{}
-	result := make(map[string]interface{})
+	result := make(map[string]interface{}, len(health.Details)+1)
 	result["healthy"] = health.Healthy
 	for k, v := range health.Details {
 		result[k] = v

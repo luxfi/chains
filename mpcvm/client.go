@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -104,40 +103,55 @@ func (c *Client) call(ctx context.Context, method string, params interface{}, re
 }
 
 // =============================================================================
-// Key Generation
+// Ceremonies
 // =============================================================================
 
-// KeygenRequest contains parameters for key generation
+// CeremonyInfo is one ceremony as the chain records it: what was signed, by
+// whom, and the signature it produced. It is the shape returned both by a
+// ceremony that just ran and by a lookup in the replicated ceremony log, so a
+// caller parses one thing.
+//
+// Height is 0 for a ceremony that has completed but whose block has not been
+// accepted yet — the signature is valid, it just has no place in history yet.
+type CeremonyInfo struct {
+	CeremonyID string `json:"ceremonyId"`
+	Kind       string `json:"kind"` // keygen | sign
+	KeyID      string `json:"keyId"`
+	Digest     string `json:"digest"`    // 0x-hex, 32 bytes
+	Signature  string `json:"signature"` // 0x-hex, 65 bytes r‖s‖v
+	R          string `json:"r,omitempty"`
+	S          string `json:"s,omitempty"`
+	V          int    `json:"v,omitempty"`
+	// Signers is the participating quorum, canonically ordered.
+	Signers         []string `json:"signers"`
+	RequestingChain string   `json:"requestingChain,omitempty"`
+	Height          uint64   `json:"height,omitempty"`
+}
+
+// KeygenRequest contains parameters for key generation.
 type KeygenRequest struct {
-	KeyID        string `json:"keyId"`
-	Protocol     string `json:"protocol"`     // lss, cggmp21, bls, corona
-	Threshold    int    `json:"threshold"`    // Optional
-	TotalParties int    `json:"totalParties"` // Optional
+	KeyID string `json:"keyId"`
+	// Policy is the quorum in operator form, "3-of-5". Empty means the chain's
+	// default.
+	Policy string `json:"policy,omitempty"`
 }
 
-// KeygenResponse contains the keygen result
+// KeygenResponse is a COMPLETED key generation.
 type KeygenResponse struct {
-	SessionID    string `json:"sessionId"`
-	KeyID        string `json:"keyId"`
-	Protocol     string `json:"protocol"`
-	Status       string `json:"status"`
-	Threshold    int    `json:"threshold"`
-	TotalParties int    `json:"totalParties"`
-	StartedAt    int64  `json:"startedAt"`
+	Ceremony CeremonyInfo `json:"ceremony"`
+	Key      KeyInfo      `json:"key"`
 }
 
-// Keygen initiates key generation on T-Chain
+// Keygen runs a distributed key generation and returns when the key exists.
+// There is no status to poll afterwards: the ceremony either produced a
+// registered key or returned an error.
 func (c *Client) Keygen(ctx context.Context, req KeygenRequest) (*KeygenResponse, error) {
 	params := map[string]interface{}{
 		"keyId":       req.KeyID,
-		"protocol":    req.Protocol,
 		"requestedBy": c.chainID,
 	}
-	if req.Threshold > 0 {
-		params["threshold"] = req.Threshold
-	}
-	if req.TotalParties > 0 {
-		params["totalParties"] = req.TotalParties
+	if req.Policy != "" {
+		params["policy"] = req.Policy
 	}
 
 	var result KeygenResponse
@@ -147,210 +161,95 @@ func (c *Client) Keygen(ctx context.Context, req KeygenRequest) (*KeygenResponse
 	return &result, nil
 }
 
-// GetKeygenStatus retrieves the status of a keygen session
-func (c *Client) GetKeygenStatus(ctx context.Context, sessionID string) (*KeygenResponse, error) {
-	params := map[string]string{
-		"sessionId": sessionID,
-	}
-
-	var result KeygenResponse
-	if err := c.call(ctx, "threshold_getKeygenStatus", params, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
-}
-
-// WaitForKeygen waits for keygen to complete
-func (c *Client) WaitForKeygen(ctx context.Context, sessionID string, timeout time.Duration) (*KeygenResponse, error) {
-	deadline := time.Now().Add(timeout)
-	pollInterval := 500 * time.Millisecond
-
-	for time.Now().Before(deadline) {
-		status, err := c.GetKeygenStatus(ctx, sessionID)
-		if err != nil {
-			return nil, err
-		}
-
-		switch status.Status {
-		case "completed":
-			return status, nil
-		case "failed":
-			return nil, fmt.Errorf("keygen failed: session %s", sessionID)
-		default:
-			// Still running, wait and retry
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(pollInterval):
-			}
-		}
-	}
-
-	return nil, errors.New("keygen timed out")
-}
-
-// =============================================================================
-// Signing
-// =============================================================================
-
-// SignRequest contains parameters for signing
+// SignRequest contains parameters for signing.
 type SignRequest struct {
-	KeyID       string `json:"keyId"`
+	KeyID string `json:"keyId"`
+	// MessageHash is the exact 32 bytes to sign. The caller owns its signing
+	// domain; M-Chain signs what it is given and never re-hashes.
 	MessageHash []byte `json:"messageHash"`
-	MessageType string `json:"messageType"` // raw, eth_sign, typed_data
 }
 
-// SignResponse contains the signing session info
-type SignResponse struct {
-	SessionID string `json:"sessionId"`
-	KeyID     string `json:"keyId"`
-	Status    string `json:"status"`
-	CreatedAt int64  `json:"createdAt"`
-	ExpiresAt int64  `json:"expiresAt"`
-}
-
-// SignatureResponse contains a completed signature
-type SignatureResponse struct {
-	SessionID     string   `json:"sessionId"`
-	Status        string   `json:"status"`
-	Signature     string   `json:"signature,omitempty"`
-	R             string   `json:"r,omitempty"`
-	S             string   `json:"s,omitempty"`
-	V             int      `json:"v,omitempty"`
-	SignerParties []string `json:"signerParties,omitempty"`
-	CompletedAt   int64    `json:"completedAt,omitempty"`
-	Error         string   `json:"error,omitempty"`
-}
-
-// Sign requests a signature from T-Chain
-func (c *Client) Sign(ctx context.Context, req SignRequest) (*SignResponse, error) {
+// Sign runs a threshold signing ceremony and returns the finished signature.
+//
+// The call blocks for the duration of the ceremony. The returned CeremonyID is
+// the durable handle: GetCeremony re-reads the same signature from replicated
+// state once the block carrying it is accepted.
+func (c *Client) Sign(ctx context.Context, req SignRequest) (*CeremonyInfo, error) {
 	params := map[string]interface{}{
 		"keyId":           req.KeyID,
 		"messageHash":     hex.EncodeToString(req.MessageHash),
-		"messageType":     req.MessageType,
 		"requestingChain": c.chainID,
 	}
 
-	var result SignResponse
+	var result CeremonyInfo
 	if err := c.call(ctx, "threshold_sign", params, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
 }
 
-// GetSignature retrieves a signature from T-Chain
-func (c *Client) GetSignature(ctx context.Context, sessionID string) (*SignatureResponse, error) {
-	params := map[string]string{
-		"sessionId": sessionID,
-	}
-
-	var result SignatureResponse
-	if err := c.call(ctx, "threshold_getSignature", params, &result); err != nil {
+// GetCeremony reads one recorded ceremony from replicated state.
+func (c *Client) GetCeremony(ctx context.Context, ceremonyID string) (*CeremonyInfo, error) {
+	var result CeremonyInfo
+	if err := c.call(ctx, "mpc_getCeremony", map[string]string{"ceremonyId": ceremonyID}, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
 }
 
-// WaitForSignature waits for signature to complete
-func (c *Client) WaitForSignature(ctx context.Context, sessionID string, timeout time.Duration) (*SignatureResponse, error) {
-	deadline := time.Now().Add(timeout)
-	pollInterval := 100 * time.Millisecond
-
-	for time.Now().Before(deadline) {
-		sig, err := c.GetSignature(ctx, sessionID)
-		if err != nil {
-			return nil, err
-		}
-
-		switch sig.Status {
-		case "completed":
-			return sig, nil
-		case "failed":
-			return nil, fmt.Errorf("signing failed: %s", sig.Error)
-		default:
-			// Still signing, wait and retry
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(pollInterval):
-			}
-		}
-	}
-
-	return nil, errors.New("signing timed out")
-}
-
-// SignAndWait signs a message and waits for completion
-func (c *Client) SignAndWait(ctx context.Context, req SignRequest, timeout time.Duration) (*SignatureResponse, error) {
-	// Start signing
-	resp, err := c.Sign(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-
-	// Wait for completion
-	return c.WaitForSignature(ctx, resp.SessionID, timeout)
-}
-
-// BatchSign requests multiple signatures
-func (c *Client) BatchSign(ctx context.Context, keyID string, messageHashes [][]byte) ([]string, error) {
-	hashes := make([]string, len(messageHashes))
-	for i, h := range messageHashes {
-		hashes[i] = hex.EncodeToString(h)
-	}
-
-	params := map[string]interface{}{
-		"keyId":           keyID,
-		"messageHashes":   hashes,
-		"requestingChain": c.chainID,
-	}
-
-	var result struct {
-		SessionIDs []string `json:"sessionIds"`
-	}
-	if err := c.call(ctx, "threshold_batchSign", params, &result); err != nil {
-		return nil, err
-	}
-	return result.SessionIDs, nil
-}
-
-// =============================================================================
-// Key Management
-// =============================================================================
-
-// KeyInfo contains key information
-type KeyInfo struct {
-	KeyID        string   `json:"keyId"`
-	Protocol     string   `json:"protocol"`
-	PublicKey    string   `json:"publicKey"`
-	Address      string   `json:"address,omitempty"`
-	Threshold    int      `json:"threshold"`
-	TotalParties int      `json:"totalParties"`
-	Generation   uint64   `json:"generation"`
-	Status       string   `json:"status"`
-	SignCount    uint64   `json:"signCount"`
-	CreatedAt    int64    `json:"createdAt"`
-	LastUsedAt   int64    `json:"lastUsedAt,omitempty"`
-	PartyIDs     []string `json:"partyIds"`
-}
-
-// ListKeys lists all keys on T-Chain
-func (c *Client) ListKeys(ctx context.Context) ([]KeyInfo, error) {
-	var result []KeyInfo
-	if err := c.call(ctx, "threshold_listKeys", nil, &result); err != nil {
+// ListCeremonies reads the whole ceremony log.
+func (c *Client) ListCeremonies(ctx context.Context) ([]CeremonyInfo, error) {
+	var result []CeremonyInfo
+	if err := c.call(ctx, "mpc_listCeremonies", nil, &result); err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
-// GetKey retrieves key information
-func (c *Client) GetKey(ctx context.Context, keyID string) (*KeyInfo, error) {
-	params := map[string]string{
-		"keyId": keyID,
+// StateRoot returns the chain's custody state root — the value two validators
+// compare to know whether they agree about custody.
+func (c *Client) StateRoot(ctx context.Context) (string, error) {
+	var result map[string]string
+	if err := c.call(ctx, "mpc_getStateRoot", nil, &result); err != nil {
+		return "", err
 	}
+	return result["stateRoot"], nil
+}
 
+// =============================================================================
+// Custody registry
+// =============================================================================
+
+// KeyInfo is a custody key's replicated public record. It carries no secret and
+// no per-node bookkeeping: every field here is identical on every validator.
+type KeyInfo struct {
+	KeyID string `json:"keyId"`
+	Kind  string `json:"kind"` // threshold protocol that generated it, e.g. cggmp21
+	// Policy is the operator form, "3-of-5". Degree is the polynomial degree
+	// (K-1) it was generated with, reported so the two can be checked against
+	// each other rather than inferred.
+	Policy         string   `json:"policy"`
+	Degree         int      `json:"degree"`
+	GroupPublicKey string   `json:"groupPublicKey"` // 0x-hex, 33-byte compressed
+	Address        string   `json:"address"`        // 0x-hex, 20-byte custody address
+	Participants   []string `json:"participants"`
+	Generation     uint64   `json:"generation"`
+	CreatedHeight  uint64   `json:"createdHeight"`
+}
+
+// ListKeys lists every registered custody key.
+func (c *Client) ListKeys(ctx context.Context) ([]KeyInfo, error) {
+	var result []KeyInfo
+	if err := c.call(ctx, "mpc_listKeys", nil, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// GetKey retrieves one custody key's record.
+func (c *Client) GetKey(ctx context.Context, keyID string) (*KeyInfo, error) {
 	var result KeyInfo
-	if err := c.call(ctx, "threshold_getKey", params, &result); err != nil {
+	if err := c.call(ctx, "mpc_getKey", map[string]string{"keyId": keyID}, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -392,36 +291,6 @@ func (c *Client) GetAddress(ctx context.Context, keyID string) ([]byte, error) {
 	}
 
 	return hex.DecodeString(addrHex)
-}
-
-// Reshare triggers key resharing
-func (c *Client) Reshare(ctx context.Context, keyID string, newPartyIDs []string, newThreshold int) (*KeygenResponse, error) {
-	params := map[string]interface{}{
-		"keyId":        keyID,
-		"newPartyIds":  newPartyIDs,
-		"newThreshold": newThreshold,
-		"requestedBy":  c.chainID,
-	}
-
-	var result KeygenResponse
-	if err := c.call(ctx, "threshold_reshare", params, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
-}
-
-// Refresh triggers key refresh
-func (c *Client) Refresh(ctx context.Context, keyID string) (*KeygenResponse, error) {
-	params := map[string]interface{}{
-		"keyId":       keyID,
-		"requestedBy": c.chainID,
-	}
-
-	var result KeygenResponse
-	if err := c.call(ctx, "threshold_refresh", params, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
 }
 
 // =============================================================================
@@ -466,22 +335,25 @@ func (c *Client) GetProtocolInfo(ctx context.Context, protocol string) (*Protoco
 // Network Information
 // =============================================================================
 
-// ThresholdInfo contains T-Chain information
+// ThresholdInfo describes one M-Chain node: what the chain agrees on (policy,
+// authorized chains, key count, state root) and what is true of THIS node
+// (party id, shares held, staged ceremonies). The two are reported separately
+// because conflating them is how an operator concludes the chain is broken
+// when in fact this one validator holds no share.
 type ThresholdInfo struct {
-	Version            string   `json:"version"`
-	NodeID             string   `json:"nodeId"`
-	ChainID            string   `json:"chainId"`
-	MPCReady           bool     `json:"mpcReady"`
-	ActiveKeyID        string   `json:"activeKeyId,omitempty"`
-	Threshold          int      `json:"threshold"`
-	TotalParties       int      `json:"totalParties"`
-	SupportedProtocols []string `json:"supportedProtocols"`
-	AuthorizedChains   []string `json:"authorizedChains"`
-	TotalKeys          int      `json:"totalKeys"`
-	ActiveSessions     int      `json:"activeSessions"`
+	Version          string   `json:"version"`
+	NodeID           string   `json:"nodeId"`
+	ChainID          string   `json:"chainId"`
+	PartyID          string   `json:"partyId"`
+	Policy           string   `json:"policy"` // default quorum, "3-of-5"
+	AuthorizedChains []string `json:"authorizedChains"`
+	TotalKeys        int      `json:"totalKeys"`
+	SharesHeld       int      `json:"sharesHeld"`
+	StagedCeremonies int      `json:"stagedCeremonies"`
+	StateRoot        string   `json:"stateRoot"`
 }
 
-// GetInfo retrieves T-Chain information
+// GetInfo retrieves M-Chain information.
 func (c *Client) GetInfo(ctx context.Context) (*ThresholdInfo, error) {
 	var result ThresholdInfo
 	if err := c.call(ctx, "threshold_getInfo", nil, &result); err != nil {
@@ -490,14 +362,13 @@ func (c *Client) GetInfo(ctx context.Context) (*ThresholdInfo, error) {
 	return &result, nil
 }
 
-// NetworkStats contains network statistics
+// NetworkStats counts what this node did: ceremonies it completed, and the
+// ceremonies it has finished but not yet gotten into a block.
 type NetworkStats struct {
-	TotalSignatures    uint64            `json:"totalSignatures"`
-	TotalKeygens       uint64            `json:"totalKeygens"`
-	ActiveSessions     int               `json:"activeSessions"`
-	SignaturesByChain  map[string]uint64 `json:"signaturesByChain"`
-	AverageSigningTime int64             `json:"averageSigningTime"` // nanoseconds
-	SuccessRate        float64           `json:"successRate"`
+	TotalSignatures   uint64            `json:"totalSignatures"`
+	TotalKeygens      uint64            `json:"totalKeygens"`
+	StagedCeremonies  int               `json:"stagedCeremonies"`
+	SignaturesByChain map[string]uint64 `json:"signaturesByChain"`
 }
 
 // GetStats retrieves T-Chain statistics
@@ -535,20 +406,11 @@ func (c *Client) GetQuota(ctx context.Context) (*QuotaInfo, error) {
 // Health
 // =============================================================================
 
-// Health retrieves T-Chain health status
+// Health retrieves M-Chain health status.
 func (c *Client) Health(ctx context.Context) (map[string]interface{}, error) {
 	var result map[string]interface{}
 	if err := c.call(ctx, "threshold_health", nil, &result); err != nil {
 		return nil, err
 	}
 	return result, nil
-}
-
-// IsReady checks if mpcvm (M-Chain MPC mode per LP-134) is ready
-func (c *Client) IsReady(ctx context.Context) (bool, error) {
-	info, err := c.GetInfo(ctx)
-	if err != nil {
-		return false, err
-	}
-	return info.MPCReady, nil
 }

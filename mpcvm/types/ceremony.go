@@ -13,6 +13,8 @@ package types
 import (
 	"errors"
 	"fmt"
+
+	"github.com/luxfi/threshold/pkg/quorum"
 )
 
 // CeremonyState is the position of a ceremony in the shared state
@@ -54,13 +56,13 @@ func (s CeremonyState) String() string {
 type CeremonyKind uint8
 
 const (
-	KindUnknown        CeremonyKind = 0
-	KindCGGMP21        CeremonyKind = 1 // M-Chain: ECDSA threshold
-	KindFROST          CeremonyKind = 2 // M-Chain: Schnorr/EdDSA threshold
-	KindCoronaGen    CeremonyKind = 3 // M-Chain: PQ general-purpose threshold
-	KindTFHEKeygen     CeremonyKind = 4 // M-Chain → F-Chain: TFHE bootstrap-key gen
-	KindTFHECompute    CeremonyKind = 5 // F-Chain: encrypted compute attestation
-	KindTFHEBootstrap  CeremonyKind = 6 // F-Chain: blind-rotate / bootstrap proof
+	KindUnknown       CeremonyKind = 0
+	KindCGGMP21       CeremonyKind = 1 // M-Chain: ECDSA threshold
+	KindFROST         CeremonyKind = 2 // M-Chain: Schnorr/EdDSA threshold
+	KindCoronaGen     CeremonyKind = 3 // M-Chain: PQ general-purpose threshold
+	KindTFHEKeygen    CeremonyKind = 4 // M-Chain → F-Chain: TFHE bootstrap-key gen
+	KindTFHECompute   CeremonyKind = 5 // F-Chain: encrypted compute attestation
+	KindTFHEBootstrap CeremonyKind = 6 // F-Chain: blind-rotate / bootstrap proof
 )
 
 // IsMChain reports whether the kind belongs to the M-Chain operational chain.
@@ -91,12 +93,21 @@ type CeremonyID [32]byte
 // Transition() in this package; the host chain (M-Chain or F-Chain)
 // drives transitions on its own block ticks.
 type Ceremony struct {
-	ID         CeremonyID
-	Kind       CeremonyKind
-	State      CeremonyState
-	Round      uint8 // 1..N, valid only when State is Round1 or Round2
-	Threshold  uint16
-	Total      uint16 // total participants
+	ID    CeremonyID
+	Kind  CeremonyKind
+	State CeremonyState
+	Round uint8 // 1..N, valid only when State is Round1 or Round2
+	// Policy is the quorum: K signers of N parties. It replaces the former
+	// pair of bare uint16s named Threshold/Total.
+	//
+	// Those two fields were the bug. "Threshold" was read as the signer count
+	// here (Validate enforced threshold*2 > total, an honest-majority floor on
+	// K) and as the polynomial degree in the VM (which computed threshold+1
+	// parties and passed the value straight to cmp.Keygen, which reads it as
+	// t). The same field therefore meant K in one file and t in another, and
+	// the two differ by one. A quorum.Policy cannot be read either way: K and N
+	// are named, and t is only ever obtained by calling Degree().
+	Policy     quorum.Policy
 	StartEpoch uint64
 	Subject    [32]byte // certificate_subject the ceremony binds into
 	// PayloadArena is the per-ceremony buffer that all share payloads
@@ -104,6 +115,17 @@ type Ceremony struct {
 	// substrate never allocates.
 	PayloadArena []byte
 }
+
+// Degree returns t, the polynomial degree the underlying protocol is
+// parameterised with, for this ceremony's policy. It is the ONLY conversion
+// from the operator's k-of-n to the protocol's t, and it lives in
+// luxfi/threshold/pkg/quorum so the whole stack shares one answer.
+//
+// For 3-of-5 this is 2: any 3 shares reconstruct, any 2 do not. Passing 3 to
+// cmp.Keygen instead would build a degree-3 key that needs 4 signers — a
+// 4-of-5 wallet provisioned by someone who asked for 3-of-5, discovered only
+// when three custodians cannot produce a signature.
+func (c *Ceremony) Degree() int { return c.Policy.Degree() }
 
 // Validate checks structural invariants. Use at boundaries only; the
 // substrate trusts its own callers (the host chain) for routine
@@ -116,18 +138,29 @@ func (c *Ceremony) Validate() error {
 	if c.Kind == KindUnknown {
 		return errors.New("ceremony: kind unset")
 	}
-	if c.Total == 0 {
-		return errors.New("ceremony: total participants is zero")
+	if !c.Policy.Valid() {
+		return fmt.Errorf("ceremony: %s is not a deployable policy", c.Policy)
 	}
-	// Honest-majority safety floor (LP-076 §Security).
-	if uint32(c.Threshold)*2 <= uint32(c.Total) {
-		return fmt.Errorf("ceremony: threshold %d <= n/2 for total %d", c.Threshold, c.Total)
-	}
-	if c.Threshold > c.Total {
-		return fmt.Errorf("ceremony: threshold %d > total %d", c.Threshold, c.Total)
+	if !HasUniqueQuorum(c.Policy) {
+		return fmt.Errorf("ceremony: policy %s admits two disjoint quorums", c.Policy)
 	}
 	return nil
 }
+
+// HasUniqueQuorum reports whether a policy admits only one quorum at a time:
+// 2K > N, so no two disjoint sets of K parties both exist.
+//
+// This is a custody policy, not a soundness requirement of the protocol.
+// CGGMP21 is unforgeable against up to N-1 corruptions, so a 2-of-5 key is
+// perfectly sound cryptographically. But with 2K <= N two disjoint coalitions
+// can each independently produce a valid signature, so possession of a
+// signature no longer implies the committee as a whole authorised anything —
+// two halves could authorise contradictory releases of the same funds. For a
+// chain whose keys hold bridged assets that is the wrong trade, so M-Chain
+// requires the majority floor that the archived LP-076 §Security called for,
+// now expressed unambiguously in terms of K rather than a field that might
+// have meant t.
+func HasUniqueQuorum(p quorum.Policy) bool { return 2*p.K > p.N }
 
 // Transition advances the ceremony state. It is the only function
 // that mutates State. Returns the post-transition copy or an error

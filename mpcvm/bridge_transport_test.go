@@ -3,25 +3,30 @@
 
 package mpcvm
 
-// bridge_transport_test.go — proves the B→M threshold-signing seam end to end
-// over the REAL cross-validator transport.
+// bridge_transport_test.go — proves the B→M custody path end to end over the
+// REAL cross-validator transport and the REAL chain state machine.
 //
 // Three in-process M-Chain validators are wired together by an in-memory p2p
 // fabric that stands in for real sockets. The fabric drives the EXACT
 // production path: warpAppNetwork.Broadcast → warp.Sender.SendGossip → the peer
 // VMs' Gossip handler → envelope demux → the ceremony's gossipRouter.Deliver →
-// the executor's receive loop. A DKG establishes one group key; then B asks
-// every validator to release the same transfer, the validators run a CGGMP21
-// threshold sign across the fabric, and each independently returns an
-// attestation that VerifyBridgeAttestation accepts against the group key.
+// the executor's receive loop.
 //
-// What is DEMONSTRATED here: the message router transports ceremony messages
-// between separate VM instances, a signing session completes, and the produced
-// signature verifies against the expected custody pubkey over a domain-bound,
-// replay-safe digest. What is SIMULATED: the p2p fabric (in-memory, not
-// sockets) and the request fan-out to the committee (the test hands the same
-// request to every validator; production needs B to deliver it + a policy layer
-// agreeing to sign).
+// The whole custody lifecycle runs through it, with no shortcut at any step:
+//
+//	DKG over gossip  →  every validator stages the SAME registration
+//	block            →  one proposer builds it, every validator VERIFIES and
+//	                    accepts it, and the key enters the replicated registry
+//	sign over gossip →  B asks for a release; every validator independently
+//	                    returns the identical signature
+//	block            →  the ceremony is recorded, and can be read back from
+//	                    consensus state by its derived id
+//
+// What is SIMULATED: only the p2p fabric (in-memory channels, not sockets) and
+// the request fan-out to the committee (the test hands the same request to
+// every validator; production needs B to deliver it plus a policy layer).
+// Nothing about the cryptography, the state transition or the block rules is
+// stubbed.
 
 import (
 	"context"
@@ -35,9 +40,10 @@ import (
 	"github.com/luxfi/log"
 	"github.com/luxfi/math/set"
 	"github.com/luxfi/runtime"
-	"github.com/luxfi/threshold/pkg/party"
-	"github.com/luxfi/threshold/pkg/pool"
+	validators "github.com/luxfi/validators"
+	"github.com/luxfi/validators/validatorstest"
 	vmcore "github.com/luxfi/vm"
+	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/warp"
 	"github.com/stretchr/testify/require"
 )
@@ -122,10 +128,26 @@ var _ warp.Sender = (*memSender)(nil)
 // Fabric VM construction
 // =============================================================================
 
-func newFabricVM(t *testing.T, fab *memFabric, nid ids.NodeID) *VM {
+// committeeState is the validator set the ceremonies draw their committee from.
+// In production this is the P-Chain's view at a height; here it is the fabric's
+// membership — the same fact, which is the point: the MPC committee IS the
+// validator set, with no separate operator roster to drift from it.
+func committeeState(nodes []ids.NodeID) *validatorstest.TestState {
+	return &validatorstest.TestState{
+		GetValidatorSetF: func(context.Context, uint64, ids.ID) (map[ids.NodeID]*validators.GetValidatorOutput, error) {
+			out := make(map[ids.NodeID]*validators.GetValidatorOutput, len(nodes))
+			for _, n := range nodes {
+				out[n] = &validators.GetValidatorOutput{NodeID: n, Weight: 1}
+			}
+			return out, nil
+		},
+	}
+}
+
+func newFabricVM(t *testing.T, fab *memFabric, nid ids.NodeID, vs *validatorstest.TestState) *VM {
 	t.Helper()
 	vm := &VM{}
-	rt := &runtime.Runtime{NodeID: nid, NetworkID: 3}
+	rt := &runtime.Runtime{NodeID: nid, NetworkID: 3, ValidatorState: vs}
 	toEngine := make(chan vmcore.Message, 1)
 	init := vmcore.Init{
 		Runtime:  rt,
@@ -139,67 +161,123 @@ func newFabricVM(t *testing.T, fab *memFabric, nid ids.NodeID) *VM {
 	return vm
 }
 
+// ceremonyContext gives the ceremonies whatever wall clock the harness allows,
+// less a margin so a budget overrun surfaces as a named failure rather than as
+// the test binary being killed mid-round.
+//
+// The budget is taken rather than hardcoded because a CGGMP21 DKG is genuinely
+// expensive (Paillier key generation) and roughly an order of magnitude slower
+// again under -race: any fixed number is either too tight for the race detector
+// or a lie about how long this takes. Each individual ceremony is still capped
+// by the VM's own session timeout, which is the production bound.
+func ceremonyContext(t *testing.T) (context.Context, context.CancelFunc) {
+	t.Helper()
+	if deadline, ok := t.Deadline(); ok {
+		return context.WithDeadline(context.Background(), deadline.Add(-15*time.Second))
+	}
+	return context.WithCancel(context.Background())
+}
+
+// commitBlock has one validator propose a block and EVERY validator verify and
+// accept it — including the proposer, which re-parses its own block from the
+// wire so it applies exactly the bytes its peers applied.
+//
+// It returns the accepted block. A validator that rejects here has diverged,
+// which is what the state root exists to surface.
+func commitBlock(t *testing.T, ctx context.Context, proposer *VM, all []*VM) chain.Block {
+	t.Helper()
+	built, err := proposer.BuildBlock(ctx)
+	require.NoError(t, err, "proposer could not build a block from its staged ceremonies")
+	raw := built.Bytes()
+
+	var accepted chain.Block
+	for _, vm := range all {
+		blk, err := vm.ParseBlock(ctx, raw)
+		require.NoError(t, err)
+		require.Equal(t, built.ID(), blk.ID(), "block id must be derived from the bytes, identically on every validator")
+		require.NoError(t, blk.Verify(ctx), "validator rejected a block it should have verified")
+		require.NoError(t, blk.Accept(ctx))
+		accepted = blk
+	}
+
+	// Agreement is the whole point: after applying the same block to the same
+	// prior state, every validator must hold the same root.
+	want := all[0].StateRoot()
+	for _, vm := range all {
+		require.Equal(t, want, vm.StateRoot(), "validators disagree about custody state after accepting the same block")
+	}
+	return accepted
+}
+
 // =============================================================================
-// The end-to-end B→M threshold-signing test
+// The end-to-end B→M custody test
 // =============================================================================
 
-func TestBridgeRelease_ThresholdSignOverGossip(t *testing.T) {
+func TestBridgeCustody_KeygenSignAndRecordOverGossip(t *testing.T) {
 	if testing.Short() {
 		t.Skip("threshold DKG/sign is slow; skipped in -short")
 	}
 
 	const n = 3
-	const threshold = 1 // t+1 = 2 minimum signers; we sign with all n
+	const keyID = "bridge-custody"
+
+	nodes := make([]ids.NodeID, n)
+	for i := range nodes {
+		nodes[i] = ids.GenerateTestNodeID()
+	}
+	vs := committeeState(nodes)
 
 	fab := newMemFabric()
 	vms := make([]*VM, n)
-	parties := make([]party.ID, n)
-	for i := 0; i < n; i++ {
-		nid := ids.GenerateTestNodeID()
-		vms[i] = newFabricVM(t, fab, nid)
-		parties[i] = vms[i].partyID
+	for i, nid := range nodes {
+		vms[i] = newFabricVM(t, fab, nid, vs)
 	}
 
-	// --- DKG (in-process mesh) to establish one group key + per-party shares ---
-	execs := make(map[party.ID]*ProtocolExecutor, n)
-	for _, p := range parties {
-		pl := pool.NewPool(4)
-		defer pl.TearDown()
-		execs[p] = NewProtocolExecutor(pl, log.NewTestLogger(log.ErrorLevel))
-	}
-	dkgCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := ceremonyContext(t)
 	defer cancel()
-	configs := runKeygenViaTransport(t, dkgCtx, execs, parties, threshold)
 
-	var groupPub []byte
-	for _, p := range parties {
-		pub, err := configs[p].PublicPoint().MarshalBinary()
-		require.NoError(t, err)
-		if groupPub == nil {
-			groupPub = pub
-		} else {
-			require.Equal(t, groupPub, pub, "all validators must agree on the group key")
-		}
+	// --- DKG over the gossip fabric: every validator runs the ceremony ---
+	//
+	// The chain's default policy is 2-of-3, so the committee is all three
+	// validators and any two of them can sign.
+	policy := vms[0].Policy()
+	require.Equal(t, "2-of-3", policy.String())
+
+	keygens := runOnAll(t, ctx, vms, func(ctx context.Context, vm *VM) (*Operation, error) {
+		return vm.StartKeygen(ctx, keyID, "B-Chain")
+	})
+
+	first := keygens[0]
+	require.Equal(t, OpTypeKeygen, first.Type)
+	require.NotNil(t, first.Key)
+	require.Len(t, first.Key.GroupPublicKey, 33, "compressed secp256k1 custody key")
+	require.Len(t, first.Key.Address, 20, "20-byte external-chain custody address")
+	require.Equal(t, policy, first.Key.Policy)
+	require.Equal(t, 1, first.Key.Degree(), "2-of-3 is a degree-1 key; a degree-2 key would need 3 signers")
+	for _, op := range keygens {
+		require.Equal(t, first.CeremonyID, op.CeremonyID, "every validator must derive the same ceremony id with no announce round")
+		require.Equal(t, first.Key.GroupPublicKey, op.Key.GroupPublicKey, "all validators must agree on the group key")
+		require.Equal(t, first.Artifact, op.Artifact, "all honest validators derive the identical proof of possession")
 	}
-	require.Len(t, groupPub, 33, "compressed secp256k1 custody key")
+	// The proof of possession is a real signature by the fresh group key over
+	// its own registration — this is what stops a proposer registering a public
+	// key it does not control.
+	commit := KeyCommitDigest(first.Key)
+	require.Equal(t, commit[:], first.Digest)
+	require.NoError(t, verifyGroupSignature(first.Key.GroupPublicKey, commit[:], first.Artifact))
 
-	// --- install the CGGMP21 custody key into every validator ---
-	const keyID = "bridge-custody"
-	for i, vm := range vms {
-		p := parties[i]
-		vm.mu.Lock()
-		vm.keys[keyID] = &ManagedKey{
-			KeyID:        keyID,
-			KeyType:      string(ProtocolCGGMP21),
-			PublicKey:    groupPub,
-			Threshold:    threshold,
-			TotalParties: n,
-			Status:       "active",
-			PartyIDs:     parties,
-			CMPConfig:    configs[p],
-		}
-		vm.activeKeyID = keyID
-		vm.mu.Unlock()
+	// --- the registration becomes consensus state ---
+	commitBlock(t, ctx, vms[0], vms)
+	groupPub := first.Key.GroupPublicKey
+	for _, vm := range vms {
+		rec, err := vm.Key(keyID)
+		require.NoError(t, err, "key must be readable from the registry after the block is accepted")
+		require.Equal(t, groupPub, rec.GroupPublicKey)
+		require.Equal(t, policy, rec.Policy)
+
+		held, err := vm.state.HasShare(keyID)
+		require.NoError(t, err)
+		require.True(t, held, "every committee member must hold a share for a key it participated in")
 	}
 
 	// --- B asks every validator to release the SAME transfer ---
@@ -218,34 +296,10 @@ func TestBridgeRelease_ThresholdSignOverGossip(t *testing.T) {
 		Nonce:           7,
 	}
 
-	type result struct {
-		att *BridgeTransferAttestation
-		err error
-	}
-	results := make(chan result, n)
-	for _, vm := range vms {
-		vm := vm
-		go func() {
-			att, err := vm.RequestBridgeRelease(req)
-			results <- result{att, err}
-		}()
-	}
+	atts := runOnAll(t, ctx, vms, func(ctx context.Context, vm *VM) (*BridgeTransferAttestation, error) {
+		return vm.RequestBridgeRelease(ctx, req)
+	})
 
-	atts := make([]*BridgeTransferAttestation, 0, n)
-	for i := 0; i < n; i++ {
-		select {
-		case r := <-results:
-			require.NoError(t, r.err, "validator failed to produce a bridge attestation")
-			require.NotNil(t, r.att)
-			atts = append(atts, r.att)
-		case <-time.After(150 * time.Second):
-			t.Fatal("bridge release timed out — ceremony did not complete over the gossip transport")
-		}
-	}
-
-	// (a) the router transported messages and the signing session completed on
-	//     every validator (all n returned an attestation above), and
-	// (b) the produced signature verifies against the expected custody pubkey.
 	bt := BridgeTransfer{
 		SrcChainID: req.SrcChainID,
 		DstChainID: req.DstChainID,
@@ -254,10 +308,11 @@ func TestBridgeRelease_ThresholdSignOverGossip(t *testing.T) {
 		Recipient:  req.Recipient,
 		Nonce:      req.Nonce,
 	}
-	first := atts[0]
-	require.NotEmpty(t, first.Signature)
+	att := atts[0]
+	require.Len(t, att.Signature, 65, "r‖s‖v")
 	for _, a := range atts {
-		require.Equal(t, first.Signature, a.Signature, "all honest validators derive the identical signature")
+		require.Equal(t, att.Signature, a.Signature, "all honest validators derive the identical signature")
+		require.Equal(t, att.CeremonyID, a.CeremonyID, "the ceremony id is derived from the task, not announced")
 		require.Equal(t, groupPub, a.GroupPubKey, "attestation carries the custody group key")
 		require.True(t, VerifyBridgeAttestation(groupPub, bt, a.Signature),
 			"threshold signature must verify against the custody key over the domain-bound digest")
@@ -265,18 +320,61 @@ func TestBridgeRelease_ThresholdSignOverGossip(t *testing.T) {
 
 	// The signature is bound to THIS transfer only: a verifier that flips any
 	// digest-committed field must reject the same signature (replay/rebind).
-	require.False(t, VerifyBridgeAttestation(groupPub, mutateNonce(bt), first.Signature),
+	require.False(t, VerifyBridgeAttestation(groupPub, mutateNonce(bt), att.Signature),
 		"signature must not verify under a different nonce")
-	require.False(t, VerifyBridgeAttestation(groupPub, mutateDstChain(bt), first.Signature),
+	require.False(t, VerifyBridgeAttestation(groupPub, mutateDstChain(bt), att.Signature),
 		"signature must not verify under a different destination chain")
+
+	// --- the signature becomes an auditable record in replicated state ---
+	commitBlock(t, ctx, vms[1], vms) // a DIFFERENT proposer: nothing depends on who builds
+	digest := bt.Digest()
+	for _, vm := range vms {
+		rec, err := vm.Ceremony(att.CeremonyID)
+		require.NoError(t, err, "a produced signature must be readable from the ceremony log")
+		require.Equal(t, OpTypeSign, rec.Kind)
+		require.Equal(t, keyID, rec.KeyID)
+		require.Equal(t, digest[:], rec.Digest)
+		require.Equal(t, att.Signature, rec.Artifact, "the recorded artifact is the signature B was handed")
+		require.Equal(t, "B-Chain", rec.RequestingChain)
+		require.Len(t, rec.Signers, n)
+	}
+
+	// Replay is refused: the ceremony id is derived from (key, digest, signers),
+	// so asking again for the identical release is the identical ceremony — and
+	// recording it twice would be a double release.
+	_, err := vms[0].RequestBridgeRelease(ctx, req)
+	require.ErrorIs(t, err, ErrCeremonyExists)
 
 	// Proof the fabric actually carried ceremony messages between validators
 	// (not a single-party shortcut).
 	require.Greater(t, fab.delivered.Load(), int64(0),
 		"no ceremony messages crossed the gossip fabric")
 
-	t.Logf("bridge release: %d validators threshold-signed over gossip; %d envelopes carried; signature verifies against custody key",
-		n, fab.delivered.Load())
+	t.Logf("custody lifecycle: %d validators ran DKG + threshold sign over gossip; %d envelopes carried; signature verifies and is recorded at state root %x",
+		n, fab.delivered.Load(), vms[0].StateRoot())
+}
+
+// runOnAll invokes fn on every validator concurrently and returns the results
+// in validator order. Every validator must succeed: a ceremony that completes
+// on some nodes and not others is exactly the split-brain this VM exists to
+// prevent, so a partial success is a failure.
+func runOnAll[T any](t *testing.T, ctx context.Context, vms []*VM, fn func(context.Context, *VM) (T, error)) []T {
+	t.Helper()
+	var wg sync.WaitGroup
+	out := make([]T, len(vms))
+	errs := make([]error, len(vms))
+	for i, vm := range vms {
+		wg.Add(1)
+		go func(i int, vm *VM) {
+			defer wg.Done()
+			out[i], errs[i] = fn(ctx, vm)
+		}(i, vm)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		require.NoErrorf(t, err, "validator %d failed", i)
+	}
+	return out
 }
 
 func mutateNonce(bt BridgeTransfer) BridgeTransfer    { bt.Nonce++; return bt }

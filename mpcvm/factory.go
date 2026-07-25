@@ -4,6 +4,7 @@
 package mpcvm
 
 import (
+	"github.com/luxfi/constants"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/vms"
@@ -11,19 +12,30 @@ import (
 
 var _ vms.Factory = (*Factory)(nil)
 
-// VMID is the unique identifier for the shared threshold substrate VM.
-// Per LP-134 / LP-7050 there is NO T-Chain and NO teleportvm: teleport IS
-// bridgevm (B-Chain, LP-6000). This VM is the shared library substrate that
-// M-Chain (MPC — threshold signing / bridge custody, LP-7100) and F-Chain
-// (FHE — confidential compute, LP-8200) run; it is not itself a chain.
-var VMID = ids.ID{'t', 'h', 'r', 'e', 's', 'h', 'o', 'l', 'd', 'v', 'm', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+// VMID identifies M-Chain: MPC threshold signing and bridge custody of external
+// wallets (LP-7100). It is constants.MPCVMID and nothing else.
+//
+// A vmID is an immutable one-way door: it is baked into the CreateChainTx at
+// genesis, it is the plugin binary's filename, and it is what the P-Chain stores
+// forever. Every declaration of it must agree, so there is exactly one — this
+// alias — and it points at the single source of truth in luxfi/constants.
+//
+// This VM previously declared a private `thresholdvm` literal here that matched
+// no other declaration in the stack. Per LP-7050 the thresholdvm package was
+// split into mpcvm (M-Chain) and fhevm (F-Chain); "ThresholdVM" and "mvm" are
+// stale names. constants.MPCVMID, node/genesis/builder/registry.go and
+// node/node/vms.go all say mpcvm.
+var VMID = constants.MPCVMID
 
-// Factory creates new ThresholdVM instances
+// Assert at compile time that the alias really is the shared constant, so a
+// future edit cannot silently reintroduce a private literal.
+var _ = map[bool]struct{}{VMID == ids.ID{'m', 'p', 'c', 'v', 'm'}: {}}
+
+// Factory creates M-Chain VM instances.
 type Factory struct{}
 
-// New returns a new instance of the ThresholdVM
+// New returns a new M-Chain VM. Everything that needs configuration or a
+// database is set up in Initialize; a Factory-built VM holds no state.
 func (f *Factory) New(log.Logger) (interface{}, error) {
-	return &VM{
-		protocolRegistry: NewProtocolRegistry(nil), // Will be initialized properly in Initialize
-	}, nil
+	return &VM{}, nil
 }

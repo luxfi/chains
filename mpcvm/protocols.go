@@ -226,12 +226,12 @@ func (s *lssKeyShare) Protocol() Protocol {
 func (s *lssKeyShare) Serialize() ([]byte, error) {
 	// Serialize key share data to JSON format for storage
 	data := struct {
-		PublicKey   []byte   `json:"publicKey"`
-		PartyID     string   `json:"partyId"`
-		Threshold   int      `json:"threshold"`
-		TotalParties int     `json:"totalParties"`
-		Generation  uint64   `json:"generation"`
-		Protocol    string   `json:"protocol"`
+		PublicKey    []byte `json:"publicKey"`
+		PartyID      string `json:"partyId"`
+		Threshold    int    `json:"threshold"`
+		TotalParties int    `json:"totalParties"`
+		Generation   uint64 `json:"generation"`
+		Protocol     string `json:"protocol"`
 	}{
 		PublicKey:    s.pubKey,
 		PartyID:      string(s.partyID),

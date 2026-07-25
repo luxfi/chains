@@ -268,19 +268,19 @@ func (k GPUBackendKind) String() string {
 // GPU prefix distinguishes the wire mirror from the domain-level Ceremony
 // types in protocols.go / runtime/. ONLY the GPU bridge ever touches these.
 type GPUCeremony struct {
-	CeremonyID          uint64
-	StartedAtNs         uint64
-	DeadlineNs          uint64
-	ParticipantsBitmap  uint64
-	Kind                uint32
-	Round               uint32
-	Threshold           uint32
-	TotalParticipants   uint32
-	Status              uint32
-	ContributionCount   uint32
-	Subject             [32]byte
-	CeremonySeed        [32]byte
-	_                   [8]byte // tail pad to 128
+	CeremonyID         uint64
+	StartedAtNs        uint64
+	DeadlineNs         uint64
+	ParticipantsBitmap uint64
+	Kind               uint32
+	Round              uint32
+	Threshold          uint32
+	TotalParticipants  uint32
+	Status             uint32
+	ContributionCount  uint32
+	Subject            [32]byte
+	CeremonySeed       [32]byte
+	_                  [8]byte // tail pad to 128
 }
 
 // GPUKeyShare is the on-GPU key share record. 368 bytes, __align__(16).
@@ -443,10 +443,10 @@ type GPUBackend struct {
 	handle unsafe.Pointer // dlopen handle; nil = no plugin
 
 	// Resolved symbols. Nil = symbol missing in plugin (launcher disabled).
-	fnCeremonyApply  unsafe.Pointer
-	fnCeremonySweep  unsafe.Pointer
-	fnComputeLeaves  unsafe.Pointer
-	fnComposeRoot    unsafe.Pointer
+	fnCeremonyApply unsafe.Pointer
+	fnCeremonySweep unsafe.Pointer
+	fnComputeLeaves unsafe.Pointer
+	fnComposeRoot   unsafe.Pointer
 }
 
 var (
@@ -823,4 +823,3 @@ func tryLoadPlugin(kind GPUBackendKind, candidates ...string) *GPUBackend {
 	}
 	return b
 }
-

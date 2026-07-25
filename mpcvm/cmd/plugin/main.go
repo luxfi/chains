@@ -8,16 +8,23 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/luxfi/log"
 	"github.com/luxfi/chains/mpcvm"
+	"github.com/luxfi/log"
 	"github.com/luxfi/sys/ulimit"
 	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/vm/rpc"
 )
 
+// main serves the M-Chain VM as a plugin.
+//
+// The binary's FILENAME must be the CB58 of mpcvm.VMID
+// (qCURact1n41FcoNBch8iMVBwc9AWie48D118ZNJ5tBdWrvryS) — that is how the node's
+// plugin registry resolves a vmID from a CreateChainTx to an implementation.
+// A binary installed under any other name is invisible and the chain silently
+// never starts. See node/Dockerfile and TestVMID_IsCanonicalAndStable.
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "version" {
-		fmt.Println("Threshold-VM/1.0.0")
+		fmt.Printf("mpcvm/%s\n", mpcvm.Version)
 		os.Exit(0)
 	}
 
