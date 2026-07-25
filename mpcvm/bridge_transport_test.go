@@ -30,6 +30,7 @@ package mpcvm
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -40,6 +41,7 @@ import (
 	"github.com/luxfi/log"
 	"github.com/luxfi/math/set"
 	"github.com/luxfi/runtime"
+	"github.com/luxfi/threshold/pkg/quorum"
 	validators "github.com/luxfi/validators"
 	"github.com/luxfi/validators/validatorstest"
 	vmcore "github.com/luxfi/vm"
@@ -296,9 +298,14 @@ func TestBridgeCustody_KeygenSignAndRecordOverGossip(t *testing.T) {
 		Nonce:           7,
 	}
 
-	atts := runOnAll(t, ctx, vms, func(ctx context.Context, vm *VM) (*BridgeTransferAttestation, error) {
+	// Every validator is asked; only the policy's K-subset signs. With a 2-of-3
+	// key that is two of the three, chosen deterministically from the task, so
+	// the third declines without anyone coordinating that.
+	atts, declined := runOnQuorum(t, ctx, vms, func(ctx context.Context, vm *VM) (*BridgeTransferAttestation, error) {
 		return vm.RequestBridgeRelease(ctx, req)
 	})
+	require.Len(t, atts, policy.K, "exactly K validators sign")
+	require.Equal(t, policy.N-policy.K, declined, "the rest decline rather than sign")
 
 	bt := BridgeTransfer{
 		SrcChainID: req.SrcChainID,
@@ -326,7 +333,7 @@ func TestBridgeCustody_KeygenSignAndRecordOverGossip(t *testing.T) {
 		"signature must not verify under a different destination chain")
 
 	// --- the signature becomes an auditable record in replicated state ---
-	commitBlock(t, ctx, vms[1], vms) // a DIFFERENT proposer: nothing depends on who builds
+	commitBlock(t, ctx, signerVM(t, vms, atts[0]), vms)
 	digest := bt.Digest()
 	for _, vm := range vms {
 		rec, err := vm.Ceremony(att.CeremonyID)
@@ -336,13 +343,13 @@ func TestBridgeCustody_KeygenSignAndRecordOverGossip(t *testing.T) {
 		require.Equal(t, digest[:], rec.Digest)
 		require.Equal(t, att.Signature, rec.Artifact, "the recorded artifact is the signature B was handed")
 		require.Equal(t, "B-Chain", rec.RequestingChain)
-		require.Len(t, rec.Signers, n)
+		require.Len(t, rec.Signers, policy.K, "the recorded quorum is K, not the whole committee")
 	}
 
 	// Replay is refused: the ceremony id is derived from (key, digest, signers),
 	// so asking again for the identical release is the identical ceremony — and
 	// recording it twice would be a double release.
-	_, err := vms[0].RequestBridgeRelease(ctx, req)
+	_, err := signerVM(t, vms, atts[0]).RequestBridgeRelease(ctx, req)
 	require.ErrorIs(t, err, ErrCeremonyExists)
 
 	// Proof the fabric actually carried ceremony messages between validators
@@ -377,5 +384,183 @@ func runOnAll[T any](t *testing.T, ctx context.Context, vms []*VM, fn func(conte
 	return out
 }
 
+// runOnQuorum invokes fn on every validator and separates the ones that signed
+// from the ones that correctly declined because they are outside this task's
+// K-subset. Any OTHER error is a failure: a ceremony that breaks on some nodes
+// and not others is the split-brain this VM exists to prevent.
+func runOnQuorum[T any](t *testing.T, ctx context.Context, vms []*VM, fn func(context.Context, *VM) (T, error)) (signed []T, declined int) {
+	t.Helper()
+	var wg sync.WaitGroup
+	out := make([]T, len(vms))
+	errs := make([]error, len(vms))
+	for i, vm := range vms {
+		wg.Add(1)
+		go func(i int, vm *VM) {
+			defer wg.Done()
+			out[i], errs[i] = fn(ctx, vm)
+		}(i, vm)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			signed = append(signed, out[i])
+		case errors.Is(err, ErrNotInQuorum):
+			declined++
+		default:
+			require.NoErrorf(t, err, "validator %d failed for a reason other than being outside the quorum", i)
+		}
+	}
+	return signed, declined
+}
+
+// signerVM returns a validator that participated in att's ceremony — i.e. one
+// whose party id is in the signing quorum. Such a node has the signature staged
+// (so it can propose a block carrying it) and is the node that would re-run the
+// ceremony on a replay rather than declining as an outsider.
+//
+// Membership is read from the attestation's signer set rather than from the
+// staging map, because Accept clears a ceremony from staging once its block
+// lands — a post-commit lookup by staging would find nobody.
+func signerVM(t *testing.T, vms []*VM, att *BridgeTransferAttestation) *VM {
+	t.Helper()
+	for _, vm := range vms {
+		for _, s := range att.Signers {
+			if s == vm.partyID {
+				return vm
+			}
+		}
+	}
+	t.Fatalf("no validator is in the signing quorum of ceremony %s", att.CeremonyID)
+	return nil
+}
+
 func mutateNonce(bt BridgeTransfer) BridgeTransfer    { bt.Nonce++; return bt }
 func mutateDstChain(bt BridgeTransfer) BridgeTransfer { bt.DstChainID++; return bt }
+
+// =============================================================================
+// THE GATE: a genuine 3-of-5 custody key, signing through the chain
+// =============================================================================
+
+// TestBridgeCustody_ThreeOfFive is the proof that M-Chain replaces an off-chain
+// signer cluster with something strictly better than what it replaces.
+//
+// Five validators generate one custody key under a 3-of-5 policy. The policy is
+// consensus state, so the degree is not a per-binary flag that can silently
+// disagree with it — which is exactly how three live k8s quorums ended up
+// 1-of-n while their configs said 3-of-5.
+//
+// It then proves the quorum is real in both directions:
+//
+//   - EXACTLY THREE of the five validators run the signing ceremony and produce
+//     a valid signature. Not five. If the key were degree-3 (the off-by-one this
+//     whole change exists to prevent) three parties could not have signed at all.
+//   - The other two never touch the ceremony, yet still verify and accept the
+//     block — non-participants validate custody without trusting the signers.
+func TestBridgeCustody_ThreeOfFive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("threshold DKG/sign is slow; skipped in -short")
+	}
+
+	const n = 5
+	const keyID = "bridge-custody-3of5"
+	policy := quorum.MustNew(3, 5)
+
+	nodes := make([]ids.NodeID, n)
+	for i := range nodes {
+		nodes[i] = ids.GenerateTestNodeID()
+	}
+	vs := committeeState(nodes)
+
+	fab := newMemFabric()
+	vms := make([]*VM, n)
+	for i, nid := range nodes {
+		vms[i] = newFabricVM(t, fab, nid, vs)
+	}
+
+	ctx, cancel := ceremonyContext(t)
+	defer cancel()
+
+	// --- DKG at degree 2 across all five ---
+	keygens := runOnAll(t, ctx, vms, func(ctx context.Context, vm *VM) (*Operation, error) {
+		return vm.StartKeygenWithPolicy(ctx, keyID, policy, "B-Chain")
+	})
+	rec := keygens[0].Key
+	require.Equal(t, policy, rec.Policy)
+	require.Equal(t, 2, rec.Degree(),
+		"3-of-5 must be a degree-2 key; degree 3 would need four signers and is the classic off-by-one")
+	require.Len(t, rec.Participants, 5)
+	for _, op := range keygens {
+		require.Equal(t, rec.GroupPublicKey, op.Key.GroupPublicKey, "all five must agree on the group key")
+	}
+
+	commitBlock(t, ctx, vms[0], vms)
+	groupPub := rec.GroupPublicKey
+
+	// --- exactly three sign ---
+	var asset [32]byte
+	copy(asset[:], []byte("LUX"))
+	var recip [20]byte
+	copy(recip[:], []byte("recipient-3of5"))
+	req := BridgeReleaseRequest{
+		RequestingChain: "B-Chain",
+		KeyID:           keyID,
+		SrcChainID:      200201,
+		DstChainID:      97368,
+		Asset:           asset,
+		Amount:          4_200_000,
+		Recipient:       recip,
+		Nonce:           11,
+	}
+
+	// Every validator is asked; the ones outside this task's quorum decline with
+	// ErrNotInQuorum. Nobody coordinates that — each node computes the same
+	// quorum from the task alone.
+	signed, declined := runOnQuorum(t, ctx, vms, func(ctx context.Context, vm *VM) (*BridgeTransferAttestation, error) {
+		return vm.RequestBridgeRelease(ctx, req)
+	})
+	require.Len(t, signed, 3, "exactly K=3 validators must sign a 3-of-5 key")
+	require.Equal(t, 2, declined, "the remaining N-K=2 validators must decline, not sign")
+
+	att := signed[0]
+	bt := BridgeTransfer{
+		SrcChainID: req.SrcChainID,
+		DstChainID: req.DstChainID,
+		Asset:      req.Asset,
+		Amount:     req.Amount,
+		Recipient:  req.Recipient,
+		Nonce:      req.Nonce,
+	}
+	for _, a := range signed {
+		require.Equal(t, att.Signature, a.Signature, "the three signers derive one identical signature")
+		require.True(t, VerifyBridgeAttestation(groupPub, bt, a.Signature),
+			"three shares of a 3-of-5 key must produce a signature that verifies under the group key")
+	}
+	require.Len(t, att.Signers, 3)
+
+	// --- the two non-signers verify and accept a block they had no part in ---
+	//
+	// The signature reaches a block via one of the three signers (a non-signer
+	// has nothing staged to propose). Every validator then verifies it against
+	// its own registry. That is the property that matters: verification does not
+	// require participation, so a validator that sat out the ceremony still
+	// polices custody rather than trusting whoever signed.
+	commitBlock(t, ctx, signerVM(t, vms, att), vms)
+
+	digest := bt.Digest()
+	for i, vm := range vms {
+		crec, err := vm.Ceremony(att.CeremonyID)
+		require.NoErrorf(t, err, "validator %d cannot read the ceremony it accepted", i)
+		require.Equal(t, digest[:], crec.Digest)
+		require.Equal(t, att.Signature, crec.Artifact)
+		require.Len(t, crec.Signers, 3, "the recorded quorum is three, not five")
+
+		krec, err := vm.Key(keyID)
+		require.NoError(t, err)
+		require.Equal(t, "3-of-5", krec.Policy.String())
+		require.Equal(t, 2, krec.Degree())
+	}
+
+	t.Logf("3-of-5 custody: key %s addr 0x%x | %d of %d validators signed, %d declined | signature verifies | state root %x",
+		keyID, rec.Address, len(signed), n, declined, vms[0].StateRoot())
+}

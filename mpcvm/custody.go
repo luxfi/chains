@@ -35,11 +35,13 @@ package mpcvm
 // disagrees with a participant's own share is rejected by that participant.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/luxfi/ids"
@@ -53,6 +55,11 @@ import (
 // id, so the two can never collide even for identical (key, participant) inputs.
 const keygenDomainTag = "LUX_MPC_KEYGEN_v1"
 
+// quorumSelectTag domain-separates the per-task quorum selection hash, so the
+// ranking of a party for one message can never be reused as a ranking for
+// another, nor collide with a ceremony id or a signing preimage.
+const quorumSelectTag = "LUX_MPC_QUORUM_SELECT_v1"
+
 // KindCGGMP21 names the threshold-ECDSA protocol used for bridge custody of
 // external wallets. It is the value stored in KeyRecord.Kind.
 const KindCGGMP21 = "cggmp21"
@@ -60,6 +67,7 @@ const KindCGGMP21 = "cggmp21"
 var (
 	ErrNoCommittee    = errors.New("mpcvm: no validator committee available")
 	ErrNotParticipant = errors.New("mpcvm: this node is not in the ceremony committee")
+	ErrNotInQuorum    = errors.New("mpcvm: this node is not in this task's signing quorum")
 	ErrPolicyTooLarge = errors.New("mpcvm: policy requires more parties than the committee has")
 )
 
@@ -298,12 +306,22 @@ func (vm *VM) RunSign(ctx context.Context, keyID string, digest []byte, requesti
 		return nil, ErrNotParticipant
 	}
 
-	// The signer set is the key's full participant set. Every member signs.
-	// Selecting a minimal K-subset under partial availability is a liveness
-	// optimisation, not a correctness one, and it is deliberately not done
-	// here: a subset chosen independently by each node would give different
-	// nodes different ceremony ids and no ceremony would ever converge.
-	signers := rec.Participants
+	// The signer set is a K-subset of the participants — the quorum the policy
+	// actually calls for, not everyone. A 3-of-5 key signs with three parties.
+	//
+	// The subset is chosen deterministically from the task itself (see
+	// quorumFor), because a subset chosen independently by each node would give
+	// different nodes different ceremony ids and no ceremony would ever
+	// converge. Determinism is what makes a leaderless quorum possible: every
+	// node computes the same answer without negotiating one.
+	signers := quorumFor(rec, digest)
+	if !containsParty(signers, selfID) {
+		// This node holds a share but is not in this task's quorum. That is
+		// normal and not an error condition for the chain: the ceremony will
+		// complete without it, and it will verify the result like any other
+		// validator when the block arrives.
+		return nil, ErrNotInQuorum
+	}
 	cid := ceremonyID(keyID, digest, signers)
 
 	if _, err := vm.state.GetCeremony(cid); err == nil {
@@ -453,6 +471,58 @@ func (vm *VM) drain(limit int) []*Operation {
 		}
 	}
 	return out
+}
+
+// quorumFor selects the K participants that sign a given task.
+//
+// The selection is a deterministic function of (key, digest) alone, so every
+// node — signer or not — computes the same quorum and therefore the same
+// ceremony id, with no election and no coordinator. Ordering the participants
+// by H(tag ‖ keyID ‖ digest ‖ party) rather than taking the first K in
+// canonical order spreads signing work evenly across the committee instead of
+// loading the same K parties for every transfer, and it means an adversary
+// cannot choose which subset will sign a message it does not control.
+//
+// Liveness note: the quorum is fixed per task, so a task whose selected subset
+// contains an offline party stalls rather than falling back to another subset.
+// Availability-aware reselection needs a deterministic epoch or view number to
+// rotate on — every node must still agree — and that is a follow-up. Safety
+// does not depend on it: a stalled ceremony produces no signature and no state
+// transition.
+func quorumFor(rec *KeyRecord, digest []byte) []party.ID {
+	type ranked struct {
+		id   party.ID
+		rank [32]byte
+	}
+	rs := make([]ranked, 0, len(rec.Participants))
+	for _, p := range rec.Participants {
+		h := sha256.New()
+		writeTagged(h, quorumSelectTag)
+		writeField(h, []byte(rec.KeyID))
+		writeField(h, digest)
+		writeField(h, []byte(p))
+		var r [32]byte
+		copy(r[:], h.Sum(nil))
+		rs = append(rs, ranked{id: p, rank: r})
+	}
+	sort.Slice(rs, func(i, j int) bool {
+		if c := bytes.Compare(rs[i].rank[:], rs[j].rank[:]); c != 0 {
+			return c < 0
+		}
+		return rs[i].id < rs[j].id // total order even on a hash collision
+	})
+
+	k := rec.Policy.K
+	if k > len(rs) {
+		k = len(rs)
+	}
+	out := make([]party.ID, 0, k)
+	for _, r := range rs[:k] {
+		out = append(out, r.id)
+	}
+	// Canonical order is what the ceremony id and the block record are hashed
+	// over; the ranking above only decides membership.
+	return canonicalParties(out)
 }
 
 func containsParty(ps []party.ID, want party.ID) bool {
