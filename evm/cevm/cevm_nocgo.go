@@ -2,6 +2,9 @@
 
 package cevm
 
+// No library linked, so there is no ABI to report.
+const ABIVersion uint32 = 0
+
 import "fmt"
 
 // AutoDetect returns CPUSequential when built without CGo.
