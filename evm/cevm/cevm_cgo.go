@@ -118,78 +118,13 @@ func copyU64(ptr *C.uint64_t, want uint32) []uint64 {
 	return dst
 }
 
-// ExecuteBlock runs a block of transactions through the C++ EVM.
-//
-// Thread safety: ExecuteBlock is safe to call from multiple goroutines
-// concurrently. The C++ engine uses thread-local kernel hosts, so each
-// goroutine that reaches the GPU path gets its own MTLBuffer/CUDA context
-// cache. There are no shared mutable globals between calls.
-//
-// Memory safety: every Go-owned []byte the C side dereferences (tx.Data,
-// tx.Code) is pinned for the duration of the C call. The ctxs[] slice
-// itself is a stack-allocated local (or heap-promoted by escape analysis,
-// either way reachable) — runtime.KeepAlive(ctxs) at the end guarantees
-// the GC won't collect it while the C call is still in flight. The pinner
-// is unpinned via defer on every return path including errors.
-// Deprecated: use ExecuteBlock. V1 (no threads, no ctx, no state, smaller
-// BlockResult shape) is now a thin adapter over the canonical ExecuteBlock —
-// retained only for test-file compatibility.
-func ExecuteBlockV1(backend Backend, txs []Transaction) (*BlockResult, error) {
-	r, err := ExecuteBlock(backend, 0, txs, nil, nil)
-	if err != nil {
-		return nil, err
-	}
-	if r == nil {
-		return &BlockResult{}, nil
-	}
-	return &BlockResult{
-		GasUsed:      r.GasUsed,
-		TotalGas:     r.TotalGas,
-		ExecTimeMs:   r.ExecTimeMs,
-		Conflicts:    r.Conflicts,
-		ReExecutions: r.ReExecutions,
-	}, nil
-}
-
-// ExecuteBlockV2 runs a block through the C++ EVM and returns the V2 result
-// with per-tx status and post-execution state root.
-//
-// Thread safety: same as ExecuteBlock — safe under concurrent goroutines.
-// Memory safety: same pinner + KeepAlive contract as ExecuteBlock.
-// Deprecated: use ExecuteBlock. V2 (no block context, no state snapshot)
-// is now a thin adapter over the canonical ExecuteBlock — retained only
-// for test-file compatibility.
-func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*BlockResultV2, error) {
-	return ExecuteBlock(backend, numThreads, txs, nil, nil)
-}
-
-// Deprecated: use ExecuteBlock. V3 (block context, no state snapshot) is
-// now a thin adapter over the canonical ExecuteBlock — retained only for
-// test-file compatibility.
-func ExecuteBlockV3(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext) (*BlockResultV2, error) {
-	return ExecuteBlock(backend, numThreads, txs, ctx, nil)
-}
-
-// ExecuteBlock is the single canonical entry point for cevm block execution.
-// Takes a state snapshot, runs the block on the chosen backend, returns
-// (gas_used, per-tx status, state_root). One way to dispatch — no version
-// proliferation. ExecuteBlockV4 is the same function under the legacy name
-// (kept until consumers migrate).
-//
-// The underlying C ABI is gpu_execute_block_v4 in luxcpp/cevm. When the
-// luxcpp side adds CALL/CREATE-on-device + per-tx logs, this single Go
-// entry switches to the new C entry — callers don't change.
-func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext, state []StateAccount) (*BlockResultV2, error) {
-	return ExecuteBlockV4(backend, numThreads, txs, ctx, state)
-}
-
-// ExecuteBlockV4 is the legacy name for ExecuteBlock. New code uses
+// ExecuteBlock is the legacy name for ExecuteBlock. New code uses
 // ExecuteBlock; this is retained for test-file compatibility.
 //
 // Deprecated: use ExecuteBlock.
-func ExecuteBlockV4(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext, state []StateAccount) (*BlockResultV2, error) {
+func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext, state []StateAccount) (*BlockResult, error) {
 	if len(txs) == 0 {
-		return &BlockResultV2{ABIVersion: ABIVersion}, nil
+		return &BlockResult{ABIVersion: ABIVersion}, nil
 	}
 
 	var pinner runtime.Pinner
@@ -292,7 +227,7 @@ func ExecuteBlockV4(backend Backend, numThreads uint32, txs []Transaction, ctx *
 			uint32(result.abi_version), ABIVersion)
 	}
 
-	br := &BlockResultV2{
+	br := &BlockResult{
 		GasUsed:      copyU64(result.gas_used, uint32(result.num_txs)),
 		TotalGas:     uint64(result.total_gas),
 		ExecTimeMs:   float64(result.exec_time_ms),
@@ -354,8 +289,8 @@ func LibraryABIVersion() uint32 {
 // program with its expected execution status. Every conformant backend must
 // run each probe to its expected status with non-zero gas.
 type healthProbe struct {
-	name      string
-	bytecode  []byte
+	name       string
+	bytecode   []byte
 	wantStatus TxStatus
 	// callBridge=true marks probes whose top-level opcode is in the CALL
 	// family (CALL/CALLCODE/DELEGATECALL/STATICCALL/CREATE/CREATE2). On the
@@ -581,7 +516,7 @@ func runHealthProbe(b Backend, p healthProbe, isGPU bool) HealthProbeResult {
 		GasPrice: 1,
 	}
 	pr := HealthProbeResult{Name: p.name}
-	r, err := ExecuteBlockV2(b, 0, []Transaction{tx})
+	r, err := ExecuteBlock(b, 0, []Transaction{tx}, nil, nil)
 	if err != nil {
 		pr.Err = fmt.Errorf("probe %q: %w", p.name, err)
 		return pr

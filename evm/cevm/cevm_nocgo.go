@@ -2,10 +2,10 @@
 
 package cevm
 
+import "fmt"
+
 // No library linked, so there is no ABI to report.
 const ABIVersion uint32 = 0
-
-import "fmt"
 
 // AutoDetect returns CPUSequential when built without CGo.
 func AutoDetect() Backend { return CPUSequential }
@@ -19,48 +19,11 @@ func BackendName(b Backend) string { return b.String() }
 // LibraryABIVersion returns the Go-side constant when there's no library.
 func LibraryABIVersion() uint32 { return ABIVersion }
 
-// ExecuteBlock is the canonical entry — returns an error under !cgo.
-func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext, state []StateAccount) (*BlockResultV2, error) {
-	if len(txs) == 0 {
-		return &BlockResultV2{ABIVersion: ABIVersion}, nil
-	}
-	_ = ctx
-	_ = state
-	return nil, fmt.Errorf("cevm: built without CGo, cannot execute transactions (rebuild with CGO_ENABLED=1)")
-}
-
-// Deprecated: use ExecuteBlock.
-func ExecuteBlockV1(backend Backend, txs []Transaction) (*BlockResult, error) {
-	if len(txs) == 0 {
-		return &BlockResult{}, nil
-	}
-	return nil, fmt.Errorf("cevm: built without CGo, cannot execute transactions (rebuild with CGO_ENABLED=1)")
-}
-
-// ExecuteBlockV2 returns an error when built without CGo.
-func ExecuteBlockV2(backend Backend, numThreads uint32, txs []Transaction) (*BlockResultV2, error) {
-	if len(txs) == 0 {
-		return &BlockResultV2{ABIVersion: ABIVersion}, nil
-	}
-	return nil, fmt.Errorf("cevm: built without CGo, cannot execute transactions (rebuild with CGO_ENABLED=1)")
-}
-
-// ExecuteBlockV3 returns an error when built without CGo. Mirrors the
-// V3 cgo signature so the package surface is identical regardless of
-// build mode.
-func ExecuteBlockV3(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext) (*BlockResultV2, error) {
-	if len(txs) == 0 {
-		return &BlockResultV2{ABIVersion: ABIVersion}, nil
-	}
-	_ = ctx
-	return nil, fmt.Errorf("cevm: built without CGo, cannot execute transactions (rebuild with CGO_ENABLED=1)")
-}
-
-// ExecuteBlockV4 returns an error when built without CGo. Mirrors the V4
+// ExecuteBlock returns an error when built without CGo. Mirrors the V4
 // cgo signature so consumers can call it unconditionally.
-func ExecuteBlockV4(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext, state []StateAccount) (*BlockResultV2, error) {
+func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext, state []StateAccount) (*BlockResult, error) {
 	if len(txs) == 0 {
-		return &BlockResultV2{ABIVersion: ABIVersion}, nil
+		return &BlockResult{ABIVersion: ABIVersion}, nil
 	}
 	_ = ctx
 	_ = state
