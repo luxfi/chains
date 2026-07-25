@@ -300,6 +300,12 @@ func (vm *VM) verifySign(op *Operation, pending map[string]*KeyRecord) error {
 	// The signer set must satisfy the key's own policy. K signers, not K-1: a
 	// set of size Degree() cannot produce a signature, so a record claiming one
 	// did is either a lie or a wrong-degree key.
+	//
+	// Which particular K-subset signed is deliberately NOT pinned here. The
+	// signature verifies under the group key or it does not, and an adversary
+	// able to produce one already holds K shares — constraining the subset adds
+	// no security, while leaving it open lets a future availability-aware
+	// reselection ship without a consensus change.
 	if len(op.Signers) < rec.Policy.K {
 		return fmt.Errorf("%w: %d signers for policy %s", ErrQuorumTooSmall, len(op.Signers), rec.Policy)
 	}
