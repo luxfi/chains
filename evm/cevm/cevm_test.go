@@ -5,7 +5,7 @@ import "testing"
 // Tests in this file run under both `cgo` and `!cgo` builds. They cover the
 // parts of the API that don't depend on the C++ library: enum stringers,
 // constant exports, and the empty-input fast-paths that ExecuteBlock /
-// ExecuteBlockV2 promise to return without error.
+// ExecuteBlock promise to return without error.
 
 func TestBackendString(t *testing.T) {
 	tests := []struct {
@@ -73,28 +73,18 @@ func TestPluginExists(t *testing.T) {
 	_ = PluginExists()
 }
 
-// TestExecuteBlockEmpty must succeed on both cgo and nocgo paths: the API
-// contract is "empty input ⇒ empty result, no error" regardless of build.
+// TestExecuteBlockEmpty pins the contract for a block with no transactions:
+// no error, no gas, and the ABI the linked library reports.
 func TestExecuteBlockEmpty(t *testing.T) {
-	result, err := ExecuteBlockV1(CPUSequential, nil)
+	result, err := ExecuteBlock(CPUSequential, 0, nil, nil, nil)
 	if err != nil {
-		t.Fatalf("ExecuteBlock(nil) returned error: %v", err)
+		t.Fatalf("ExecuteBlock(nil): %v", err)
 	}
 	if result.TotalGas != 0 {
-		t.Errorf("expected 0 total gas for empty block, got %d", result.TotalGas)
-	}
-}
-
-func TestExecuteBlockV2Empty(t *testing.T) {
-	result, err := ExecuteBlockV2(CPUSequential, 0, nil)
-	if err != nil {
-		t.Fatalf("ExecuteBlockV2(nil) returned error: %v", err)
+		t.Errorf("TotalGas = %d, want 0 for an empty block", result.TotalGas)
 	}
 	if result.ABIVersion != ABIVersion {
 		t.Errorf("ABIVersion = %d, want %d", result.ABIVersion, ABIVersion)
-	}
-	if result.TotalGas != 0 {
-		t.Errorf("expected 0 total gas for empty block, got %d", result.TotalGas)
 	}
 }
 
@@ -123,22 +113,6 @@ func TestHealth_AlwaysReturnsReports(t *testing.T) {
 	reports := Health()
 	if len(reports) == 0 {
 		t.Fatal("Health() returned no reports — even nocgo must report status")
-	}
-}
-
-// TestExecuteBlockV3Empty checks the V3 entry point honours the same
-// "empty input ⇒ empty result, no error" contract as V1/V2, on both
-// cgo and nocgo builds.
-func TestExecuteBlockV3Empty(t *testing.T) {
-	result, err := ExecuteBlockV3(CPUSequential, 0, nil, nil)
-	if err != nil {
-		t.Fatalf("ExecuteBlockV3(nil, nil) returned error: %v", err)
-	}
-	if result.ABIVersion != ABIVersion {
-		t.Errorf("ABIVersion = %d, want %d", result.ABIVersion, ABIVersion)
-	}
-	if result.TotalGas != 0 {
-		t.Errorf("expected 0 total gas for empty block, got %d", result.TotalGas)
 	}
 }
 

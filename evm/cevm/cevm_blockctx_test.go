@@ -28,12 +28,12 @@ import (
 // we skip the CHAINID assertion for CUDA but still verify the call returned.
 func TestBlockContextChainID(t *testing.T) {
 	code := []byte{
-		0x46,             // CHAINID
-		0x60, 0x00,       // PUSH1 0
-		0x52,             // MSTORE
-		0x60, 0x20,       // PUSH1 32
-		0x60, 0x00,       // PUSH1 0
-		0xf3,             // RETURN
+		0x46,       // CHAINID
+		0x60, 0x00, // PUSH1 0
+		0x52,       // MSTORE
+		0x60, 0x20, // PUSH1 32
+		0x60, 0x00, // PUSH1 0
+		0xf3, // RETURN
 	}
 	tx := Transaction{
 		HasTo:    true,
@@ -51,9 +51,9 @@ func TestBlockContextChainID(t *testing.T) {
 	for _, b := range backends {
 		b := b
 		t.Run(BackendName(b), func(t *testing.T) {
-			r, err := ExecuteBlockV3(b, 0, []Transaction{tx}, ctx)
+			r, err := ExecuteBlock(b, 0, []Transaction{tx}, ctx, nil)
 			if err != nil {
-				t.Fatalf("ExecuteBlockV3 failed: %v", err)
+				t.Fatalf("ExecuteBlock failed: %v", err)
 			}
 			if len(r.Status) != 1 {
 				t.Fatalf("expected 1 status entry, got %d", len(r.Status))
@@ -108,12 +108,12 @@ func TestBlockContextChainID(t *testing.T) {
 	}
 
 	// One more invariant: a zero BlockContext (V2 path) MUST NOT panic and
-	// MUST return a clean (non-error) BlockResultV2. This guards the
+	// MUST return a clean (non-error) BlockResult. This guards the
 	// "ctx == nil" call shape against silent regressions.
 	t.Run("zero-ctx-fallback", func(t *testing.T) {
-		r, err := ExecuteBlockV3(backends[0], 0, []Transaction{tx}, nil)
+		r, err := ExecuteBlock(backends[0], 0, []Transaction{tx}, nil, nil)
 		if err != nil {
-			t.Fatalf("ExecuteBlockV3 with nil ctx failed: %v", err)
+			t.Fatalf("ExecuteBlock with nil ctx failed: %v", err)
 		}
 		if r.ABIVersion != ABIVersion {
 			t.Errorf("ABIVersion mismatch: got %d, want %d", r.ABIVersion, ABIVersion)
@@ -122,7 +122,7 @@ func TestBlockContextChainID(t *testing.T) {
 }
 
 // encodeBE32 is a helper used by future test extensions that decode RETURN
-// data once we wire output bytes through BlockResultV2. Kept here so the
+// data once we wire output bytes through BlockResult. Kept here so the
 // chain id big-endian encoding stays in one place.
 func encodeBE32(v uint64) [32]byte {
 	var b [32]byte

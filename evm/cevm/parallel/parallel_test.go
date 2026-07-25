@@ -21,13 +21,13 @@ import (
 // We don't assert TxOK strictly — the LP-108 P5 corpus is the cevm side's
 // gate for which CALL shapes the GPU CALL trampoline supports. What we
 // verify here is that:
-//   1. ExecuteBlockV4 returns without error.
-//   2. The result has the new ABIVersion (6) — proves the v4 ABI wired
-//      end-to-end.
-//   3. Per-tx status / gas slices have the right length.
-//   4. Backends that DO support state-aware CALL return a non-OOG status
-//      (i.e. the kernel made progress past the kernel-internal "not
-//      supported" sentinel).
+//  1. ExecuteBlockV4 returns without error.
+//  2. The result has the new ABIVersion (6) — proves the v4 ABI wired
+//     end-to-end.
+//  3. Per-tx status / gas slices have the right length.
+//  4. Backends that DO support state-aware CALL return a non-OOG status
+//     (i.e. the kernel made progress past the kernel-internal "not
+//     supported" sentinel).
 func TestExecuteBlockV4_StateSnapshot_GPUCall(t *testing.T) {
 	backends := cevm.AvailableBackends()
 	if len(backends) == 0 {
@@ -97,7 +97,7 @@ func TestExecuteBlockV4_StateSnapshot_GPUCall(t *testing.T) {
 	for _, b := range backends {
 		b := b
 		t.Run(cevm.BackendName(b), func(t *testing.T) {
-			r, err := cevm.ExecuteBlockV4(b, 0, []cevm.Transaction{tx}, nil, state)
+			r, err := cevm.ExecuteBlock(b, 0, []cevm.Transaction{tx}, nil, state)
 			if err != nil {
 				t.Fatalf("ExecuteBlockV4: %v", err)
 			}
@@ -141,11 +141,11 @@ func TestExecuteBlockV4_EmptySnapshot(t *testing.T) {
 	for _, b := range backends {
 		b := b
 		t.Run(cevm.BackendName(b), func(t *testing.T) {
-			r3, err3 := cevm.ExecuteBlockV3(b, 0, []cevm.Transaction{tx}, nil)
+			r3, err3 := cevm.ExecuteBlock(b, 0, []cevm.Transaction{tx}, nil, nil)
 			if err3 != nil {
 				t.Fatalf("V3: %v", err3)
 			}
-			r4, err4 := cevm.ExecuteBlockV4(b, 0, []cevm.Transaction{tx}, nil, nil)
+			r4, err4 := cevm.ExecuteBlock(b, 0, []cevm.Transaction{tx}, nil, nil)
 			if err4 != nil {
 				t.Fatalf("V4: %v", err4)
 			}

@@ -278,8 +278,8 @@ func recordOutcome(o opcodeOutcome) {
 // ----------------------------------------------------------------------------
 
 // runTx builds a Transaction for the given opcode test and runs it through
-// `backend`. It always calls ExecuteBlockV2 so we get per-tx status.
-func runOpcodeTx(backend Backend, ot opcodeTest) (*BlockResultV2, error) {
+// `backend`. It always calls ExecuteBlock so we get per-tx status.
+func runOpcodeTx(backend Backend, ot opcodeTest) (*BlockResult, error) {
 	var from [20]byte
 	from[19] = 0x42
 	tx := Transaction{
@@ -303,7 +303,7 @@ func runOpcodeTx(backend Backend, ot opcodeTest) (*BlockResultV2, error) {
 			0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
 		}
 	}
-	return ExecuteBlockV2(backend, 1, []Transaction{tx})
+	return ExecuteBlock(backend, 1, []Transaction{tx}, nil, nil)
 }
 
 // ----------------------------------------------------------------------------

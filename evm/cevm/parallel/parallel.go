@@ -5,7 +5,7 @@
 //
 // LP-108 (2026-05-04) ENSURE step: the per-tx TransactionExecutor
 // abstraction in luxfi/evm/core/parallel was the wrong shape for
-// cevm. cevm.ExecuteBlockV3 is block-batched; the per-tx wrapper
+// cevm. cevm.ExecuteBlock is block-batched; the per-tx wrapper
 // in luxfi/evm/core/parallel/backend_cevm.go always returned
 // (nil, nil). This package implements luxfi/evm/core/parallel's
 // BlockExecutor interface (whole-block) which is the natural shape
@@ -47,8 +47,8 @@ import (
 	"sync"
 
 	"github.com/luxfi/crypto/backend"
-	"github.com/luxfi/evm/core/state"
 	evmparallel "github.com/luxfi/evm/core/parallel"
+	"github.com/luxfi/evm/core/state"
 	"github.com/luxfi/geth/common"
 	"github.com/luxfi/geth/core/types"
 	"github.com/luxfi/geth/core/vm"
@@ -111,7 +111,7 @@ func declineBlock(reason string, blockNumber, txIndex uint64) ([]*types.Receipt,
 }
 
 // Executor is a luxfi/evm/core/parallel.BlockExecutor that dispatches
-// every block to cevm.ExecuteBlockV3 in one cgo call.
+// every block to cevm.ExecuteBlock in one cgo call.
 //
 // Compile-time interface check; the var line below ensures Executor
 // satisfies BlockExecutor.
@@ -131,7 +131,7 @@ type Executor struct {
 var _ evmparallel.BlockExecutor = (*Executor)(nil)
 
 // ExecuteBlock implements evmparallel.BlockExecutor. Dispatches the
-// whole block in one cgo call to cevm.ExecuteBlockV3 and reconstructs
+// whole block in one cgo call to cevm.ExecuteBlock and reconstructs
 // receipts.
 //
 // Returns (nil, nil) — the documented "fall through to sequential"

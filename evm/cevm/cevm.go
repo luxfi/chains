@@ -14,7 +14,7 @@
 //
 // # Concurrency model
 //
-// ExecuteBlock and ExecuteBlockV2 are safe to call concurrently from
+// ExecuteBlock and ExecuteBlock are safe to call concurrently from
 // multiple goroutines. The implementation guarantees:
 //
 //  1. No shared mutable state on the Go side. Every call allocates a fresh
@@ -57,6 +57,19 @@ package cevm
 import "fmt"
 
 // Backend selects the C++ EVM execution mode.
+// BlockResult extends BlockResult with the V2 ABI fields: per-tx status
+// and the post-execution state root.
+type BlockResult struct {
+	StateRoot    [32]byte
+	GasUsed      []uint64
+	Status       []TxStatus
+	TotalGas     uint64
+	ExecTimeMs   float64
+	Conflicts    uint32
+	ReExecutions uint32
+	ABIVersion   uint32
+}
+
 type Backend int
 
 const (
@@ -104,29 +117,15 @@ type Transaction struct {
 	GasPrice uint64
 }
 
-// BlockResult holds the outcome of executing a block of transactions.
-type BlockResult struct {
-	// GasUsed per transaction, indexed by position.
-	GasUsed []uint64
-	// TotalGas consumed by the entire block.
-	TotalGas uint64
-	// ExecTimeMs is wall-clock execution time in milliseconds.
-	ExecTimeMs float64
-	// Conflicts detected during Block-STM parallel execution.
-	Conflicts uint32
-	// ReExecutions caused by conflicts.
-	ReExecutions uint32
-}
-
 // TxStatus is a per-transaction execution outcome from the V2 ABI.
 type TxStatus uint8
 
 const (
-	TxOK              TxStatus = 0 // STOP / clean exit
-	TxReturn          TxStatus = 1
-	TxRevert          TxStatus = 2
-	TxOOG             TxStatus = 3
-	TxError           TxStatus = 4
+	TxOK               TxStatus = 0 // STOP / clean exit
+	TxReturn           TxStatus = 1
+	TxRevert           TxStatus = 2
+	TxOOG              TxStatus = 3
+	TxError            TxStatus = 4
 	TxCallNotSupported TxStatus = 5
 )
 
@@ -150,25 +149,12 @@ func (s TxStatus) String() string {
 	}
 }
 
-// BlockResultV2 extends BlockResult with the V2 ABI fields: per-tx status
-// and the post-execution state root.
-type BlockResultV2 struct {
-	StateRoot [32]byte
-	GasUsed   []uint64
-	Status    []TxStatus
-	TotalGas  uint64
-	ExecTimeMs   float64
-	Conflicts    uint32
-	ReExecutions uint32
-	ABIVersion   uint32
-}
-
 // BlockContext is the block-level execution context shared by every
 // transaction in a block. It feeds the EVM opcodes that report block-level
 // state: TIMESTAMP, NUMBER, CHAINID, BASEFEE, COINBASE, GASLIMIT,
 // PREVRANDAO, BLOBHASH, BLOBBASEFEE.
 //
-// Pass a non-nil *BlockContext to ExecuteBlockV3 when the call must mirror
+// Pass a non-nil *BlockContext to ExecuteBlock when the call must mirror
 // real chain semantics (consensus, replay, fork-aware execution). The
 // zero-value is the documented "no context" default — chain id resolves
 // to 0, timestamp to 0, etc., which matches the dispatcher's pre-v0.26
@@ -199,7 +185,7 @@ type BlockContext struct {
 //
 // v5 (v0.26.0): added gpu_execute_block_v3 with CBlockContext (TIMESTAMP,
 // NUMBER, CHAINID, BASEFEE, etc.) and per-tx status[] in BlockResult. V2
-// callers still work; only ExecuteBlockV3 sees the new BlockContext fields.
+// callers still work; only ExecuteBlock sees the new BlockContext fields.
 //
 // v6: added gpu_execute_block_v4 + CGpuStateAccount. Callers can now hand
 // the GPU a state snapshot (account nonce, balance, code, code_hash) so
@@ -208,7 +194,7 @@ type BlockContext struct {
 //
 
 // StateAccount is one entry in the snapshot of touched accounts handed to
-// ExecuteBlockV4. Fields mirror the C-side CGpuStateAccount byte-for-byte
+// ExecuteBlock. Fields mirror the C-side CGpuStateAccount byte-for-byte
 // (modulo the inline `Code` slice which the binding flattens into a single
 // blob before crossing the cgo boundary).
 //
