@@ -52,6 +52,10 @@ func AutoDetect() Backend {
 // module's expected ABIVersion. A mismatch means the binary and the cevm
 // module were built against incompatible C++ headers and any execution would
 // produce silently wrong results — fail fast at process start instead.
+// ABIVersion is the ABI this build was compiled against, taken from the
+// library's own header. There is no second copy to keep in sync.
+const ABIVersion = uint32(C.EVM_GPU_ABI_VERSION)
+
 func init() {
 	got := uint32(C.gpu_abi_version())
 	if got != ABIVersion {
@@ -262,7 +266,7 @@ func ExecuteBlockV4(backend Backend, numThreads uint32, txs []Transaction, ctx *
 		}
 	}
 
-	result := C.gpu_execute_block_v4(
+	result := C.gpu_execute_block(
 		&ctxs[0],
 		C.uint32_t(len(ctxs)),
 		C.uint8_t(backend),
@@ -274,7 +278,7 @@ func ExecuteBlockV4(backend Backend, numThreads uint32, txs []Transaction, ctx *
 		codePtr,
 		C.uint32_t(codeSize),
 	)
-	defer C.gpu_free_result_v2(&result)
+	defer C.gpu_free_result(&result)
 	runtime.KeepAlive(ctxs)
 	runtime.KeepAlive(cctxStorage)
 	runtime.KeepAlive(cAccts)

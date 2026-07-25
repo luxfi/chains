@@ -205,7 +205,7 @@ type BlockContext struct {
 // the GPU a state snapshot (account nonce, balance, code, code_hash) so
 // the kernel CALL/CREATE path resolves targets on-device instead of
 // returning CallNotSupported. V3 callers still see the same wire shape.
-const ABIVersion uint32 = 6
+//
 
 // StateAccount is one entry in the snapshot of touched accounts handed to
 // ExecuteBlockV4. Fields mirror the C-side CGpuStateAccount byte-for-byte
