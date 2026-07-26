@@ -35,7 +35,24 @@ domain-execution chain that MUST consume UTXO settlement via the
 | `aivm/` | **A** | Inference receipt + attestation. Rides B's settlement engine (LP-0130 §9) | LP-5000 |
 | `bridgevm/` | **B** | Cross-chain message lifecycle. Fees deducted from bridged amount (LP-0130 §8) | LP-6000 |
 | `mpcvm/` | **M** | MPC signing / custody. Service fees paid by originating chain (LP-0130 §7); no user M-balance | LP-7100 |
-| `mpcvm/fhe/` | **F** | FHE runtime. Encrypted supply reconciles to X-escrow (LP-0130 §2, I-5) | LP-8200 |
+| `mpcvm/fhe/` | **F** | FHE runtime **library** — a package inside `mpcvm`, not a chain. See the deployment note below. | LP-8200 |
+
+**Deployment reality (probed on mainnet 96369, `platform.getBlockchains`).** Ten
+chains are live: P X + C D Q Z A B G K. **M and F are NOT deployed**, and the
+two are not equally close to shipping:
+
+- **M** has a full VM (`mpcvm/`, `mpcvm/cmd/plugin`) — it builds, it just has no
+  chain registered on any network.
+- **F** has **no VM at all**. `luxfi/constants` reserves
+  `FHEVMID = {'f','h','e','v','m'}` and `luxfi/node/node/vms.go` lists it in
+  `OptionalVMs` as plugin `fhevm`, so luxd scans `--plugin-dir` for a binary
+  that this repo never produces (no `fhevm/` directory ⇒ no `make` target ⇒ no
+  binary). `mpcvm/fhe/` above is the FHE runtime library, not a standalone
+  F-Chain. **F-Chain is a spec (LP-8200, LP-167) with no shipping VM.**
+
+T-Chain is gone entirely — LP-134 dissolves it with zero remainder (threshold
+signing → M, FHE → F, cross-chain messaging/teleport → B). There is no
+`teleportvm` here and no `teleportvm` VM ID in `luxfi/constants`.
 
 **Service VMs** (not canonical primary chains under LP-0130):
 
