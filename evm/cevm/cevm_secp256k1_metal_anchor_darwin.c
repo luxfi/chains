@@ -11,5 +11,5 @@ extern int secp256k1_ecrecover_address_batch_metal(
     const uint8_t* inputs, size_t n,
     uint8_t* out_addr, uint8_t* out_st, const char* metallib_path);
 
-void* const lux_secp256k1_metal_anchor =
+void* const lux_cevm_secp256k1_metal_anchor =
     (void*)&secp256k1_ecrecover_address_batch_metal;
