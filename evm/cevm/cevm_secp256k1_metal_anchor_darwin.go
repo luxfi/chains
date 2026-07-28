@@ -8,17 +8,17 @@ package cevm
 /*
 #include <stddef.h>
 
-extern void* const lux_secp256k1_metal_anchor;
+extern void* const lux_cevm_secp256k1_metal_anchor;
 
-static inline void* lux_secp256k1_metal_anchor_keep(void) {
-    return lux_secp256k1_metal_anchor;
+static inline void* lux_cevm_secp256k1_metal_anchor_keep(void) {
+    return lux_cevm_secp256k1_metal_anchor;
 }
 */
 import "C"
 
 // metalAnchorAddr keeps the anchor + Metal driver symbol alive through
 // linker DCE. See cpp/ecrecover.cpp for the dispatch logic.
-var metalAnchorAddr = C.lux_secp256k1_metal_anchor_keep()
+var metalAnchorAddr = C.lux_cevm_secp256k1_metal_anchor_keep()
 
 func init() {
 	if metalAnchorAddr == nil {

@@ -154,7 +154,7 @@ require (
 	github.com/luxfi/genesis v1.16.2 // indirect
 	github.com/luxfi/go-bip32 v1.1.0 // indirect
 	github.com/luxfi/go-bip39 v1.2.0 // indirect
-	github.com/luxfi/gpu v1.0.1 // indirect
+	github.com/luxfi/gpu v1.1.2 // indirect
 	github.com/luxfi/keychain v1.1.1 // indirect
 	github.com/luxfi/lens v0.2.1 // indirect
 	github.com/luxfi/magnetar v1.2.3 // indirect
