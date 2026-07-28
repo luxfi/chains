@@ -38,7 +38,7 @@ jobs:
       pre-build-command: |
         mkdir -p build
         export GONOSUMCHECK=github.com/luxfi/*
-        export GONOSUMDB=github.com/luxfi/*
+        export GONOSUMDB=github.com/lux-private/*
         export CGO_ENABLED=${{ matrix.image.cgo }}
         export CGO_CFLAGS="${{ matrix.image.cgo == '1' && '-O2 -D__BLST_PORTABLE__' || '' }}"
         if [ -f ${{ matrix.image.vm }}/main.go ]; then
