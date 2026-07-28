@@ -30,6 +30,7 @@ require (
 	github.com/luxfi/sys v0.1.0
 	github.com/luxfi/threshold v1.12.6
 	github.com/luxfi/timer v1.1.1
+	github.com/luxfi/validators v1.3.1
 	github.com/luxfi/version v1.0.1
 	github.com/luxfi/vm v1.3.1
 	github.com/luxfi/warp v1.24.1
@@ -175,7 +176,6 @@ require (
 	github.com/luxfi/upgrade v1.0.3 // indirect
 	github.com/luxfi/utils v1.3.1 // indirect
 	github.com/luxfi/utxo v0.5.8 // indirect
-	github.com/luxfi/validators v1.3.1 // indirect
 	github.com/luxfi/zapdb v1.10.1 // indirect
 	github.com/luxfi/zwing v0.6.1 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
