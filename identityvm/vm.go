@@ -636,12 +636,13 @@ func (vm *VM) VerifyCredential(credID ids.ID) (bool, error) {
 		return false, errCredentialRevoked
 	}
 
-	// Verify ZK proof if required
-	if vm.config.RequireZKProofs && cred.Proof != nil {
-		if len(cred.Proof.ZKProof) == 0 {
+	// When the chain requires ZK proofs, a credential must carry one. Gating the
+	// requirement on cred.Proof != nil made the requirement optional: a credential
+	// with no proof object at all skipped the check and verified.
+	if vm.config.RequireZKProofs {
+		if cred.Proof == nil || len(cred.Proof.ZKProof) == 0 {
 			return false, errInvalidProof
 		}
-		// Would verify ZK proof here
 	}
 
 	return true, nil
