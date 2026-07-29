@@ -126,7 +126,14 @@ func (vm *VM) verifyImported(height uint64, recorded []CIntent, wantRoot common.
 			return err
 		}
 	}
-	if got := vm.quorum.ReceiptRoot(vm.qstate); wantRoot != (common.Hash{}) && got != wantRoot {
+	// The recorded root must equal the one these imports actually produce, with no
+	// exemption for the zero hash. Skipping the comparison when the block claims
+	// zero made the determinism check opt-out: a proposer wrote a zero receipt_root
+	// and followers applied its intents without ever checking that their engine
+	// state agreed. An honest proposer stamps the engine's own root (vm.go:622), and
+	// a block with no folded receipts carries zero on both sides, so an equality
+	// check admits every honest case and only rejects a genuine divergence.
+	if got := vm.quorum.ReceiptRoot(vm.qstate); got != wantRoot {
 		return ErrReceiptRootMismatch
 	}
 	return nil
