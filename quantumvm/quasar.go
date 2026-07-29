@@ -13,6 +13,7 @@ package quantumvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -195,8 +196,8 @@ func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte
 	}
 
 	q.mu.Lock()
-	pending.BLSSignatures = append(pending.BLSSignatures, blsSig)
-	pending.CoronaSignatures = append(pending.CoronaSignatures, pqSig)
+	pending.addBLS(blsSig)
+	pending.addCorona(pqSig)
 	q.mu.Unlock()
 
 	q.log.Debug("Block signed with Quasar (BLS + Corona parallel)",
@@ -209,6 +210,36 @@ func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte
 	return &BlockSigs{BLS: blsSig, Corona: pqSig}, nil
 }
 
+// errDuplicateSigner — a validator that already contributed a signature for this
+// block sent another. Both finality legs are counted by len(signatures) against
+// the threshold, so admitting a second signature from one validator would let a
+// single peer reach the threshold alone by resending.
+var errDuplicateSigner = errors.New("quantumvm: validator already signed this block")
+
+// addBLS records one BLS signature per validator and reports whether it was new.
+// Caller holds q.mu.
+func (p *PendingBlock) addBLS(sig *quasar.BLSSignature) bool {
+	for _, have := range p.BLSSignatures {
+		if have.ValidatorID == sig.ValidatorID {
+			return false
+		}
+	}
+	p.BLSSignatures = append(p.BLSSignatures, sig)
+	return true
+}
+
+// addCorona records one Corona signature per validator and reports whether it was
+// new. Caller holds q.mu.
+func (p *PendingBlock) addCorona(sig *quasar.CoronaSignature) bool {
+	for _, have := range p.CoronaSignatures {
+		if have.ValidatorID == sig.ValidatorID {
+			return false
+		}
+	}
+	p.CoronaSignatures = append(p.CoronaSignatures, sig)
+	return true
+}
+
 // AddBLSSignature adds a BLS signature from another validator
 func (q *Quasar) AddBLSSignature(blockID ids.ID, sig *quasar.BLSSignature) error {
 	q.mu.Lock()
@@ -219,7 +250,9 @@ func (q *Quasar) AddBLSSignature(blockID ids.ID, sig *quasar.BLSSignature) error
 		return fmt.Errorf("pending block not found: %s", blockID)
 	}
 
-	pending.BLSSignatures = append(pending.BLSSignatures, sig)
+	if !pending.addBLS(sig) {
+		return fmt.Errorf("%w: %s (BLS)", errDuplicateSigner, sig.ValidatorID)
+	}
 
 	q.log.Debug("Added BLS signature",
 		"blockID", blockID,
@@ -230,7 +263,12 @@ func (q *Quasar) AddBLSSignature(blockID ids.ID, sig *quasar.BLSSignature) error
 	return nil
 }
 
-// AddCoronaSignature adds a Corona signature from another validator
+// AddCoronaSignature adds a Corona signature from another validator.
+//
+// The Corona leg is finalized on count alone (TryFinalize does not verify Corona
+// signatures the way the BLS leg verifies its aggregate), so the count must be a
+// count of DISTINCT validators or the post-quantum half of quantum finality is
+// satisfied by one peer resending one signature.
 func (q *Quasar) AddCoronaSignature(blockID ids.ID, sig *quasar.CoronaSignature) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -240,7 +278,9 @@ func (q *Quasar) AddCoronaSignature(blockID ids.ID, sig *quasar.CoronaSignature)
 		return fmt.Errorf("pending block not found: %s", blockID)
 	}
 
-	pending.CoronaSignatures = append(pending.CoronaSignatures, sig)
+	if !pending.addCorona(sig) {
+		return fmt.Errorf("%w: %s (Corona)", errDuplicateSigner, sig.ValidatorID)
+	}
 
 	q.log.Debug("Added Corona signature",
 		"blockID", blockID,
