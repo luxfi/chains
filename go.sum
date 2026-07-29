@@ -314,7 +314,7 @@ github.com/luxfi/oracle v0.1.1-0.20260429020431-76258cfcddf9 h1:y+foW/ZJuTEb/AUU
 github.com/luxfi/oracle v0.1.1-0.20260429020431-76258cfcddf9/go.mod h1:ueeF3b4SrhpCNb8hUYeP/kV7qgkp/BKKjsKbUhEjg40=
 github.com/luxfi/p2p v1.19.2 h1:uqZq7ofmEDbXlTkv1QThtci01Q+dmDkNmAPeORIyP8E=
 github.com/luxfi/p2p v1.19.2/go.mod h1:tI9Bt1R0ouvVtJvXG4e20GlGeV4AR230k4mFF9Vglzk=
-github.com/luxfi/pq v1.0.3 h1:pFlQm1+5FuKTDUh2y/23bXWkN4I2Rc5iuxJypwDFFMs=
+github.com/luxfi/pq v1.0.3 h1:ksw1dmfTR0dqqNMRS7BjGcprCO2Fhc+3Iiq2/NMuONw=
 github.com/luxfi/pq v1.0.3/go.mod h1:8bppZcRElfrVt0n3nYCZW3iX1TvhvzNbdjNdK1irgIE=
 github.com/luxfi/precompile v0.5.23 h1:AhKZmc0qtb8iwHhRorCEN4VjVGQPUMTIZSCEPNRAvxs=
 github.com/luxfi/precompile v0.5.23/go.mod h1:K/1lY+UEYpQKelLFKhh0vnMM50uhW9HEf51CB4YBlto=
