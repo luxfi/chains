@@ -306,8 +306,15 @@ func (h *FHEProtocolHandler) SubmitDecryptionShare(
 		return errors.New("session already finished")
 	}
 
+	if _, dup := session.Shares[partyID]; dup {
+		return errors.New("party already submitted a decryption share")
+	}
+
 	session.Shares[partyID] = share
-	session.ShareCount++
+	// The share set is the only source of truth for how many DISTINCT parties
+	// have contributed. Counting calls instead lets one party reach the threshold
+	// alone by resubmitting, which decrypts a value t-of-n exists to protect.
+	session.ShareCount = len(session.Shares)
 	session.Status = StatusCollecting
 
 	// Check if we have enough shares
