@@ -4,7 +4,6 @@
 package bridgevm
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 
@@ -61,16 +60,23 @@ func batchVerifyBlockSignatures(
 	// CPU fallback: sequential
 	validCount := 0
 	for _, e := range entries {
-		sig, err := deserializeSignature(mpcCfg.Group, e.sigBytes)
-		if err != nil {
-			continue
-		}
-		pubInfo := mpcCfg.Public[e.partyID]
-		if sig.Verify(pubInfo.ECDSA, blockHash[:]) {
+		if verifyBlockSig(mpcCfg, blockHash, e) {
 			validCount++
 		}
 	}
 	return validCount
+}
+
+// verifyBlockSig is the ONE acceptance predicate for a block MPC signature: is
+// sigBytes a valid signature by this party's key over the block hash? Both the
+// CPU loop and the GPU batch answer this same question — the accelerator only
+// batches it, it never redefines it.
+func verifyBlockSig(mpcCfg *config.Config, blockHash ids.ID, e sigEntry) bool {
+	sig, err := deserializeSignature(mpcCfg.Group, e.sigBytes)
+	if err != nil {
+		return false
+	}
+	return sig.Verify(mpcCfg.Public[e.partyID].ECDSA, blockHash[:])
 }
 
 // sigEntry holds a signature entry for batch verification.
@@ -78,6 +84,53 @@ type sigEntry struct {
 	nodeID   ids.NodeID
 	sigBytes []byte
 	partyID  party.ID
+}
+
+// Tensor row widths for the block-signature batch.
+const (
+	batchHashSize = 32
+	batchSigSize  = 64
+	batchPKSize   = 33
+)
+
+// packBlockSigBatch lays out the (message, signature, public key) rows the ECDSA
+// batch kernel consumes, one row per entry.
+//
+// The message is the block hash ITSELF, byte for byte what verifyBlockSig hands
+// to sig.Verify. Hashing it again here would have the accelerator check a
+// different message than the CPU, so one signature set would be valid on a GPU
+// node and invalid on a node without one — an accept/reject split decided by host
+// hardware.
+//
+// Every row of the result vector must carry real inputs. Zero-filling a row whose
+// signature or public key could not be prepared, and then trusting the kernel's
+// verdict for that row, counts a signature the CPU path rejects outright. Anything
+// this layout cannot represent exactly is an error, which sends the whole batch to
+// the CPU — the one acceptance authority.
+func packBlockSigBatch(blockHash ids.ID, entries []sigEntry, mpcCfg *config.Config) (messages, sigs, pubkeys []byte, err error) {
+	n := len(entries)
+	messages = make([]byte, n*batchHashSize)
+	sigs = make([]byte, n*batchSigSize)
+	pubkeys = make([]byte, n*batchPKSize)
+
+	for i, e := range entries {
+		copy(messages[i*batchHashSize:], blockHash[:])
+
+		if len(e.sigBytes) < batchSigSize {
+			return nil, nil, nil, fmt.Errorf("signature for %s is %d bytes, want at least %d", e.partyID, len(e.sigBytes), batchSigSize)
+		}
+		copy(sigs[i*batchSigSize:], e.sigBytes[:batchSigSize])
+
+		pkBytes, mErr := mpcCfg.Public[e.partyID].ECDSA.MarshalBinary()
+		if mErr != nil {
+			return nil, nil, nil, fmt.Errorf("public key for %s: %w", e.partyID, mErr)
+		}
+		if len(pkBytes) < batchPKSize {
+			return nil, nil, nil, fmt.Errorf("public key for %s is %d bytes, want %d", e.partyID, len(pkBytes), batchPKSize)
+		}
+		copy(pubkeys[i*batchPKSize:], pkBytes[:batchPKSize])
+	}
+	return messages, sigs, pubkeys, nil
 }
 
 // batchVerifyECDSABlockGPU runs GPU-accelerated ECDSA batch verification for block signatures.
@@ -93,31 +146,11 @@ func batchVerifyECDSABlockGPU(
 	}
 
 	n := len(entries)
-	msgHash := sha256.Sum256(blockHash[:])
+	hashSize, sigSize, pkSize := batchHashSize, batchSigSize, batchPKSize
 
-	const hashSize = 32
-	const sigSize = 64
-	const pkSize = 33
-
-	messages := make([]byte, n*hashSize)
-	sigs := make([]byte, n*sigSize)
-	pubkeys := make([]byte, n*pkSize)
-
-	for i, e := range entries {
-		copy(messages[i*hashSize:], msgHash[:])
-
-		if len(e.sigBytes) >= sigSize {
-			copy(sigs[i*sigSize:], e.sigBytes[:sigSize])
-		}
-
-		pubInfo := mpcCfg.Public[e.partyID]
-		pkBytes, mErr := pubInfo.ECDSA.MarshalBinary()
-		if mErr != nil {
-			continue
-		}
-		if len(pkBytes) >= pkSize {
-			copy(pubkeys[i*pkSize:], pkBytes[:pkSize])
-		}
+	messages, sigs, pubkeys, err := packBlockSigBatch(blockHash, entries, mpcCfg)
+	if err != nil {
+		return 0, err
 	}
 
 	msgTensor, err := accel.NewTensorWithData[byte](session, []int{n, hashSize}, messages)
