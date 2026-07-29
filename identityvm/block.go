@@ -121,8 +121,13 @@ func (b *Block) verifyCredential(cred *Credential) error {
 		return errors.New("too many claims")
 	}
 
-	// Verify expiration is in future
-	if time.Now().After(cred.ExpirationDate) {
+	// The credential must be unexpired AS OF THIS BLOCK. Comparing against the
+	// wall clock would make the verdict depend on when a node happens to verify:
+	// the same block is valid before the expiry and invalid after it, and a node
+	// replaying history during bootstrap rejects every block whose credentials
+	// have since expired. The block timestamp is the only clock every node agrees
+	// on, and Verify has already bounded it against the parent and local time.
+	if time.Unix(b.BlockTimestamp, 0).After(cred.ExpirationDate) {
 		return errors.New("credential already expired")
 	}
 
