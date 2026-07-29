@@ -23,10 +23,6 @@ type StateTree struct {
 	currentRoot []byte
 	treeHeight  int
 
-	// Pending changes
-	pendingAdds    [][]byte
-	pendingRemoves [][]byte
-
 	// Merkle tree cache (path -> hash)
 	nodeCache map[string][]byte
 
@@ -59,64 +55,47 @@ func NewStateTree(db database.Database, log log.Logger) (*StateTree, error) {
 	return st, nil
 }
 
-// ApplyTransaction applies a transaction to the state tree
-func (st *StateTree) ApplyTransaction(tx *Transaction) error {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
-	// Remove spent UTXOs (nullifiers)
-	for _, nullifier := range tx.Nullifiers {
-		st.pendingRemoves = append(st.pendingRemoves, nullifier)
-	}
-
-	// Add new UTXOs (output commitments)
-	for _, output := range tx.Outputs {
-		st.pendingAdds = append(st.pendingAdds, output.Commitment)
-	}
-
-	return nil
-}
-
-// ComputeRoot computes the new Merkle root after pending changes.
-// Uses GPU-accelerated Poseidon hash when available for ZK-friendly hashing.
-// Falls back to SHA-256 when GPU is unavailable.
-func (st *StateTree) ComputeRoot() ([]byte, error) {
+// RootAfter returns the state root that results from applying txs on top of the
+// current root, as SHA-256 over
+//
+//	currentRoot ‖ every output commitment (tx order) ‖ every nullifier (tx order)
+//
+// It is PURE: the tree is not mutated, so computing a root is safe to do inside
+// Block.Verify. Verifying the same block twice, or verifying a block that is
+// later rejected and then verifying its competitor, all yield the root that
+// block's proposer computed. Only Finalize advances currentRoot, and only Accept
+// calls Finalize.
+//
+// There is exactly ONE root function. A hardware-conditional digest (a GPU
+// Poseidon path with a SHA-256 fallback) would make the consensus-committed root
+// depend on whether the node has an accelerator, so validators with and without
+// one would reject each other's blocks.
+func (st *StateTree) RootAfter(txs []*Transaction) []byte {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
 
-	// Collect all inputs for hashing
-	inputs := make([][]byte, 0, 1+len(st.pendingAdds)+len(st.pendingRemoves))
-	inputs = append(inputs, st.currentRoot)
-	inputs = append(inputs, st.pendingAdds...)
-	inputs = append(inputs, st.pendingRemoves...)
-
-	// Try GPU Poseidon hash (ZK-friendly)
-	if result, err := poseidonHashGPU(inputs); err == nil && len(result) > 0 {
-		// Pad to 32 bytes for consistency
-		root := make([]byte, 32)
-		copy(root, result)
-		return root, nil
-	}
-
-	// CPU fallback: SHA-256
 	h := sha256.New()
-	for _, input := range inputs {
-		h.Write(input)
+	h.Write(st.currentRoot)
+	for _, tx := range txs {
+		for _, output := range tx.Outputs {
+			h.Write(output.Commitment)
+		}
 	}
-	return h.Sum(nil), nil
+	for _, tx := range txs {
+		for _, nullifier := range tx.Nullifiers {
+			h.Write(nullifier)
+		}
+	}
+	return h.Sum(nil)
 }
 
-// Finalize commits the pending changes and updates the root
+// Finalize advances the committed root. It is the only mutation of tree state,
+// and Accept is its only caller.
 func (st *StateTree) Finalize(newRoot []byte) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	// Update root
 	st.currentRoot = newRoot
-
-	// Clear pending changes
-	st.pendingAdds = nil
-	st.pendingRemoves = nil
 
 	// Save root to database
 	if err := st.db.Put([]byte("state_root"), newRoot); err != nil {
@@ -125,8 +104,6 @@ func (st *StateTree) Finalize(newRoot []byte) error {
 
 	st.log.Debug("State tree finalized",
 		log.String("root", fmt.Sprintf("%x", newRoot[:8])),
-		log.Int("adds", len(st.pendingAdds)),
-		log.Int("removes", len(st.pendingRemoves)),
 	)
 
 	return nil
@@ -214,8 +191,6 @@ func (st *StateTree) Close() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	st.pendingAdds = nil
-	st.pendingRemoves = nil
 	st.nodeCache = nil
 }
 
@@ -277,90 +252,4 @@ func (st *StateTree) getNodeHash(path []byte) ([]byte, error) {
 	// Cache for future use
 	st.nodeCache[pathKey] = hash
 	return hash, nil
-}
-
-// setNodeHash stores a node hash in the database and cache
-func (st *StateTree) setNodeHash(path []byte, hash []byte) error {
-	// Update cache
-	pathKey := string(path)
-	st.nodeCache[pathKey] = hash
-
-	// Store in database
-	dbKey := append([]byte("smt_node_"), path...)
-	return st.db.Put(dbKey, hash)
-}
-
-// computeRoot computes the root hash after applying pending changes
-func (st *StateTree) computeRootFromLeaves(leaves map[string][]byte) ([]byte, error) {
-	// Build tree bottom-up from all leaves
-
-	if len(leaves) == 0 {
-		return make([]byte, 32), nil // Empty root
-	}
-
-	// For each leaf, update its path to the root
-	for leafPath, leafHash := range leaves {
-		if err := st.updateLeafPath([]byte(leafPath), leafHash); err != nil {
-			return nil, err
-		}
-	}
-
-	// Root is at the top level
-	return st.currentRoot, nil
-}
-
-// updateLeafPath updates a leaf and propagates changes to the root
-func (st *StateTree) updateLeafPath(leafIndex []byte, leafHash []byte) error {
-	currentHash := leafHash
-
-	for level := 0; level < st.treeHeight; level++ {
-		bit := getBit(leafIndex, level)
-		siblingPath := getSiblingPath(leafIndex, level)
-
-		// Get sibling hash
-		siblingHash, err := st.getNodeHash(siblingPath)
-		if err != nil {
-			// Sibling doesn't exist, use empty hash
-			siblingHash = make([]byte, 32)
-		}
-
-		// Compute parent hash
-		var parentHash []byte
-		if bit == 0 {
-			parentHash = hashPair(currentHash, siblingHash)
-		} else {
-			parentHash = hashPair(siblingHash, currentHash)
-		}
-
-		// Get parent path by truncating to level+1 bits
-		parentPath := getParentPath(leafIndex, level+1)
-
-		// Store parent hash
-		if err := st.setNodeHash(parentPath, parentHash); err != nil {
-			return err
-		}
-
-		currentHash = parentHash
-	}
-
-	// Update root
-	st.currentRoot = currentHash
-	return nil
-}
-
-// getParentPath gets the path to a node's parent
-func getParentPath(path []byte, bitsToKeep int) []byte {
-	result := make([]byte, len(path))
-	copy(result, path)
-
-	// Zero out bits beyond bitsToKeep
-	for i := bitsToKeep; i < len(result)*8; i++ {
-		byteIndex := i / 8
-		bitIndex := i % 8
-		if byteIndex < len(result) {
-			result[byteIndex] &^= (1 << (7 - bitIndex))
-		}
-	}
-
-	return result
 }

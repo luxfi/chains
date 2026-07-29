@@ -352,12 +352,7 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		vm:             vm,
 	}
 
-	// Compute state root after applying transactions
-	stateRoot, err := vm.computeStateRoot(validTxs)
-	if err != nil {
-		return nil, err
-	}
-	block.StateRoot = stateRoot
+	block.StateRoot = vm.computeStateRoot(validTxs)
 
 	// Compute block ID
 	block.ID_ = block.computeID()
@@ -520,17 +515,11 @@ func (vm *VM) verifyTransaction(tx *Transaction) error {
 	return nil
 }
 
-// computeStateRoot computes the new state root after applying transactions
-func (vm *VM) computeStateRoot(txs []*Transaction) ([]byte, error) {
-	// Apply transactions to state tree
-	for _, tx := range txs {
-		if err := vm.stateTree.ApplyTransaction(tx); err != nil {
-			return nil, err
-		}
-	}
-
-	// Compute and return new root
-	return vm.stateTree.ComputeRoot()
+// computeStateRoot returns the state root a block carrying txs commits to. It
+// reads the tree without mutating it, so BuildBlock and Verify agree and a
+// rejected block leaves nothing behind.
+func (vm *VM) computeStateRoot(txs []*Transaction) []byte {
+	return vm.stateTree.RootAfter(txs)
 }
 
 // processGenesisTransactions processes initial transactions from genesis
@@ -550,14 +539,11 @@ func (vm *VM) processGenesisTransactions(genesis *Genesis) error {
 				return err
 			}
 		}
-
-		// Add to state tree
-		if err := vm.stateTree.ApplyTransaction(tx); err != nil {
-			return err
-		}
 	}
 
-	return nil
+	// Commit genesis to the root so block 1 builds on it, rather than leaving
+	// genesis to be re-folded into every later block's root.
+	return vm.stateTree.Finalize(vm.stateTree.RootAfter(genesis.InitialTxs))
 }
 
 // Additional interface implementations
