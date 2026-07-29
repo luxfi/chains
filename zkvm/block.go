@@ -112,6 +112,21 @@ func (b *Block) Verify(ctx context.Context) error {
 		return errFutureBlock
 	}
 
+	// Block-level shape: every nullifier in the block must be distinct.
+	// verifyTransaction below only sees nullifiers already spent in ACCEPTED
+	// state, so without this two txs in one block — or one tx listing a nullifier
+	// twice — spend the same shielded note and inflate supply. Checked before the
+	// proofs because it is the cheaper gate.
+	spentHere := make(map[string]struct{}, len(b.Txs))
+	for _, tx := range b.Txs {
+		for _, nullifier := range tx.Nullifiers {
+			if _, dup := spentHere[string(nullifier)]; dup {
+				return errDuplicateNullifier
+			}
+			spentHere[string(nullifier)] = struct{}{}
+		}
+	}
+
 	// Verify each transaction
 	for _, tx := range b.Txs {
 		if err := tx.ValidateBasic(); err != nil {
@@ -153,12 +168,7 @@ func (b *Block) Verify(ctx context.Context) error {
 	}
 
 	// Verify state root
-	expectedRoot, err := b.vm.computeStateRoot(b.Txs)
-	if err != nil {
-		return err
-	}
-
-	if !bytes.Equal(b.StateRoot, expectedRoot) {
+	if !bytes.Equal(b.StateRoot, b.vm.computeStateRoot(b.Txs)) {
 		return errInvalidStateRoot
 	}
 
@@ -340,4 +350,8 @@ var (
 	errInvalidHeight    = errors.New("invalid block height")
 	errInvalidTimestamp = errors.New("invalid block timestamp")
 	errInvalidStateRoot = errors.New("invalid state root")
+
+	// errDuplicateNullifier — the same nullifier appears twice inside one block or
+	// vertex, i.e. one shielded note spent twice. Fail closed.
+	errDuplicateNullifier = errors.New("nullifier spent twice in one block")
 )

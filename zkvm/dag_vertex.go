@@ -40,6 +40,19 @@ func (v *Vertex) Txs() []ids.ID        { return v.txIDs }
 func (v *Vertex) Status() choices.Status { return v.status }
 
 func (v *Vertex) Verify(ctx context.Context) error {
+	// Every nullifier in the vertex must be distinct. verifyTransaction only sees
+	// accepted state; BuildVertex already refuses to batch conflicting txs, and a
+	// vertex that arrived on the wire is held to the same rule or one shielded
+	// note is spent twice.
+	spentHere := make(map[string]struct{}, len(v.txs))
+	for _, tx := range v.txs {
+		for _, nullifier := range tx.Nullifiers {
+			if _, dup := spentHere[string(nullifier)]; dup {
+				return errDuplicateNullifier
+			}
+			spentHere[string(nullifier)] = struct{}{}
+		}
+	}
 	for _, tx := range v.txs {
 		if err := tx.ValidateBasic(); err != nil {
 			return err
@@ -265,14 +278,17 @@ func deserializeVertex(data []byte, vm *VM) (*Vertex, error) {
 	epoch := binary.BigEndian.Uint32(data[pos:])
 	pos += 4
 
+	// Counts are attacker-controlled: bound each by the bytes that remain before
+	// allocating, or a 16-byte vertex claiming 2^32-1 parents asks for 128 GiB and
+	// the node dies on an unrecoverable out-of-memory.
 	parentCount := binary.BigEndian.Uint32(data[pos:])
 	pos += 4
+	if int(parentCount) > (len(data)-pos)/32 {
+		return nil, errInvalidBlock
+	}
 
 	parents := make([]ids.ID, parentCount)
 	for i := uint32(0); i < parentCount; i++ {
-		if pos+32 > len(data) {
-			return nil, errInvalidBlock
-		}
 		copy(parents[i][:], data[pos:pos+32])
 		pos += 32
 	}
@@ -282,6 +298,10 @@ func deserializeVertex(data []byte, vm *VM) (*Vertex, error) {
 	}
 	txCount := binary.BigEndian.Uint32(data[pos:])
 	pos += 4
+	// Every tx costs at least its 4-byte length prefix.
+	if int(txCount) > (len(data)-pos)/4 {
+		return nil, errInvalidBlock
+	}
 
 	txs := make([]*Transaction, 0, txCount)
 	txIDs := make([]ids.ID, 0, txCount)
