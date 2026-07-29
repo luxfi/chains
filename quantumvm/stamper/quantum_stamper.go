@@ -458,24 +458,21 @@ func (qs *QuantumStamper) verifyWorker() {
 	}
 }
 
+// stampMatchesBlock reports whether a stamp commits to exactly the C-Chain block
+// it claims. It is the ONE definition of that correspondence: the sequential and
+// the accelerated batch paths both call it, so an accelerated verification can
+// never accept a field the sequential one refuses.
+func stampMatchesBlock(stamp *QuantumStamp, block *types.Block) bool {
+	return stamp.CChainHeight == block.NumberU64() &&
+		stamp.CChainHash == block.Hash() &&
+		stamp.StateRoot == block.Root() &&
+		stamp.ReceiptsRoot == block.ReceiptHash() &&
+		stamp.GasUsed == block.GasUsed()
+}
+
 // verifyStampSync performs synchronous stamp verification
 func (qs *QuantumStamper) verifyStampSync(stamp *QuantumStamp, block *types.Block) bool {
-	// Verify block correspondence
-	if stamp.CChainHeight != block.NumberU64() {
-		return false
-	}
-	if stamp.CChainHash != block.Hash() {
-		return false
-	}
-
-	// Verify state correspondence
-	if stamp.StateRoot != block.Root() {
-		return false
-	}
-	if stamp.ReceiptsRoot != block.ReceiptHash() {
-		return false
-	}
-	if stamp.GasUsed != block.GasUsed() {
+	if !stampMatchesBlock(stamp, block) {
 		return false
 	}
 
@@ -578,12 +575,12 @@ func (qs *QuantumStamper) gpuBatchVerifyStamps(stamps []*QuantumStamp, blocks []
 		if stamp.Mode == StampModeSLHDSA {
 			continue
 		}
-		// Verify block correspondence first (cheap check)
-		if stamp.CChainHeight != block.NumberU64() || stamp.CChainHash != block.Hash() {
-			results[i] = false
-			continue
-		}
-		if stamp.StateRoot != block.Root() || stamp.GasUsed != block.GasUsed() {
+		// Verify block correspondence first (cheap check), through the same
+		// predicate the sequential path uses. Re-listing the fields here had
+		// already lost ReceiptsRoot, so a stamp with a forged receipts root was
+		// accepted whenever the batch went to the accelerator and refused when it
+		// did not.
+		if !stampMatchesBlock(stamp, block) {
 			results[i] = false
 			continue
 		}
@@ -675,16 +672,30 @@ func (qs *QuantumStamper) gpuBatchVerifyStamps(stamps []*QuantumStamp, blocks []
 	}
 
 	// Handle hybrid mode: also verify SLH-DSA for hybrid stamps (CPU only)
-	for _, idx := range indices {
-		if stamps[idx].Mode == StampModeHybrid && results[idx] {
-			if !qs.verifySLHDSA(stamps[idx], signDataSlice[0]) {
-				results[idx] = false
-				qs.stampsFailed.Add(1)
-			}
-		}
-	}
+	qs.verifyHybridSLHDSA(stamps, indices, signDataSlice, results)
 
 	return true
+}
+
+// verifyHybridSLHDSA runs the SLH-DSA leg of every hybrid stamp in the batch that
+// passed ML-DSA.
+//
+// signDataSlice is indexed by BATCH POSITION while indices maps position to the
+// caller's stamp index; the two must be read together. Reading signDataSlice[0]
+// for every stamp verified each hybrid stamp's SLH-DSA signature against the FIRST
+// batch entry's signing bytes, so a signature over data the stamp does not commit
+// to satisfied its post-quantum leg — and a batch submitter chooses what entry
+// zero contains.
+func (qs *QuantumStamper) verifyHybridSLHDSA(stamps []*QuantumStamp, indices []int, signDataSlice [][]byte, results []bool) {
+	for pos, idx := range indices {
+		if stamps[idx].Mode != StampModeHybrid || !results[idx] {
+			continue
+		}
+		if !qs.verifySLHDSA(stamps[idx], signDataSlice[pos]) {
+			results[idx] = false
+			qs.stampsFailed.Add(1)
+		}
+	}
 }
 
 // GetStampForBlock retrieves a stamp for a specific block
