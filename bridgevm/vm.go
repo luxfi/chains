@@ -4,11 +4,13 @@
 package bridgevm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -168,6 +170,10 @@ const (
 	// MPCRequestRefresh triggers a proactive key refresh
 	MPCRequestRefresh
 )
+
+// maxRequestsPerBlock caps how many bridge requests one block carries. Applied to
+// the id-sorted candidate list, so the cap is a deterministic prefix.
+const maxRequestsPerBlock = 100
 
 // VM implements the Bridge VM for cross-chain interoperability
 type VM struct {
@@ -428,18 +434,26 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		return nil, fmt.Errorf("failed to get parent block: %w", err)
 	}
 
-	// Collect bridge requests that are ready
-	var requests []*BridgeRequest
+	// Collect bridge requests that are ready, then order them by request id.
+	// pendingBridges is a map, and Go randomises map iteration: taking the first
+	// maxRequestsPerBlock straight out of the range made both the ORDER of the
+	// block's requests and, once more than that many are ready, WHICH requests it
+	// carries vary run to run. That order is hashed into the block id
+	// (block.go computeID) and written to the wire, so the same pending set
+	// produced a different block every time and a request could be starved at
+	// random. Sorting first makes the block a function of its inputs and the cap a
+	// deterministic prefix.
+	requests := make([]*BridgeRequest, 0, len(vm.pendingBridges))
 	for _, req := range vm.pendingBridges {
-		// Check if request has enough confirmations
 		if req.Confirmations >= vm.config.MinConfirmations {
 			requests = append(requests, req)
 		}
-
-		// Limit block size
-		if len(requests) >= 100 {
-			break
-		}
+	}
+	sort.Slice(requests, func(i, j int) bool {
+		return bytes.Compare(requests[i].ID[:], requests[j].ID[:]) < 0
+	})
+	if len(requests) > maxRequestsPerBlock {
+		requests = requests[:maxRequestsPerBlock]
 	}
 
 	if len(requests) == 0 {
