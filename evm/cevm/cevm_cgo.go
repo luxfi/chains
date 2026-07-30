@@ -118,10 +118,9 @@ func copyU64(ptr *C.uint64_t, want uint32) []uint64 {
 	return dst
 }
 
-// ExecuteBlock is the legacy name for ExecuteBlock. New code uses
-// ExecuteBlock; this is retained for test-file compatibility.
-//
-// Deprecated: use ExecuteBlock.
+// ExecuteBlock runs txs against backend and returns the block result. A nil ctx
+// leaves the C side on its own block defaults; nil state means no prestate is
+// seeded. numThreads is passed through to the C executor.
 func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext, state []StateAccount) (*BlockResult, error) {
 	if len(txs) == 0 {
 		return &BlockResult{ABIVersion: ABIVersion}, nil
