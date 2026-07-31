@@ -1,0 +1,125 @@
+name: Release
+
+# Builds one ghcr.io/luxfi/chains/<vm> plugin image per entry in
+# .github/images.json, on the native runners (git.hanzo.ai → git-runner).
+#
+# This replaces .github/workflows/release.yml, which delegated the build to
+# `hanzoai/.github/.github/workflows/docker-build.yml@main`. A cross-org
+# workflow_call from luxfi/* into hanzoai/.github fails before any job starts —
+# luxfi/operator recorded the same thing against the same reusable
+# ("startup_failure on EVERY run since the migration to that reusable ...
+# every attempt failed at 0-2s with zero jobs dispatched") and inlined its build
+# for exactly this reason. So these thirteen plugin images have not been built
+# by this workflow at all.
+#
+# The build is inlined here instead. It is short: compile the VM to build/<vm>
+# on the runner, then Dockerfile.plugin copies that one binary into a scratch
+# image. Two runner labels were wrong on the way in — the `plan` job named
+# `lux-build-amd64` and the reusable was handed `["self-hosted","linux","amd64"]`,
+# neither of which any runner on this forge carries, and a job naming a label
+# nothing carries does not fail: it waits.
+#
+# ghcr auth is GHCR_USER / GHCR_TOKEN, org Actions secrets sourced from KMS. The
+# instance GITHUB_TOKEN is a Hanzo Git token and has no rights at ghcr.io.
+#
+# amd64 only. The reusable was asked for an arm64 leg on a
+# `["self-hosted","linux","arm64"]` pool that does not exist; arm64 returns as a
+# native matrix entry when we own an arm64 runner.
+#
+# Semver-only: a v* tag produces the version tags, and every run produces an
+# immutable sha tag. No :latest, no floating tags.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A release is not made irrelevant by a newer one — let it finish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: [lux-build-linux-amd64]
+    timeout-minutes: 10
+    outputs:
+      images: ${{ steps.load.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: load
+        run: echo "images=$(jq -c . .github/images.json)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJson(needs.plan.outputs.images) }}
+    runs-on: [lux-build-linux-amd64]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build ${{ matrix.image.vm }}
+        env:
+          # luxfi modules are re-tagged in place; skip the public sum DB for
+          # them. This never disables verification of third-party modules.
+          GONOSUMCHECK: github.com/luxfi/*
+          GONOSUMDB: github.com/lux-private/*
+          CGO_ENABLED: ${{ matrix.image.cgo }}
+          # blst needs the portable build when CGO is on.
+          CGO_CFLAGS: ${{ matrix.image.cgo == '1' && '-O2 -D__BLST_PORTABLE__' || '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          vm='${{ matrix.image.vm }}'
+          # Some VMs are their own main package, others keep it under cmd/plugin.
+          if [ -f "${vm}/main.go" ]; then
+            go build -trimpath -ldflags="-s -w" -o "build/${vm}" "./${vm}"
+          else
+            go build -trimpath -ldflags="-s -w" -o "build/${vm}" "./${vm}/cmd/plugin"
+          fi
+          test -s "build/${vm}"
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: network=host
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USER }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ matrix.image.image }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern=v{{version}}
+            type=sha,prefix=sha-
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.plugin
+          platforms: linux/amd64
+          build-args: |
+            VM=${{ matrix.image.vm }}
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          provenance: false
+          push: true
