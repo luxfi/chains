@@ -1,19 +1,31 @@
-name: Validate DEX Asset Manifests
+name: CI
 
-# Gate A — the green-first gate for the DEX real-assets-only model. Every entry in
-# every per-network asset manifest MUST resolve to a real on-chain asset on its target
-# network, and the fail-closed registry gate MUST hold. This workflow proves both before
-# a change to the manifests or the registry can merge.
+# Gate A — the green-first gate for the DEX real-assets-only model, on the
+# native runners (git.hanzo.ai → git-runner).
 #
-#   1. registry unit + gate tests (structural: no synthetic asset/market can register,
-#      AssetID binds the real token address / UTXO assetID, consensus-mode value guard,
-#      startup gate refuses synthetic flags / Liquidity / mock / ticker references).
-#   2. dexvm Gate-A wiring tests (enforceRealAssetsOnly refuses bad configs end-to-end).
-#   3. LIVE validation: for each net, dex-assets-validate proves every manifest entry
-#      real against that net's public RPC (eth_chainId, C-Chain consensus id, code>0 +
-#      decimals() for ERC-20, UTXO assetID on X-Chain) and that the gate passes.
+# Every entry in every per-network asset manifest MUST resolve to a real
+# on-chain asset on its target network, and the fail-closed registry gate MUST
+# hold. This proves both before a change to the manifests or the registry can
+# merge:
 #
-# Any failure stops the job (and thus the merge/deploy). The live step is read-only.
+#   1. registry unit + gate tests (structural: no synthetic asset or market can
+#      register, AssetID binds the real token address / UTXO assetID, the
+#      consensus-mode value guard holds, and the startup gate refuses synthetic
+#      flags / Liquidity / mock / ticker references).
+#   2. dexvm Gate-A wiring tests (enforceRealAssetsOnly refuses bad configs
+#      end to end).
+#   3. LIVE validation: for each net, dex-assets-validate proves every manifest
+#      entry real against that net's public RPC (eth_chainId, C-Chain consensus
+#      id, code>0 + decimals() for ERC-20, UTXO assetID on X-Chain) and that the
+#      gate passes.
+#
+# Any failure stops the job, and thus the merge. The live step is read-only.
+#
+# This replaces .github/workflows/validate-asset-manifests.yml, whose two jobs
+# named the bare `['self-hosted', 'linux', 'amd64']` triple. The pool on this
+# forge is `lux-build-linux-amd64`; nothing answers to the triple, and a job
+# naming a label no runner carries does not fail — it waits. So this gate has
+# not actually been gating anything.
 
 on:
   push:
@@ -21,28 +33,35 @@ on:
     paths:
       - 'dexvm/registry/**'
       - 'cmd/dex-assets-validate/**'
-      - '.github/workflows/validate-asset-manifests.yml'
+      - '.hanzo/workflows/ci.yml'
   pull_request:
     branches: [main]
     paths:
       - 'dexvm/registry/**'
       - 'cmd/dex-assets-validate/**'
-      - '.github/workflows/validate-asset-manifests.yml'
+      - '.hanzo/workflows/ci.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# A newer commit makes the older run irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  # luxfi modules are re-tagged in place; skip the public sum DB for them (the same
-  # discipline release.yml uses). Never disables verification of third-party modules.
+  # luxfi modules are re-tagged in place; skip the public sum DB for them (the
+  # same discipline release.yml uses). Never disables verification of
+  # third-party modules.
   GONOSUMCHECK: github.com/luxfi/*
   GONOSUMDB: github.com/luxfi/*
   GOFLAGS: -mod=mod
 
 jobs:
   registry-tests:
-    runs-on: ['self-hosted', 'linux', 'amd64']
+    runs-on: [lux-build-linux-amd64]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -56,7 +75,8 @@ jobs:
 
   live-validation:
     needs: registry-tests
-    runs-on: ['self-hosted', 'linux', 'amd64']
+    runs-on: [lux-build-linux-amd64]
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
