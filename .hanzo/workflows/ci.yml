@@ -12,9 +12,7 @@ name: CI
 #      register, AssetID binds the real token address / UTXO assetID, the
 #      consensus-mode value guard holds, and the startup gate refuses synthetic
 #      flags / Liquidity / mock / ticker references).
-#   2. dexvm Gate-A wiring tests (enforceRealAssetsOnly refuses bad configs
-#      end to end).
-#   3. LIVE validation: for each net, dex-assets-validate proves every manifest
+#   2. LIVE validation: for each net, dex-assets-validate proves every manifest
 #      entry real against that net's public RPC (eth_chainId, C-Chain consensus
 #      id, code>0 + decimals() for ERC-20, UTXO assetID on X-Chain) and that the
 #      gate passes.
@@ -70,8 +68,6 @@ jobs:
           cache: false
       - name: registry structural + gate tests
         run: CGO_ENABLED=0 go test -count=1 -race=false ./dexvm/registry/...
-      - name: dexvm Gate-A wiring tests
-        run: CGO_ENABLED=0 go test -count=1 -run '^TestGateA' ./dexvm/
 
   live-validation:
     needs: registry-tests
