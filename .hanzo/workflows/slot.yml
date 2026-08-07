@@ -1,0 +1,38 @@
+name: slot
+
+# Which VM plugin slots this module may claim.
+#
+# luxd loads a VM by executing the binary at <PluginDir>/<VMID>, so a slot admits
+# exactly one artifact and the VMID alone decides which chain a binary drives. Two
+# artifacts built for one slot is a coin flip settled by whichever image wrote the
+# file last, and the losing case reads as a healthy node that answers nothing.
+#
+# This runs unfiltered, on every push. A path filter would scope it to the files
+# that are already clean and miss the case it exists to catch: a NEW package
+# claiming a slot that is already filled.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  slot:
+    runs-on: [lux-build-linux-amd64]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: CGO_ENABLED=0 go test -count=1 -race=false ./internal/slot/
