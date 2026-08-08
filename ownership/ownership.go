@@ -128,11 +128,17 @@ func (c Claim) Root() [32]byte {
 // attestations in this domain with the same subject and epoch but different
 // roots are two conflicting ownership facts about one node, which is exactly the
 // condition mpcvm's DetectEquivocation slashes.
-func (c Claim) Subject() [32]byte {
+//
+// It is a package function as well as a method because a lookup starts from a
+// node, before any claim is in hand. One encoding, both directions.
+func Subject(node [20]byte) [32]byte {
 	var out [32]byte
-	copy(out[:], c.Node[:])
+	copy(out[:], node[:])
 	return out
 }
+
+// Subject is this claim's SubjectID. See the package-level Subject.
+func (c Claim) Subject() [32]byte { return Subject(c.Node) }
 
 // Payload is the preimage a quorum signs. It MUST stay byte-identical to
 // mpcvm.ComputeAttestationPayload for this domain — that function hashes the
