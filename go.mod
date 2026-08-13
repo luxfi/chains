@@ -14,7 +14,7 @@ require (
 	github.com/luxfi/crypto v1.20.2
 	github.com/luxfi/database v1.21.1
 	github.com/luxfi/dex v1.14.2
-	github.com/luxfi/evm v1.104.29
+	github.com/luxfi/evm v1.104.30
 	github.com/luxfi/geth v1.20.1
 	github.com/luxfi/ids v1.3.2
 	github.com/luxfi/lattice/v7 v7.1.4
