@@ -97,30 +97,6 @@ func (s *Service) GenerateCoronaKey(r *http.Request, args *GenerateCoronaKeyArgs
 	return nil
 }
 
-// SignWithQuantumArgs are the arguments for SignWithQuantum
-type SignWithQuantumArgs struct {
-	Message    string `json:"message"`
-	PrivateKey string `json:"privateKey"`
-}
-
-// SignWithQuantumReply is the reply for SignWithQuantum
-type SignWithQuantumReply struct {
-	Signature string `json:"signature"`
-	Algorithm uint32 `json:"algorithm"`
-	Timestamp int64  `json:"timestamp"`
-}
-
-// SignWithQuantum signs a message with quantum signature
-func (s *Service) SignWithQuantum(r *http.Request, args *SignWithQuantumArgs, reply *SignWithQuantumReply) error {
-	if !s.vm.Config.QuantumStampEnabled {
-		return errors.New("quantum signatures are not enabled")
-	}
-
-	// This would typically validate the private key and create proper signature
-	// For security reasons, this is a simplified example
-	return errors.New("direct signing not supported via RPC")
-}
-
 // VerifyQuantumSignatureArgs are the arguments for VerifyQuantumSignature
 type VerifyQuantumSignatureArgs struct {
 	Message   string          `json:"message"`
