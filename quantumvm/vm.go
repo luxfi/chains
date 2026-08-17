@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/rpc/v2"
 	"github.com/luxfi/chains/quantumvm/config"
@@ -209,6 +210,12 @@ func (vm *VM) Initialize(ctx context.Context, init luxvm.Init) error {
 
 	// Initialize state
 	vm.state = vm.versiondb
+
+	// A chain with no block cannot answer the frontier query bootstrap starts
+	// with, so write height 0 before anything asks.
+	if err := vm.seedGenesis(); err != nil {
+		return fmt.Errorf("failed to seed genesis: %w", err)
+	}
 
 	// Set up HTTP handlers
 	if err := vm.initializeHTTPHandlers(); err != nil {
@@ -471,6 +478,55 @@ func (vm *VM) parseGenesis(genesisBytes []byte) error {
 	// Genesis parsing for quantumvm is a no-op; initial state is derived
 	// from the quantum signer configuration and the empty state trie.
 	vm.log.Info("genesis loaded", "size", len(genesisBytes))
+	return nil
+}
+
+// seedGenesis writes the height-0 block on a chain that has none, so the VM can
+// name a tip the moment it starts.
+//
+// A VM whose last-accepted is empty answers the bootstrap frontier query with no
+// block, and an answer naming no block is not a responder — it neither backs a
+// tip nor counts toward the response floor (see tally in the node's
+// chains/bootstrap_trust.go). Every node then reads every other node as silent,
+// so the beacon floor is unreachable and each waits on the others for as long as
+// the chain runs. State derived lazily from config is enough to EXECUTE against,
+// but consensus starts by asking what block you hold, and "none" is not an
+// answer it can build a quorum from.
+//
+// The block is a constant, so every node computes one id alone: fixed timestamp,
+// height 0, empty parent, no transactions. Wall-clock time here would give each
+// node a different id for the same block and make the repair a fork.
+func (vm *VM) seedGenesis() error {
+	if vm.getLastAcceptedID() != ids.Empty {
+		return nil
+	}
+
+	block := &Block{
+		timestamp: time.Unix(0, 0).UTC(),
+		height:    0,
+		parentID:  ids.Empty,
+		vm:        vm,
+	}
+	block.id = block.computeID()
+
+	if err := vm.state.Put(block.id[:], block.Bytes()); err != nil {
+		return fmt.Errorf("store genesis block: %w", err)
+	}
+	if err := vm.state.Put([]byte("lastAccepted"), block.id[:]); err != nil {
+		return fmt.Errorf("set genesis last-accepted: %w", err)
+	}
+	heightBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(heightBytes, block.height)
+	if err := vm.state.Put([]byte("height"), heightBytes); err != nil {
+		return fmt.Errorf("set genesis height: %w", err)
+	}
+	// Commit, or the tip exists only in memory and the next start is back to
+	// naming no block.
+	if err := vm.versiondb.Commit(); err != nil {
+		return fmt.Errorf("commit genesis: %w", err)
+	}
+
+	vm.log.Info("genesis block written", "blockID", block.id, "height", block.height)
 	return nil
 }
 
