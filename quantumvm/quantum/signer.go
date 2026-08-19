@@ -63,7 +63,22 @@ type MLDSAValidatorKey struct {
 	PublicKey  []byte
 	PrivateKey []byte
 	Nonce      []byte
-	mldsaPriv  *mldsa.PrivateKey
+
+	parse     sync.Once
+	mldsaPriv *mldsa.PrivateKey
+	parseErr  error
+}
+
+// signer returns the ML-DSA key for this identity. A key that arrives as bytes
+// is parsed on first use and reused for every signature after that; a key that
+// was just generated already holds its parsed form.
+func (k *MLDSAValidatorKey) signer(mode mldsa.Mode) (*mldsa.PrivateKey, error) {
+	k.parse.Do(func() {
+		if k.mldsaPriv == nil {
+			k.mldsaPriv, k.parseErr = mldsa.PrivateKeyFromBytes(mode, k.PrivateKey)
+		}
+	})
+	return k.mldsaPriv, k.parseErr
 }
 
 // NewQuantumSigner creates a new quantum signer with real ML-DSA
@@ -128,16 +143,9 @@ func (qs *QuantumSigner) Sign(message []byte, key *MLDSAValidatorKey) (*QuantumS
 		return nil, ErrInvalidCoronaKey
 	}
 
-	// Restore ML-DSA key if not cached
-	var mldsaPriv *mldsa.PrivateKey
-	if key.mldsaPriv != nil {
-		mldsaPriv = key.mldsaPriv
-	} else {
-		var err error
-		mldsaPriv, err = mldsa.PrivateKeyFromBytes(qs.mldsaMode, key.PrivateKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to restore ML-DSA key: %w", err)
-		}
+	mldsaPriv, err := key.signer(qs.mldsaMode)
+	if err != nil {
+		return nil, fmt.Errorf("failed to restore ML-DSA key: %w", err)
 	}
 
 	// Generate quantum stamp
