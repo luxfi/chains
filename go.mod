@@ -11,7 +11,7 @@ require (
 	github.com/luxfi/ai v0.1.0
 	github.com/luxfi/consensus v1.36.2
 	github.com/luxfi/constants v1.6.2
-	github.com/luxfi/crypto v1.20.2
+	github.com/luxfi/crypto v1.20.5
 	github.com/luxfi/database v1.21.1
 	github.com/luxfi/dex v1.14.2
 	github.com/luxfi/evm v1.104.30
