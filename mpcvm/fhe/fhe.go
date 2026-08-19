@@ -10,6 +10,7 @@
 package fhe
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -59,6 +60,28 @@ func (g *FHEAccelerator) Stats() FHEStats {
 	return *g.stats
 }
 
+// workers is how many goroutines a batch is split across. It follows
+// GOMAXPROCS rather than a constant: the batch paths were pinned at four, so a
+// node with more cores than that ran the rest idle and throughput flattened as
+// soon as the batch outgrew the four chunks -- on an 8-core node, measured,
+// batch throughput stopped improving past 8 polynomials no matter how large the
+// batch got.
+//
+// Capped by the batch size, because a chunk per worker with nothing in it is a
+// goroutine that costs a scheduler slot to do nothing, and floored at one so a
+// constrained GOMAXPROCS cannot produce a zero-worker loop that silently skips
+// the whole batch.
+func workers(items int) int {
+	n := runtime.GOMAXPROCS(0)
+	if n > items {
+		n = items
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
 // BatchNTTForward performs forward NTT on multiple polynomials.
 // Uses parallel processing for better performance on multi-core CPUs.
 func (g *FHEAccelerator) BatchNTTForward(r *ring.Ring, polys []ring.Poly) error {
@@ -77,7 +100,7 @@ func (g *FHEAccelerator) BatchNTTForward(r *ring.Ring, polys []ring.Poly) error 
 
 	// For larger batches, use parallel processing
 	var wg sync.WaitGroup
-	numWorkers := 4
+	numWorkers := workers(len(polys))
 	chunkSize := (len(polys) + numWorkers - 1) / numWorkers
 
 	for w := 0; w < numWorkers; w++ {
@@ -123,7 +146,7 @@ func (g *FHEAccelerator) BatchNTTInverse(r *ring.Ring, polys []ring.Poly) error 
 
 	// For larger batches, use parallel processing
 	var wg sync.WaitGroup
-	numWorkers := 4
+	numWorkers := workers(len(polys))
 	chunkSize := (len(polys) + numWorkers - 1) / numWorkers
 
 	for w := 0; w < numWorkers; w++ {
@@ -169,7 +192,7 @@ func (g *FHEAccelerator) BatchPolyMul(r *ring.Ring, a, b, out []ring.Poly) error
 
 	// For larger batches, use parallel processing
 	var wg sync.WaitGroup
-	numWorkers := 4
+	numWorkers := workers(len(a))
 	chunkSize := (len(a) + numWorkers - 1) / numWorkers
 
 	for w := 0; w < numWorkers; w++ {
