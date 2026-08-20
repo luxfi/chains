@@ -72,10 +72,6 @@ jobs:
 
       - name: Build ${{ matrix.image.vm }}
         env:
-          # luxfi modules are re-tagged in place; skip the public sum DB for
-          # them. This never disables verification of third-party modules.
-          GONOSUMCHECK: github.com/luxfi/*
-          GONOSUMDB: github.com/lux-private/*
           CGO_ENABLED: ${{ matrix.image.cgo }}
           # blst needs the portable build when CGO is on.
           CGO_CFLAGS: ${{ matrix.image.cgo == '1' && '-O2 -D__BLST_PORTABLE__' || '' }}
