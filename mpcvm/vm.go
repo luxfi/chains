@@ -396,9 +396,17 @@ func (vm *VM) parseConfig(configBytes []byte) error {
 	if len(configBytes) == 0 {
 		// Default configuration
 		vm.config = ThresholdConfig{
-			// 2-of-3: the smallest policy that is actually a threshold policy.
-			// Degree 1, so one party may be corrupt or offline.
-			Policy:              quorum.MustNew(2, 3),
+			// 3-of-5. Two seats no longer reach a quorum, which matters because
+			// seats are held by validators and validator entry is permissionless:
+			// under 2-of-3 an adversary that got two seats held a quorum of every
+			// key on the chain and could sign locally, off-chain, with nothing
+			// on-chain to observe. At 3-of-5 it must hold a majority of the custody
+			// set, and seats are allocated by stake (custodySet), so that costs
+			// what attacking consensus costs.
+			//
+			// Degree 2: two parties may be corrupt or offline. 2K > N holds, so the
+			// quorum is unique — two disjoint quorums cannot both sign.
+			Policy:              quorum.MustNew(3, 5),
 			SessionTimeout:      5 * time.Minute,
 			MaxActiveSessions:   100,
 			MaxSessionsPerChain: 10,
