@@ -64,7 +64,7 @@ func (s *Service) GetBlock(r *http.Request, args *GetBlockArgs, reply *GetBlockR
 	reply.Height = qBlock.height
 	reply.Timestamp = qBlock.timestamp.Unix()
 	reply.TxCount = len(qBlock.transactions)
-	reply.QuantumSig = qBlock.quantumSignature != nil
+	reply.QuantumSig = false // blocks carry no stamp; see signBlockWithQuasar
 
 	return nil
 }
