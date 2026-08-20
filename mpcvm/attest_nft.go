@@ -56,11 +56,11 @@ func init() {
 // same node at a LATER block is the legitimate way ownership changes hands.
 func (vm *VM) AttestNFTOwnership(
 	ctx context.Context,
-	requestingChain string,
+	by Caller,
 	keyID string,
 	claim ownership.Claim,
 ) (*ownership.Attestation, error) {
-	qa, err := vm.attest(ctx, requestingChain, keyID, DomainNFTOwnership, claim.Subject(), claim.Root(), claim.Block)
+	qa, err := vm.attest(ctx, by, keyID, DomainNFTOwnership, claim.Subject(), claim.Root(), claim.Block)
 	if err != nil {
 		return nil, fmt.Errorf("mpcvm: attest ownership of token %d for node %x: %w", claim.Token, claim.Node, err)
 	}

@@ -111,10 +111,16 @@ func (vm *VM) handleRPCMethod(ctx context.Context, method string, params json.Ra
 	switch method {
 	// Ceremonies. Both run to completion before returning: keygen yields a
 	// registered key, sign yields the signature itself.
-	case "threshold_keygen":
-		return vm.rpcKeygen(ctx, params)
-	case "threshold_sign":
-		return vm.rpcSign(ctx, params)
+	case "threshold_keygen", "threshold_sign":
+		// Ceremonies are requested BY a chain, and this transport authenticates
+		// no chain: an HTTP body can say it is the bridge as easily as it can
+		// say anything else. Custody rights are granted over the cross-chain
+		// path, where the sender's chain id is authenticated (CrossChainRequest),
+		// so there is exactly one way in and it is not this one.
+		return nil, &RPCError{
+			Code:    RPCErrorUnauthorized,
+			Message: fmt.Sprintf("%s is requested by a chain, over the cross-chain transport that authenticates it; this endpoint authenticates no caller", method),
+		}
 
 	// Custody registry (replicated state)
 	case "mpc_getKey":
@@ -205,31 +211,6 @@ type KeygenResult struct {
 	Key      KeyInfo      `json:"key"`
 }
 
-func (vm *VM) rpcKeygen(ctx context.Context, params json.RawMessage) (*KeygenResult, error) {
-	var p KeygenParams
-	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: err.Error()}
-	}
-
-	var (
-		op  *Operation
-		err error
-	)
-	if p.Policy.Valid() {
-		op, err = vm.StartKeygenWithPolicy(ctx, p.KeyID, p.Policy, p.RequestedBy)
-	} else {
-		op, err = vm.StartKeygen(ctx, p.KeyID, p.RequestedBy)
-	}
-	if err != nil {
-		return nil, asRPCError(err)
-	}
-
-	return &KeygenResult{
-		Ceremony: ceremonyInfoOf(pendingRecord(op)),
-		Key:      keyInfoOf(op.Key),
-	}, nil
-}
-
 // SignParams contains parameters for signing.
 type SignParams struct {
 	KeyID string `json:"keyId"`
@@ -238,24 +219,6 @@ type SignParams struct {
 	// chain that re-hashed would sign a preimage nobody authorised.
 	MessageHash     string `json:"messageHash"`
 	RequestingChain string `json:"requestingChain"`
-}
-
-func (vm *VM) rpcSign(ctx context.Context, params json.RawMessage) (*CeremonyInfo, error) {
-	var p SignParams
-	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: err.Error()}
-	}
-	messageHash, err := hex.DecodeString(stripHexPrefix(p.MessageHash))
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "messageHash is not hex"}
-	}
-
-	op, err := vm.RequestSignature(ctx, p.RequestingChain, p.KeyID, messageHash)
-	if err != nil {
-		return nil, asRPCError(err)
-	}
-	info := ceremonyInfoOf(pendingRecord(op))
-	return &info, nil
 }
 
 // =============================================================================

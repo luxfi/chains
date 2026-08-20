@@ -98,7 +98,6 @@ type BridgeTransferAttestation struct {
 // key must sign). Everything the digest commits to travels here; nothing else
 // can be minted from the resulting attestation.
 type BridgeReleaseRequest struct {
-	RequestingChain string `json:"requestingChain"` // authorised chain id in M's permission table (e.g. "B-Chain")
 	// KeyID names the custody key that must sign. It is REQUIRED: there is no
 	// "active key" for a request to fall back to, because a fallback means the
 	// chain, not the requester, chose which vault to spend from — and a key
@@ -121,8 +120,8 @@ type BridgeReleaseRequest struct {
 // The signature is a standard secp256k1 ECDSA signature over the domain-bound
 // digest, so a destination-chain gateway contract verifies it exactly like a
 // single-key signature (ecrecover to the custody address).
-func (vm *VM) RequestBridgeRelease(ctx context.Context, req BridgeReleaseRequest) (*BridgeTransferAttestation, error) {
-	return vm.AttestBridgeTransfer(ctx, req.RequestingChain, req.KeyID, BridgeTransfer{
+func (vm *VM) RequestBridgeRelease(ctx context.Context, by Caller, req BridgeReleaseRequest) (*BridgeTransferAttestation, error) {
+	return vm.AttestBridgeTransfer(ctx, by, req.KeyID, BridgeTransfer{
 		SrcChainID: req.SrcChainID,
 		DstChainID: req.DstChainID,
 		Asset:      req.Asset,
@@ -143,13 +142,13 @@ func (vm *VM) RequestBridgeRelease(ctx context.Context, req BridgeReleaseRequest
 // (Ceremony(id), against consensus state).
 func (vm *VM) AttestBridgeTransfer(
 	ctx context.Context,
-	requestingChain string,
+	by Caller,
 	keyID string,
 	bt BridgeTransfer,
 ) (*BridgeTransferAttestation, error) {
 	digest := bt.Digest()
 
-	op, err := vm.RequestSignature(ctx, requestingChain, keyID, digest[:])
+	op, err := vm.RequestSignature(ctx, by, keyID, digest[:])
 	if err != nil {
 		return nil, fmt.Errorf("mpcvm: bridge attestation for %s: %w", keyID, err)
 	}

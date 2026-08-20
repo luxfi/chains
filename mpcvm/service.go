@@ -51,12 +51,12 @@ import (
 // handle to an unfinished ceremony is a handle to state that only one node has.
 type ThresholdService interface {
 	// StartKeygen runs a distributed key-generation ceremony for keyID under
-	// the chain's default policy, attributed to requestedBy.
-	StartKeygen(ctx context.Context, keyID, requestedBy string) (*Operation, error)
+	// the chain's default policy, attributed to the AUTHENTICATED caller.
+	StartKeygen(ctx context.Context, keyID string, by Caller) (*Operation, error)
 
 	// StartKeygenWithPolicy runs DKG under an explicit k-of-n policy. The
 	// polynomial degree is derived from the policy, never passed alongside it.
-	StartKeygenWithPolicy(ctx context.Context, keyID string, policy quorum.Policy, requestedBy string) (*Operation, error)
+	StartKeygenWithPolicy(ctx context.Context, keyID string, policy quorum.Policy, by Caller) (*Operation, error)
 
 	// Policy returns the chain's default signing policy.
 	Policy() quorum.Policy
@@ -86,9 +86,9 @@ type MPCService interface {
 	ThresholdService
 
 	// RequestSignature asks the custody committee for keyID to threshold-sign
-	// messageHash on behalf of requestingChain. It returns when the ceremony
+	// messageHash on behalf of the AUTHENTICATED caller. It returns when the ceremony
 	// has produced a signature that verifies under the registered group key.
-	RequestSignature(ctx context.Context, requestingChain, keyID string, messageHash []byte) (*Operation, error)
+	RequestSignature(ctx context.Context, by Caller, keyID string, messageHash []byte) (*Operation, error)
 
 	// Ceremony returns one recorded ceremony — the replicated, durable evidence
 	// that a signature was produced, including the signature. Ceremonies
@@ -102,18 +102,18 @@ type MPCService interface {
 
 	// RequestBridgeRelease is the B→M seam: a bridge release request in, a
 	// threshold-signed self-describing attestation out.
-	RequestBridgeRelease(ctx context.Context, req BridgeReleaseRequest) (*BridgeTransferAttestation, error)
+	RequestBridgeRelease(ctx context.Context, by Caller, req BridgeReleaseRequest) (*BridgeTransferAttestation, error)
 
 	// AttestOracleCommit produces a threshold attestation over an oracle
 	// read/write commitment for requestingChain.
-	AttestOracleCommit(ctx context.Context, requestingChain, keyID string, requestID [32]byte, kind uint8, commitRoot [32]byte, epoch uint64) (*QuantumAttestation, error)
+	AttestOracleCommit(ctx context.Context, by Caller, keyID string, requestID [32]byte, kind uint8, commitRoot [32]byte, epoch uint64) (*QuantumAttestation, error)
 
 	// AttestSessionComplete attests that a bridge/custody session finished with
 	// the given output/oracle/receipts roots.
-	AttestSessionComplete(ctx context.Context, requestingChain, keyID string, sessionID [32]byte, outputHash, oracleRoot, receiptsRoot [32]byte, epoch uint64) (*QuantumAttestation, error)
+	AttestSessionComplete(ctx context.Context, by Caller, keyID string, sessionID [32]byte, outputHash, oracleRoot, receiptsRoot [32]byte, epoch uint64) (*QuantumAttestation, error)
 
 	// AttestEpochBeacon produces the per-epoch beacon attestation.
-	AttestEpochBeacon(ctx context.Context, requestingChain, keyID string, epoch uint64, previousRef [32]byte) (*QuantumAttestation, error)
+	AttestEpochBeacon(ctx context.Context, by Caller, keyID string, epoch uint64, previousRef [32]byte) (*QuantumAttestation, error)
 
 	// VerifyAttestation verifies a QuantumAttestation against this node's
 	// custody registry.
