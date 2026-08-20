@@ -123,6 +123,67 @@ func keygenCeremonyID(keyID string, policy quorum.Policy, participants []party.I
 	return "mpc/keygen/" + hex.EncodeToString(h.Sum(nil))
 }
 
+// custodySet chooses the N validators that will hold shares of a key: the N with
+// the most stake, ties broken by node id.
+//
+// Selection used to be "the first N in canonical order", and canonical order is a
+// lexicographic sort of node ids. A node id is a hash of the node's certificate,
+// so an attacker grinds certificates offline until its ids sort first — roughly
+// 256 hashes per leading zero byte, and a zero byte encodes as the smallest
+// base58 digit. Two ground certificates would then sit in the share set of EVERY
+// key the chain generates, which under a 2-of-3 policy is a quorum. Nothing needs
+// reconstructing at that point: the holder runs the signing protocol locally with
+// both shares and signs whatever it likes, off-chain, with no block to detect.
+//
+// Weight cannot be ground. Entering the set costs stake proportional to the stake
+// already there — the same cost as attacking consensus — so custody stops being
+// the cheaper target. Selection stays a pure function of replicated state, so
+// every validator derives the same set without negotiating one.
+func (vm *VM) custodySet(ctx context.Context, pchainHeight uint64, n int) ([]party.ID, error) {
+	if vm.rt == nil || vm.rt.ValidatorState == nil {
+		return nil, ErrNoCommittee
+	}
+	set, err := vm.rt.ValidatorState.GetValidatorSet(ctx, pchainHeight, vm.netID)
+	if err != nil {
+		return nil, fmt.Errorf("mpcvm: validator set at height %d: %w", pchainHeight, err)
+	}
+	if len(set) < n {
+		return nil, fmt.Errorf("%w: need %d parties, validator set has %d",
+			ErrPolicyTooLarge, n, len(set))
+	}
+
+	type seat struct {
+		id     party.ID
+		weight uint64
+	}
+	seats := make([]seat, 0, len(set))
+	for nodeID, v := range set {
+		var w uint64
+		if v != nil {
+			w = v.Weight
+		}
+		seats = append(seats, seat{id: party.ID(nodeID.String()), weight: w})
+	}
+	// Descending weight; node id breaks ties so the order is total and identical
+	// on every validator. The tie-break is still lexicographic, but it now orders
+	// only validators of EQUAL stake — grinding an id buys a position among peers
+	// whose stake you already had to match.
+	sort.Slice(seats, func(i, j int) bool {
+		if seats[i].weight != seats[j].weight {
+			return seats[i].weight > seats[j].weight
+		}
+		return seats[i].id < seats[j].id
+	})
+
+	out := make([]party.ID, 0, n)
+	for _, s := range seats[:n] {
+		out = append(out, s.id)
+	}
+	// The ceremony id and every later check hash this set, so it must come back in
+	// the one canonical order the rest of the package uses.
+	return canonicalParties(out), nil
+}
+
 // Committee returns the ceremony party set: every validator of this chain at
 // the given P-Chain height, in canonical order.
 //
@@ -170,17 +231,10 @@ func (vm *VM) runKeygen(ctx context.Context, keyID string, policy quorum.Policy,
 	selfID := vm.partyID
 	vm.mu.RUnlock()
 
-	participants, err := vm.Committee(ctx, pchainHeight)
+	participants, err := vm.custodySet(ctx, pchainHeight, policy.N)
 	if err != nil {
 		return nil, err
 	}
-	if len(participants) < policy.N {
-		return nil, fmt.Errorf("%w: policy %s needs %d parties, committee has %d",
-			ErrPolicyTooLarge, policy, policy.N, len(participants))
-	}
-	// The committee is the first N validators in canonical order. Deterministic
-	// selection, so every node picks the same N without negotiating.
-	participants = participants[:policy.N]
 	if !containsParty(participants, selfID) {
 		return nil, ErrNotParticipant
 	}

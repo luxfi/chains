@@ -220,7 +220,7 @@ func TestBridgeCustody_KeygenSignAndRecordOverGossip(t *testing.T) {
 		t.Skip("threshold DKG/sign is slow; skipped in -short")
 	}
 
-	const n = 3
+	const n = 5
 	const keyID = "bridge-custody"
 
 	nodes := make([]ids.NodeID, n)
@@ -240,10 +240,12 @@ func TestBridgeCustody_KeygenSignAndRecordOverGossip(t *testing.T) {
 
 	// --- DKG over the gossip fabric: every validator runs the ceremony ---
 	//
-	// The chain's default policy is 2-of-3, so the committee is all three
-	// validators and any two of them can sign.
+	// The chain's default policy is 3-of-5: the custody set is five validators
+	// and any three of them can sign. Two seats are deliberately NOT a quorum —
+	// validator entry is permissionless, so a policy where two seats suffice is a
+	// policy an adversary can buy its way into.
 	policy := vms[0].Policy()
-	require.Equal(t, "2-of-3", policy.String())
+	require.Equal(t, "3-of-5", policy.String())
 
 	keygens := runOnAll(t, ctx, vms, func(ctx context.Context, vm *VM) (*Operation, error) {
 		return vm.StartKeygen(ctx, keyID, authenticated(vm, "B-Chain"))
@@ -255,7 +257,7 @@ func TestBridgeCustody_KeygenSignAndRecordOverGossip(t *testing.T) {
 	require.Len(t, first.Key.GroupPublicKey, 33, "compressed secp256k1 custody key")
 	require.Len(t, first.Key.Address, 20, "20-byte external-chain custody address")
 	require.Equal(t, policy, first.Key.Policy)
-	require.Equal(t, 1, first.Key.Degree(), "2-of-3 is a degree-1 key; a degree-2 key would need 3 signers")
+	require.Equal(t, 2, first.Key.Degree(), "3-of-5 is a degree-2 key; K signers reconstruct nothing below K")
 	for _, op := range keygens {
 		require.Equal(t, first.CeremonyID, op.CeremonyID, "every validator must derive the same ceremony id with no announce round")
 		require.Equal(t, first.Key.GroupPublicKey, op.Key.GroupPublicKey, "all validators must agree on the group key")
@@ -297,7 +299,7 @@ func TestBridgeCustody_KeygenSignAndRecordOverGossip(t *testing.T) {
 		Nonce:           7,
 	}
 
-	// Every validator is asked; only the policy's K-subset signs. With a 2-of-3
+	// Every validator is asked; only the policy's K-subset signs. With a 3-of-5
 	// key that is two of the three, chosen deterministically from the task, so
 	// the third declines without anyone coordinating that.
 	atts, declined := runOnQuorum(t, ctx, vms, func(ctx context.Context, vm *VM) (*BridgeTransferAttestation, error) {
