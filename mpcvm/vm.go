@@ -321,9 +321,15 @@ func (vm *VM) Initialize(
 
 	bound, unbound := 0, make([]string, 0, len(vm.config.AuthorizedChains))
 	for name, p := range vm.config.AuthorizedChains {
+		// A chainId that is not a chain id binds to nothing. The stock entries carry
+		// labels ("B-Chain"), which never equal a node's base58 chain id, so counting
+		// them as bound reported five authorized chains on a node where none were —
+		// the exact reading this warning exists to prevent.
 		if p != nil && p.ChainID != "" {
-			bound++
-			continue
+			if _, err := ids.FromString(p.ChainID); err == nil {
+				bound++
+				continue
+			}
 		}
 		unbound = append(unbound, name)
 	}
@@ -340,7 +346,7 @@ func (vm *VM) Initialize(
 		// is not an identity — until an operator sets chainId, the entry grants
 		// custody to nobody. Silence here would read as "custody is configured"
 		// right up until the first release fails.
-		vm.log.Warn("custody entries name a chain but bind to none — set chainId on each to grant it",
+		vm.log.Warn("custody entries bind to no chain id — set chainId to a real chain id on each to grant it",
 			log.Strings("chains", unbound),
 		)
 	}
@@ -503,7 +509,7 @@ func (vm *VM) StartKeygenWithPolicy(ctx context.Context, keyID string, policy qu
 	requestedBy := by.name
 	ctx, cancel := context.WithTimeout(ctx, vm.sessionTimeout())
 	defer cancel()
-	op, err := vm.RunKeygen(ctx, keyID, policy, requestedBy)
+	op, err := vm.runKeygen(ctx, keyID, policy, requestedBy)
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +545,7 @@ func (vm *VM) RequestSignature(ctx context.Context, by Caller, keyID string, mes
 
 	ctx, cancel := context.WithTimeout(ctx, vm.sessionTimeout())
 	defer cancel()
-	op, err := vm.RunSign(ctx, keyID, messageHash, requestingChain)
+	op, err := vm.runSign(ctx, keyID, messageHash, requestingChain)
 	if err != nil {
 		return nil, err
 	}

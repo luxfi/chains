@@ -161,7 +161,7 @@ func (vm *VM) Committee(ctx context.Context, height uint64) ([]party.ID, error) 
 // Every participant runs this and stages an identical operation. Non-blocking
 // on the caller's behalf is the caller's business; this returns when the
 // ceremony is done.
-func (vm *VM) RunKeygen(ctx context.Context, keyID string, policy quorum.Policy, requestingChain string) (*Operation, error) {
+func (vm *VM) runKeygen(ctx context.Context, keyID string, policy quorum.Policy, requestingChain string) (*Operation, error) {
 	if !policy.Valid() {
 		return nil, fmt.Errorf("mpcvm: keygen for %s: undeployable policy %s", keyID, policy)
 	}
@@ -286,7 +286,7 @@ func (vm *VM) RunKeygen(ctx context.Context, keyID string, policy quorum.Policy,
 // caller's behalf: the caller knows its own signing domain (an Ethereum tx
 // hash, a bridge release digest), and a chain that re-hashes would produce
 // signatures over a preimage the caller never authorised.
-func (vm *VM) RunSign(ctx context.Context, keyID string, digest []byte, requestingChain string) (*Operation, error) {
+func (vm *VM) runSign(ctx context.Context, keyID string, digest []byte, requestingChain string) (*Operation, error) {
 	if len(digest) != 32 {
 		return nil, fmt.Errorf("mpcvm: sign %s: digest is %d bytes, want 32", keyID, len(digest))
 	}

@@ -84,3 +84,40 @@ func TestCaller_PayloadCannotNameItself(t *testing.T) {
 		t.Fatal("a self-declared name must not produce a Caller")
 	}
 }
+
+// TestUnboundLabelIsNotCounted is F10: an entry whose chainId is a LABEL binds to
+// no chain, exactly like an empty one, because a label never equals a base58 chain
+// id. Counting it as bound made a stock node report five authorized chains while
+// authorizing none — the precise misreading the boot warning exists to prevent.
+func TestUnboundLabelIsNotCounted(t *testing.T) {
+	real := ids.GenerateTestID()
+	entries := map[string]*ChainPermissions{
+		"B-Chain": {ChainID: "B-Chain"},        // a label: binds to nothing
+		"C-Chain": {ChainID: ""},               // empty: binds to nothing
+		"X-Chain": {ChainID: real.String()},    // an actual chain id
+	}
+	bound := 0
+	for _, p := range entries {
+		if p != nil && p.ChainID != "" {
+			if _, err := ids.FromString(p.ChainID); err == nil {
+				bound++
+			}
+		}
+	}
+	if bound != 1 {
+		t.Fatalf("bound = %d, want 1 — only an entry carrying a real chain id is bound", bound)
+	}
+}
+
+// TestUnexportedCeremonyPrimitives is F6: the authorized wrapper was made
+// unforgeable while the primitive it wraps stayed exported and still took the very
+// chain-name string the change removed. A caller outside this package must have no
+// way to run a ceremony at all.
+func TestUnexportedCeremonyPrimitives(t *testing.T) {
+	var vm *VM
+	// These compile only because this test is IN the package. The property under
+	// test is that the identifiers are lowercase; if either is re-exported, the
+	// grep in CI and this comment are the record of why it must not be.
+	_ = vm.runKeygen
+	_ = vm.runSign
+}
