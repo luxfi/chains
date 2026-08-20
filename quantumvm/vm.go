@@ -282,13 +282,7 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		vm:           vm,
 	}
 	block.id = block.computeID()
-
-	// Sign block with quantum signature if enabled
-	if vm.Config.QuantumStampEnabled {
-		if err := vm.signBlockWithQuantum(block); err != nil {
-			return nil, fmt.Errorf("failed to sign block with quantum stamp: %w", err)
-		}
-	}
+	vm.signBlockWithQuasar(block)
 
 	vm.log.Debug("built block",
 		"blockID", block.ID(),
@@ -307,13 +301,6 @@ func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (chain.Block, e
 	block, err := vm.parseBlock(blockBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse block: %w", err)
-	}
-
-	// Verify quantum signature if enabled
-	if vm.Config.QuantumStampEnabled {
-		if err := vm.verifyBlockQuantumSignature(block); err != nil {
-			return nil, fmt.Errorf("quantum signature verification failed: %w", err)
-		}
 	}
 
 	return block, nil
@@ -430,47 +417,25 @@ func (vm *VM) processTransactionsParallel(txs []Transaction) ([]Transaction, err
 	return validTxs, nil
 }
 
-// signBlockWithQuantum signs a block with quantum signature using Quasar hybrid consensus
-func (vm *VM) signBlockWithQuantum(block *Block) error {
-	ctx := context.Background()
-	blockData := block.Bytes()
-
-	// Use Quasar bridge for dual BLS+Corona threshold signing
-	if vm.quasarBridge != nil {
-		_, err := vm.quasarBridge.SignBlock(ctx, block.ID(), blockData, block.Height())
-		if err != nil {
-			vm.log.Warn("Quasar signing failed, falling back to ML-DSA", "error", err)
-		} else {
-			vm.log.Debug("Block signed with Quasar BLS threshold",
-				"blockID", block.ID(),
-				"height", block.Height(),
-			)
-		}
+// Quasar signs the block for the CONSENSUS layer, which is where a block-level
+// signature belongs: a cert is a quorum's statement about a block, verifiable by
+// anyone holding the validator set. It is deliberately not a field on the block.
+//
+// A per-block stamp cannot be one. The block id is sha256 of its own bytes, so a
+// stamp on the wire makes the id depend on WHO signed and two honest nodes compute
+// two ids for one block -- a fork by construction, the same hazard seedGenesis
+// avoids by refusing to put wall-clock time in a block. Kept off the wire instead,
+// it exists only on the object the builder made and is gone the moment the block
+// is serialized, which is every time it leaves this process.
+func (vm *VM) signBlockWithQuasar(block *Block) {
+	if vm.quasarBridge == nil {
+		return
 	}
-
-	// Also sign with ML-DSA for quantum resistance (standalone signature)
-	key, err := vm.quantumSigner.GenerateCoronaKey()
-	if err != nil {
-		return fmt.Errorf("failed to generate corona key: %w", err)
+	if _, err := vm.quasarBridge.SignBlock(context.Background(), block.ID(), block.Bytes(), block.Height()); err != nil {
+		vm.log.Warn("quasar block signing failed", "blockID", block.ID(), "error", err)
+		return
 	}
-
-	sig, err := vm.quantumSigner.Sign(blockData, key)
-	if err != nil {
-		return fmt.Errorf("failed to sign block with ML-DSA: %w", err)
-	}
-
-	block.quantumSignature = sig
-	return nil
-}
-
-// verifyBlockQuantumSignature verifies a block's quantum signature
-func (vm *VM) verifyBlockQuantumSignature(block *Block) error {
-	if block.quantumSignature == nil {
-		return errInvalidQuantumStamp
-	}
-
-	blockData := block.Bytes()
-	return vm.quantumSigner.Verify(blockData, block.quantumSignature)
+	vm.log.Debug("block signed with quasar BLS threshold", "blockID", block.ID(), "height", block.Height())
 }
 
 // parseGenesis parses genesis data

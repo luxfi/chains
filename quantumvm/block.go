@@ -26,7 +26,6 @@ type Block struct {
 	height           uint64
 	parentID         ids.ID
 	transactions     []Transaction
-	quantumSignature *quantum.QuantumSignature
 	vm               *VM
 	bytes            []byte
 }
@@ -104,16 +103,6 @@ func (b *Block) Verify(ctx context.Context) error {
 	if b.height > 1 {
 		if _, err := b.vm.GetBlock(ctx, b.parentID); err != nil {
 			return errInvalidParentID
-		}
-	}
-
-	// Verify quantum signature if enabled
-	if b.vm.Config.QuantumStampEnabled {
-		if b.quantumSignature == nil {
-			return errInvalidQuantumStamp
-		}
-		if err := b.vm.quantumSigner.Verify(b.Bytes(), b.quantumSignature); err != nil {
-			return errBlockVerificationFailed
 		}
 	}
 
