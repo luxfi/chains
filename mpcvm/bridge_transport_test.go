@@ -246,7 +246,7 @@ func TestBridgeCustody_KeygenSignAndRecordOverGossip(t *testing.T) {
 	require.Equal(t, "2-of-3", policy.String())
 
 	keygens := runOnAll(t, ctx, vms, func(ctx context.Context, vm *VM) (*Operation, error) {
-		return vm.StartKeygen(ctx, keyID, "B-Chain")
+		return vm.StartKeygen(ctx, keyID, authenticated(vm, "B-Chain"))
 	})
 
 	first := keygens[0]
@@ -288,7 +288,6 @@ func TestBridgeCustody_KeygenSignAndRecordOverGossip(t *testing.T) {
 	var recip [20]byte
 	copy(recip[:], []byte("recipient-0xabc0123"))
 	req := BridgeReleaseRequest{
-		RequestingChain: "B-Chain",
 		KeyID:           keyID,
 		SrcChainID:      200201, // Zoo EVM
 		DstChainID:      97368,  // Lux testnet M-Chain route
@@ -302,7 +301,7 @@ func TestBridgeCustody_KeygenSignAndRecordOverGossip(t *testing.T) {
 	// key that is two of the three, chosen deterministically from the task, so
 	// the third declines without anyone coordinating that.
 	atts, declined := runOnQuorum(t, ctx, vms, func(ctx context.Context, vm *VM) (*BridgeTransferAttestation, error) {
-		return vm.RequestBridgeRelease(ctx, req)
+		return vm.RequestBridgeRelease(ctx, authenticated(vm, "B-Chain"), req)
 	})
 	require.Len(t, atts, policy.K, "exactly K validators sign")
 	require.Equal(t, policy.N-policy.K, declined, "the rest decline rather than sign")
@@ -349,7 +348,7 @@ func TestBridgeCustody_KeygenSignAndRecordOverGossip(t *testing.T) {
 	// Replay is refused: the ceremony id is derived from (key, digest, signers),
 	// so asking again for the identical release is the identical ceremony — and
 	// recording it twice would be a double release.
-	_, err := signerVM(t, vms, atts[0]).RequestBridgeRelease(ctx, req)
+	_, err := signerVM(t, vms, atts[0]).RequestBridgeRelease(ctx, authenticated(signerVM(t, vms, atts[0]), "B-Chain"), req)
 	require.ErrorIs(t, err, ErrCeremonyExists)
 
 	// Proof the fabric actually carried ceremony messages between validators
@@ -483,7 +482,7 @@ func TestBridgeCustody_ThreeOfFive(t *testing.T) {
 
 	// --- DKG at degree 2 across all five ---
 	keygens := runOnAll(t, ctx, vms, func(ctx context.Context, vm *VM) (*Operation, error) {
-		return vm.StartKeygenWithPolicy(ctx, keyID, policy, "B-Chain")
+		return vm.StartKeygenWithPolicy(ctx, keyID, policy, authenticated(vm, "B-Chain"))
 	})
 	rec := keygens[0].Key
 	require.Equal(t, policy, rec.Policy)
@@ -503,7 +502,6 @@ func TestBridgeCustody_ThreeOfFive(t *testing.T) {
 	var recip [20]byte
 	copy(recip[:], []byte("recipient-3of5"))
 	req := BridgeReleaseRequest{
-		RequestingChain: "B-Chain",
 		KeyID:           keyID,
 		SrcChainID:      200201,
 		DstChainID:      97368,
@@ -517,7 +515,7 @@ func TestBridgeCustody_ThreeOfFive(t *testing.T) {
 	// ErrNotInQuorum. Nobody coordinates that — each node computes the same
 	// quorum from the task alone.
 	signed, declined := runOnQuorum(t, ctx, vms, func(ctx context.Context, vm *VM) (*BridgeTransferAttestation, error) {
-		return vm.RequestBridgeRelease(ctx, req)
+		return vm.RequestBridgeRelease(ctx, authenticated(vm, "B-Chain"), req)
 	})
 	require.Len(t, signed, 3, "exactly K=3 validators must sign a 3-of-5 key")
 	require.Equal(t, 2, declined, "the remaining N-K=2 validators must decline, not sign")

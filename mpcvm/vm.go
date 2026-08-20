@@ -11,6 +11,7 @@
 package mpcvm
 
 import (
+	"sort"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -318,12 +319,31 @@ func (vm *VM) Initialize(
 		return fmt.Errorf("mpcvm: load key shares: %w", err)
 	}
 
+	bound, unbound := 0, make([]string, 0, len(vm.config.AuthorizedChains))
+	for name, p := range vm.config.AuthorizedChains {
+		if p != nil && p.ChainID != "" {
+			bound++
+			continue
+		}
+		unbound = append(unbound, name)
+	}
+	sort.Strings(unbound)
+
 	vm.log.Info("M-Chain initialized",
 		log.String("policy", vm.config.Policy.String()),
 		log.String("party", string(vm.partyID)),
 		log.Int("sharesHeld", len(vm.shares)),
-		log.Int("authorizedChains", len(vm.config.AuthorizedChains)),
+		log.Int("authorizedChains", bound),
 	)
+	if len(unbound) > 0 {
+		// Say it plainly. A permission entry names a chain by label, and a label
+		// is not an identity — until an operator sets chainId, the entry grants
+		// custody to nobody. Silence here would read as "custody is configured"
+		// right up until the first release fails.
+		vm.log.Warn("custody entries name a chain but bind to none — set chainId on each to grant it",
+			log.Strings("chains", unbound),
+		)
+	}
 
 	return nil
 }
@@ -467,8 +487,8 @@ func (vm *VM) parseConfig(configBytes []byte) error {
 // chain. It is gone.
 
 // StartKeygen generates a custody key using the chain's default policy.
-func (vm *VM) StartKeygen(ctx context.Context, keyID, requestedBy string) (*Operation, error) {
-	return vm.StartKeygenWithPolicy(ctx, keyID, vm.Policy(), requestedBy)
+func (vm *VM) StartKeygen(ctx context.Context, keyID string, by Caller) (*Operation, error) {
+	return vm.StartKeygenWithPolicy(ctx, keyID, vm.Policy(), by)
 }
 
 // StartKeygenWithPolicy generates a custody key under an explicit k-of-n policy.
@@ -476,11 +496,11 @@ func (vm *VM) StartKeygen(ctx context.Context, keyID, requestedBy string) (*Oper
 // The policy is a quorum.Policy, not a pair of ints, so a caller cannot express
 // the quorum ambiguously: "3-of-5" is the only spelling, and the polynomial
 // degree is derived from it inside RunKeygen.
-func (vm *VM) StartKeygenWithPolicy(ctx context.Context, keyID string, policy quorum.Policy, requestedBy string) (*Operation, error) {
-	perms, ok := vm.permissions(requestedBy)
-	if !ok || !perms.CanKeygen {
-		return nil, fmt.Errorf("%w: %s may not request key generation", ErrUnauthorizedChain, requestedBy)
+func (vm *VM) StartKeygenWithPolicy(ctx context.Context, keyID string, policy quorum.Policy, by Caller) (*Operation, error) {
+	if by.perms == nil || !by.perms.CanKeygen {
+		return nil, fmt.Errorf("%w: %s may not request key generation", ErrUnauthorizedChain, by.name)
 	}
+	requestedBy := by.name
 	ctx, cancel := context.WithTimeout(ctx, vm.sessionTimeout())
 	defer cancel()
 	op, err := vm.RunKeygen(ctx, keyID, policy, requestedBy)
@@ -495,11 +515,12 @@ func (vm *VM) StartKeygenWithPolicy(ctx context.Context, keyID string, policy qu
 
 // RequestSignature produces a threshold signature over messageHash with a
 // registered custody key and stages it for the next block.
-func (vm *VM) RequestSignature(ctx context.Context, requestingChain, keyID string, messageHash []byte) (*Operation, error) {
-	perms, ok := vm.permissions(requestingChain)
-	if !ok || !perms.CanSign {
-		return nil, fmt.Errorf("%w: %s may not request signatures", ErrUnauthorizedChain, requestingChain)
+func (vm *VM) RequestSignature(ctx context.Context, by Caller, keyID string, messageHash []byte) (*Operation, error) {
+	perms := by.perms
+	if perms == nil || !perms.CanSign {
+		return nil, fmt.Errorf("%w: %s may not request signatures", ErrUnauthorizedChain, by.name)
 	}
+	requestingChain := by.name
 	if perms.MaxSigningSize > 0 && len(messageHash) > perms.MaxSigningSize {
 		return nil, fmt.Errorf("message too large: %d > %d", len(messageHash), perms.MaxSigningSize)
 	}
@@ -857,12 +878,22 @@ func (vm *VM) CrossChainRequest(ctx context.Context, chainID ids.ID, requestID u
 		return err
 	}
 
+	// Authorize from the chain id the TRANSPORT authenticated, never from
+	// req.RequestingChain. That field is written by the sender about itself, so
+	// reading it here would let any peer that can reach this method claim any
+	// chain's custody rights; it survives only as attribution on the recorded
+	// operation, where it is set from the authenticated name below.
+	by, err := vm.caller(chainID)
+	if err != nil {
+		return err
+	}
+
 	switch req.Type {
 	case "sign":
-		_, err := vm.RequestSignature(ctx, req.RequestingChain, req.KeyID, req.MessageHash)
+		_, err := vm.RequestSignature(ctx, by, req.KeyID, req.MessageHash)
 		return err
 	case "keygen":
-		_, err := vm.StartKeygen(ctx, req.KeyID, req.RequestingChain)
+		_, err := vm.StartKeygen(ctx, req.KeyID, by)
 		return err
 	default:
 		return fmt.Errorf("mpcvm: unknown cross-chain request type %q", req.Type)
@@ -1156,7 +1187,7 @@ func ComputeAttestationPayload(domain AttestationDomain, subjectID, commitmentRo
 // between an oracle commit, a session completion and an epoch beacon.
 func (vm *VM) attest(
 	ctx context.Context,
-	requestingChain string,
+	by Caller,
 	keyID string,
 	domain AttestationDomain,
 	subjectID [32]byte,
@@ -1165,7 +1196,7 @@ func (vm *VM) attest(
 ) (*QuantumAttestation, error) {
 	payload := ComputeAttestationPayload(domain, subjectID, commitRoot, epoch)
 
-	op, err := vm.RequestSignature(ctx, requestingChain, keyID, payload[:])
+	op, err := vm.RequestSignature(ctx, by, keyID, payload[:])
 	if err != nil {
 		return nil, fmt.Errorf("mpcvm: attest %s: %w", domain, err)
 	}
@@ -1201,7 +1232,7 @@ func (vm *VM) attest(
 // AttestOracleCommit creates a threshold attestation for an oracle commitment.
 func (vm *VM) AttestOracleCommit(
 	ctx context.Context,
-	requestingChain string,
+	by Caller,
 	keyID string,
 	requestID [32]byte,
 	kind uint8, // 0 = write, 1 = read
@@ -1212,13 +1243,13 @@ func (vm *VM) AttestOracleCommit(
 	if kind != 0 {
 		domain = DomainOracleRead
 	}
-	return vm.attest(ctx, requestingChain, keyID, domain, requestID, commitRoot, epoch)
+	return vm.attest(ctx, by, keyID, domain, requestID, commitRoot, epoch)
 }
 
 // AttestSessionComplete creates a threshold attestation for session completion.
 func (vm *VM) AttestSessionComplete(
 	ctx context.Context,
-	requestingChain string,
+	by Caller,
 	keyID string,
 	sessionID [32]byte,
 	outputHash [32]byte,
@@ -1233,13 +1264,13 @@ func (vm *VM) AttestSessionComplete(
 	var commitRoot [32]byte
 	copy(commitRoot[:], h.Sum(nil))
 
-	return vm.attest(ctx, requestingChain, keyID, DomainSessionComplete, sessionID, commitRoot, epoch)
+	return vm.attest(ctx, by, keyID, DomainSessionComplete, sessionID, commitRoot, epoch)
 }
 
 // AttestEpochBeacon creates a threshold attestation for epoch beacon randomness.
 func (vm *VM) AttestEpochBeacon(
 	ctx context.Context,
-	requestingChain string,
+	by Caller,
 	keyID string,
 	epoch uint64,
 	previousRef [32]byte,
@@ -1261,7 +1292,7 @@ func (vm *VM) AttestEpochBeacon(
 	var commitRoot [32]byte
 	copy(commitRoot[:], h2.Sum(nil))
 
-	return vm.attest(ctx, requestingChain, keyID, DomainEpochBeacon, subjectID, commitRoot, epoch)
+	return vm.attest(ctx, by, keyID, DomainEpochBeacon, subjectID, commitRoot, epoch)
 }
 
 // VerifyAttestation checks an attestation against this node's registry: the
