@@ -1,7 +1,11 @@
 // Copyright (C) 2025-2026, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
-//go:build !cgo
+//go:build !cgo || !lux_cevm_native
+
+// Pure-Go path for the batch sig primitive, used whenever the native
+// luxcpp crypto is NOT linked in — the default build (cgo without
+// `-tags=lux_cevm_native`) and any no-cgo build.
 
 package cevm
 
@@ -21,5 +25,5 @@ func BatchRecoverSenders(txs types.Transactions, signer types.Signer) ([]common.
 		return nil, nil
 	}
 	_ = signer
-	return nil, fmt.Errorf("cevm: BatchRecoverSenders requires CGO_ENABLED=1 (libsecp256k1_cpu)")
+	return nil, fmt.Errorf("cevm: BatchRecoverSenders requires CGO_ENABLED=1 -tags=lux_cevm_native (libsecp256k1_cpu)")
 }

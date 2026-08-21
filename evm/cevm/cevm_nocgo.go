@@ -1,4 +1,9 @@
-//go:build !cgo
+//go:build !cgo || !lux_cevm_native
+
+// Pure-Go path, used whenever the native luxcpp EVM is NOT linked in —
+// i.e. the default build (cgo without `-tags=lux_cevm_native`) and any
+// no-cgo build. Opt in with `-tags=lux_cevm_native` (see cevm_cgo.go)
+// once the lux-cevm pkg-config bundle is installed.
 
 package cevm
 
@@ -27,7 +32,7 @@ func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *Bl
 	}
 	_ = ctx
 	_ = state
-	return nil, fmt.Errorf("cevm: built without CGo, cannot execute transactions (rebuild with CGO_ENABLED=1)")
+	return nil, fmt.Errorf("cevm: native EVM not linked, cannot execute transactions (rebuild with CGO_ENABLED=1 -tags=lux_cevm_native)")
 }
 
 // HealthProbeResult mirrors the cgo build's struct so consumers see the same
