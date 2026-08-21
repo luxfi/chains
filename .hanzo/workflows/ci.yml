@@ -49,11 +49,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # luxfi modules are re-tagged in place; skip the public sum DB for them (the
-  # same discipline release.yml uses). Never disables verification of
-  # third-party modules.
-  GONOSUMCHECK: github.com/luxfi/*
-  GONOSUMDB: github.com/luxfi/*
   GOFLAGS: -mod=mod
 
 jobs:
