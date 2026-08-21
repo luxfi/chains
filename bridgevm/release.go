@@ -195,8 +195,10 @@ func (vm *VM) releaseTransfer(ctx context.Context, transfer bridgeattest.BridgeT
 		return ids.Empty, fmt.Errorf("bridgevm: attest: %w", err)
 	}
 
-	// 3. Verify M's attestation locally before spending gas — defense in depth.
-	if att == nil || !att.Verify() {
+	// 3. Verify M's attestation against the group key THIS chain was configured
+	//    with, before spending gas. Verifying against the key carried inside the
+	//    attestation would accept any key an attacker supplied alongside it.
+	if att == nil || !att.VerifyAgainst(vm.mpcGroupPublicKey()) {
 		return ids.Empty, errBadAttestation
 	}
 

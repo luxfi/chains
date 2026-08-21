@@ -22,6 +22,7 @@
 package bridgeattest
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 
@@ -96,19 +97,34 @@ type Attestation struct {
 	CreatedAt   int64          `json:"createdAt"`
 }
 
-// Verify returns true iff the attestation's signature is a valid threshold
-// signature by the group key over THIS transfer's domain-bound digest, and the
-// self-reported digest matches the recomputed one. Defense in depth: B calls
-// this before it broadcasts a release, even though the on-chain gateway also
-// verifies.
-func (a *Attestation) Verify() bool {
-	if a == nil {
+// VerifyAgainst returns true iff the attestation's signature is a valid
+// threshold signature, by the EXPECTED group key, over this transfer's
+// domain-bound digest, and the self-reported digest matches the recomputed one.
+//
+// The expected key is an argument because it is the whole check. This method
+// used to read a.GroupPubKey — a field of the very struct being verified — so it
+// answered "was this signed by whoever signed it", which every attestation
+// satisfies, including one an attacker minted with its own key and shipped
+// alongside. A signature is only evidence when the verifier already knows whose
+// signature it is willing to accept.
+//
+// The caller has that key: B-Chain holds the group public point from M-Chain's
+// keygen and never holds a custody secret. Passing nil or a mismatched key
+// fails closed.
+func (a *Attestation) VerifyAgainst(expectedGroupKey []byte) bool {
+	if a == nil || len(expectedGroupKey) == 0 {
 		return false
 	}
 	if a.Digest != a.Transfer.Digest() {
 		return false
 	}
-	return VerifyBridgeAttestation(a.GroupPubKey, a.Transfer, a.Signature)
+	// The attestation still carries its own key so a holder can see which group
+	// signed, but a disagreement with the key we trust is a refusal, not a
+	// preference for theirs.
+	if len(a.GroupPubKey) != 0 && !bytes.Equal(a.GroupPubKey, expectedGroupKey) {
+		return false
+	}
+	return VerifyBridgeAttestation(expectedGroupKey, a.Transfer, a.Signature)
 }
 
 // VerifyBridgeAttestation returns true iff sig is a valid ECDSA signature by
