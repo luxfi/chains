@@ -9,6 +9,7 @@ require (
 	github.com/holiman/uint256 v1.3.2
 	github.com/luxfi/accel v1.3.1
 	github.com/luxfi/ai v0.1.0
+	github.com/luxfi/api v1.1.3
 	github.com/luxfi/consensus v1.36.2
 	github.com/luxfi/constants v1.6.2
 	github.com/luxfi/crypto v1.20.5
@@ -140,7 +141,6 @@ require (
 	github.com/kr/text v0.2.0 // indirect
 	github.com/luxfi/address v1.1.1 // indirect
 	github.com/luxfi/age v1.6.0 // indirect
-	github.com/luxfi/api v1.1.3 // indirect
 	github.com/luxfi/atomic v1.0.0 // indirect
 	github.com/luxfi/cache v1.3.1 // indirect
 	github.com/luxfi/codec v1.2.1 // indirect

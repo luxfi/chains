@@ -235,21 +235,26 @@ func (vm *VM) Version(context.Context) (string, error) {
 	return Version.String(), nil
 }
 
-// CreateHandlers implements the common.VM interface
+// CreateHandlers implements the common.VM interface.
+//
+// The node mounts each key under /v1/bc/<chainID> and matches that full path
+// EXACTLY, then hands the handler the request with the path it arrived on. A
+// handler that dispatches on r.URL.Path therefore never recognizes anything.
+// The key IS the route; one handler per key.
 func (vm *VM) CreateHandlers(context.Context) (map[string]http.Handler, error) {
-	handler := &apiHandler{vm: vm}
-
-	// Wrap sensitive endpoints with authentication if required
-	var graphqlHandler http.Handler = handler
-	if vm.config.RequireAuth {
-		graphqlHandler = authMiddleware(handler, vm.config.APIKeys)
+	h := &apiHandler{vm: vm}
+	guard := func(next http.Handler) http.Handler {
+		if vm.config.RequireAuth {
+			return authMiddleware(next, vm.config.APIKeys)
+		}
+		return next
 	}
 
 	return map[string]http.Handler{
-		"/graphql": graphqlHandler,
-		"/schema":  handler, // Schema can be public
-		"/query":   graphqlHandler,
-		"/index":   handler, // Index metadata can be public
+		"/graphql": guard(http.HandlerFunc(h.handleGraphQL)),
+		"/schema":  http.HandlerFunc(h.handleSchema), // Schema can be public
+		"/query":   guard(http.HandlerFunc(h.handleQuery)),
+		"/index":   http.HandlerFunc(h.handleIndex), // Index metadata can be public
 	}, nil
 }
 

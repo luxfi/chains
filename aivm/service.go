@@ -16,38 +16,29 @@ type Service struct {
 	vm *VM
 }
 
-// NewService creates a new AIVM service
-func NewService(vm *VM) http.Handler {
+// Routes returns one handler per endpoint.
+//
+// The node mounts each key under /v1/bc/<chainID> and matches that full path
+// EXACTLY, then hands the handler the request with the path it arrived on. A
+// handler therefore never sees a path it can dispatch on, and no path below a
+// mount is routable at all. The key IS the route — the same shape bridgevm and
+// zkvm use.
+func Routes(vm *VM) map[string]http.Handler {
 	s := &Service{vm: vm}
-	mux := http.NewServeMux()
-
-	// Provider endpoints
-	mux.HandleFunc("/providers", s.handleProviders)
-	mux.HandleFunc("/providers/register", s.handleRegisterProvider)
-
-	// Task endpoints
-	mux.HandleFunc("/tasks", s.handleTasks)
-	mux.HandleFunc("/tasks/submit", s.handleSubmitTask)
-	mux.HandleFunc("/tasks/result", s.handleSubmitResult)
-
-	// Model endpoints
-	mux.HandleFunc("/models", s.handleModels)
-
-	// Attestation endpoints
-	mux.HandleFunc("/attestation/verify", s.handleVerifyAttestation)
-
-	// Reward endpoints
-	mux.HandleFunc("/rewards/claim", s.handleClaimRewards)
-	mux.HandleFunc("/rewards/stats", s.handleRewardStats)
-
-	// Stats endpoints
-	mux.HandleFunc("/stats", s.handleStats)
-	mux.HandleFunc("/merkle", s.handleMerkleRoot)
-
-	// Health endpoint
-	mux.HandleFunc("/health", s.handleHealth)
-
-	return mux
+	return map[string]http.Handler{
+		"/providers":          http.HandlerFunc(s.handleProviders),
+		"/providers/register": http.HandlerFunc(s.handleRegisterProvider),
+		"/tasks":              http.HandlerFunc(s.handleTasks),
+		"/tasks/submit":       http.HandlerFunc(s.handleSubmitTask),
+		"/tasks/result":       http.HandlerFunc(s.handleSubmitResult),
+		"/models":             http.HandlerFunc(s.handleModels),
+		"/attestation/verify": http.HandlerFunc(s.handleVerifyAttestation),
+		"/rewards/claim":      http.HandlerFunc(s.handleClaimRewards),
+		"/rewards/stats":      http.HandlerFunc(s.handleRewardStats),
+		"/stats":              http.HandlerFunc(s.handleStats),
+		"/merkle":             http.HandlerFunc(s.handleMerkleRoot),
+		"/health":             http.HandlerFunc(s.handleHealth),
+	}
 }
 
 // handleProviders returns all registered providers

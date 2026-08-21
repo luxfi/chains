@@ -404,10 +404,8 @@ func (vm *VM) Shutdown(ctx context.Context) error {
 }
 
 // CreateHandlers returns HTTP handlers
-func (vm *VM) CreateHandlers(ctx context.Context) (map[string]http.Handler, error) {
-	return map[string]http.Handler{
-		"/rpc": NewService(vm),
-	}, nil
+func (vm *VM) CreateHandlers(context.Context) (map[string]http.Handler, error) {
+	return Routes(vm), nil
 }
 
 // Connected notifies the VM about connected nodes

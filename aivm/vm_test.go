@@ -258,7 +258,28 @@ func TestVMCreateHandlers(t *testing.T) {
 	vm := &VM{}
 	handlers, err := vm.CreateHandlers(context.Background())
 	require.NoError(err)
-	require.Contains(handlers, "/rpc")
+
+	// Each key is a route the node mounts under /v1/bc/<chainID>, so the set of
+	// keys IS the chain's public surface. Collapsing them behind one key hides
+	// every endpoint but the one named.
+	keys := make([]string, 0, len(handlers))
+	for k := range handlers {
+		keys = append(keys, k)
+	}
+	require.ElementsMatch([]string{
+		"/providers",
+		"/providers/register",
+		"/tasks",
+		"/tasks/submit",
+		"/tasks/result",
+		"/models",
+		"/attestation/verify",
+		"/rewards/claim",
+		"/rewards/stats",
+		"/stats",
+		"/merkle",
+		"/health",
+	}, keys)
 }
 
 func TestProviderRegJSON(t *testing.T) {
