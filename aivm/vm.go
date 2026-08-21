@@ -403,7 +403,18 @@ func (vm *VM) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// CreateHandlers returns HTTP handlers
+// CreateHandlers returns one entry per endpoint.
+//
+// The node mounts each KEY as a route and delivers the request on the path it
+// arrived on, so a handler that dispatches on r.URL.Path never matches: it is
+// asked for /v1/bc/<chainID>/rpc and looks for /stats. A flat map of endpoints to
+// handlers that answer AT their mount is the simplest shape that works, and it is
+// what this VM uses.
+//
+// It is not the only shape. An endpoint also owns the paths beneath it, and a VM
+// that wants a subtree may mount one handler and read the remainder — the node
+// strips the mount before handing it over (node server/http/router.go,
+// serveBelowMount). Both are served; a VM picks whichever matches its surface.
 func (vm *VM) CreateHandlers(context.Context) (map[string]http.Handler, error) {
 	return Routes(vm), nil
 }
