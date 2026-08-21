@@ -221,7 +221,7 @@ func (vm *VM) recordRelease(req *BridgeRequest, destTx ids.ID) {
 		log.Stringer("destTxID", destTx))
 }
 
-func (vm *VM) evmClientByID(id uint32) *evmChainClient {
+func (vm *VM) evmClientByID(id uint32) ChainClient {
 	vm.mu.RLock()
 	defer vm.mu.RUnlock()
 	return vm.evmByChainID[id]
@@ -246,7 +246,7 @@ func (vm *VM) EnableBridgeRelease(ctx context.Context, chains []ExternalChainCon
 	}
 
 	byName := make(map[string]ChainClient, len(chains))
-	byID := make(map[uint32]*evmChainClient, len(chains))
+	byID := make(map[uint32]ChainClient, len(chains))
 	for _, cfg := range chains {
 		if cfg.GasKeyKMSPath == "" {
 			return fmt.Errorf("bridgevm: chain %q: gasKeyKmsPath required (KMS only)", cfg.Name)
