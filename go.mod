@@ -9,14 +9,14 @@ require (
 	github.com/holiman/uint256 v1.3.2
 	github.com/luxfi/accel v1.3.1
 	github.com/luxfi/ai v0.1.0
-	github.com/luxfi/api v1.1.3
-	github.com/luxfi/consensus v1.36.2
+	github.com/luxfi/api v1.1.6
+	github.com/luxfi/consensus v1.36.63
 	github.com/luxfi/constants v1.6.2
 	github.com/luxfi/crypto v1.20.5
-	github.com/luxfi/database v1.21.1
+	github.com/luxfi/database v1.21.5
 	github.com/luxfi/dex v1.14.2
 	github.com/luxfi/evm v1.104.30
-	github.com/luxfi/geth v1.20.1
+	github.com/luxfi/geth v1.20.2
 	github.com/luxfi/ids v1.3.2
 	github.com/luxfi/lattice/v7 v7.1.4
 	github.com/luxfi/log v1.4.3
@@ -33,7 +33,7 @@ require (
 	github.com/luxfi/timer v1.1.1
 	github.com/luxfi/validators v1.3.1
 	github.com/luxfi/version v1.0.1
-	github.com/luxfi/vm v1.3.6
+	github.com/luxfi/vm v1.3.12
 	github.com/luxfi/warp v1.24.1
 	github.com/luxfi/zap v1.2.6
 	github.com/stretchr/testify v1.11.1
@@ -128,7 +128,10 @@ require (
 	github.com/gtank/merlin v0.1.1 // indirect
 	github.com/gtank/ristretto255 v0.2.0 // indirect
 	github.com/hanzoai/vfs v0.4.3 // indirect
+	github.com/hanzos3/crc64nvme v1.1.2 // indirect
+	github.com/hanzos3/go v1.0.2 // indirect
 	github.com/hanzos3/go-sdk v1.0.2 // indirect
+	github.com/hanzos3/md5-simd v1.1.3 // indirect
 	github.com/hashicorp/go-bexpr v0.1.16 // indirect
 	github.com/holiman/billy v0.0.0-20250707135307-f2f9b9aae7db // indirect
 	github.com/holiman/bloomfilter/v2 v2.0.3 // indirect
@@ -146,7 +149,7 @@ require (
 	github.com/luxfi/codec v1.2.1 // indirect
 	github.com/luxfi/compress v0.1.1 // indirect
 	github.com/luxfi/concurrent v0.1.1 // indirect
-	github.com/luxfi/container v0.2.1 // indirect
+	github.com/luxfi/container v0.2.2 // indirect
 	github.com/luxfi/corona v0.10.4 // indirect
 	github.com/luxfi/crypto/ipa v1.2.4 // indirect
 	github.com/luxfi/dkg v0.3.5 // indirect
@@ -178,7 +181,7 @@ require (
 	github.com/luxfi/upgrade v1.0.3 // indirect
 	github.com/luxfi/utils v1.3.1 // indirect
 	github.com/luxfi/utxo v0.5.8 // indirect
-	github.com/luxfi/zapdb v1.10.1 // indirect
+	github.com/luxfi/zapdb v1.10.6 // indirect
 	github.com/luxfi/zwing v0.6.1 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
