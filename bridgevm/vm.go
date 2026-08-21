@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/luxfi/chains/internal/bridgeattest"
 	"net/http"
 	"sort"
 	"sync"
@@ -211,7 +212,7 @@ type VM struct {
 	// routing index the release path uses. Both are populated by
 	// EnableBridgeRelease and point at the same *evmChainClient objects.
 	chainClients map[string]ChainClient
-	evmByChainID map[uint32]*evmChainClient
+	evmByChainID map[uint32]ChainClient
 
 	// EVM release plumbing (injected via EnableBridgeRelease; nil until a
 	// relayer node wires it). attestClient is B's boundary to M-Chain; releaser
@@ -235,9 +236,9 @@ type VM struct {
 
 // BridgeRequest represents a cross-chain bridge request
 type BridgeRequest struct {
-	ID            ids.ID    `json:"id"`
-	SourceChain   string    `json:"sourceChain"`
-	DestChain     string    `json:"destChain"`
+	ID          ids.ID `json:"id"`
+	SourceChain string `json:"sourceChain"`
+	DestChain   string `json:"destChain"`
 	// SrcChainID / DstChainID are the numeric EVM chain ids (200201, 96368) that
 	// the canonical attestation digest binds; SourceChain / DestChain remain the
 	// human labels used to key clients. Nonce is the per-route replay guard
@@ -261,6 +262,10 @@ type ChainClient interface {
 	GetConfirmations(ctx context.Context, txID ids.ID) (uint32, error)
 	SendTransaction(ctx context.Context, tx interface{}) (ids.ID, error)
 	ValidateAddress(address []byte) error
+	// IsProcessed asks the destination gateway whether it already released this
+	// transfer. The release path calls it before requesting an attestation, so it
+	// belongs to the contract that path depends on.
+	IsProcessed(ctx context.Context, transfer bridgeattest.BridgeTransfer) (bool, error)
 }
 
 // BridgeRegistry tracks bridge operations and validators
@@ -309,7 +314,7 @@ func (vm *VM) Initialize(
 	vm.pendingBlocks = make(map[ids.ID]*Block)
 	vm.pendingBridges = make(map[ids.ID]*BridgeRequest)
 	vm.chainClients = make(map[string]ChainClient)
-	vm.evmByChainID = make(map[uint32]*evmChainClient)
+	vm.evmByChainID = make(map[uint32]ChainClient)
 
 	// Pin fee policy. B-Chain accepts user-submitted bridge transfers
 	// so attach the canonical FlatPolicy at MinTxFeeFloor; fee.Validate
