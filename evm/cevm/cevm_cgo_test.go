@@ -1,4 +1,4 @@
-//go:build cgo
+//go:build cgo && lux_cevm_native
 
 package cevm
 
@@ -9,14 +9,28 @@ import (
 	"testing"
 )
 
-// Tests in this file require the C++ EVM library (CGO_ENABLED=1). They are
-// excluded from the nocgo build entirely so the nocgo build doesn't fail on
-// API calls that can't possibly succeed without the library.
+// Tests in this file require the C++ EVM library (CGO_ENABLED=1
+// -tags=lux_cevm_native). They are excluded from every build that does not
+// link it, so those builds don't fail on API calls that can't possibly
+// succeed without the library.
 
 func TestLibraryABIVersion(t *testing.T) {
 	got := LibraryABIVersion()
 	if got != ABIVersion {
 		t.Errorf("LibraryABIVersion() = %d, want %d (rebuild libevm-gpu)", got, ABIVersion)
+	}
+}
+
+// TestABIVersion locks the ABIVersion constant so a careless bump is caught
+// by code review. Update both this test and ABIVersion together when the
+// C ABI surface changes. It lives here because ABIVersion reports the linked
+// library's ABI: without the library there is none, and cevm_nocgo.go says so
+// with 0.
+func TestABIVersion(t *testing.T) {
+	const want uint32 = 6
+	if ABIVersion != want {
+		t.Errorf("ABIVersion = %d, want %d (update C-side EVM_GPU_ABI_VERSION in lockstep)",
+			ABIVersion, want)
 	}
 }
 

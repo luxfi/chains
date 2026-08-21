@@ -7,7 +7,7 @@ require (
 	github.com/gorilla/rpc v1.2.1
 	github.com/hashicorp/golang-lru v1.0.2
 	github.com/holiman/uint256 v1.3.2
-	github.com/luxfi/accel v1.3.1
+	github.com/luxfi/accel v1.3.2
 	github.com/luxfi/ai v0.1.0
 	github.com/luxfi/api v1.1.6
 	github.com/luxfi/consensus v1.36.63

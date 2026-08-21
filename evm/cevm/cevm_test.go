@@ -116,17 +116,6 @@ func TestHealth_AlwaysReturnsReports(t *testing.T) {
 	}
 }
 
-// TestABIVersion locks the ABIVersion constant so a careless bump is caught
-// by code review. Update both this test and ABIVersion together when the
-// C ABI surface changes.
-func TestABIVersion(t *testing.T) {
-	const want uint32 = 6
-	if ABIVersion != want {
-		t.Errorf("ABIVersion = %d, want %d (update C-side EVM_GPU_ABI_VERSION in lockstep)",
-			ABIVersion, want)
-	}
-}
-
 // TestBlockContextLayout asserts the Go BlockContext fields are the right
 // widths in the right order. The C-side layout assertion lives in
 // go_bridge.cpp (static_assert sizeof(BlockContext) == sizeof(CBlockContext));

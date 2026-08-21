@@ -1,4 +1,4 @@
-//go:build cgo
+//go:build cgo && lux_cevm_native
 
 package cevm
 

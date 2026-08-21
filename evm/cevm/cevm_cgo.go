@@ -1,7 +1,13 @@
-//go:build cgo
+//go:build cgo && lux_cevm_native
 
 package cevm
 
+// OPT-IN via `-tags=lux_cevm_native`. cgo says a C compiler is available;
+// it does not say the luxcpp bundle below is installed. Those are two
+// facts, so they get two predicates: without the tag the package builds
+// against cevm_nocgo.go and reports CPUSequential, which is what every
+// host that has not run `cmake --install` on luxcpp/cevm should get.
+//
 // Linkage goes through the lux-cevm pkg-config bundle (libevm + libevm-gpu).
 // The C header "go_bridge.h" ships under
 // $LUXCPP_PREFIX/include/cevm/lib/evm/gpu/, which is in the .pc Cflags.

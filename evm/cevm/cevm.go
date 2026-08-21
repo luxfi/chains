@@ -8,8 +8,9 @@
 //   - GPU EVM opcode interpreter (Metal/CUDA)
 //   - ZAP VM plugin protocol (native)
 //
-// Build with CGo: CGO_ENABLED=1 go build -tags cgo
-// Build without CGo: CGO_ENABLED=0 go build (types only, no execution)
+// Build against the native library: CGO_ENABLED=1 go build -tags lux_cevm_native
+// Build without it: go build (types only, no execution) — the default,
+// and the only thing that works on a host lacking the lux-cevm bundle.
 // Binary: the `cevm` binary in luxcpp/evm/build/bin/ is the Lux VM plugin.
 //
 // # Concurrency model
