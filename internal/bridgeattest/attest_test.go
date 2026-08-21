@@ -76,8 +76,8 @@ func TestVerifyRoundTrip(t *testing.T) {
 
 	att := &Attestation{Transfer: bt, Digest: digest, Signature: sig, GroupPubKey: pub}
 
-	if !att.Verify() {
-		t.Fatal("valid attestation failed to verify")
+	if !att.VerifyAgainst(pub) {
+		t.Fatal("valid attestation failed to verify against its true group key")
 	}
 	// r||s (drop v) must also verify.
 	if !VerifyBridgeAttestation(pub, bt, sig[:64]) {
@@ -135,7 +135,64 @@ func TestAttestationSelfConsistency(t *testing.T) {
 	var wrong [32]byte
 	copy(wrong[:], bytes.Repeat([]byte{0xab}, 32))
 	att := &Attestation{Transfer: bt, Digest: wrong, Signature: sig, GroupPubKey: key.PublicKey().CompressedBytes()}
-	if att.Verify() {
+	if att.VerifyAgainst(key.PublicKey().CompressedBytes()) {
 		t.Fatal("attestation with mismatched self-reported digest verified")
+	}
+}
+
+// TestAttestationMustNameTheKeyWeTrust is the defect this signature shape exists
+// to prevent.
+//
+// Verify() used to check the signature against a.GroupPubKey — a field of the
+// very struct being verified. That answers "was this signed by whoever signed
+// it", which EVERY attestation satisfies, including one an attacker minted with
+// its own key and shipped alongside. B-Chain would then have released real funds
+// against a signature from a key that never held custody of anything.
+func TestAttestationMustNameTheKeyWeTrust(t *testing.T) {
+	bt := katTransfer(t)
+	digest := bt.Digest()
+
+	custody, _ := secp256k1.NewPrivateKey()   // the key B-Chain is configured with
+	attacker, _ := secp256k1.NewPrivateKey()  // a key the attacker just made
+
+	// A perfectly self-consistent attestation: real transfer, real digest, a
+	// signature that verifies — under the attacker's own key, which it helpfully
+	// supplies.
+	sig, _ := secp256k1.Sign(digest[:], attacker.Bytes())
+	forged := &Attestation{
+		Transfer:    bt,
+		Digest:      digest,
+		Signature:   sig,
+		GroupPubKey: attacker.PublicKey().CompressedBytes(),
+	}
+
+	if forged.VerifyAgainst(custody.PublicKey().CompressedBytes()) {
+		t.Fatal("an attestation signed by a self-supplied key verified against the custody " +
+			"key — a signature is only evidence when the verifier already knows whose " +
+			"signature it will accept")
+	}
+	// Sanity: the same attestation IS valid under its own key, so the test is
+	// discriminating on the expected key and not on a malformed signature.
+	if !forged.VerifyAgainst(attacker.PublicKey().CompressedBytes()) {
+		t.Fatal("fixture is wrong: the forged attestation should verify under its own key")
+	}
+}
+
+// TestAttestationRefusesWithoutAnExpectedKey: a caller that has no configured
+// group key cannot verify anything, and must not be handed a pass. Nil is the
+// state of a B-Chain whose M-Chain keygen has not completed, which is exactly
+// when releasing funds would be worst.
+func TestAttestationRefusesWithoutAnExpectedKey(t *testing.T) {
+	bt := katTransfer(t)
+	digest := bt.Digest()
+	key, _ := secp256k1.NewPrivateKey()
+	sig, _ := secp256k1.Sign(digest[:], key.Bytes())
+	att := &Attestation{Transfer: bt, Digest: digest, Signature: sig, GroupPubKey: key.PublicKey().CompressedBytes()}
+
+	if att.VerifyAgainst(nil) {
+		t.Fatal("verified with no expected key — an unconfigured chain must fail closed")
+	}
+	if att.VerifyAgainst([]byte{}) {
+		t.Fatal("verified against an empty expected key")
 	}
 }
