@@ -242,6 +242,11 @@ type VM struct {
 
 	// Consensus
 	toEngine chan<- vmcore.Message
+	// notify wakes WaitForEvent when work arrives. Depth 1 and sent
+	// non-blocking, so a burst of submissions coalesces into one build signal
+	// rather than flooding the engine — the concern that WaitForEvent used to
+	// answer by never returning at all.
+	notify chan struct{}
 
 	// Logging
 	log log.Logger
@@ -308,6 +313,7 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	}
 
 	vm.pendingBlocks = make(map[ids.ID]*Block)
+	vm.notify = make(chan struct{}, 1)
 
 	// Parse configuration
 	if len(init.Config) > 0 {
@@ -508,9 +514,13 @@ func (vm *VM) SubmitTask(task *aivm.Task) error {
 	}
 
 	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	return vm.core.SubmitTask(task)
+	err := vm.core.SubmitTask(task)
+	vm.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	vm.signalWork()
+	return nil
 }
 
 // GetTask returns a task by ID
@@ -524,13 +534,17 @@ func (vm *VM) GetTask(taskID string) (*aivm.Task, error) {
 // SubmitResult submits a task result
 func (vm *VM) SubmitResult(result *aivm.TaskResult) error {
 	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
 	if !vm.running {
+		vm.mu.Unlock()
 		return ErrNotInitialized
 	}
-
-	return vm.core.SubmitResult(result)
+	err := vm.core.SubmitResult(result)
+	vm.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	vm.signalWork()
+	return nil
 }
 
 // GetProviders returns all registered providers
@@ -720,12 +734,28 @@ func (vm *VM) Version(ctx context.Context) (string, error) {
 	return Version.String(), nil
 }
 
-// WaitForEvent implements chain.ChainVM interface
+// signalWork wakes a waiting WaitForEvent. Non-blocking: the channel has depth
+// 1, so concurrent submissions collapse into a single pending build signal.
+func (vm *VM) signalWork() {
+	if vm.notify == nil {
+		return
+	}
+	select {
+	case vm.notify <- struct{}{}:
+	default:
+	}
+}
+
+// WaitForEvent blocks until there is work to build a block from, or the VM
+// stops. Returning only on ctx.Done() would mean BuildBlock is never called and
+// the chain can never leave genesis.
 func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
-	// Block until context is cancelled - AIVM doesn't proactively build blocks
-	// CRITICAL: Must block here to avoid notification flood loop in chains/manager.go
-	<-ctx.Done()
-	return vmcore.Message{}, ctx.Err()
+	select {
+	case <-ctx.Done():
+		return vmcore.Message{}, ctx.Err()
+	case <-vm.notify:
+		return vmcore.Message{Type: vmcore.PendingTxs}, nil
+	}
 }
 
 // HealthCheck implements chain.ChainVM interface
