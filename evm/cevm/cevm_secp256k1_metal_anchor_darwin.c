@@ -4,6 +4,8 @@
 // Anchor for the secp256k1 Metal driver symbol. See cpp/ecrecover.cpp in
 // luxcpp/crypto for the dispatch logic that resolves this symbol via dlsym.
 
+//go:build cgo && lux_cevm_native && darwin
+
 #include <stddef.h>
 #include <stdint.h>
 
