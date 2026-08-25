@@ -11,7 +11,6 @@
 package mpcvm
 
 import (
-	"sort"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -20,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -151,9 +151,9 @@ type VM struct {
 	// Completed ceremonies awaiting inclusion in a block, and their staging
 	// order. Every participant stages the same operations, so whichever node
 	// proposes produces a block the others can verify.
-	inflight      map[string]*Operation
-	order         []string
-	buildRequests chan struct{}
+	inflight map[string]*Operation
+	order    []string
+	work     vmcore.Latch
 
 	// localMesh is the in-process ceremony transport used when the VM has no
 	// p2p sender (single-process dev and tests). Nil on a networked node.
@@ -210,7 +210,6 @@ func (vm *VM) Initialize(
 	vm.pendingBlocks = make(map[ids.ID]*Block)
 	vm.shares = make(map[string]*heldShare)
 	vm.inflight = make(map[string]*Operation)
-	vm.buildRequests = make(chan struct{}, 1)
 	vm.sessionRouters = make(map[string]*gossipRouter)
 	vm.pendingBySession = make(map[string][]*protocol.Message)
 	vm.dailySigningCount = make(map[string]uint64)
@@ -951,12 +950,7 @@ func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
 // completed ceremony never reaches a block unless some other chain happened to
 // wake the builder.
 func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
-	select {
-	case <-vm.buildRequests:
-		return vmcore.Message{Type: vmcore.PendingTxs}, nil
-	case <-ctx.Done():
-		return vmcore.Message{}, ctx.Err()
-	}
+	return vm.work.WaitForEvent(ctx)
 }
 
 // Helper methods

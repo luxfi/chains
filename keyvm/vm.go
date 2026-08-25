@@ -105,7 +105,7 @@ type VM struct {
 	versdb   *versiondb.Database
 	state    database.Database // == versdb; buffered writes commit per block
 	toEngine chan<- vmcore.Message
-	notify   chan struct{}
+	work     vmcore.Latch
 
 	networkID uint32
 	clock     mockable.Clock
@@ -157,7 +157,6 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	vm.versdb = versiondb.New(init.DB)
 	vm.state = vm.versdb
 	vm.toEngine = init.ToEngine
-	vm.notify = make(chan struct{}, 1)
 
 	if init.Runtime != nil {
 		if logger, ok := init.Runtime.Log.(log.Logger); ok {
@@ -470,21 +469,13 @@ func (vm *VM) SubmitTx(tx *Transaction) (ids.ID, error) {
 	vm.mempool = append(vm.mempool, tx)
 	vm.mempoolLock.Unlock()
 
-	select {
-	case vm.notify <- struct{}{}:
-	default:
-	}
+	vm.work.Signal()
 	return tx.ID(), nil
 }
 
 // WaitForEvent blocks until there are pending transactions or the VM stops.
 func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
-	select {
-	case <-ctx.Done():
-		return vmcore.Message{}, ctx.Err()
-	case <-vm.notify:
-		return vmcore.Message{Type: vmcore.PendingTxs}, nil
-	}
+	return vm.work.WaitForEvent(ctx)
 }
 
 // BuildBlock drains the mempool into a new block extending the last accepted
@@ -538,10 +529,7 @@ func (vm *VM) requeue(txs []*Transaction) {
 	vm.mempoolLock.Lock()
 	vm.mempool = append(txs, vm.mempool...)
 	vm.mempoolLock.Unlock()
-	select {
-	case vm.notify <- struct{}{}:
-	default:
-	}
+	vm.work.Signal()
 }
 
 // dropFromMempool removes accepted transactions from the mempool by ID.

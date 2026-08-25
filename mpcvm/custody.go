@@ -504,12 +504,8 @@ func (vm *VM) stage(op *Operation) {
 	vm.order = append(vm.order, op.CeremonyID)
 	vm.mu.Unlock()
 
-	// Tell the engine there is work. Non-blocking: a full channel means the
-	// engine already has a pending build notification, which is all this is.
-	select {
-	case vm.buildRequests <- struct{}{}:
-	default:
-	}
+	// Tell the engine there is work.
+	vm.work.Signal()
 }
 
 // drain returns the staged operations in staging order, ready for a block.
