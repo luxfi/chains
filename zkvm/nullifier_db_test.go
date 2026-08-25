@@ -4,6 +4,7 @@
 package zkvm
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/luxfi/database/memdb"
@@ -54,4 +55,55 @@ func TestSpentCountFollowsTheSet(t *testing.T) {
 	// counted as one.
 	require.Error(t, ndb.RemoveNullifier([]byte("never")))
 	require.Equal(t, uint64(1), ndb.GetNullifierCount())
+}
+
+// TestNullifierReadDoesNotWriteTheSet. GetNullifierHeight used to memoise what
+// it loaded while holding only the read lock, and a read lock promises every
+// other reader that nothing is changing — so two callers missing at once wrote
+// the same map at the same time, which is a runtime throw that takes the
+// process down rather than an error anyone can handle. Consensus and RPC both
+// sit on this path.
+func TestNullifierReadDoesNotWriteTheSet(t *testing.T) {
+	ndb, err := NewNullifierDB(memdb.New(), log.NoLog{})
+	require.NoError(t, err)
+	require.NoError(t, ndb.MarkNullifierSpent([]byte("n"), 4))
+
+	// A record on disk that the in-memory set does not know about is what a
+	// memoising read would fill in.
+	ndb.nullifierCache = map[string]uint64{}
+
+	var readers sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			height, err := ndb.GetNullifierHeight([]byte("n"))
+			switch {
+			case err != nil:
+				t.Errorf("read failed: %v", err)
+			case height != 4:
+				t.Errorf("read height %d, want 4", height)
+			}
+		}()
+	}
+	readers.Wait()
+
+	require.Empty(t, ndb.nullifierCache, "a read must not change the set it reads")
+}
+
+// TestShortRecordIsNotAHeight. Blocks are stored in the same database under
+// their raw id, so the nullifier prefix can turn up over a value that is not a
+// height. loadNullifiers already passes over anything that is not eight bytes;
+// the read path has to agree with it, or reading one of those is a panic where
+// a miss was meant.
+func TestShortRecordIsNotAHeight(t *testing.T) {
+	db := memdb.New()
+	require.NoError(t, db.Put(makeNullifierKey([]byte("n")), []byte{1}))
+
+	ndb, err := NewNullifierDB(db, log.NoLog{})
+	require.NoError(t, err)
+	require.Zero(t, ndb.GetNullifierCount())
+
+	_, err = ndb.GetNullifierHeight([]byte("n"))
+	require.ErrorContains(t, err, "not found")
 }
