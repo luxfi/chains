@@ -12,6 +12,7 @@ import (
 	"github.com/luxfi/chains/internal/bridgeattest"
 	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -535,21 +536,51 @@ func (vm *VM) LastAccepted(ctx context.Context) (ids.ID, error) {
 	return vm.lastAcceptedID, nil
 }
 
-// CreateHandlers implements the common.VM interface
+// CreateHandlers implements the common.VM interface. The bridge's API is the
+// JSON-RPC service in rpc.go — estimate a fee, submit a request, ask after one,
+// read the signer set. It was written and never served.
 func (vm *VM) CreateHandlers(ctx context.Context) (map[string]http.Handler, error) {
-	handlers := map[string]http.Handler{
-		"/bridge":     http.HandlerFunc(vm.handleBridgeRequest),
-		"/status":     http.HandlerFunc(vm.handleStatus),
-		"/validators": http.HandlerFunc(vm.handleValidators),
-	}
-	return handlers, nil
+	return vm.CreateRPCHandlers()
 }
 
-// HealthCheck implements the common.VM interface
+// readiness reports whether this node can do what it is configured to do, and
+// says what is missing when it cannot.
+func (vm *VM) readiness() (ready bool, reason string, chains int) {
+	vm.mu.RLock()
+	chains = len(vm.evmByChainID)
+	watching := vm.watcher != nil
+	vm.mu.RUnlock()
+
+	// No chains wired means this node is not a relayer, which is a
+	// configuration and not a fault: it validates like any other node and has
+	// nothing to release.
+	if chains == 0 {
+		return true, "healthy", 0
+	}
+	// A relayer needs a threshold key to attest with and has to be reading the
+	// chains it relays from. Answering healthy without either routes transfers
+	// at a node that cannot carry them.
+	switch {
+	case len(vm.mpcGroupPublicKey()) == 0:
+		return false, "no threshold signing key", chains
+	case !watching:
+		return false, "not watching for locks", chains
+	default:
+		return true, "healthy", chains
+	}
+}
+
+// HealthCheck implements the common.VM interface. Answering healthy whatever the
+// state is tells an operator nothing and routes traffic at a node that cannot
+// bridge.
 func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
+	ready, reason, chains := vm.readiness()
 	return chain.HealthResult{
-		Healthy: true,
-		Details: map[string]string{"status": "healthy"},
+		Healthy: ready,
+		Details: map[string]string{
+			"status": reason,
+			"chains": strconv.Itoa(chains),
+		},
 	}, nil
 }
 
@@ -683,27 +714,6 @@ func (vm *VM) getBlock(id ids.ID) (*Block, error) {
 }
 
 // HTTP handler methods
-
-func (vm *VM) handleBridgeRequest(w http.ResponseWriter, r *http.Request) {
-	// Handle bridge request
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status": "bridge request handler"}`))
-}
-
-func (vm *VM) handleStatus(w http.ResponseWriter, r *http.Request) {
-	// Handle status request
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status": "operational"}`))
-}
-
-func (vm *VM) handleValidators(w http.ResponseWriter, r *http.Request) {
-	// Handle validators request
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"validators": []}`))
-}
 
 // Genesis represents the genesis state
 type Genesis struct {

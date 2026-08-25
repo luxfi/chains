@@ -501,15 +501,19 @@ type HealthArgs struct{}
 type HealthReply struct {
 	Status   string `json:"status"`
 	MPCReady bool   `json:"mpcReady"`
+	Ready    bool   `json:"ready"`
+	Chains   int    `json:"chains"`
 }
 
 // Health answers bridge_health. Liveness probe used by daemons + load
 // balancers before routing traffic at this node.
 func (s *Service) Health(_ *http.Request, _ *HealthArgs, reply *HealthReply) error {
-	reply.Status = "healthy"
-	if s.vm != nil {
-		reply.MPCReady = len(s.vm.mpcGroupPublicKey()) > 0
+	if s.vm == nil {
+		reply.Status = "no vm"
+		return nil
 	}
+	reply.MPCReady = len(s.vm.mpcGroupPublicKey()) > 0
+	reply.Ready, reply.Status, reply.Chains = s.vm.readiness()
 	return nil
 }
 
