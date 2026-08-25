@@ -247,7 +247,7 @@ func (pv *ProofVerifier) verifyGroth16Proof(tx *Transaction) error {
 	// Get verifying key for circuit type
 	vkBytes, exists := pv.verifyingKeys[string(tx.Type)]
 	if !exists {
-		return errors.New("verifying key not found for circuit type")
+		return fmt.Errorf("zkvm: no verifying key for circuit %q", tx.Type)
 	}
 
 	// Verify public inputs match transaction data
@@ -280,7 +280,7 @@ func (pv *ProofVerifier) verifyPLONKProof(tx *Transaction) error {
 	// Get verifying key for circuit type
 	vkBytes, exists := pv.verifyingKeys[string(tx.Type)]
 	if !exists {
-		return errors.New("verifying key not found for circuit type")
+		return fmt.Errorf("zkvm: no verifying key for circuit %q", tx.Type)
 	}
 
 	// Verify public inputs
@@ -341,41 +341,32 @@ func (pv *ProofVerifier) verifyPublicInputs(tx *Transaction) error {
 	return nil
 }
 
-// loadVerifyingKeys loads verifying keys for different circuit types.
-// Real (non-dummy) keys come from ZConfig.VerifyingKeys when supplied;
-// otherwise all-zero dummy keys are installed (proof verification
-// disabled, fail-closed). After loading, checks whether keys are all
-// zeros (dummy). If so, sets dummyKeys=true which causes VerifyProof to
-// reject all proofs.
+// loadVerifyingKeys takes the verifying key for each circuit the config keys,
+// and installs nothing for the others.
+//
+// It used to install an all-zero key for an unkeyed circuit and then decide, for
+// the whole verifier at once, whether the keys were "dummy" — true only while
+// EVERY key was zero. So keying one circuit turned that protection off for the
+// rest, and their all-zero keys were then used as if real. That is the worst
+// direction for a rule to fail in: the more of a chain an operator configures,
+// the less of it is guarded. A key that is absent cannot be mistaken for one
+// that is present, so the placeholder is gone and the circuit is refused by
+// name at the lookup that already checks for it.
 func (pv *ProofVerifier) loadVerifyingKeys() error {
-	// Install a key per circuit type. If the config supplies a real key
-	// for that circuit, use it (copied so the verifier owns its bytes);
-	// otherwise install an all-zero dummy key.
 	for _, ct := range []TransactionType{
 		TransactionTypeTransfer,
 		TransactionTypeShield,
 		TransactionTypeUnshield,
 	} {
+		// Copied, so the verifier owns its bytes.
 		if vk, ok := pv.config.VerifyingKeys[string(ct)]; ok && len(vk) > 0 {
 			pv.verifyingKeys[string(ct)] = append([]byte(nil), vk...)
-			continue
 		}
-		pv.verifyingKeys[string(ct)] = make([]byte, 1024)
 	}
 
-	// Detect dummy (all-zero) verifying keys
-	pv.dummyKeys = true
-	for _, vk := range pv.verifyingKeys {
-		for _, b := range vk {
-			if b != 0 {
-				pv.dummyKeys = false
-				break
-			}
-		}
-		if !pv.dummyKeys {
-			break
-		}
-	}
+	// A verifier holding no key at all judges nothing, which is what the
+	// classical path checks before it starts.
+	pv.dummyKeys = len(pv.verifyingKeys) == 0
 
 	// Strict-PQ hard gate (Red H1). Loading a REAL (non-dummy) bn254
 	// verifying key on a strict-PQ chain is forbidden: such keys would
