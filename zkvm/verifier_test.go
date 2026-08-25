@@ -359,3 +359,34 @@ func TestKeyingOneCircuitDoesNotEnableTheOthers(t *testing.T) {
 		t.Fatalf("the refusal does not name the unkeyed circuit: %v", err)
 	}
 }
+
+// TestPLONKProofMustBeWholeAndNoMore. A short proof used to decode with
+// whichever evaluations were missing left at zero, so a truncated proof became a
+// well-formed one carrying values nobody sent. Trailing bytes are refused for
+// the reason they are refused everywhere else: bytes the format does not
+// describe are bytes two different proofs can differ in.
+func TestPLONKProofMustBeWholeAndNoMore(t *testing.T) {
+	whole := plonkFrame()
+	if len(whole) != plonkProofSize {
+		t.Fatalf("the test frame is %d bytes, want %d", len(whole), plonkProofSize)
+	}
+	if _, err := deserializePLONKProof(whole); err != nil {
+		t.Fatalf("a whole proof was refused: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{"missing every evaluation", whole[:9*64]},
+		{"missing the last evaluation", whole[:plonkProofSize-32]},
+		{"one byte short", whole[:plonkProofSize-1]},
+		{"one byte over", append(append([]byte(nil), whole...), 0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := deserializePLONKProof(tc.data); err == nil {
+				t.Fatalf("%d bytes decoded as a whole proof", len(tc.data))
+			}
+		})
+	}
+}
