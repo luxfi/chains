@@ -119,32 +119,85 @@ type Note struct {
 	Nullifier  []byte   `json:"nullifier"`  // Computed nullifier
 }
 
-// ComputeID computes the transaction ID
+// ComputeID is the transaction's identity: a hash over everything the
+// transaction means.
+//
+// Every variable-length field is written with its length first and every list
+// with its count. Concatenated raw, a byte could move from the end of one field
+// to the start of the next without the hash noticing — ["ab","c"] and ["a","bc"]
+// are the same bytes — and two transactions sharing an identity is what
+// consensus decides between blocks with.
+//
+// The signature is left out because it is made over this value. Including it
+// would be circular, and would let a second valid signature give a different
+// identity to a transaction moving the same value.
 func (tx *Transaction) ComputeID() ids.ID {
 	h := sha256.New()
+	num := func(v uint64) { binary.Write(h, binary.BigEndian, v) }
+	blob := func(b []byte) { num(uint64(len(b))); h.Write(b) }
+	count := func(n int) { num(uint64(n)) }
+	present := func(yes bool) {
+		if yes {
+			h.Write([]byte{1})
+			return
+		}
+		h.Write([]byte{0})
+	}
 
-	// Include transaction type and version
 	h.Write([]byte{byte(tx.Type), tx.Version})
 
-	// Include nullifiers
+	count(len(tx.TransparentInputs))
+	for _, in := range tx.TransparentInputs {
+		h.Write(in.TxID[:])
+		num(uint64(in.OutputIdx))
+		num(in.Amount)
+		blob(in.Address)
+	}
+
+	count(len(tx.TransparentOutputs))
+	for _, out := range tx.TransparentOutputs {
+		num(out.Amount)
+		h.Write(out.AssetID[:])
+		blob(out.Address)
+	}
+
+	count(len(tx.Nullifiers))
 	for _, nullifier := range tx.Nullifiers {
-		h.Write(nullifier)
+		blob(nullifier)
 	}
 
-	// Include output commitments
+	count(len(tx.Outputs))
 	for _, output := range tx.Outputs {
-		h.Write(output.Commitment)
+		blob(output.Commitment)
+		blob(output.EncryptedNote)
+		blob(output.EphemeralPubKey)
+		blob(output.OutputProof)
 	}
 
-	// Include proof
+	present(tx.Proof != nil)
 	if tx.Proof != nil {
-		h.Write([]byte(tx.Proof.ProofType))
-		h.Write(tx.Proof.ProofData)
+		blob([]byte(tx.Proof.ProofType))
+		blob(tx.Proof.ProofData)
+		count(len(tx.Proof.PublicInputs))
+		for _, input := range tx.Proof.PublicInputs {
+			blob(input)
+		}
 	}
 
-	// Include fee and expiry
-	binary.Write(h, binary.BigEndian, tx.Fee)
-	binary.Write(h, binary.BigEndian, tx.Expiry)
+	present(tx.FHEData != nil)
+	if tx.FHEData != nil {
+		count(len(tx.FHEData.EncryptedInputs))
+		for _, input := range tx.FHEData.EncryptedInputs {
+			blob(input)
+		}
+		blob([]byte(tx.FHEData.CircuitID))
+		blob(tx.FHEData.EncryptedResult)
+		blob(tx.FHEData.ComputationProof)
+	}
+
+	num(tx.Fee)
+	num(tx.Expiry)
+	blob(tx.Memo)
 
 	return ids.ID(h.Sum(nil))
 }
