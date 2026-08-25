@@ -253,11 +253,23 @@ func TestVMRevokeCredential(t *testing.T) {
 	require.False(valid)
 }
 
+// withPendingCredential gives a VM one credential to build a block from, which
+// a block now needs: an empty one says nothing and still has to be voted on.
+func withPendingCredential(t *testing.T, vm *VM) {
+	t.Helper()
+	subject, err := vm.CreateIdentity([]byte("subject-key"), nil)
+	require.NoError(t, err)
+	_, err = vm.IssueCredential(subject.ID, subject.ID, []string{"test"},
+		map[string]interface{}{"claim": "value"}, time.Hour)
+	require.NoError(t, err)
+}
+
 func TestVMBuildBlock(t *testing.T) {
 	require := require.New(t)
 
 	vm := setupTestVM(t)
 	defer vm.Shutdown(context.Background())
+	withPendingCredential(t, vm)
 
 	// Build a block
 	blk, err := vm.BuildBlock(context.Background())
@@ -276,6 +288,7 @@ func TestVMParseBlock(t *testing.T) {
 
 	vm := setupTestVM(t)
 	defer vm.Shutdown(context.Background())
+	withPendingCredential(t, vm)
 
 	blk, err := vm.BuildBlock(context.Background())
 	require.NoError(err)
@@ -292,6 +305,7 @@ func TestBlockVerifyAcceptReject(t *testing.T) {
 
 	vm := setupTestVM(t)
 	defer vm.Shutdown(context.Background())
+	withPendingCredential(t, vm)
 
 	blk, err := vm.BuildBlock(context.Background())
 	require.NoError(err)
