@@ -632,9 +632,12 @@ func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, er
 // WaitForEvent blocks until an event triggers block building. Implements chain.ChainVM.
 // CRITICAL: must block on ctx.Done() to avoid the notification flood loop in
 // node/chains/manager.go (matches the relayvm contract).
+// WaitForEvent blocks until there is a transaction to build a block from, or
+// the VM stops. Waiting only on the context would mean BuildBlock is never
+// called and the chain never leaves genesis, however many transactions the pool
+// has accepted.
 func (vm *VM) WaitForEvent(ctx context.Context) (luxvm.Message, error) {
-	<-ctx.Done()
-	return luxvm.Message{}, ctx.Err()
+	return vm.txPool.WaitForEvent(ctx)
 }
 
 // GetQuasarBridge returns the Quasar hybrid consensus bridge

@@ -484,11 +484,12 @@ func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
 	return NewRPCHandler(vm), nil
 }
 
-// WaitForEvent blocks until an event occurs that should trigger block building
+// WaitForEvent blocks until there is a transaction to build a block from, or
+// the VM stops. Waiting only on the context would mean BuildBlock is never
+// called and the chain never leaves genesis, however many transactions the
+// mempool has accepted.
 func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
-	// CRITICAL: Must block here to avoid notification flood loop in chains/manager.go
-	<-ctx.Done()
-	return vmcore.Message{}, ctx.Err()
+	return vm.mempool.WaitForEvent(ctx)
 }
 
 // verifyTransaction verifies a transaction including ZK proofs

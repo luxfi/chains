@@ -242,11 +242,10 @@ type VM struct {
 
 	// Consensus
 	toEngine chan<- vmcore.Message
-	// notify wakes WaitForEvent when work arrives. Depth 1 and sent
-	// non-blocking, so a burst of submissions coalesces into one build signal
-	// rather than flooding the engine — the concern that WaitForEvent used to
-	// answer by never returning at all.
-	notify chan struct{}
+	// work wakes WaitForEvent when there is something to build. A burst of
+	// submissions coalesces into one signal rather than flooding the engine —
+	// the concern WaitForEvent used to answer by never returning at all.
+	work vmcore.Latch
 
 	// Logging
 	log log.Logger
@@ -313,7 +312,6 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	}
 
 	vm.pendingBlocks = make(map[ids.ID]*Block)
-	vm.notify = make(chan struct{}, 1)
 
 	// Parse configuration
 	if len(init.Config) > 0 {
@@ -519,7 +517,7 @@ func (vm *VM) SubmitTask(task *aivm.Task) error {
 	if err != nil {
 		return err
 	}
-	vm.signalWork()
+	vm.work.Signal()
 	return nil
 }
 
@@ -543,7 +541,7 @@ func (vm *VM) SubmitResult(result *aivm.TaskResult) error {
 	if err != nil {
 		return err
 	}
-	vm.signalWork()
+	vm.work.Signal()
 	return nil
 }
 
@@ -734,28 +732,11 @@ func (vm *VM) Version(ctx context.Context) (string, error) {
 	return Version.String(), nil
 }
 
-// signalWork wakes a waiting WaitForEvent. Non-blocking: the channel has depth
-// 1, so concurrent submissions collapse into a single pending build signal.
-func (vm *VM) signalWork() {
-	if vm.notify == nil {
-		return
-	}
-	select {
-	case vm.notify <- struct{}{}:
-	default:
-	}
-}
-
 // WaitForEvent blocks until there is work to build a block from, or the VM
 // stops. Returning only on ctx.Done() would mean BuildBlock is never called and
 // the chain can never leave genesis.
 func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
-	select {
-	case <-ctx.Done():
-		return vmcore.Message{}, ctx.Err()
-	case <-vm.notify:
-		return vmcore.Message{Type: vmcore.PendingTxs}, nil
-	}
+	return vm.work.WaitForEvent(ctx)
 }
 
 // HealthCheck implements chain.ChainVM interface
