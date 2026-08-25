@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"math/big"
 	"sync"
 
@@ -697,25 +696,6 @@ func deserializeVerifyingKey(data []byte) (*Groth16VerifyingKey, error) {
 	return vk, nil
 }
 
-// bytesReader is a simple io.Reader implementation for byte slices
-type bytesReader struct {
-	data []byte
-	pos  int
-}
-
-func newBytesReader(data []byte) *bytesReader {
-	return &bytesReader{data: data}
-}
-
-func (br *bytesReader) Read(p []byte) (n int, err error) {
-	if br.pos >= len(br.data) {
-		return 0, io.EOF
-	}
-	n = copy(p, br.data[br.pos:])
-	br.pos += n
-	return n, nil
-}
-
 // ============================================================================
 // PLONK Verification Implementation
 // ============================================================================
@@ -822,12 +802,18 @@ func verifyPLONKPairing(_ *PLONKProof, _ *PLONKVerifyingKey, _ []fr.Element) err
 	return errPLONKIncomplete
 }
 
-// deserializePLONKProof deserializes a PLONK proof from bytes
+// plonkProofSize is 9 G1 commitments and the 5 evaluations that go with them.
+const plonkProofSize = 9*64 + 5*32
+
+// deserializePLONKProof reads a PLONK proof, which is exactly plonkProofSize
+// bytes. It used to take anything from 544 bytes up and leave whichever
+// evaluations were missing at zero, so a truncated proof decoded as a
+// well-formed one carrying values nobody sent. Trailing bytes are refused for
+// the same reason they are refused elsewhere: bytes the format does not
+// describe are bytes two different proofs can differ in.
 func deserializePLONKProof(data []byte) (*PLONKProof, error) {
-	// Expected format: 9 G1 points (64 bytes each) + 5 scalars (32 bytes each)
-	// Total: 9*64 + 5*32 = 576 + 160 = 736 bytes
-	if len(data) < 544 {
-		return nil, errors.New("PLONK proof data too short")
+	if len(data) != plonkProofSize {
+		return nil, fmt.Errorf("PLONK proof is %d bytes, want %d", len(data), plonkProofSize)
 	}
 
 	proof := &PLONKProof{}
@@ -841,9 +827,6 @@ func deserializePLONKProof(data []byte) (*PLONKProof, error) {
 	}
 
 	for i, pt := range points {
-		if offset+64 > len(data) {
-			return nil, fmt.Errorf("insufficient data for G1 point %d", i)
-		}
 		if err := pt.Unmarshal(data[offset : offset+64]); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal G1 point %d: %w", i, err)
 		}
@@ -853,17 +836,10 @@ func deserializePLONKProof(data []byte) (*PLONKProof, error) {
 		offset += 64
 	}
 
-	// Unmarshal 5 scalar evaluations if present
-	scalars := []*fr.Element{
+	for _, sc := range []*fr.Element{
 		&proof.AEval, &proof.BEval, &proof.CEval, &proof.SigmaEval, &proof.ZEval,
-	}
-	for i, sc := range scalars {
-		if offset+32 > len(data) {
-			// Scalars are optional in some proof formats
-			break
-		}
+	} {
 		sc.SetBytes(data[offset : offset+32])
-		_ = i // Used for debugging if needed
 		offset += 32
 	}
 
