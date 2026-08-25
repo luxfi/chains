@@ -219,6 +219,11 @@ type VM struct {
 	// drives broadcasts off the consensus path.
 	attestClient AttestationClient
 	releaser     *releaser
+	watcher      *watcher
+
+	// work tells consensus a block can be built. The watcher signals it when a
+	// source chain reports a lock.
+	work vmcore.Latch
 
 	// Block management
 	preferred      ids.ID
@@ -644,13 +649,11 @@ func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
 	return mux, nil
 }
 
-// WaitForEvent blocks until an event occurs that should trigger block building
+// WaitForEvent blocks until there is a bridge request to build a block from, or
+// the VM stops. Waiting only on the context would mean BuildBlock is never
+// called, so no lock the watcher found would ever reach a block.
 func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
-	// Block until context is cancelled
-	// In production, this would wait for bridge requests, etc.
-	// CRITICAL: Must block here to avoid notification flood loop in chains/manager.go
-	<-ctx.Done()
-	return vmcore.Message{}, ctx.Err()
+	return vm.work.WaitForEvent(ctx)
 }
 
 // Helper methods
