@@ -4,6 +4,7 @@
 package quantumvm
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"github.com/luxfi/chains/quantumvm/quantum"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
+	luxvm "github.com/luxfi/vm"
 )
 
 // Transaction represents a QVM transaction
@@ -94,6 +96,10 @@ type TransactionPool struct {
 	mu        sync.RWMutex
 	closed    bool
 	closeChan chan struct{}
+
+	// work tells consensus a block can be built. The pool is what learns that
+	// first, whichever path the transaction arrived by.
+	work luxvm.Latch
 }
 
 // NewTransactionPool creates a new transaction pool
@@ -134,7 +140,16 @@ func (p *TransactionPool) AddTransaction(tx Transaction) error {
 	p.pending[txID] = tx
 	p.queue = append(p.queue, tx)
 
+	// Consensus builds nothing until it is told there is something to build.
+	p.work.Signal()
+
 	return nil
+}
+
+// WaitForEvent blocks until there is a transaction to build a block from, or
+// the caller gives up.
+func (p *TransactionPool) WaitForEvent(ctx context.Context) (luxvm.Message, error) {
+	return p.work.WaitForEvent(ctx)
 }
 
 // RemoveTransaction removes a transaction from the pool

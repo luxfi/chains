@@ -4,6 +4,7 @@
 package quantumvm
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -65,5 +66,40 @@ func TestQuantumVM_IssueTx_RejectsAllUserTx(t *testing.T) {
 		if err := v.IssueTx(tx); !errors.Is(err, fee.ErrChainAcceptsNoUserTxs) {
 			t.Fatalf("IssueTx(fee=%d) = %v, want ErrChainAcceptsNoUserTxs", paid, err)
 		}
+	}
+}
+
+// TestPoolTellsConsensusThereIsWork: a transaction the pool accepted is worth
+// nothing until consensus is told about it. WaitForEvent used to wait only on
+// the context, so it never returned, BuildBlock was never called, and the chain
+// could not leave genesis however many transactions arrived.
+func TestPoolTellsConsensusThereIsWork(t *testing.T) {
+	pool := NewTransactionPool(8, 8, log.NewNoOpLogger())
+
+	// Nothing has arrived, so nothing should be claimed.
+	idle, cancelIdle := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelIdle()
+	if _, err := pool.WaitForEvent(idle); err == nil {
+		t.Fatal("an empty pool reported work to build")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	woke := make(chan error, 1)
+	go func() {
+		_, err := pool.WaitForEvent(ctx)
+		woke <- err
+	}()
+
+	if err := pool.AddTransaction(&feeTestTx{id: ids.GenerateTestID(), fee: 1}); err != nil {
+		t.Fatalf("add transaction: %v", err)
+	}
+	select {
+	case err := <-woke:
+		if err != nil {
+			t.Fatalf("waiting for work: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a transaction was accepted and consensus was never told; this chain cannot produce a block")
 	}
 }

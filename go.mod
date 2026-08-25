@@ -9,7 +9,7 @@ require (
 	github.com/holiman/uint256 v1.3.2
 	github.com/luxfi/accel v1.3.2
 	github.com/luxfi/ai v0.1.0
-	github.com/luxfi/api v1.1.6
+	github.com/luxfi/api v1.1.9
 	github.com/luxfi/consensus v1.36.63
 	github.com/luxfi/constants v1.6.2
 	github.com/luxfi/crypto v1.20.5
@@ -33,7 +33,7 @@ require (
 	github.com/luxfi/timer v1.1.1
 	github.com/luxfi/validators v1.3.1
 	github.com/luxfi/version v1.0.1
-	github.com/luxfi/vm v1.3.12
+	github.com/luxfi/vm v1.3.16
 	github.com/luxfi/warp v1.24.1
 	github.com/luxfi/zap v1.2.6
 	github.com/stretchr/testify v1.11.1

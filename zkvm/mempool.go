@@ -5,6 +5,7 @@ package zkvm
 
 import (
 	"container/heap"
+	"context"
 	"errors"
 	"sync"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/luxfi/log"
 
 	"github.com/luxfi/ids"
+	vmcore "github.com/luxfi/vm"
 )
 
 // Mempool manages pending transactions
@@ -25,6 +27,10 @@ type Mempool struct {
 
 	// Nullifier tracking to prevent conflicts
 	nullifiers map[string]ids.ID // nullifier -> txID
+
+	// work tells consensus a block can be built. The mempool is what learns
+	// that first, whichever path the transaction arrived by.
+	work vmcore.Latch
 
 	mu sync.RWMutex
 }
@@ -104,7 +110,16 @@ func (mp *Mempool) AddTransaction(tx *Transaction) error {
 		log.Int("mempoolSize", len(mp.txs)),
 	)
 
+	// Consensus builds nothing until it is told there is something to build.
+	mp.work.Signal()
+
 	return nil
+}
+
+// WaitForEvent blocks until there is a transaction to build a block from, or
+// the caller gives up.
+func (mp *Mempool) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
+	return mp.work.WaitForEvent(ctx)
 }
 
 // RemoveTransaction removes a transaction from the mempool
