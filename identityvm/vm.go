@@ -57,6 +57,7 @@ var (
 	errCredentialRevoked = errors.New("credential revoked")
 	errCredentialExpired = errors.New("credential expired")
 	errNotIssuer         = errors.New("not authorized issuer")
+	errNothingToBuild    = errors.New("no credentials to build a block from")
 	errInvalidProof      = errors.New("invalid zero-knowledge proof")
 )
 
@@ -149,6 +150,10 @@ type VM struct {
 	revocations   map[ids.ID]*RevocationEntry
 	pendingCreds  []*Credential
 	pendingBlocks map[ids.ID]*Block
+
+	// work tells consensus a block can be built, which is what issuing a
+	// credential produces.
+	work vmcore.Latch
 
 	// Consensus
 	lastAccepted   *Block
@@ -364,6 +369,11 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 
+	// A block with nothing in it says nothing and still has to be voted on.
+	if len(vm.pendingCreds) == 0 {
+		return nil, errNothingToBuild
+	}
+
 	// Copy pending credentials to avoid slice mutation issues during Accept
 	creds := make([]*Credential, len(vm.pendingCreds))
 	copy(creds, vm.pendingCreds)
@@ -553,6 +563,9 @@ func (vm *VM) IssueCredential(issuerID, subjectID ids.ID, credType []string, cla
 	vm.credentials[credID] = cred
 	vm.pendingCreds = append(vm.pendingCreds, cred)
 
+	// Consensus builds nothing until it is told there is something to build.
+	vm.work.Signal()
+
 	return cred, nil
 }
 
@@ -705,12 +718,11 @@ func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, er
 }
 
 // WaitForEvent implements chain.ChainVM
+// WaitForEvent blocks until there is a credential to build a block from, or the
+// VM stops. Waiting only on the context would mean BuildBlock is never called
+// and the chain never leaves genesis, however many credentials are issued.
 func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
-	// Block until context is cancelled
-	// In production, this would wait for credential requests, etc.
-	// CRITICAL: Must block here to avoid notification flood loop in chains/manager.go
-	<-ctx.Done()
-	return vmcore.Message{}, ctx.Err()
+	return vm.work.WaitForEvent(ctx)
 }
 
 // ======== Issuer Management ========
