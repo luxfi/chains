@@ -249,17 +249,17 @@ type BridgeRequest struct {
 	// the canonical attestation digest binds; SourceChain / DestChain remain the
 	// human labels used to key clients. Nonce is the per-route replay guard
 	// assigned by the source lock and enforced by the destination gateway.
-	SrcChainID    uint32    `json:"srcChainId"`
-	DstChainID    uint32    `json:"dstChainId"`
-	Nonce         uint64    `json:"nonce"`
-	Asset         ids.ID    `json:"asset"`
-	Amount        uint64    `json:"amount"`
-	Recipient     []byte    `json:"recipient"`
-	SourceTxID    ids.ID    `json:"sourceTxId"`
-	Confirmations uint32    `json:"confirmations"`
-	Status        string    `json:"status"` // pending, signing, completed, failed
-	MPCSignatures [][]byte  `json:"mpcSignatures"`
-	CreatedAt     time.Time `json:"createdAt"`
+	SrcChainID    uint32              `json:"srcChainId"`
+	DstChainID    uint32              `json:"dstChainId"`
+	Nonce         uint64              `json:"nonce"`
+	Asset         ids.ID              `json:"asset"`
+	Amount        uint64              `json:"amount"`
+	Recipient     []byte              `json:"recipient"`
+	SourceTxID    ids.ID              `json:"sourceTxId"`
+	Confirmations uint32              `json:"confirmations"`
+	Status        BridgeRequestStatus `json:"status"`
+	MPCSignatures [][]byte            `json:"mpcSignatures"`
+	CreatedAt     time.Time           `json:"createdAt"`
 }
 
 // ChainClient interface for interacting with different chains

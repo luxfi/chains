@@ -39,6 +39,14 @@ var (
 	}
 
 	errNotImplemented = errors.New("not implemented")
+
+	// errReadOnlyChain is what BuildBlock answers. G-Chain indexes what other
+	// chains have already agreed, so it holds no state of its own to agree on
+	// and never advances past genesis. That is the design, not a gap: a block
+	// here would commit a query result, which is derived from state a peer can
+	// recompute, or a schema, which is local configuration. Neither is
+	// something the network has to vote on.
+	errReadOnlyChain = errors.New("graphvm: this chain indexes other chains and builds no blocks")
 )
 
 // GConfig contains VM configuration
@@ -263,11 +271,12 @@ func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
 	return &apiHandler{vm: vm}, nil
 }
 
-// WaitForEvent blocks until an event occurs that should trigger block building
+// WaitForEvent waits out the context and reports nothing, because this chain
+// has nothing to report: it never builds a block, so there is never news of one
+// to send. A latch here would wake a builder that declines, which is why this
+// is not the frozen WaitForEvent the other chains had — those had work and no
+// way to say so. See errReadOnlyChain.
 func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
-	// Block until context is cancelled
-	// In production, this would wait for queries/schema updates in queue
-	// CRITICAL: Must block here to avoid notification flood loop in chains/manager.go
 	<-ctx.Done()
 	return vmcore.Message{}, ctx.Err()
 }
@@ -342,9 +351,10 @@ func (vm *VM) CrossChainResponse(ctx context.Context, chainID ids.ID, requestID 
 	return nil
 }
 
-// BuildBlock implements the chain.ChainVM interface
+// BuildBlock implements the chain.ChainVM interface, by declining. See
+// errReadOnlyChain.
 func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
-	return nil, errNotImplemented
+	return nil, errReadOnlyChain
 }
 
 // ParseBlock implements the chain.ChainVM interface. It decodes the canonical
