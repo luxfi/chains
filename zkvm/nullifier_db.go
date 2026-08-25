@@ -104,7 +104,15 @@ func (ndb *NullifierDB) IsNullifierSpent(nullifier []byte) bool {
 	return err == nil
 }
 
-// GetNullifierHeight returns the height when a nullifier was spent
+// GetNullifierHeight returns the height when a nullifier was spent.
+//
+// A miss falls through to the records and returns what it finds without
+// memoising it. Memoising here would be a write on a path that holds only the
+// read lock, and a read lock promises every other reader that nothing is
+// changing: two callers missing at once would write the same map at the same
+// time, which is a runtime throw, not a returned error. The write lock is not
+// the answer either — it would serialise every reader of a path consensus and
+// RPC both sit on, to save a lookup the set already answers.
 func (ndb *NullifierDB) GetNullifierHeight(nullifier []byte) (uint64, error) {
 	ndb.mu.RLock()
 	defer ndb.mu.RUnlock()
@@ -119,16 +127,11 @@ func (ndb *NullifierDB) GetNullifierHeight(nullifier []byte) (uint64, error) {
 	// Load from database
 	key := makeNullifierKey(nullifier)
 	heightBytes, err := ndb.db.Get(key)
-	if err != nil {
+	if err != nil || len(heightBytes) != 8 {
 		return 0, errors.New("nullifier not found")
 	}
 
-	height := binary.BigEndian.Uint64(heightBytes)
-
-	// Update cache
-	ndb.nullifierCache[nullifierStr] = height
-
-	return height, nil
+	return binary.BigEndian.Uint64(heightBytes), nil
 }
 
 // GetNullifiersByHeight returns all nullifiers spent at a specific height
