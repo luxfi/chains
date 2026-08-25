@@ -807,90 +807,28 @@ func (pv *ProofVerifier) verifyPLONKWithGnark(proof *ZKProof, vkBytes []byte) er
 	return nil
 }
 
-// verifyPLONKPairing performs the PLONK pairing check
-// Verifies: e([W_z]_1 + u·[W_{zw}]_1, [x]_2) = e([W_z]_1·z + u·[W_{zw}]_1·(zω) + [F]_1 - [E]_1, [1]_2)
-func verifyPLONKPairing(proof *PLONKProof, vk *PLONKVerifyingKey, publicInputs []fr.Element) error {
-	// Compute Fiat-Shamir challenge (simplified transcript)
-	transcript := sha256.New()
-	transcript.Write(proof.LCommit.Marshal())
-	transcript.Write(proof.RCommit.Marshal())
-	transcript.Write(proof.OCommit.Marshal())
+// errPLONKIncomplete says why a PLONK proof is never accepted here.
+//
+// What stood in this place checked e(Wz + u·Wzw, [α]₂) = e(z·Wz + u·zω·Wzw, [1]₂)
+// and nothing else. It computed the public-input polynomial at the challenge
+// point and threw the value away, and it never read the selector, permutation,
+// quotient or evaluation commitments — so it related the two opening proofs to
+// each other and said nothing about the statement being proved. A proof bound to
+// no statement is a proof of anything.
+//
+// The precompile at 0x81 reached the same conclusion about its own copy and
+// fails closed for it. This is the same rule at the second door: refusing costs
+// nothing that works today, because an honest prover's proof does not satisfy
+// that equation either.
+var errPLONKIncomplete = errors.New(
+	"plonk: the verification equation is not implemented — failing closed rather than " +
+		"binding a proof to nothing; use the STARK/FRI verifier on strict-PQ chains")
 
-	transcriptState := transcript.Sum(nil)
-	var alpha, beta, gamma, z fr.Element
-	alphaHash := sha256.Sum256(append(transcriptState, []byte("alpha")...))
-	alpha.SetBytes(alphaHash[:])
-	betaHash := sha256.Sum256(append(transcriptState, []byte("beta")...))
-	beta.SetBytes(betaHash[:])
-	gammaHash := sha256.Sum256(append(transcriptState, []byte("gamma")...))
-	gamma.SetBytes(gammaHash[:])
-	zHash := sha256.Sum256(append(transcriptState, []byte("zeta")...))
-	z.SetBytes(zHash[:])
-
-	// Compute evaluation of public input polynomial at z
-	var piZ fr.Element
-	var zPow fr.Element
-	zPow.SetOne()
-	for _, pi := range publicInputs {
-		var term fr.Element
-		term.Mul(&pi, &zPow)
-		piZ.Add(&piZ, &term)
-		zPow.Mul(&zPow, &z)
-	}
-
-	// Compute linearization polynomial evaluation
-	// r(z) = a(z)·b(z)·qM(X) + a(z)·qL(X) + b(z)·qR(X) + c(z)·qO(X) + PI(z) + qC(X)
-	//       + alpha·[(a(z)+beta·z+gamma)·(b(z)+beta·k1·z+gamma)·(c(z)+beta·k2·z+gamma)·z(X)
-	//       - (a(z)+beta·S1(z)+gamma)·(b(z)+beta·S2(z)+gamma)·beta·S3(X)·z(zw)]
-	//       + alpha^2·[(z(X)-1)·L1(z)]
-
-	// For the pairing check, compute:
-	// [D]_1 = [F]_1 - e·[1]_1
-	// where [F]_1 is the batched opening commitment and e is the batched evaluation
-
-	// Compute separation challenge u from the transcript
-	transcript.Write(proof.WzOpening.Marshal())
-	uBytes := transcript.Sum(nil)
-	var u fr.Element
-	u.SetBytes(uBytes[:32])
-
-	// Compute: [W_z]_1 + u·[W_{zw}]_1
-	var scalar big.Int
-	var leftG1 bn254.G1Affine
-	var uWzw bn254.G1Affine
-	uWzw.ScalarMultiplication(&proof.WzwOpening, u.BigInt(&scalar))
-	leftG1.Add(&proof.WzOpening, &uWzw)
-
-	// Compute: z·[W_z]_1 + u·(zω)·[W_{zw}]_1
-	var zOmega fr.Element
-	zOmega.Mul(&z, &vk.Omega)
-
-	var zWz, uzwWzw bn254.G1Affine
-	zWz.ScalarMultiplication(&proof.WzOpening, z.BigInt(&scalar))
-	uzwWzw.ScalarMultiplication(&proof.WzwOpening, zOmega.BigInt(&scalar))
-	uzwWzw.ScalarMultiplication(&uzwWzw, u.BigInt(&scalar))
-
-	var rightG1 bn254.G1Affine
-	rightG1.Add(&zWz, &uzwWzw)
-
-	// Perform pairing check: e([left]_1, [x]_2) = e([right]_1, [1]_2)
-	// Rearranged: e([left]_1, [x]_2) · e(-[right]_1, [1]_2) = 1
-	var negRightG1 bn254.G1Affine
-	negRightG1.Neg(&rightG1)
-
-	pairingCheck, err := bn254.PairingCheck(
-		[]bn254.G1Affine{leftG1, negRightG1},
-		[]bn254.G2Affine{vk.G2Alpha, vk.G2},
-	)
-	if err != nil {
-		return fmt.Errorf("pairing computation failed: %w", err)
-	}
-
-	if !pairingCheck {
-		return errors.New("PLONK pairing check failed: proof is invalid")
-	}
-
-	return nil
+// verifyPLONKPairing refuses every proof. The decoding above it still runs, so a
+// caller can tell a malformed proof from one this will not judge, and there is
+// no path through here that returns nil.
+func verifyPLONKPairing(_ *PLONKProof, _ *PLONKVerifyingKey, _ []fr.Element) error {
+	return errPLONKIncomplete
 }
 
 // deserializePLONKProof deserializes a PLONK proof from bytes

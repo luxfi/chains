@@ -5,6 +5,7 @@ package zkvm
 
 import (
 	"encoding/binary"
+	"errors"
 	"math/big"
 	"strings"
 	"testing"
@@ -218,7 +219,7 @@ func TestGroth16ReachesItsPairing(t *testing.T) {
 
 // TestPLONKReachesItsPairing is the same property for the other classical
 // system a non-strict chain may be configured with.
-func TestPLONKReachesItsPairing(t *testing.T) {
+func TestPLONKIsRefusedForTheStatedReason(t *testing.T) {
 	pv := keyedVerifier(t, "plonk", map[string][]byte{
 		string(TransactionTypeTransfer): plonkKey(),
 	})
@@ -251,8 +252,12 @@ func TestPLONKReachesItsPairing(t *testing.T) {
 		err = pv.VerifyTransactionProof(tx)
 	}()
 
-	if err == nil || !strings.Contains(err.Error(), "PLONK") {
-		t.Fatalf("expected a PLONK verdict, got: %v", err)
+	// The verification equation is not implemented, so every PLONK proof is
+	// refused rather than bound to nothing. Pin the refusal to that reason: a
+	// decode failure, a panic, or any other error would also be non-nil, and
+	// none of them would mean what this test is named for.
+	if !errors.Is(err, errPLONKIncomplete) {
+		t.Fatalf("a PLONK proof must be refused because the equation is not implemented, got: %v", err)
 	}
 }
 
