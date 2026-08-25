@@ -411,12 +411,6 @@ func TestRegressionL02_LoadNullifiersPopulatesCache(t *testing.T) {
 	if err := db.Put(key, heightBytes); err != nil {
 		t.Fatalf("db.Put: %v", err)
 	}
-	countBytes := make([]byte, 8)
-	countBytes[7] = 1
-	if err := db.Put([]byte(nullifierCountKey), countBytes); err != nil {
-		t.Fatalf("db.Put count: %v", err)
-	}
-
 	// Construct NullifierDB -- loadNullifiers runs during construction
 	ndb, err := NewNullifierDB(db, log.NoLog{})
 	if err != nil {

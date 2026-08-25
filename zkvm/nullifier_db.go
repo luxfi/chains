@@ -16,7 +16,6 @@ import (
 const (
 	// Database prefixes
 	nullifierPrefix    = 0x20
-	nullifierCountKey  = "nullifier_count"
 	nullifierHeightKey = "nullifier_height_"
 )
 
@@ -25,9 +24,10 @@ type NullifierDB struct {
 	db  database.Database
 	log log.Logger
 
-	// Caches
+	// Caches. Every nullifier record is loaded at startup and nullifiers are
+	// never pruned, so this is the whole set, not a sample of it — which is why
+	// the count is read off it rather than kept beside it.
 	nullifierCache map[string]uint64 // nullifier -> height when spent
-	nullifierCount uint64
 
 	// Indexes
 	heightIndex map[uint64][]string // height -> nullifiers
@@ -42,16 +42,6 @@ func NewNullifierDB(db database.Database, log log.Logger) (*NullifierDB, error) 
 		log:            log,
 		nullifierCache: make(map[string]uint64),
 		heightIndex:    make(map[uint64][]string),
-	}
-
-	// Load nullifier count
-	countBytes, err := db.Get([]byte(nullifierCountKey))
-	if err == database.ErrNotFound {
-		ndb.nullifierCount = 0
-	} else if err != nil {
-		return nil, err
-	} else {
-		ndb.nullifierCount = binary.BigEndian.Uint64(countBytes)
 	}
 
 	if err := ndb.loadNullifiers(); err != nil {
@@ -88,17 +78,9 @@ func (ndb *NullifierDB) MarkNullifierSpent(nullifier []byte, height uint64) erro
 	// Update height index
 	ndb.heightIndex[height] = append(ndb.heightIndex[height], nullifierStr)
 
-	// Update count
-	ndb.nullifierCount++
-	countBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(countBytes, ndb.nullifierCount)
-	if err := ndb.db.Put([]byte(nullifierCountKey), countBytes); err != nil {
-		return err
-	}
-
 	ndb.log.Debug("Marked nullifier as spent",
 		log.Uint64("height", height),
-		log.Uint64("nullifierCount", ndb.nullifierCount),
+		log.Int("nullifiers", len(ndb.nullifierCache)),
 	)
 
 	return nil
@@ -167,11 +149,17 @@ func (ndb *NullifierDB) GetNullifiersByHeight(height uint64) [][]byte {
 	return nullifiers
 }
 
-// GetNullifierCount returns the total number of spent nullifiers
+// GetNullifierCount returns the number of spent nullifiers.
+//
+// It counts the set rather than reading a running total kept beside it. A total
+// is a second write, and a node that dies between the two comes back with a
+// number that disagrees with its own records — from which one removal drives an
+// unsigned counter below zero and reports 1.8e19 spent notes forever. Counting
+// the set cannot disagree with the set.
 func (ndb *NullifierDB) GetNullifierCount() uint64 {
 	ndb.mu.RLock()
 	defer ndb.mu.RUnlock()
-	return ndb.nullifierCount
+	return uint64(len(ndb.nullifierCache))
 }
 
 // RemoveNullifier removes a nullifier (used for reorg)
@@ -210,14 +198,6 @@ func (ndb *NullifierDB) RemoveNullifier(nullifier []byte) error {
 				break
 			}
 		}
-	}
-
-	// Update count
-	ndb.nullifierCount--
-	countBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(countBytes, ndb.nullifierCount)
-	if err := ndb.db.Put([]byte(nullifierCountKey), countBytes); err != nil {
-		return err
 	}
 
 	return nil
