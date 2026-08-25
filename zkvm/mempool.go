@@ -40,7 +40,6 @@ type MempoolTx struct {
 	tx         *Transaction
 	addedAt    time.Time
 	feePerByte uint64
-	priority   int // For heap ordering
 }
 
 // NewMempool creates a new mempool
@@ -75,18 +74,22 @@ func (mp *Mempool) AddTransaction(tx *Transaction) error {
 		}
 	}
 
-	// Check mempool size limit
-	if len(mp.txs) >= mp.maxSize {
-		// Remove lowest priority transaction
-		if mp.txHeap.Len() > 0 {
-			lowest := heap.Pop(&mp.txHeap).(*MempoolTx)
-			mp.removeTxNoLock(lowest.tx.ID)
-		}
-	}
-
 	// Fixed size estimate for fee calculation
 	txSize := uint64(256)
 	feePerByte := tx.Fee / txSize
+
+	// A full pool has to give something up, and it has to be whatever pays
+	// least. Dropping the best payer instead inverts the fee market and
+	// discards exactly the transaction a block would have taken first. If the
+	// arrival is itself the cheapest, the pool already holds better and there
+	// is nothing to gain by swapping.
+	if len(mp.txs) >= mp.maxSize {
+		cheapest := mp.cheapest()
+		if cheapest == nil || cheapest.feePerByte >= feePerByte {
+			return errors.New("mempool is full and the transaction pays less than what it would displace")
+		}
+		mp.removeTxNoLock(cheapest.tx.ID)
+	}
 
 	// Create mempool entry
 	mempoolTx := &MempoolTx{
@@ -128,6 +131,20 @@ func (mp *Mempool) RemoveTransaction(txID ids.ID) {
 	defer mp.mu.Unlock()
 
 	mp.removeTxNoLock(txID)
+}
+
+// cheapest returns the transaction paying least per byte, which is the one a
+// full pool gives up. The heap is ordered highest-first, so the cheapest sits
+// somewhere among its leaves rather than at its root; the pool is bounded and
+// this runs only when it is full, so walking it is the whole of the work.
+func (mp *Mempool) cheapest() *MempoolTx {
+	var out *MempoolTx
+	for _, candidate := range mp.txHeap {
+		if out == nil || candidate.feePerByte < out.feePerByte {
+			out = candidate
+		}
+	}
+	return out
 }
 
 // removeTxNoLock removes a transaction without locking (internal use)
@@ -249,15 +266,10 @@ func (h TxHeap) Less(i, j int) bool {
 
 func (h TxHeap) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
-	h[i].priority = i
-	h[j].priority = j
 }
 
 func (h *TxHeap) Push(x interface{}) {
-	n := len(*h)
-	tx := x.(*MempoolTx)
-	tx.priority = n
-	*h = append(*h, tx)
+	*h = append(*h, x.(*MempoolTx))
 }
 
 func (h *TxHeap) Pop() interface{} {
