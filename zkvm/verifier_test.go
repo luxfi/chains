@@ -315,3 +315,47 @@ func TestCircuitWithoutAKeyIsRefused(t *testing.T) {
 		t.Fatal("a shield proof judged against an unkeyed circuit must be refused, not accepted")
 	}
 }
+
+// TestKeyingOneCircuitDoesNotEnableTheOthers. An unkeyed circuit used to get an
+// all-zero placeholder key, and whether those placeholders counted as real was
+// decided for the whole verifier at once — "dummy" only while EVERY key was
+// zero. So keying a single circuit turned the protection off for the rest, and
+// their zeros were then used as verifying keys. The rule failed in the worst
+// direction: the more of a chain an operator configured, the less of it was
+// guarded.
+//
+// A circuit with no key now has no key, and is refused by name.
+func TestKeyingOneCircuitDoesNotEnableTheOthers(t *testing.T) {
+	pv := keyedVerifier(t, "groth16", map[string][]byte{
+		string(TransactionTypeTransfer): groth16Key(4),
+	})
+
+	if _, keyed := pv.verifyingKeys[string(TransactionTypeShield)]; keyed {
+		t.Fatal("a circuit the operator did not key was given one anyway")
+	}
+	if !pv.VerifyingKeysLoaded() {
+		t.Fatal("a verifier holding a real key reports none loaded")
+	}
+
+	commitment := make([]byte, 32)
+	commitment[0] = 0xC1
+	tx := &Transaction{
+		Type:    TransactionTypeShield,
+		Version: 1,
+		Outputs: []*ShieldedOutput{{Commitment: commitment}},
+		Proof: &ZKProof{
+			ProofType:    "groth16",
+			ProofData:    groth16Frame(),
+			PublicInputs: [][]byte{commitment},
+		},
+	}
+	tx.ID = tx.ComputeID()
+
+	err := pv.VerifyTransactionProof(tx)
+	if err == nil {
+		t.Fatal("a shield proof was judged against a circuit nobody keyed, and accepted")
+	}
+	if !strings.Contains(err.Error(), "no verifying key for circuit") {
+		t.Fatalf("the refusal does not name the unkeyed circuit: %v", err)
+	}
+}
