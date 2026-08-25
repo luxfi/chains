@@ -266,9 +266,10 @@ func (vm *VM) EnableBridgeRelease(ctx context.Context, chains []ExternalChainCon
 		byID[uint32(cfg.ChainID)] = client
 	}
 
-	// Swap in the new wiring, then (re)start the worker.
+	// Swap in the new wiring, then (re)start the workers.
 	vm.mu.Lock()
 	old := vm.releaser
+	oldWatch := vm.watcher
 	vm.chainClients = byName
 	vm.evmByChainID = byID
 	vm.attestClient = ac
@@ -277,21 +278,31 @@ func (vm *VM) EnableBridgeRelease(ctx context.Context, chains []ExternalChainCon
 	if old != nil {
 		old.stop()
 	}
+	if oldWatch != nil {
+		oldWatch.stop()
+	}
 	r := newReleaser(vm)
+	w := newWatcher(vm, chains)
 	vm.mu.Lock()
 	vm.releaser = r
+	vm.watcher = w
 	vm.mu.Unlock()
 	return nil
 }
 
-// stopReleaser halts the worker if running (called from Shutdown).
+// stopReleaser halts the workers if running (called from Shutdown).
 func (vm *VM) stopReleaser() {
 	vm.mu.Lock()
 	r := vm.releaser
+	w := vm.watcher
 	vm.releaser = nil
+	vm.watcher = nil
 	vm.mu.Unlock()
 	if r != nil {
 		r.stop()
+	}
+	if w != nil {
+		w.stop()
 	}
 }
 

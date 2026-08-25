@@ -341,7 +341,11 @@ func (c *evmChainClient) broadcastRelease(ctx context.Context, rc *ReleaseCall) 
 // [from,to] block range and decodes them into transfers. This is the inbound
 // EVM plumbing: B observes a lock/burn on the source chain from its OWN view,
 // then routes an attested release to the destination.
-func (c *evmChainClient) FetchLockEvents(ctx context.Context, from, to *big.Int) ([]bridgeattest.BridgeTransfer, error) {
+func (c *evmChainClient) HeadBlock(ctx context.Context) (uint64, error) {
+	return c.primary().BlockNumber(ctx)
+}
+
+func (c *evmChainClient) FetchLockEvents(ctx context.Context, from, to *big.Int) ([]lock, error) {
 	q := ethereum.FilterQuery{
 		FromBlock: from,
 		ToBlock:   to,
@@ -352,13 +356,13 @@ func (c *evmChainClient) FetchLockEvents(ctx context.Context, from, to *big.Int)
 	if err != nil {
 		return nil, fmt.Errorf("bridgevm: chain %q: filter Locked logs: %w", c.name, err)
 	}
-	out := make([]bridgeattest.BridgeTransfer, 0, len(logs))
+	out := make([]lock, 0, len(logs))
 	for i := range logs {
 		bt, err := decodeLockedLog(&logs[i])
 		if err != nil {
 			return nil, fmt.Errorf("bridgevm: chain %q: decode Locked log: %w", c.name, err)
 		}
-		out = append(out, bt)
+		out = append(out, lock{Transfer: bt, TxID: ids.ID(logs[i].TxHash), Block: logs[i].BlockNumber})
 	}
 	return out, nil
 }
