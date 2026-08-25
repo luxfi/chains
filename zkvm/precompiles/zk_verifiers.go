@@ -40,6 +40,7 @@ var (
 	errInputTooShort       = errors.New("input too short")
 	errInvalidPoint        = errors.New("invalid elliptic curve point")
 	errSubgroupCheck       = errors.New("point not in correct subgroup")
+	errPointAtInfinity     = errors.New("point at infinity")
 	errPairingFailed       = errors.New("pairing computation failed")
 	errProofInvalid        = errors.New("proof verification failed")
 	errNotImplemented      = errors.New("verifier not yet available")
@@ -321,6 +322,32 @@ type groth16VK struct {
 	K     []bn254.G1Affine
 }
 
+// A pairing drops every term whose argument is the point at infinity, so a
+// key or proof element at infinity removes itself from the equation: a key of
+// all-infinity points turns the check into 1 == 1 and reports any proof valid.
+// gnark decodes all-zero bytes to infinity and calls it in-subgroup, so the
+// subgroup test alone does not catch it. checkG1 and checkG2 are the one place
+// that decides what a usable point is.
+func checkG1(p *bn254.G1Affine) error {
+	if !p.IsInSubGroup() {
+		return errSubgroupCheck
+	}
+	if p.IsInfinity() {
+		return errPointAtInfinity
+	}
+	return nil
+}
+
+func checkG2(p *bn254.G2Affine) error {
+	if !p.IsInSubGroup() {
+		return errSubgroupCheck
+	}
+	if p.IsInfinity() {
+		return errPointAtInfinity
+	}
+	return nil
+}
+
 func parseGroth16Proof(data []byte) (*groth16Proof, error) {
 	if len(data) < 256 {
 		return nil, errInputTooShort
@@ -329,20 +356,20 @@ func parseGroth16Proof(data []byte) (*groth16Proof, error) {
 	if err := p.Ar.Unmarshal(data[0:64]); err != nil {
 		return nil, fmt.Errorf("Ar: %w", err)
 	}
-	if !p.Ar.IsInSubGroup() {
-		return nil, errSubgroupCheck
+	if err := checkG1(&p.Ar); err != nil {
+		return nil, fmt.Errorf("Ar: %w", err)
 	}
 	if err := p.Bs.Unmarshal(data[64:192]); err != nil {
 		return nil, fmt.Errorf("Bs: %w", err)
 	}
-	if !p.Bs.IsInSubGroup() {
-		return nil, errSubgroupCheck
+	if err := checkG2(&p.Bs); err != nil {
+		return nil, fmt.Errorf("Bs: %w", err)
 	}
 	if err := p.Krs.Unmarshal(data[192:256]); err != nil {
 		return nil, fmt.Errorf("Krs: %w", err)
 	}
-	if !p.Krs.IsInSubGroup() {
-		return nil, errSubgroupCheck
+	if err := checkG1(&p.Krs); err != nil {
+		return nil, fmt.Errorf("Krs: %w", err)
 	}
 	return p, nil
 }
@@ -359,32 +386,32 @@ func parseVerifyingKey(data []byte) (*groth16VK, error) {
 	if err := vk.Alpha.Unmarshal(data[off : off+64]); err != nil {
 		return nil, fmt.Errorf("Alpha: %w", err)
 	}
-	if !vk.Alpha.IsInSubGroup() {
-		return nil, fmt.Errorf("Alpha: %w", errSubgroupCheck)
+	if err := checkG1(&vk.Alpha); err != nil {
+		return nil, fmt.Errorf("Alpha: %w", err)
 	}
 	off += 64
 
 	if err := vk.Beta.Unmarshal(data[off : off+128]); err != nil {
 		return nil, fmt.Errorf("Beta: %w", err)
 	}
-	if !vk.Beta.IsInSubGroup() {
-		return nil, fmt.Errorf("Beta: %w", errSubgroupCheck)
+	if err := checkG2(&vk.Beta); err != nil {
+		return nil, fmt.Errorf("Beta: %w", err)
 	}
 	off += 128
 
 	if err := vk.Gamma.Unmarshal(data[off : off+128]); err != nil {
 		return nil, fmt.Errorf("Gamma: %w", err)
 	}
-	if !vk.Gamma.IsInSubGroup() {
-		return nil, fmt.Errorf("Gamma: %w", errSubgroupCheck)
+	if err := checkG2(&vk.Gamma); err != nil {
+		return nil, fmt.Errorf("Gamma: %w", err)
 	}
 	off += 128
 
 	if err := vk.Delta.Unmarshal(data[off : off+128]); err != nil {
 		return nil, fmt.Errorf("Delta: %w", err)
 	}
-	if !vk.Delta.IsInSubGroup() {
-		return nil, fmt.Errorf("Delta: %w", errSubgroupCheck)
+	if err := checkG2(&vk.Delta); err != nil {
+		return nil, fmt.Errorf("Delta: %w", err)
 	}
 	off += 128
 
@@ -400,8 +427,8 @@ func parseVerifyingKey(data []byte) (*groth16VK, error) {
 		if err := vk.K[i].Unmarshal(data[off : off+64]); err != nil {
 			return nil, fmt.Errorf("K[%d]: %w", i, err)
 		}
-		if !vk.K[i].IsInSubGroup() {
-			return nil, fmt.Errorf("K[%d]: %w", i, errSubgroupCheck)
+		if err := checkG1(&vk.K[i]); err != nil {
+			return nil, fmt.Errorf("K[%d]: %w", i, err)
 		}
 		off += 64
 	}
