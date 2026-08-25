@@ -274,3 +274,83 @@ func TestALockBecomesABlock(t *testing.T) {
 		t.Fatalf("the block carries a different transfer: %+v", carried)
 	}
 }
+
+// TestHealthSaysWhatItCannotDo. HealthCheck answered healthy whatever the state
+// was, which routes traffic at a node that cannot bridge and tells an operator
+// nothing about why. Releasing needs a threshold key to attest with and a chain
+// to broadcast to.
+func TestHealthSaysWhatItCannotDo(t *testing.T) {
+	// A node with no chains wired is not a relayer. That is a configuration,
+	// not a fault, and calling it unhealthy would take validators that were
+	// never meant to relay out of rotation.
+	plain := &VM{log: log.NewNoOpLogger(), pendingBridges: make(map[ids.ID]*BridgeRequest)}
+	res, err := plain.HealthCheck(context.Background())
+	if err != nil {
+		t.Fatalf("health check: %v", err)
+	}
+	if !res.Healthy {
+		t.Fatalf("a validator that relays nothing reported unhealthy: %q", res.Details["status"])
+	}
+
+	// A node that IS configured to relay but cannot attest is a different
+	// matter: answering healthy routes transfers at a node that cannot carry
+	// them.
+	relayer := &VM{
+		log:            log.NewNoOpLogger(),
+		pendingBridges: make(map[ids.ID]*BridgeRequest),
+		evmByChainID:   map[uint32]ChainClient{96368: &fakeSource{}},
+	}
+	res, err = relayer.HealthCheck(context.Background())
+	if err != nil {
+		t.Fatalf("health check: %v", err)
+	}
+	if res.Healthy {
+		t.Fatal("a relayer with no threshold signing key reported healthy")
+	}
+	if res.Details["status"] != "no threshold signing key" {
+		t.Fatalf("health does not say what is missing: %q", res.Details["status"])
+	}
+	if res.Details["chains"] != "1" {
+		t.Fatalf("health does not say how many chains it relays: %q", res.Details["chains"])
+	}
+}
+
+// The endpoint and the node's own check must not disagree about the same node.
+func TestHealthEndpointAgreesWithTheNodeCheck(t *testing.T) {
+	vm := &VM{
+		log:            log.NewNoOpLogger(),
+		pendingBridges: make(map[ids.ID]*BridgeRequest),
+		evmByChainID:   map[uint32]ChainClient{96368: &fakeSource{}},
+	}
+
+	res, err := vm.HealthCheck(context.Background())
+	if err != nil {
+		t.Fatalf("health check: %v", err)
+	}
+	var reply HealthReply
+	if err := (&Service{vm: vm}).Health(nil, &HealthArgs{}, &reply); err != nil {
+		t.Fatalf("health rpc: %v", err)
+	}
+	if reply.Ready != res.Healthy || reply.Status != res.Details["status"] {
+		t.Fatalf("the endpoint says %q/%v and the node says %q/%v",
+			reply.Status, reply.Ready, res.Details["status"], res.Healthy)
+	}
+}
+
+// The bridge's API is the JSON-RPC service; the canned handlers that used to
+// stand in front of it answered fiction.
+func TestTheServedAPIIsTheRealOne(t *testing.T) {
+	vm := &VM{log: log.NewNoOpLogger()}
+	handlers, err := vm.CreateHandlers(context.Background())
+	if err != nil {
+		t.Fatalf("create handlers: %v", err)
+	}
+	if _, ok := handlers["/rpc"]; !ok {
+		t.Fatalf("the bridge API is not served; handlers are %v", handlers)
+	}
+	for _, canned := range []string{"/status", "/validators", "/bridge"} {
+		if _, ok := handlers[canned]; ok {
+			t.Errorf("%s is served again, and it answers the same thing whatever the state", canned)
+		}
+	}
+}
