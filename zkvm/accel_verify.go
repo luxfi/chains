@@ -6,6 +6,7 @@ package zkvm
 import (
 	"errors"
 	"fmt"
+	"math/big"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
@@ -108,9 +109,10 @@ func msmWithSession(session *accel.Session, scalars []fr.Element, bases []bn254.
 // msmCPU computes MSM sequentially on CPU.
 func msmCPU(scalars []fr.Element, bases []bn254.G1Affine) bn254.G1Affine {
 	var result bn254.G1Affine
-	for i, s := range scalars {
+	var scalar big.Int
+	for i := range scalars {
 		var term bn254.G1Affine
-		term.ScalarMultiplication(&bases[i], s.BigInt(nil))
+		term.ScalarMultiplication(&bases[i], scalars[i].BigInt(&scalar))
 		result.Add(&result, &term)
 	}
 	return result
@@ -175,16 +177,6 @@ func batchVerifyProofsGPU(pv *ProofVerifier, txs []*Transaction) []error {
 			continue
 		}
 
-		// Subgroup checks on proof points
-		if !grothProof.Ar.IsInSubGroup() || !grothProof.Krs.IsInSubGroup() {
-			results[i] = errors.New("zkvm: Groth16 proof G1 point not in prime-order subgroup")
-			continue
-		}
-		if !grothProof.Bs.IsInSubGroup() {
-			results[i] = errors.New("zkvm: Groth16 proof G2 point not in prime-order subgroup")
-			continue
-		}
-
 		vk, err := deserializeVerifyingKey(vkBytes)
 		if err != nil {
 			results[i] = fmt.Errorf("deserialize vk: %w", err)
@@ -206,76 +198,12 @@ func batchVerifyProofsGPU(pv *ProofVerifier, txs []*Transaction) []error {
 		batch = append(batch, batchEntry{index: i, proof: grothProof, vk: vk, wit: witness})
 	}
 
-	// If no GPU or only 1 proof, verify sequentially
-	if len(batch) <= 1 || !accel.Available() {
-		for _, e := range batch {
-			results[e.index] = verifyGroth16Pairing(e.proof, e.vk, e.wit)
-		}
-		return results
-	}
-
-	// GPU batch path: accelerate MSM per proof, verify pairings
+	// One pairing check serves both doors: a block of one transaction and a
+	// block of many must reach the same verdict on the same proof.
 	for _, e := range batch {
-		results[e.index] = verifyGroth16PairingGPU(e.proof, e.vk, e.wit, pv.log)
+		results[e.index] = verifyGroth16Pairing(e.proof, e.vk, e.wit)
 	}
 	return results
-}
-
-// verifyGroth16PairingGPU is identical to verifyGroth16Pairing but uses GPU MSM
-// for the public input linear combination step.
-func verifyGroth16PairingGPU(proof *Groth16Proof, vk *Groth16VerifyingKey, witness []fr.Element, logger log.Logger) error {
-	if len(witness) > len(vk.K) {
-		return errors.New("too many public inputs")
-	}
-
-	// GPU-accelerated MSM for public input LC: K[0] + sum(witness_i * K[i+1])
-	// Build scalars=[1, w0, w1, ...] and bases=[K[0], K[1], K[2], ...]
-	scalars := make([]fr.Element, len(witness)+1)
-	bases := make([]bn254.G1Affine, len(witness)+1)
-
-	scalars[0].SetOne()
-	bases[0].Set(&vk.K[0])
-	for i, w := range witness {
-		scalars[i+1].Set(&w)
-		bases[i+1].Set(&vk.K[i+1])
-	}
-
-	publicInputLC, err := msmGPU(scalars, bases, logger)
-	if err != nil {
-		return fmt.Errorf("GPU MSM failed: %w", err)
-	}
-
-	// Pairing check (same as CPU path)
-	leftSide, err := bn254.Pair([]bn254.G1Affine{proof.Ar}, []bn254.G2Affine{proof.Bs})
-	if err != nil {
-		return fmt.Errorf("pairing A*B failed: %w", err)
-	}
-
-	alphaBeta, err := bn254.Pair([]bn254.G1Affine{vk.Alpha}, []bn254.G2Affine{vk.Beta})
-	if err != nil {
-		return fmt.Errorf("pairing alpha*beta failed: %w", err)
-	}
-
-	pubGamma, err := bn254.Pair([]bn254.G1Affine{publicInputLC}, []bn254.G2Affine{vk.Gamma})
-	if err != nil {
-		return fmt.Errorf("pairing pubInput*gamma failed: %w", err)
-	}
-
-	cDelta, err := bn254.Pair([]bn254.G1Affine{proof.Krs}, []bn254.G2Affine{vk.Delta})
-	if err != nil {
-		return fmt.Errorf("pairing C*delta failed: %w", err)
-	}
-
-	var rightSide bn254.GT
-	rightSide.Set(&alphaBeta)
-	rightSide.Mul(&rightSide, &pubGamma)
-	rightSide.Mul(&rightSide, &cDelta)
-
-	if !leftSide.Equal(&rightSide) {
-		return errors.New("pairing check failed: proof is invalid")
-	}
-
-	return nil
 }
 
 // poseidonHashGPU computes Poseidon hash of inputs using GPU acceleration.

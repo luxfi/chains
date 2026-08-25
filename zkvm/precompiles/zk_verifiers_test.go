@@ -182,6 +182,44 @@ func TestGroth16VerifierRejectsInvalidProof(t *testing.T) {
 	}
 }
 
+// TestGroth16VerifierRefusesADegenerateKey. The verifying key arrives in the
+// precompile's own input, so a caller picks it. A pairing skips every term
+// whose argument is the point at infinity, and gnark decodes all-zero bytes to
+// infinity and calls it in-subgroup — so a key of infinity points leaves the
+// multi-pairing empty, which equals one, which reads as "valid" for a proof
+// nobody checked. Such a key must be refused at parse.
+func TestGroth16VerifierRefusesADegenerateKey(t *testing.T) {
+	_, _, g1, g2 := bn254.Generators()
+
+	// Alpha, Beta, Gamma, Delta at infinity; K holds real points so the
+	// public-input bound does not fire first.
+	vk := &groth16VK{K: []bn254.G1Affine{g1, g1}}
+
+	var w fr.Element
+	w.SetRandom()
+
+	// Ar at infinity makes the one surviving term vanish as well.
+	proof := &groth16Proof{Bs: g2, Krs: g1}
+
+	input := serializeGroth16Input(vk, proof, []fr.Element{w})
+
+	v := &Groth16Verifier{}
+	res, err := v.Run(input)
+	if err == nil && len(res) == 1 && res[0] == 0x01 {
+		t.Fatal("Groth16Verifier accepted a proof against a key of infinity points")
+	}
+	if len(res) != 1 || res[0] != 0x00 {
+		t.Fatalf("expected 0x00 for a degenerate key, got res=%x err=%v", res, err)
+	}
+
+	if _, err := parseVerifyingKey(input[4 : 4+binary.BigEndian.Uint32(input[:4])]); err == nil {
+		t.Fatal("parseVerifyingKey accepted a key of infinity points")
+	}
+	if _, err := parseGroth16Proof(make([]byte, 256)); err == nil {
+		t.Fatal("parseGroth16Proof accepted a proof of infinity points")
+	}
+}
+
 func TestPLONKVerifierGas(t *testing.T) {
 	v := &PLONKVerifier{}
 	if g := v.RequiredGas(nil); g != plonkGas {

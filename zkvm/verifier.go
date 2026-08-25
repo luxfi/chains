@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"sync"
 
 	"github.com/luxfi/accel"
@@ -476,14 +477,6 @@ func (pv *ProofVerifier) verifyGroth16WithGnark(proof *ZKProof, vkBytes []byte) 
 		return fmt.Errorf("failed to deserialize proof: %w", err)
 	}
 
-	// Subgroup checks on proof points — prevents small-subgroup attacks
-	if !grothProof.Ar.IsInSubGroup() || !grothProof.Krs.IsInSubGroup() {
-		return errors.New("zkvm: Groth16 proof G1 point not in prime-order subgroup")
-	}
-	if !grothProof.Bs.IsInSubGroup() {
-		return errors.New("zkvm: Groth16 proof G2 point not in prime-order subgroup")
-	}
-
 	// Deserialize public witness (public inputs)
 	witness := make([]fr.Element, 0, len(proof.PublicInputs))
 	for _, inputBytes := range proof.PublicInputs {
@@ -502,38 +495,28 @@ func (pv *ProofVerifier) verifyGroth16WithGnark(proof *ZKProof, vkBytes []byte) 
 
 // verifyGroth16Pairing performs the Groth16 pairing check
 // Verifies: e(A, B) = e(alpha, beta) * e(sum(pubInput_i * K_i), gamma) * e(C, delta)
-// Uses GPU MSM for the public input linear combination when available.
+//
+// K carries one point per public input plus the constant term K[0], so a key
+// of n points speaks about n-1 public inputs. The witness length arrives with
+// the transaction and a peer chooses it, so it is bounded against the key
+// before any K point is read.
 func verifyGroth16Pairing(proof *Groth16Proof, vk *Groth16VerifyingKey, witness []fr.Element) error {
-	if len(witness) > len(vk.K) {
-		return errors.New("too many public inputs")
+	if len(witness)+1 > len(vk.K) {
+		return fmt.Errorf("public inputs: %d supplied, verifying key holds %d K points",
+			len(witness), len(vk.K))
 	}
 
-	// Compute public input linear combination: K[0] + sum(witness_i * K[i+1])
-	// GPU MSM path when available and enough inputs to justify overhead
+	// Public input linear combination: K[0] + sum(witness_i * K[i+1]).
+	// Every node has to reach the same point from the same key and witness,
+	// so the sum stays on the CPU rather than being handed to an accelerator
+	// whose answer is never compared against it.
 	var publicInputLC bn254.G1Affine
-	if accel.Available() && len(witness) > 2 {
-		scalars := make([]fr.Element, len(witness)+1)
-		bases := make([]bn254.G1Affine, len(witness)+1)
-		scalars[0].SetOne()
-		bases[0].Set(&vk.K[0])
-		for i, w := range witness {
-			scalars[i+1].Set(&w)
-			bases[i+1].Set(&vk.K[i+1])
-		}
-		publicInputLC = msmCPU(scalars, bases) // msmGPU needs logger; use CPU MSM helper
-		// For inline GPU without logger, try session directly
-		if session, err := accel.DefaultSession(); err == nil {
-			if r, err := msmWithSession(session, scalars, bases); err == nil {
-				publicInputLC = r
-			}
-		}
-	} else {
-		publicInputLC.Set(&vk.K[0])
-		for i, w := range witness {
-			var term bn254.G1Affine
-			term.ScalarMultiplication(&vk.K[i+1], w.BigInt(nil))
-			publicInputLC.Add(&publicInputLC, &term)
-		}
+	publicInputLC.Set(&vk.K[0])
+	var scalar big.Int
+	for i := range witness {
+		var term bn254.G1Affine
+		term.ScalarMultiplication(&vk.K[i+1], witness[i].BigInt(&scalar))
+		publicInputLC.Add(&publicInputLC, &term)
 	}
 
 	// Pairing check: e(A, B) == e(alpha, beta) * e(publicInputLC, gamma) * e(C, delta)
@@ -569,40 +552,67 @@ func verifyGroth16Pairing(proof *Groth16Proof, vk *Groth16VerifyingKey, witness 
 	return nil
 }
 
-// validateVerifyingKey performs subgroup checks on verifying key elliptic curve points
-// This is CRITICAL for trusted setup validation - ensures points are in correct subgroup
+// A point this verifier reads has to be in the prime-order subgroup and must
+// not be the point at infinity. gnark encodes infinity as all-zero bytes and
+// reports it as in-subgroup, and a pairing drops any term whose argument is
+// infinity — so an element at infinity silently removes itself from the
+// equation and leaves a weaker check than the one written down. checkG1 and
+// checkG2 are the one place that decides what a usable point is; every
+// decoder below routes through them.
+var (
+	errOffSubgroup = errors.New("point not in the prime-order subgroup")
+	errAtInfinity  = errors.New("point at infinity")
+)
+
+func checkG1(p *bn254.G1Affine) error {
+	if !p.IsInSubGroup() {
+		return errOffSubgroup
+	}
+	if p.IsInfinity() {
+		return errAtInfinity
+	}
+	return nil
+}
+
+func checkG2(p *bn254.G2Affine) error {
+	if !p.IsInSubGroup() {
+		return errOffSubgroup
+	}
+	if p.IsInfinity() {
+		return errAtInfinity
+	}
+	return nil
+}
+
+// validateVerifyingKey checks every point of a Groth16 verifying key.
+// A trusted setup never produces infinity for alpha, beta, gamma, delta or K,
+// so a key that carries one is not a setup output and its pairing equation
+// would collapse to something weaker.
 func validateVerifyingKey(vk *Groth16VerifyingKey) error {
-	// Validate Alpha is in G1 subgroup
-	if !vk.Alpha.IsInSubGroup() {
-		return errors.New("Alpha point not in G1 subgroup")
+	if err := checkG1(&vk.Alpha); err != nil {
+		return fmt.Errorf("Alpha: %w", err)
 	}
-
-	// Validate Beta is in G2 subgroup
-	if !vk.Beta.IsInSubGroup() {
-		return errors.New("Beta point not in G2 subgroup")
+	if err := checkG2(&vk.Beta); err != nil {
+		return fmt.Errorf("Beta: %w", err)
 	}
-
-	// Validate Gamma is in G2 subgroup
-	if !vk.Gamma.IsInSubGroup() {
-		return errors.New("Gamma point not in G2 subgroup")
+	if err := checkG2(&vk.Gamma); err != nil {
+		return fmt.Errorf("Gamma: %w", err)
 	}
-
-	// Validate Delta is in G2 subgroup
-	if !vk.Delta.IsInSubGroup() {
-		return errors.New("Delta point not in G2 subgroup")
+	if err := checkG2(&vk.Delta); err != nil {
+		return fmt.Errorf("Delta: %w", err)
 	}
-
-	// Validate all K points are in G1 subgroup
 	for i := range vk.K {
-		if !vk.K[i].IsInSubGroup() {
-			return fmt.Errorf("K[%d] point not in G1 subgroup", i)
+		if err := checkG1(&vk.K[i]); err != nil {
+			return fmt.Errorf("K[%d]: %w", i, err)
 		}
 	}
 
 	return nil
 }
 
-// deserializeGroth16Proof deserializes a Groth16 proof from bytes
+// deserializeGroth16Proof deserializes a Groth16 proof from bytes.
+// A proof it returns has already passed the point checks, so callers never
+// repeat them.
 func deserializeGroth16Proof(data []byte) (*Groth16Proof, error) {
 	// Expected format: Ar (64 bytes) | Bs (128 bytes) | Krs (64 bytes) = 256 bytes
 	if len(data) < 256 {
@@ -616,17 +626,26 @@ func deserializeGroth16Proof(data []byte) (*Groth16Proof, error) {
 	if err := proof.Ar.Unmarshal(data[offset : offset+64]); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal Ar: %w", err)
 	}
+	if err := checkG1(&proof.Ar); err != nil {
+		return nil, fmt.Errorf("Ar: %w", err)
+	}
 	offset += 64
 
 	// Deserialize Bs (G2 point, 128 bytes compressed)
 	if err := proof.Bs.Unmarshal(data[offset : offset+128]); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal Bs: %w", err)
 	}
+	if err := checkG2(&proof.Bs); err != nil {
+		return nil, fmt.Errorf("Bs: %w", err)
+	}
 	offset += 128
 
 	// Deserialize Krs (G1 point, 64 bytes compressed)
 	if err := proof.Krs.Unmarshal(data[offset : offset+64]); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal Krs: %w", err)
+	}
+	if err := checkG1(&proof.Krs); err != nil {
+		return nil, fmt.Errorf("Krs: %w", err)
 	}
 
 	return proof, nil
@@ -836,9 +855,10 @@ func verifyPLONKPairing(proof *PLONKProof, vk *PLONKVerifyingKey, publicInputs [
 	u.SetBytes(uBytes[:32])
 
 	// Compute: [W_z]_1 + u·[W_{zw}]_1
+	var scalar big.Int
 	var leftG1 bn254.G1Affine
 	var uWzw bn254.G1Affine
-	uWzw.ScalarMultiplication(&proof.WzwOpening, u.BigInt(nil))
+	uWzw.ScalarMultiplication(&proof.WzwOpening, u.BigInt(&scalar))
 	leftG1.Add(&proof.WzOpening, &uWzw)
 
 	// Compute: z·[W_z]_1 + u·(zω)·[W_{zw}]_1
@@ -846,9 +866,9 @@ func verifyPLONKPairing(proof *PLONKProof, vk *PLONKVerifyingKey, publicInputs [
 	zOmega.Mul(&z, &vk.Omega)
 
 	var zWz, uzwWzw bn254.G1Affine
-	zWz.ScalarMultiplication(&proof.WzOpening, z.BigInt(nil))
-	uzwWzw.ScalarMultiplication(&proof.WzwOpening, zOmega.BigInt(nil))
-	uzwWzw.ScalarMultiplication(&uzwWzw, u.BigInt(nil))
+	zWz.ScalarMultiplication(&proof.WzOpening, z.BigInt(&scalar))
+	uzwWzw.ScalarMultiplication(&proof.WzwOpening, zOmega.BigInt(&scalar))
+	uzwWzw.ScalarMultiplication(&uzwWzw, u.BigInt(&scalar))
 
 	var rightG1 bn254.G1Affine
 	rightG1.Add(&zWz, &uzwWzw)
@@ -898,8 +918,8 @@ func deserializePLONKProof(data []byte) (*PLONKProof, error) {
 		if err := pt.Unmarshal(data[offset : offset+64]); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal G1 point %d: %w", i, err)
 		}
-		if !pt.IsInSubGroup() {
-			return nil, fmt.Errorf("PLONK proof G1 point %d not in prime-order subgroup", i)
+		if err := checkG1(pt); err != nil {
+			return nil, fmt.Errorf("PLONK proof G1 point %d: %w", i, err)
 		}
 		offset += 64
 	}
@@ -934,8 +954,8 @@ func deserializePLONKVerifyingKey(data []byte) (*PLONKVerifyingKey, error) {
 	if err := vk.G1.Unmarshal(data[offset : offset+64]); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal G1: %w", err)
 	}
-	if !vk.G1.IsInSubGroup() {
-		return nil, errors.New("PLONK VK G1 generator not in prime-order subgroup")
+	if err := checkG1(&vk.G1); err != nil {
+		return nil, fmt.Errorf("PLONK VK G1 generator: %w", err)
 	}
 	offset += 64
 
@@ -943,8 +963,8 @@ func deserializePLONKVerifyingKey(data []byte) (*PLONKVerifyingKey, error) {
 	if err := vk.G2.Unmarshal(data[offset : offset+128]); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal G2: %w", err)
 	}
-	if !vk.G2.IsInSubGroup() {
-		return nil, errors.New("PLONK VK G2 generator not in prime-order subgroup")
+	if err := checkG2(&vk.G2); err != nil {
+		return nil, fmt.Errorf("PLONK VK G2 generator: %w", err)
 	}
 	offset += 128
 
@@ -952,8 +972,8 @@ func deserializePLONKVerifyingKey(data []byte) (*PLONKVerifyingKey, error) {
 	if err := vk.G2Alpha.Unmarshal(data[offset : offset+128]); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal G2Alpha: %w", err)
 	}
-	if !vk.G2Alpha.IsInSubGroup() {
-		return nil, errors.New("PLONK VK G2Alpha not in prime-order subgroup")
+	if err := checkG2(&vk.G2Alpha); err != nil {
+		return nil, fmt.Errorf("PLONK VK G2Alpha: %w", err)
 	}
 	offset += 128
 
@@ -968,8 +988,8 @@ func deserializePLONKVerifyingKey(data []byte) (*PLONKVerifyingKey, error) {
 		if err := pt.Unmarshal(data[offset : offset+64]); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal selector %d: %w", i, err)
 		}
-		if !pt.IsInSubGroup() {
-			return nil, fmt.Errorf("PLONK VK selector %d not in prime-order subgroup", i)
+		if err := checkG1(pt); err != nil {
+			return nil, fmt.Errorf("PLONK VK selector %d: %w", i, err)
 		}
 		offset += 64
 	}
@@ -983,8 +1003,8 @@ func deserializePLONKVerifyingKey(data []byte) (*PLONKVerifyingKey, error) {
 		if err := pt.Unmarshal(data[offset : offset+64]); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal permutation %d: %w", i, err)
 		}
-		if !pt.IsInSubGroup() {
-			return nil, fmt.Errorf("PLONK VK permutation %d not in prime-order subgroup", i)
+		if err := checkG1(pt); err != nil {
+			return nil, fmt.Errorf("PLONK VK permutation %d: %w", i, err)
 		}
 		offset += 64
 	}
