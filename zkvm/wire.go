@@ -4,6 +4,7 @@
 package zkvm
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/luxfi/ids"
@@ -17,7 +18,32 @@ import (
 // iff nil; [][]byte is a length list + concat blob. Parse rejects trailing
 // bytes (canonical). Re-genesis authorized.
 
+var (
+	// errTrailingBytes — the frame declares fewer bytes than were handed to the
+	// parser. One value has one byte string, so the remainder belongs to nobody.
+	errTrailingBytes = errors.New("zkvm wire: trailing bytes")
+
+	// errLength — a declared length vector does not exactly cover the blob it
+	// indexes: either a length reaches past the end, or blob bytes are left that
+	// no length claims.
+	errLength = errors.New("zkvm wire: declared length does not match blob")
+)
+
 // ================= leaf helpers =================
+
+// parseFrame returns the root object of a zap frame and refuses one that does
+// not account for every byte handed in. Every parser in this file goes through
+// it, so canonicality is decided in one place rather than per type.
+func parseFrame(data []byte) (zap.Object, error) {
+	m, err := zap.Parse(data)
+	if err != nil {
+		return zap.Object{}, err
+	}
+	if m.Size() != len(data) {
+		return zap.Object{}, errTrailingBytes
+	}
+	return m.Root(), nil
+}
 
 func writeU32List(b *zap.Builder, xs []uint32) int {
 	lb := b.StartList(4)
@@ -55,20 +81,32 @@ func packBytesList(xs [][]byte) (lens []uint32, blob []byte) {
 	return lens, blob
 }
 
-func unpackBytesList(lens []uint32, blob []byte) [][]byte {
+// unpackBytesList re-splits a concatenated blob by its declared lengths. Both
+// halves come from the peer and both are checked: a length the blob cannot back
+// is refused rather than dropped, and blob bytes no length claims are refused
+// too, since either way the value read is not the value that was sent. The
+// capacity comes from the length vector, which the frame already bounds, never
+// from a declared length.
+func unpackBytesList(lens []uint32, blob []byte) ([][]byte, error) {
 	if len(lens) == 0 {
-		return nil
+		if len(blob) != 0 {
+			return nil, errLength
+		}
+		return nil, nil
 	}
 	out := make([][]byte, 0, len(lens))
 	pos := 0
-	for _, l := range lens {
-		if pos+int(l) > len(blob) {
-			break
+	for i, l := range lens {
+		if int(l) > len(blob)-pos {
+			return nil, fmt.Errorf("%w: entry %d", errLength, i)
 		}
 		out = append(out, cp(blob[pos:pos+int(l)]))
 		pos += int(l)
 	}
-	return out
+	if pos != len(blob) {
+		return nil, errLength
+	}
+	return out, nil
 }
 
 // packObjs marshals each item and returns (per-item lengths, concat blob).
@@ -82,16 +120,20 @@ func packObjs[T any](items []T, marshal func(T) []byte) (lens []uint32, blob []b
 	return lens, blob
 }
 
-// unpackObjs re-splits a packed blob by lengths and parses each sub-object.
+// unpackObjs re-splits a packed blob by lengths and parses each sub-object,
+// under the same agreement rule as unpackBytesList.
 func unpackObjs[T any](lens []uint32, blob []byte, parse func([]byte) (T, error)) ([]T, error) {
 	if len(lens) == 0 {
+		if len(blob) != 0 {
+			return nil, errLength
+		}
 		return nil, nil
 	}
 	out := make([]T, 0, len(lens))
 	pos := 0
 	for i, l := range lens {
-		if pos+int(l) > len(blob) {
-			return nil, fmt.Errorf("packed obj %d out of bounds", i)
+		if int(l) > len(blob)-pos {
+			return nil, fmt.Errorf("%w: item %d", errLength, i)
 		}
 		v, err := parse(blob[pos : pos+int(l)])
 		if err != nil {
@@ -99,6 +141,9 @@ func unpackObjs[T any](lens []uint32, blob []byte, parse func([]byte) (T, error)
 		}
 		out = append(out, v)
 		pos += int(l)
+	}
+	if pos != len(blob) {
+		return nil, errLength
 	}
 	return out, nil
 }
@@ -125,11 +170,10 @@ func marshalTransparentInput(t *TransparentInput) []byte {
 }
 
 func parseTransparentInput(data []byte) (*TransparentInput, error) {
-	m, err := zap.Parse(data)
+	o, err := parseFrame(data)
 	if err != nil {
 		return nil, err
 	}
-	o := m.Root()
 	return &TransparentInput{TxID: readID(o, 0), OutputIdx: o.Uint32(32), Amount: o.Uint64(36), Address: cp(o.Bytes(44))}, nil
 }
 
@@ -148,11 +192,10 @@ func marshalTransparentOutput(t *TransparentOutput) []byte {
 }
 
 func parseTransparentOutput(data []byte) (*TransparentOutput, error) {
-	m, err := zap.Parse(data)
+	o, err := parseFrame(data)
 	if err != nil {
 		return nil, err
 	}
-	o := m.Root()
 	return &TransparentOutput{Amount: o.Uint64(0), AssetID: readID(o, 8), Address: cp(o.Bytes(40))}, nil
 }
 
@@ -172,11 +215,10 @@ func marshalShieldedOutput(s *ShieldedOutput) []byte {
 }
 
 func parseShieldedOutput(data []byte) (*ShieldedOutput, error) {
-	m, err := zap.Parse(data)
+	o, err := parseFrame(data)
 	if err != nil {
 		return nil, err
 	}
-	o := m.Root()
 	return &ShieldedOutput{Commitment: cp(o.Bytes(0)), EncryptedNote: cp(o.Bytes(8)), EphemeralPubKey: cp(o.Bytes(16)), OutputProof: cp(o.Bytes(24))}, nil
 }
 
@@ -204,12 +246,15 @@ func parseZKProof(data []byte) (*ZKProof, error) {
 	if len(data) == 0 {
 		return nil, nil
 	}
-	m, err := zap.Parse(data)
+	o, err := parseFrame(data)
 	if err != nil {
 		return nil, err
 	}
-	o := m.Root()
-	return &ZKProof{ProofType: string(o.Bytes(0)), ProofData: cp(o.Bytes(8)), PublicInputs: unpackBytesList(readU32List(o, 16), o.Bytes(24))}, nil
+	pub, err := unpackBytesList(readU32List(o, 16), o.Bytes(24))
+	if err != nil {
+		return nil, err
+	}
+	return &ZKProof{ProofType: string(o.Bytes(0)), ProofData: cp(o.Bytes(8)), PublicInputs: pub}, nil
 }
 
 // ================= FHEData: EncInLens list@0, EncInBlob bytes@8, CircuitID bytes@16, EncResult bytes@24, CompProof bytes@32 =================
@@ -237,12 +282,15 @@ func parseFHEData(data []byte) (*FHEData, error) {
 	if len(data) == 0 {
 		return nil, nil
 	}
-	m, err := zap.Parse(data)
+	o, err := parseFrame(data)
 	if err != nil {
 		return nil, err
 	}
-	o := m.Root()
-	return &FHEData{EncryptedInputs: unpackBytesList(readU32List(o, 0), o.Bytes(8)), CircuitID: string(o.Bytes(16)), EncryptedResult: cp(o.Bytes(24)), ComputationProof: cp(o.Bytes(32))}, nil
+	in, err := unpackBytesList(readU32List(o, 0), o.Bytes(8))
+	if err != nil {
+		return nil, err
+	}
+	return &FHEData{EncryptedInputs: in, CircuitID: string(o.Bytes(16)), EncryptedResult: cp(o.Bytes(24)), ComputationProof: cp(o.Bytes(32))}, nil
 }
 
 // ================= UTXO: TxID32@0, OutputIndex u32@32, Height u64@36, Commitment bytes@44, Ciphertext bytes@52, EphemeralPK bytes@60 =================
@@ -263,14 +311,10 @@ func (u *UTXO) Marshal() ([]byte, error) {
 }
 
 func parseUTXO(data []byte, u *UTXO) error {
-	m, err := zap.Parse(data)
+	o, err := parseFrame(data)
 	if err != nil {
 		return err
 	}
-	if m.Size() != len(data) {
-		return fmt.Errorf("zkvm utxo: trailing bytes")
-	}
-	o := m.Root()
 	u.TxID = readID(o, 0)
 	u.OutputIndex = o.Uint32(32)
 	u.Height = o.Uint64(36)
@@ -299,11 +343,10 @@ func (p *PrivateAddress) Marshal() ([]byte, error) {
 }
 
 func parsePrivateAddress(data []byte, p *PrivateAddress) error {
-	m, err := zap.Parse(data)
+	o, err := parseFrame(data)
 	if err != nil {
 		return err
 	}
-	o := m.Root()
 	p.Address = cp(o.Bytes(0))
 	p.ViewingKey = cp(o.Bytes(8))
 	p.SpendingKey = cp(o.Bytes(16))
@@ -360,18 +403,17 @@ func (tx *Transaction) Marshal() ([]byte, error) {
 }
 
 func parseTransaction(data []byte) (*Transaction, error) {
-	m, err := zap.Parse(data)
+	o, err := parseFrame(data)
 	if err != nil {
 		return nil, err
 	}
-	o := m.Root()
 	tx := &Transaction{
-		ID:      readID(o, 0),
-		Type:    TransactionType(o.Uint8(32)),
-		Version: o.Uint8(33),
-		Fee:     o.Uint64(34),
-		Expiry:  o.Uint64(42),
-		Memo:    cp(o.Bytes(130)),
+		ID:        readID(o, 0),
+		Type:      TransactionType(o.Uint8(32)),
+		Version:   o.Uint8(33),
+		Fee:       o.Uint64(34),
+		Expiry:    o.Uint64(42),
+		Memo:      cp(o.Bytes(130)),
 		Signature: cp(o.Bytes(138)),
 	}
 	if tx.TransparentInputs, err = unpackObjs(readU32List(o, 50), o.Bytes(58), parseTransparentInput); err != nil {
@@ -380,7 +422,9 @@ func parseTransaction(data []byte) (*Transaction, error) {
 	if tx.TransparentOutputs, err = unpackObjs(readU32List(o, 66), o.Bytes(74), parseTransparentOutput); err != nil {
 		return nil, err
 	}
-	tx.Nullifiers = unpackBytesList(readU32List(o, 82), o.Bytes(90))
+	if tx.Nullifiers, err = unpackBytesList(readU32List(o, 82), o.Bytes(90)); err != nil {
+		return nil, err
+	}
 	if tx.Outputs, err = unpackObjs(readU32List(o, 98), o.Bytes(106), parseShieldedOutput); err != nil {
 		return nil, err
 	}
@@ -420,14 +464,10 @@ func (b *Block) Marshal() ([]byte, error) {
 }
 
 func parseBlockBytes(data []byte, blk *Block) error {
-	m, err := zap.Parse(data)
+	o, err := parseFrame(data)
 	if err != nil {
 		return err
 	}
-	if m.Size() != len(data) {
-		return fmt.Errorf("zkvm block: trailing bytes")
-	}
-	o := m.Root()
 	blk.ParentID_ = readID(o, 0)
 	blk.BlockHeight = o.Uint64(32)
 	blk.BlockTimestamp = o.Int64(40)
