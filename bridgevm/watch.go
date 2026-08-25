@@ -202,7 +202,7 @@ func (w *watcher) enqueue(l lock, head uint64) {
 		Recipient:     append([]byte(nil), transfer.Recipient[:]...),
 		SourceTxID:    l.TxID,
 		Confirmations: uint32(depth),
-		Status:        "pending",
+		Status:        StatusPending,
 		CreatedAt:     time.Now(),
 	}
 	w.vm.mu.Unlock()

@@ -94,7 +94,7 @@ func readBridgeRequest(o zap.Object) *BridgeRequest {
 		CreatedAt:     time.Unix(0, o.Int64(brCreated)).UTC(),
 		SourceChain:   string(o.Bytes(brSrcName)),
 		DestChain:     string(o.Bytes(brDstName)),
-		Status:        string(o.Bytes(brStatus)),
+		Status:        BridgeRequestStatus(o.Bytes(brStatus)),
 		Recipient:     appendBytes(o.Bytes(brRecip)),
 		MPCSignatures: readSigs(o, brSigLens, brSigBlob),
 	}
