@@ -28,9 +28,8 @@ func shieldedTransfer(fee uint64, n byte) *Transaction {
 }
 
 // TestMempoolTellsConsensusThereIsWork: a transaction the mempool accepted is
-// worth nothing until consensus is told about it. WaitForEvent used to wait only
-// on the context, so it never returned, BuildBlock was never called, and the
-// chain could not leave genesis however many transactions arrived.
+// worth nothing until consensus is told about it. Consensus builds only when
+// WaitForEvent returns, so accepting work and reporting it are one step.
 func TestMempoolTellsConsensusThereIsWork(t *testing.T) {
 	mp := NewMempool(10, log.NoLog{})
 
@@ -60,11 +59,9 @@ func TestMempoolTellsConsensusThereIsWork(t *testing.T) {
 	}
 }
 
-// TestFullPoolGivesUpTheCheapest. Eviction used to pop the heap, which is
-// ordered highest-first, so a full pool discarded its best payer — inverting the
-// fee market and throwing away exactly the transaction a block would have taken
-// first. Fees are divided by a fixed 256-byte estimate, so they must differ by
-// more than that to differ in priority at all.
+// TestFullPoolGivesUpTheCheapest pins which transaction a full pool releases.
+// Fees are divided by a fixed 256-byte estimate, so they must differ by more
+// than that to differ in priority at all.
 func TestFullPoolGivesUpTheCheapest(t *testing.T) {
 	const unit = 256
 	mp := NewMempool(2, log.NoLog{})
@@ -97,9 +94,9 @@ func TestFullPoolRefusesAnArrivalWorseThanItHolds(t *testing.T) {
 }
 
 // Two callers asking what to build at once must not write to each other's
-// transactions. GetPendingTransactions sorts a copy of the heap, but the copy
-// holds the same pointers, so anything the sort wrote through them was a write
-// under a read lock. Run with -race.
+// transactions. GetPendingTransactions sorts a copy of the heap and that copy
+// holds the same pointers, so the sort must leave them untouched. Run with
+// -race.
 func TestReadingThePoolDoesNotWriteToIt(t *testing.T) {
 	mp := NewMempool(64, log.NoLog{})
 	for i := 0; i < 16; i++ {

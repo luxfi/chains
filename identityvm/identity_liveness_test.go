@@ -13,10 +13,8 @@ import (
 
 // TestIssuingACredentialBuildsABlock is the whole path: a credential is issued,
 // consensus is told there is work, and the block that gets built carries it.
-//
-// WaitForEvent used to wait only on the context, so it never returned, BuildBlock
-// was never called, and I-Chain could not leave genesis however many credentials
-// were issued.
+// Consensus builds only when WaitForEvent returns, so issuing and reporting are
+// one step.
 func TestIssuingACredentialBuildsABlock(t *testing.T) {
 	require := require.New(t)
 	vm := setupTestVM(t)

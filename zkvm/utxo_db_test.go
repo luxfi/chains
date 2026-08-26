@@ -14,7 +14,7 @@ import (
 )
 
 // TestRestartedNodeRefusesADuplicateCommitment. Block.Accept refuses a block
-// carrying a commitment the set already holds. The set used to live only in
+// carrying a commitment the set already holds. The set lives in
 // memory and was never rebuilt, so that verdict depended on how recently the
 // node was started: a restarted validator accepted what a running one refused,
 // and the two ended up on different chains.
@@ -35,11 +35,9 @@ func TestRestartedNodeRefusesADuplicateCommitment(t *testing.T) {
 	require.Equal(t, uint64(1), restarted.GetUTXOCount())
 }
 
-// TestUTXOCountIsReadOffTheRecords. The count used to be a running total
-// written beside the records, so a node that died between the two writes came
-// back with a number that disagreed with its own set — and one removal from
-// there drove an unsigned counter below zero. This starts from the state that
-// used to be unrecoverable: a record on disk with no total beside it.
+// TestUTXOCountIsReadOffTheRecords pins that the count describes the records and
+// cannot drift from them. It starts from the state a total kept alongside would
+// disagree with: a record on disk with no total beside it.
 func TestUTXOCountIsReadOffTheRecords(t *testing.T) {
 	db := memdb.New()
 	utxo := &UTXO{TxID: ids.ID{1}, Commitment: []byte("orphan"), Height: 1}
@@ -92,7 +90,7 @@ func TestRestartRebuildsTheHeightIndex(t *testing.T) {
 	require.Empty(t, empty, "a height nothing was created at holds nothing")
 }
 
-// TestUTXOReadDoesNotWriteTheSet. GetUTXO used to memoise what it loaded while
+// TestUTXOReadDoesNotWriteTheSet. GetUTXO must not memoise what it loads while
 // holding only the read lock, and a read lock promises every other reader that
 // nothing is changing — so two clients asking for uncached commitments wrote
 // the same map at the same time, which is a runtime throw that takes the

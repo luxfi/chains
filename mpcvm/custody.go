@@ -126,18 +126,17 @@ func keygenCeremonyID(keyID string, policy quorum.Policy, participants []party.I
 // custodySet chooses the N validators that will hold shares of a key: the N with
 // the most stake, ties broken by node id.
 //
-// Selection used to be "the first N in canonical order", and canonical order is a
-// lexicographic sort of node ids. A node id is a hash of the node's certificate,
-// so an attacker grinds certificates offline until its ids sort first — roughly
-// 256 hashes per leading zero byte, and a zero byte encodes as the smallest
-// base58 digit. Two ground certificates would then sit in the share set of EVERY
-// key the chain generates, which under a 2-of-3 policy is a quorum. Nothing needs
-// reconstructing at that point: the holder runs the signing protocol locally with
-// both shares and signs whatever it likes, off-chain, with no block to detect.
+// Stake decides membership because a node id cannot. An id is a hash of the
+// node's certificate, so ids can be aimed: certificates are cheap to generate
+// offline and one that sorts early is a matter of how many were tried. An order
+// over ids alone would therefore let a party choose its own seats, and seats in
+// every key the chain generates — under a 2-of-3 policy, a quorum of them, held
+// by one party that can then sign off-chain with no block to detect it.
 //
-// Weight cannot be ground. Entering the set costs stake proportional to the stake
-// already there — the same cost as attacking consensus — so custody stops being
-// the cheaper target. Selection stays a pure function of replicated state, so
+// Stake is not chosen that way. A seat costs stake proportional to the stake
+// already there, which is the same price as attacking consensus, so custody is
+// not the cheaper target. Ties break lexicographically, which is safe once stake
+// has chosen the set. Selection stays a pure function of replicated state, so
 // every validator derives the same set without negotiating one.
 func (vm *VM) custodySet(ctx context.Context, pchainHeight uint64, n int) ([]party.ID, error) {
 	if vm.rt == nil || vm.rt.ValidatorState == nil {

@@ -12,14 +12,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSpentCountIsReadOffTheRecords. The count used to be a running total
-// written beside the records, so a node that died between the two writes came
-// back with a number that disagreed with its own set — and one removal from
-// there drove an unsigned counter below zero, reporting 1.8e19 spent notes to
-// every dashboard from then on.
-//
-// Counting the set cannot disagree with the set, so this starts from the state
-// that used to be unrecoverable: a record on disk with no counter beside it.
+// TestSpentCountIsReadOffTheRecords pins that the count describes the records
+// and cannot drift from them. It starts from the state a total kept alongside
+// would disagree with: a record on disk with no counter beside it.
 func TestSpentCountIsReadOffTheRecords(t *testing.T) {
 	db := memdb.New()
 
@@ -57,7 +52,7 @@ func TestSpentCountFollowsTheSet(t *testing.T) {
 	require.Equal(t, uint64(1), ndb.GetNullifierCount())
 }
 
-// TestNullifierReadDoesNotWriteTheSet. GetNullifierHeight used to memoise what
+// TestNullifierReadDoesNotWriteTheSet. GetNullifierHeight must not memoise what
 // it loaded while holding only the read lock, and a read lock promises every
 // other reader that nothing is changing — so two callers missing at once wrote
 // the same map at the same time, which is a runtime throw that takes the

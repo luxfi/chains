@@ -320,15 +320,10 @@ func TestCircuitWithoutAKeyIsRefused(t *testing.T) {
 	}
 }
 
-// TestKeyingOneCircuitDoesNotEnableTheOthers. An unkeyed circuit used to get an
-// all-zero placeholder key, and whether those placeholders counted as real was
-// decided for the whole verifier at once — "dummy" only while EVERY key was
-// zero. So keying a single circuit turned the protection off for the rest, and
-// their zeros were then used as verifying keys. The rule failed in the worst
-// direction: the more of a chain an operator configured, the less of it was
-// guarded.
-//
-// A circuit with no key now has no key, and is refused by name.
+// TestKeyingOneCircuitDoesNotEnableTheOthers pins that each circuit is judged on
+// its own key. Keying one circuit says nothing about any other, and a circuit
+// the operator did not key is refused by name rather than judged against
+// whatever stands in for a key.
 func TestKeyingOneCircuitDoesNotEnableTheOthers(t *testing.T) {
 	pv := keyedVerifier(t, "groth16", map[string][]byte{
 		string(TransactionTypeTransfer): groth16Key(4),
@@ -364,11 +359,10 @@ func TestKeyingOneCircuitDoesNotEnableTheOthers(t *testing.T) {
 	}
 }
 
-// TestPLONKProofMustBeWholeAndNoMore. A short proof used to decode with
-// whichever evaluations were missing left at zero, so a truncated proof became a
-// well-formed one carrying values nobody sent. Trailing bytes are refused for
-// the reason they are refused everywhere else: bytes the format does not
-// describe are bytes two different proofs can differ in.
+// TestPLONKProofMustBeWholeAndNoMore pins the proof's size exactly. Every
+// evaluation is part of the proof, so a frame short of one is not a proof; and
+// bytes the format does not describe are bytes two proofs can differ in while
+// decoding alike.
 func TestPLONKProofMustBeWholeAndNoMore(t *testing.T) {
 	whole := plonkFrame()
 	if len(whole) != plonkProofSize {
@@ -397,13 +391,9 @@ func TestPLONKProofMustBeWholeAndNoMore(t *testing.T) {
 
 // TestWitnessMustMatchWhatTheKeysCircuitTakes. A verifying key holds one K point
 // per public input plus a constant term, so it states exactly how many inputs
-// the circuit it was made for takes. A transaction supplies that witness, and a
-// peer chooses its length.
-//
-// Too many reads past the end of K. Too few is quieter and no better: the linear
-// combination runs over the witness, so a short one leaves the trailing K points
-// out and checks a smaller statement than the circuit was compiled for — the
-// proof is then judged against something the key does not describe.
+// the circuit it was made for takes, and a peer picks the length it sends.
+// Either side of that count judges the proof against a statement the key does
+// not describe.
 func TestWitnessMustMatchWhatTheKeysCircuitTakes(t *testing.T) {
 	// Four K points is a circuit taking three public inputs.
 	vk, err := deserializeVerifyingKey(groth16Key(4))

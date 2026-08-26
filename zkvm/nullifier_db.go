@@ -152,13 +152,11 @@ func (ndb *NullifierDB) GetNullifiersByHeight(height uint64) [][]byte {
 	return nullifiers
 }
 
-// GetNullifierCount returns the number of spent nullifiers.
-//
-// It counts the set rather than reading a running total kept beside it. A total
-// is a second write, and a node that dies between the two comes back with a
-// number that disagrees with its own records — from which one removal drives an
-// unsigned counter below zero and reports 1.8e19 spent notes forever. Counting
-// the set cannot disagree with the set.
+// GetNullifierCount returns the number of spent nullifiers, counted off the set
+// itself. Every record is loaded at startup and nullifiers are never pruned, so
+// the set is the whole of them; a total kept alongside would be a second write
+// that has to agree with the first, and this cannot disagree with what it
+// describes.
 func (ndb *NullifierDB) GetNullifierCount() uint64 {
 	ndb.mu.RLock()
 	defer ndb.mu.RUnlock()

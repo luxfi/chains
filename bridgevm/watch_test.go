@@ -229,10 +229,6 @@ func TestWatchDoesNotAdvancePastAChainItCannotRead(t *testing.T) {
 // TestALockBecomesABlock is the whole path in one test: a gateway locks value
 // on the source chain, the watcher reads it, consensus is told there is work,
 // and the block that gets built carries exactly that transfer.
-//
-// Before the watcher existed nothing wrote to the pending queue outside of
-// tests, so BuildBlock answered "no pending bridge requests" forever and B could
-// not leave genesis however much was bridged.
 func TestALockBecomesABlock(t *testing.T) {
 	vm, _ := vmWithPending(t, 0)
 	vm.evmByChainID = map[uint32]ChainClient{96368: nil}
@@ -275,10 +271,9 @@ func TestALockBecomesABlock(t *testing.T) {
 	}
 }
 
-// TestHealthSaysWhatItCannotDo. HealthCheck answered healthy whatever the state
-// was, which routes traffic at a node that cannot bridge and tells an operator
-// nothing about why. Releasing needs a threshold key to attest with and a chain
-// to broadcast to.
+// TestHealthSaysWhatItCannotDo. Releasing needs a threshold key to attest with
+// and a chain to broadcast to, so health reports whether this node has both and
+// names what is missing when it does not.
 func TestHealthSaysWhatItCannotDo(t *testing.T) {
 	// A node with no chains wired is not a relayer. That is a configuration,
 	// not a fault, and calling it unhealthy would take validators that were
@@ -337,8 +332,7 @@ func TestHealthEndpointAgreesWithTheNodeCheck(t *testing.T) {
 	}
 }
 
-// The bridge's API is the JSON-RPC service; the canned handlers that used to
-// stand in front of it answered fiction.
+// The bridge's API is the JSON-RPC service, and that is what gets served.
 func TestTheServedAPIIsTheRealOne(t *testing.T) {
 	vm := &VM{log: log.NewNoOpLogger()}
 	handlers, err := vm.CreateHandlers(context.Background())

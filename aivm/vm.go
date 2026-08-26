@@ -243,8 +243,8 @@ type VM struct {
 	// Consensus
 	toEngine chan<- vmcore.Message
 	// work wakes WaitForEvent when there is something to build. A burst of
-	// submissions coalesces into one signal rather than flooding the engine —
-	// the concern WaitForEvent used to answer by never returning at all.
+	// submissions coalesces into one signal, so the engine is told that there
+	// is work rather than how much.
 	work vmcore.Latch
 
 	// Logging

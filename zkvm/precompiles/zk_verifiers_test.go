@@ -244,13 +244,11 @@ func buildPLONKInput(vk, proof []byte, numInputs uint32, inputs []byte) []byte {
 	return out
 }
 
-// TestPLONKVerifierNeverUniversalAccepts is the H4 regression test. The
-// previous verifyPLONK computed a self-cancelling pairing, discarded the
-// result, ignored the public inputs, and returned VALID (0x01) for ANY
-// >=544-byte blob. We construct a well-formed-but-arbitrary proof+VK
-// (7 valid G1 commitments + 3 scalars + a valid SRS G2) — exactly the
-// shape the old bypass rubber-stamped — and assert the precompile does
-// NOT return 0x01. It must fail closed (0x00).
+// TestPLONKVerifierNeverUniversalAccepts pins that this verifier accepts
+// nothing while the verification equation is unimplemented. It builds a
+// well-formed but arbitrary proof and key — 7 valid G1 commitments, 3 scalars,
+// a valid SRS G2 — which is the shape a structural check alone would pass, and
+// requires 0x00.
 func TestPLONKVerifierNeverUniversalAccepts(t *testing.T) {
 	_, _, g1, g2 := bn254.Generators()
 
@@ -547,8 +545,8 @@ func TestCrossChainVerifierRejectsTooShort(t *testing.T) {
 
 func TestCrossChainVerifierRejectsStubs(t *testing.T) {
 	v := &CrossChainZKVerifier{ZChainID: ids.ID{}}
-	// STARK is no longer a stub — it routes to the strict-PQ STARK
-	// verifier on Z-Chain. Only Halo2/Nova remain unimplemented.
+	// STARK routes to the strict-PQ verifier on Z-Chain. Halo2 and Nova are
+	// the unimplemented ones.
 	for _, vtype := range []byte{VerifierTypeHalo2, VerifierTypeNova} {
 		result, err := v.Run([]byte{vtype, 0x00})
 		if err != errNotImplemented {
