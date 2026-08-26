@@ -481,11 +481,9 @@ func verifyGroth16(proof *groth16Proof, vk *groth16VK, witness []fr.Element) err
 // errPLONKVerifierIncomplete is returned by verifyPLONK because the full
 // PLONK verification equation (linearization-polynomial reconstruction +
 // Fiat-Shamir challenge derivation + public-input binding) is not
-// implemented here. It FAILS CLOSED rather than universal-accept: a
-// previous version computed a self-cancelling pairing e(W, srsG2)·e(-W, g2)
-// (always 1), discarded the result, ignored the public inputs, and
-// returned nil (valid) for ANY >=544-byte blob — a total verification
-// bypass (Red H4). PLONK is a classical (quantum-breakable) system that is
+// implemented here, and a verifier that does not evaluate the statement is
+// not a verifier: it would accept any well-formed blob. So it FAILS CLOSED
+// and accepts nothing. PLONK is a classical (quantum-breakable) system that is
 // gated off on strict-PQ Lux chains (it is not registered there — see
 // RegisterZKPrecompiles), so failing-closed here is the safe posture: the
 // PLONKVerifier precompile now NEVER accepts a proof until a real,
