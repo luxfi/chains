@@ -122,9 +122,14 @@ func (v *Groth16Verifier) Run(input []byte) ([]byte, error) {
 		return resultInvalid, errInputTooShort
 	}
 
-	// Bound check: numInputs must match vk.K length minus 1 (K[0] is the constant term)
-	if int(numInputs)+1 > len(vk.K) {
-		return resultInvalid, errors.New("too many public inputs for verifying key")
+	// K holds one point per public input plus the constant term K[0], so the key
+	// states how many inputs its circuit takes. The caller supplies both the key
+	// and the count, and they have to agree: too many reads past the end of K,
+	// and too few leaves the trailing K points out of the linear combination
+	// below, judging the proof against a smaller statement than the key
+	// describes.
+	if want := len(vk.K) - 1; int(numInputs) != want {
+		return resultInvalid, fmt.Errorf("public inputs: %d supplied, the verifying key's circuit takes %d", numInputs, want)
 	}
 
 	witness := make([]fr.Element, numInputs)
