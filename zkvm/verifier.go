@@ -486,14 +486,19 @@ func (pv *ProofVerifier) verifyGroth16WithGnark(proof *ZKProof, vkBytes []byte) 
 // verifyGroth16Pairing performs the Groth16 pairing check
 // Verifies: e(A, B) = e(alpha, beta) * e(sum(pubInput_i * K_i), gamma) * e(C, delta)
 //
-// K carries one point per public input plus the constant term K[0], so a key
-// of n points speaks about n-1 public inputs. The witness length arrives with
-// the transaction and a peer chooses it, so it is bounded against the key
-// before any K point is read.
+// K carries one point per public input plus the constant term K[0], so a key of
+// n points speaks about exactly n-1 public inputs — that count is a property of
+// the circuit the key was made for, not something a transaction chooses.
+//
+// The witness arrives with the transaction, so a peer picks its length. Too many
+// would read past the end of K. Too few is quieter and no better: the sum below
+// runs over the witness, so a short one leaves the trailing K points out of the
+// linear combination and checks a smaller statement than the circuit was
+// compiled for. It has to be exactly what the key says.
 func verifyGroth16Pairing(proof *Groth16Proof, vk *Groth16VerifyingKey, witness []fr.Element) error {
-	if len(witness)+1 > len(vk.K) {
-		return fmt.Errorf("public inputs: %d supplied, verifying key holds %d K points",
-			len(witness), len(vk.K))
+	if want := len(vk.K) - 1; len(witness) != want {
+		return fmt.Errorf("public inputs: %d supplied, the verifying key's circuit takes %d",
+			len(witness), want)
 	}
 
 	// Public input linear combination: K[0] + sum(witness_i * K[i+1]).
