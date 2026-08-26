@@ -175,8 +175,11 @@ func TestWitnessMustFitTheVerifyingKey(t *testing.T) {
 // supported deployment and its whole point is that a groth16 proof is accepted
 // or rejected on the arithmetic. Any proof that decodes must produce a verdict.
 func TestGroth16ReachesItsPairing(t *testing.T) {
+	// Three K points is a circuit taking two public inputs, which is what this
+	// transaction supplies. A key that spoke about a different number would be
+	// refused before the pairing, and this test is about the pairing.
 	pv := keyedVerifier(t, "groth16", map[string][]byte{
-		string(TransactionTypeTransfer): groth16Key(4),
+		string(TransactionTypeTransfer): groth16Key(3),
 	})
 	if !pv.VerifyingKeysLoaded() {
 		t.Fatal("precondition: the chain holds a real verifying key")
@@ -211,8 +214,9 @@ func TestGroth16ReachesItsPairing(t *testing.T) {
 	}()
 
 	// The proof satisfies no statement, so the verdict is "rejected" — but a
-	// verdict is what has to come back.
-	if err == nil || !strings.Contains(err.Error(), "verification failed") {
+	// verdict from the arithmetic is what has to come back, not a refusal from
+	// the checks in front of it.
+	if err == nil || !strings.Contains(err.Error(), "pairing check failed") {
 		t.Fatalf("expected a pairing verdict, got: %v", err)
 	}
 }
@@ -388,5 +392,52 @@ func TestPLONKProofMustBeWholeAndNoMore(t *testing.T) {
 				t.Fatalf("%d bytes decoded as a whole proof", len(tc.data))
 			}
 		})
+	}
+}
+
+// TestWitnessMustMatchWhatTheKeysCircuitTakes. A verifying key holds one K point
+// per public input plus a constant term, so it states exactly how many inputs
+// the circuit it was made for takes. A transaction supplies that witness, and a
+// peer chooses its length.
+//
+// Too many reads past the end of K. Too few is quieter and no better: the linear
+// combination runs over the witness, so a short one leaves the trailing K points
+// out and checks a smaller statement than the circuit was compiled for — the
+// proof is then judged against something the key does not describe.
+func TestWitnessMustMatchWhatTheKeysCircuitTakes(t *testing.T) {
+	// Four K points is a circuit taking three public inputs.
+	vk, err := deserializeVerifyingKey(groth16Key(4))
+	if err != nil {
+		t.Fatalf("deserialize key: %v", err)
+	}
+	proof, err := deserializeGroth16Proof(groth16Frame())
+	if err != nil {
+		t.Fatalf("deserialize proof: %v", err)
+	}
+
+	witness := func(n int) []fr.Element {
+		out := make([]fr.Element, n)
+		for i := range out {
+			out[i].SetUint64(uint64(i + 1))
+		}
+		return out
+	}
+
+	for _, n := range []int{0, 1, 2, 4, 9} {
+		err := verifyGroth16Pairing(proof, vk, witness(n))
+		if err == nil {
+			t.Fatalf("%d public inputs judged against a circuit taking 3", n)
+		}
+		if !strings.Contains(err.Error(), "public inputs") {
+			t.Fatalf("%d inputs: refused for the wrong reason: %v", n, err)
+		}
+	}
+
+	// The count the key states reaches the arithmetic, which is the control:
+	// without it the refusals above would prove only that this rejects
+	// everything.
+	err = verifyGroth16Pairing(proof, vk, witness(3))
+	if err == nil || !strings.Contains(err.Error(), "pairing check failed") {
+		t.Fatalf("the count the key states must reach the pairing, got: %v", err)
 	}
 }
