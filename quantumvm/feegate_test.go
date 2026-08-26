@@ -22,13 +22,15 @@ type feeTestTx struct {
 	fee uint64
 }
 
-func (t *feeTestTx) ID() ids.ID                                     { return t.id }
-func (t *feeTestTx) Bytes() []byte                                  { return t.id[:] }
-func (t *feeTestTx) Verify() error                                  { return nil }
-func (t *feeTestTx) Execute() error                                 { return nil }
-func (t *feeTestTx) GetQuantumSignature() *quantum.QuantumSignature { return &quantum.QuantumSignature{} }
-func (t *feeTestTx) Timestamp() time.Time                           { return time.Unix(0, 0) }
-func (t *feeTestTx) Fee() uint64                                    { return t.fee }
+func (t *feeTestTx) ID() ids.ID     { return t.id }
+func (t *feeTestTx) Bytes() []byte  { return t.id[:] }
+func (t *feeTestTx) Verify() error  { return nil }
+func (t *feeTestTx) Execute() error { return nil }
+func (t *feeTestTx) GetQuantumSignature() *quantum.QuantumSignature {
+	return &quantum.QuantumSignature{}
+}
+func (t *feeTestTx) Timestamp() time.Time { return time.Unix(0, 0) }
+func (t *feeTestTx) Fee() uint64          { return t.fee }
 
 // newQuantumVMWithPolicy wires a VM with the canonical policy directly,
 // bypassing the full Initialize (which requires Quasar bridge setup,
@@ -70,9 +72,8 @@ func TestQuantumVM_IssueTx_RejectsAllUserTx(t *testing.T) {
 }
 
 // TestPoolTellsConsensusThereIsWork: a transaction the pool accepted is worth
-// nothing until consensus is told about it. WaitForEvent used to wait only on
-// the context, so it never returned, BuildBlock was never called, and the chain
-// could not leave genesis however many transactions arrived.
+// nothing until consensus is told about it. Consensus builds only when
+// WaitForEvent returns, so accepting work and reporting it are one step.
 func TestPoolTellsConsensusThereIsWork(t *testing.T) {
 	pool := NewTransactionPool(8, 8, log.NewNoOpLogger())
 

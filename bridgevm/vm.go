@@ -537,8 +537,8 @@ func (vm *VM) LastAccepted(ctx context.Context) (ids.ID, error) {
 }
 
 // CreateHandlers implements the common.VM interface. The bridge's API is the
-// JSON-RPC service in rpc.go — estimate a fee, submit a request, ask after one,
-// read the signer set. It was written and never served.
+// JSON-RPC service in rpc.go: estimate a fee, submit a request, ask after one,
+// read the signer set.
 func (vm *VM) CreateHandlers(ctx context.Context) (map[string]http.Handler, error) {
 	return vm.CreateRPCHandlers()
 }
@@ -570,9 +570,8 @@ func (vm *VM) readiness() (ready bool, reason string, chains int) {
 	}
 }
 
-// HealthCheck implements the common.VM interface. Answering healthy whatever the
-// state is tells an operator nothing and routes traffic at a node that cannot
-// bridge.
+// HealthCheck implements the common.VM interface, reporting what this node can
+// do so traffic reaches one that can bridge.
 func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
 	ready, reason, chains := vm.readiness()
 	return chain.HealthResult{

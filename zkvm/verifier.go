@@ -340,17 +340,14 @@ func (pv *ProofVerifier) verifyPublicInputs(tx *Transaction) error {
 	return nil
 }
 
-// loadVerifyingKeys takes the verifying key for each circuit the config keys,
-// and installs nothing for the others.
+// loadVerifyingKeys takes the verifying key for each circuit the config keys and
+// installs nothing for the others.
 //
-// It used to install an all-zero key for an unkeyed circuit and then decide, for
-// the whole verifier at once, whether the keys were "dummy" — true only while
-// EVERY key was zero. So keying one circuit turned that protection off for the
-// rest, and their all-zero keys were then used as if real. That is the worst
-// direction for a rule to fail in: the more of a chain an operator configures,
-// the less of it is guarded. A key that is absent cannot be mistaken for one
-// that is present, so the placeholder is gone and the circuit is refused by
-// name at the lookup that already checks for it.
+// A circuit the operator did not key has no key here, so the lookup in front of
+// each verify refuses it by name. That is the one place the question is asked,
+// and it is asked per circuit: a key is judged on its own, never on what the
+// verifier holds for some other circuit. An absent key cannot be mistaken for a
+// present one.
 func (pv *ProofVerifier) loadVerifyingKeys() error {
 	for _, ct := range []TransactionType{
 		TransactionTypeTransfer,
@@ -490,11 +487,11 @@ func (pv *ProofVerifier) verifyGroth16WithGnark(proof *ZKProof, vkBytes []byte) 
 // n points speaks about exactly n-1 public inputs — that count is a property of
 // the circuit the key was made for, not something a transaction chooses.
 //
-// The witness arrives with the transaction, so a peer picks its length. Too many
-// would read past the end of K. Too few is quieter and no better: the sum below
-// runs over the witness, so a short one leaves the trailing K points out of the
-// linear combination and checks a smaller statement than the circuit was
-// compiled for. It has to be exactly what the key says.
+// The witness arrives with the transaction, so a peer picks its length, and the
+// sum below runs over the witness against K. A length either side of what the
+// key states judges the proof against a statement the key does not describe —
+// past the end of K in one direction, and short of the trailing K points in the
+// other — so it has to be exactly what the key says.
 func verifyGroth16Pairing(proof *Groth16Proof, vk *Groth16VerifyingKey, witness []fr.Element) error {
 	if want := len(vk.K) - 1; len(witness) != want {
 		return fmt.Errorf("public inputs: %d supplied, the verifying key's circuit takes %d",
@@ -548,12 +545,12 @@ func verifyGroth16Pairing(proof *Groth16Proof, vk *Groth16VerifyingKey, witness 
 }
 
 // A point this verifier reads has to be in the prime-order subgroup and must
-// not be the point at infinity. gnark encodes infinity as all-zero bytes and
-// reports it as in-subgroup, and a pairing drops any term whose argument is
-// infinity — so an element at infinity silently removes itself from the
-// equation and leaves a weaker check than the one written down. checkG1 and
-// checkG2 are the one place that decides what a usable point is; every
-// decoder below routes through them.
+// not be the point at infinity. Both halves are load-bearing: gnark encodes
+// infinity as all-zero bytes and reports it as in-subgroup, and a pairing drops
+// any term whose argument is infinity, so an element at infinity would remove
+// itself from the equation and leave a weaker check than the one written down.
+// checkG1 and checkG2 are the one place that decides what a usable point is,
+// and every decoder below routes through them.
 var (
 	errOffSubgroup = errors.New("point not in the prime-order subgroup")
 	errAtInfinity  = errors.New("point at infinity")
@@ -811,11 +808,10 @@ func verifyPLONKPairing(_ *PLONKProof, _ *PLONKVerifyingKey, _ []fr.Element) err
 const plonkProofSize = 9*64 + 5*32
 
 // deserializePLONKProof reads a PLONK proof, which is exactly plonkProofSize
-// bytes. It used to take anything from 544 bytes up and leave whichever
-// evaluations were missing at zero, so a truncated proof decoded as a
-// well-formed one carrying values nobody sent. Trailing bytes are refused for
-// the same reason they are refused elsewhere: bytes the format does not
-// describe are bytes two different proofs can differ in.
+// bytes: every evaluation is part of the proof, so a frame that is short of one
+// is not a proof rather than a proof with a zero in it. Trailing bytes are
+// refused for the reason they are refused elsewhere here — bytes the format
+// does not describe are bytes two proofs can differ in while decoding alike.
 func deserializePLONKProof(data []byte) (*PLONKProof, error) {
 	if len(data) != plonkProofSize {
 		return nil, fmt.Errorf("PLONK proof is %d bytes, want %d", len(data), plonkProofSize)

@@ -264,9 +264,9 @@ func (vm *VM) Initialize(
 
 	// Resume from the accepted tip, or install genesis on a fresh database.
 	// This is the difference between a chain and a cache: a node that restarts
-	// must come back at the height it left, not at zero. Recomputing genesis
-	// unconditionally (as this VM previously did) discards every accepted block
-	// and re-runs history from an empty registry.
+	// comes back at the height it left, not at zero. Recomputing genesis
+	// unconditionally would discard every accepted block and re-run history
+	// from an empty registry.
 	tip, found, err := vm.state.LastAccepted()
 	if err != nil {
 		return fmt.Errorf("mpcvm: read accepted tip: %w", err)
@@ -493,11 +493,9 @@ func (vm *VM) parseConfig(configBytes []byte) error {
 // =============================================================================
 //
 // Every entry point below delegates to the ceremony lifecycle in custody.go.
-// There is no second path that reaches a key or a signature: the legacy
-// in-memory session machinery this VM used to carry (keygenSessions,
-// signingSessions, an activeKeyID, a `keys` map persisted only at shutdown) was
-// a parallel, unreplicated copy of state that could and did disagree with the
-// chain. It is gone.
+// There is no second path that reaches a key or a signature, and no in-memory
+// session state beside the chain: a parallel copy of who holds what would be
+// unreplicated, and two answers to that question is one too many.
 
 // StartKeygen generates a custody key using the chain's default policy.
 func (vm *VM) StartKeygen(ctx context.Context, keyID string, by Caller) (*Operation, error) {
@@ -1059,8 +1057,6 @@ func uncompressedXY(pubKey []byte) []byte {
 		return nil
 	}
 }
-
-// computeRecoveryID is no longer needed - we use sig.V() from the Signature interface
 
 // =============================================================================
 // Session-Ready: Attestation Domains

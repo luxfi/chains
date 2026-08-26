@@ -78,11 +78,10 @@ func (mp *Mempool) AddTransaction(tx *Transaction) error {
 	txSize := uint64(256)
 	feePerByte := tx.Fee / txSize
 
-	// A full pool has to give something up, and it has to be whatever pays
-	// least. Dropping the best payer instead inverts the fee market and
-	// discards exactly the transaction a block would have taken first. If the
-	// arrival is itself the cheapest, the pool already holds better and there
-	// is nothing to gain by swapping.
+	// A full pool gives up whatever pays least, so what it holds is always the
+	// best it has been offered. An arrival that is itself the cheapest is
+	// refused: taking it would mean dropping a better transaction for a worse
+	// one.
 	if len(mp.txs) >= mp.maxSize {
 		cheapest := mp.cheapest()
 		if cheapest == nil || cheapest.feePerByte >= feePerByte {
@@ -135,8 +134,8 @@ func (mp *Mempool) RemoveTransaction(txID ids.ID) {
 
 // cheapest returns the transaction paying least per byte, which is the one a
 // full pool gives up. The heap is ordered highest-first, so the cheapest sits
-// somewhere among its leaves rather than at its root; the pool is bounded and
-// this runs only when it is full, so walking it is the whole of the work.
+// among its leaves rather than at its root; the pool is bounded and this runs
+// only when it is full, so walking it is the whole of the work.
 func (mp *Mempool) cheapest() *MempoolTx {
 	var out *MempoolTx
 	for _, candidate := range mp.txHeap {
