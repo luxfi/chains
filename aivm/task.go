@@ -223,6 +223,9 @@ func (e *Engine) createTask(st QuorumState, lg QuorumLedger, requester common.Ad
 		PromptHash:     promptHash,
 	}
 	writeTask(st, taskID, task)
+	// The task now awaits a verdict, and settling one means being able to find
+	// it: engine state is keyed by slot hash and cannot be walked otherwise.
+	trackLive(st, taskID)
 	st.SetState(slotHash(nsTaskReward, taskID), h32(rewardPerOperator))
 	st.SetState(slotHash(nsTaskEscrow, taskID), h32(totalEscrow))
 	st.SetState(slotHash(nsTaskFee, taskID), h32(fee))

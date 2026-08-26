@@ -28,7 +28,7 @@
 //
 // The TEE path (luxfi/ai/pkg/attestation) is OPTIONAL across all modes.
 // Setting RequireTEEAttestation=true is a deployment policy choice for
-// permissioned/regulated subnets; the public-chain default is
+// permissioned/regulated deployments; the public-chain default is
 // VerificationMode=ModeOptimistic + RequireTEEAttestation=false.
 //
 // Other features:
@@ -105,7 +105,7 @@ const (
 	// ModeTEEAttested is OPT-IN. Providers with valid TEE attestation
 	// can shortcut the challenge period. TEE never changes the trust
 	// root; it accelerates settlement for high-trust providers.
-	// Use only on permissioned/regulated subnets where TEE-vendor
+	// Use only on permissioned/regulated deployments where TEE-vendor
 	// trust is acceptable; not the default for public mainnet.
 	ModeTEEAttested VerificationMode = 2
 )
@@ -147,7 +147,7 @@ type Config struct {
 	// Attestation settings — TEE is OPT-IN, NOT required by default.
 	// On public chains keep RequireTEEAttestation=false; setting it true
 	// restricts the provider set to TEE-equipped operators only, which
-	// is a permissioned-subnet policy choice.
+	// is a permissioned-deployment policy choice.
 	RequireTEEAttestation bool   `json:"requireTEEAttestation"`
 	MinTrustScore         uint8  `json:"minTrustScore"`
 	AttestationTimeout    string `json:"attestationTimeout"`
@@ -169,7 +169,7 @@ type Config struct {
 //   - RequireTEEAttestation = false (TEE is optional acceleration)
 //   - HostChainID = "primary" (override per L1/L2 instance)
 //
-// Permissioned/regulated subnets can opt into ModeTEEAttested +
+// Permissioned/regulated deployments can opt into ModeTEEAttested +
 // RequireTEEAttestation=true as a policy choice.
 func DefaultConfig() Config {
 	return Config{
@@ -192,7 +192,7 @@ func DefaultConfig() Config {
 }
 
 // DefaultPermissionedConfig returns AIVM config for a permissioned
-// subnet (regulated AI compute, KYC'd provider set). Sets
+// chain (regulated AI compute, KYC'd provider set). Sets
 // RequireTEEAttestation=true and VerificationMode=ModeTEEAttested.
 // NOT for public mainnet use.
 func DefaultPermissionedConfig() Config {
@@ -444,7 +444,7 @@ func (vm *VM) Disconnected(ctx context.Context, nodeID ids.NodeID) error {
 // Permissioned path (RequireTEEAttestation=true, opt-in):
 //   - Provider MUST present valid TEE attestation
 //   - TrustScore must meet MinTrustScore
-//   - Used on permissioned subnets where the validator set vets
+//   - Used on permissioned chains where the validator set vets
 //     hardware operators by policy
 func (vm *VM) RegisterProvider(provider *aivm.Provider) error {
 	vm.mu.Lock()
@@ -454,11 +454,11 @@ func (vm *VM) RegisterProvider(provider *aivm.Provider) error {
 		return ErrNotInitialized
 	}
 
-	// TEE attestation is OPT-IN. The default (public-chain) policy is
-	// RequireTEEAttestation=false: providers may register without TEE
-	// and submit results under the optimistic-verification flow.
+	// Registration is open: the default policy (RequireTEEAttestation=false) is
+	// that anyone may register and submit results, with the provider's bond and
+	// the challenge flow carrying correctness rather than an admission list.
 	//
-	// When RequireTEEAttestation=true (permissioned subnet policy):
+	// When RequireTEEAttestation=true (permissioned deployment policy):
 	// every provider MUST present TEE attestation and meet the
 	// trust-score threshold. This is a deployment-policy gate,
 	// independent of the protocol's public-BFT-safety contract.
@@ -629,6 +629,11 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	// of the engine's verified inbound seam; a live request can never reach it.
 	// Writes land in the staging versiondb, not the durable DB.
 	imported := vm.importPending(height)
+
+	// Give a verdict to every task whose reveal window has closed. This is what
+	// pays operators: without it a task sits revealed and unsettled forever, and
+	// the work the network did for it is never credited to anyone.
+	vm.settleDue(height)
 
 	// Create new block, recording the imported intents and the resulting
 	// receipt_root so Verify can re-derive identical engine state on every node.
