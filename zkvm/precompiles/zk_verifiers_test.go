@@ -621,3 +621,51 @@ func serializeGroth16Input(vk *groth16VK, proof *groth16Proof, witness []fr.Elem
 	}
 	return buf
 }
+
+// TestPublicInputCountMustMatchTheKeysCircuit. This precompile takes both the
+// verifying key and the public-input count from its caller's calldata, so a
+// caller picks both and they have to agree. K holds one point per public input
+// plus a constant term, so the key states how many its circuit takes. Too many
+// reads past the end of K; too few leaves the trailing K points out of the
+// linear combination, judging the proof against a smaller statement than the
+// key describes. Only the first was checked.
+func TestPublicInputCountMustMatchTheKeysCircuit(t *testing.T) {
+	_, _, g1, g2 := bn254.Generators()
+
+	// Three K points is a circuit taking two public inputs.
+	vk := &groth16VK{Alpha: g1, Beta: g2, Gamma: g2, Delta: g2,
+		K: []bn254.G1Affine{g1, g1, g1}}
+
+	var r fr.Element
+	r.SetRandom()
+	var rBI big.Int
+	var randG1 bn254.G1Affine
+	randG1.ScalarMultiplication(&g1, r.BigInt(&rBI))
+	proof := &groth16Proof{Ar: randG1, Bs: g2, Krs: g1}
+
+	witness := func(n int) []fr.Element {
+		out := make([]fr.Element, n)
+		for i := range out {
+			out[i].SetUint64(uint64(i + 1))
+		}
+		return out
+	}
+
+	v := &Groth16Verifier{}
+	for _, n := range []int{0, 1, 3, 7} {
+		if _, err := v.Run(serializeGroth16Input(vk, proof, witness(n))); err == nil {
+			t.Fatalf("%d public inputs judged against a circuit taking 2", n)
+		}
+	}
+
+	// The count the key states reaches the arithmetic and is answered on its
+	// merits — without this control the refusals above would prove only that
+	// this rejects everything.
+	result, err := v.Run(serializeGroth16Input(vk, proof, witness(2)))
+	if err != nil {
+		t.Fatalf("the count the key states must reach the pairing, got: %v", err)
+	}
+	if len(result) != 1 || result[0] != 0x00 {
+		t.Fatalf("a proof satisfying no statement must be rejected, got %x", result)
+	}
+}
