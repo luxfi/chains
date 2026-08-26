@@ -154,3 +154,48 @@ affects `dexvm` and every other VM here too — it is NOT schain-specific.
 ## Sibling repos
 
 See the org-level `LLM.md` at `/Users/a/work/lux/luxfi/LLM.md` for the full inventory of sibling repos and inter-repo dependencies.
+
+## Telling consensus there is work
+
+Consensus calls `WaitForEvent` and builds nothing until it returns, so a VM that
+accepts work has to report it. There is one way to do that: `vm.Latch` in
+`github.com/luxfi/vm`. `Signal()` says there is work, `WaitForEvent(ctx)` blocks
+until there is, and signalling twice before the signal is taken is the same as
+once — a builder needs to know that there is work, not how much, so a burst
+coalesces into one build. The zero value is usable, so whatever owns the pending
+work holds one.
+
+**Put the latch on the pool, not the VM.** The pool is what learns work arrived,
+whichever path it came by, so it covers internal callers as well as the HTTP
+handler and the VM's `WaitForEvent` is one line. zkvm, quantumvm, identityvm,
+bridgevm, aivm, keyvm and mpcvm all work this way.
+
+Two chains deliberately do not, and both are correct:
+
+- **schain and dexvm** notify on the `ToEngine` channel they receive in
+  `vm.Init` instead, and park on the context. That is the other of the two ways
+  a VM can report work, and a VM needs one. Before changing a parked
+  `WaitForEvent`, check which: `grep -rn "toEngine <-" <vm>/*.go`.
+- **graphvm** builds no blocks at all. G-Chain indexes what other chains have
+  already agreed, so it holds no state of its own to agree on; a block there
+  would carry a query result, which a peer recomputes, or a schema, which is
+  local configuration. `BuildBlock` declines with `errReadOnlyChain`.
+
+## B-Chain: where a bridge request comes from
+
+B learns of a bridge from the source chain's own `Locked` events, not from its
+API. `watch.go` polls each configured chain, reads the range it has not read
+yet, and turns each lock into a pending request keyed by the transfer's
+canonical digest — the same value M signs and the destination gateway keys its
+replay guard by, so two chains reusing a nonce cannot collide and the same lock
+read twice is the same request.
+
+It reads twelve blocks behind the head, so a lock a reorg takes back never
+becomes a request; it bounds one pass, so a backlog is asked for in pieces; and
+a chain it cannot reach keeps its cursor rather than skipping that chain's
+blocks. The depth a lock is buried at rides along as its confirmation count,
+which is what `BuildBlock` gates on.
+
+The bridge's API is the JSON-RPC service in `rpc.go`, and `bridge_health`
+reports what the node can do: a node with no chains wired is not a relayer and
+is healthy, while one that is configured to relay but cannot attest says so.
