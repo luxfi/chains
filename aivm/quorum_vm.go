@@ -126,6 +126,10 @@ func (vm *VM) verifyImported(height uint64, recorded []CIntent, wantRoot common.
 			return err
 		}
 	}
+	// Same pass the proposer ran, at the same height. Settlement is a function
+	// of the state and the height, so it needs nothing recorded in the block:
+	// the receipt-root comparison below is what checks it.
+	vm.settleDue(height)
 	// The recorded root must equal the one these imports actually produce, with no
 	// exemption for the zero hash. Skipping the comparison when the block claims
 	// zero made the determinism check opt-out: a proposer wrote a zero receipt_root
@@ -157,6 +161,17 @@ func (vm *VM) importPending(height uint64) []CIntent {
 	}
 	vm.pendingIntents = vm.pendingIntents[:0]
 	return imported
+}
+
+// settleDue gives a verdict to every task whose reveal window has closed. It
+// runs on both the build and the verify path at the same height over the same
+// state, so both reach the same verdicts; a disagreement about who was paid
+// changes the receipt root, which verifyImported already refuses.
+func (vm *VM) settleDue(height uint64) uint32 {
+	if vm.quorum == nil || vm.qstate == nil || vm.qledger == nil {
+		return 0
+	}
+	return vm.quorum.SettleDue(vm.qstate, vm.qledger, height)
 }
 
 // vmLedger is the engine's QuorumLedger backed by the VM's account balances. For
