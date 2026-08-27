@@ -132,15 +132,23 @@ func (e *Engine) ImportCommittedIntent(st QuorumState, lg QuorumLedger, ccv CCom
 		return common.Hash{}, ErrFeeOverflow
 	}
 
-	// (3) CREATE THE TASK under consensus. createTask enforces params, the
-	// eligible-set margin, escrows reward, burns the fee, and selects operators —
-	// all deterministically. Mark the intent consumed and record the
-	// intent->task mapping only AFTER the task is created (so a createTask failure
-	// does not burn the intent's single-use marker).
-	taskID, err := e.createTask(
-		st, lg, intent.Caller, intent.ModelSpecHash, intent.PromptHash,
-		uint32(intent.N), uint32(intent.Threshold), totalFee, intent.RewardPerOperator, height,
-	)
+	// (3) CREATE THE TASK under consensus. The candidate pool for a model intent
+	// is the operators advertising that model specification, gathered here so the
+	// write path stays one mechanism. createTask enforces params, the pool margin,
+	// escrows reward, burns the fee, and draws operators — all deterministically.
+	// Mark the intent consumed and record the intent->task mapping only AFTER the
+	// task is created (so a createTask failure does not burn the intent's
+	// single-use marker).
+	taskID, err := e.createTask(st, lg, taskSpec{
+		requester:  intent.Caller,
+		code:       intent.ModelSpecHash,
+		input:      intent.PromptHash,
+		candidates: eligibleSet(st, intent.ModelSpecHash),
+		n:          uint32(intent.N),
+		threshold:  uint32(intent.Threshold),
+		fee:        totalFee,
+		reward:     intent.RewardPerOperator,
+	}, height)
 	if err != nil {
 		return common.Hash{}, err
 	}

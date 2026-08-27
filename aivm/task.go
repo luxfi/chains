@@ -132,56 +132,77 @@ func computeTaskID(requester common.Address, nonce common.Hash, modelSpecHash, p
 	))
 }
 
+// taskSpec is everything a new task is opened from. It exists so createTask can
+// be one mechanism with two policies above it: a model intent gathers candidates
+// by the model specification an operator advertises, an agentic workload gathers
+// them by the capability an operator serves, and neither of those decisions
+// belongs inside the write path.
+type taskSpec struct {
+	requester common.Address
+	// code and input are what the operators are asked about: a model
+	// specification and a prompt for an intent, a code digest and an input
+	// digest for a workload. They ride the same two fields because the commit
+	// preimage binds them the same way.
+	code  common.Hash
+	input common.Hash
+	// candidates is the pool the draw runs over, already filtered by whatever
+	// policy gathered it.
+	candidates []common.Address
+	n          uint32
+	threshold  uint32
+	fee        *uint256.Int
+	reward     *uint256.Int
+}
+
 // createTask is the single new-task write path. It validates params, enforces
-// the eligible-set margin, escrows N*rewardPerOperator (refundable) and burns
-// N*fee (non-refundable) from the requester, deterministically selects N
-// eligible operators, and records the task in Committing state. Returns the task
-// id. Pure given (state, ledger, height); deterministic on every validator.
+// the candidate-pool margin, escrows N*reward (refundable) and burns the fee
+// (non-refundable) from the requester, deterministically draws N operators from
+// the pool, and records the task in Committing state. Returns the task id. Pure
+// given (state, ledger, height); deterministic on every validator.
 //
-// It is unexported on purpose: the ONLY caller is ImportCommittedIntent, which
-// first proves the C intent is committed. There is no public "open a task from a
+// It is unexported on purpose: the only callers are ImportCommittedIntent, which
+// first proves the C intent is committed, and OpenWorkload, which first proves
+// the workload is authorised by its payer. There is no public "open a task from a
 // live request" method, so a task can never be created from an unverified
 // off-chain call.
-func (e *Engine) createTask(st QuorumState, lg QuorumLedger, requester common.Address, modelSpecHash, promptHash common.Hash, n, threshold uint32, fee, rewardPerOperator *uint256.Int, height uint64) (common.Hash, error) {
-	if modelSpecHash == (common.Hash{}) {
+func (e *Engine) createTask(st QuorumState, lg QuorumLedger, s taskSpec, height uint64) (common.Hash, error) {
+	if s.code == (common.Hash{}) {
 		return common.Hash{}, ErrEmptyModelSpec
 	}
-	if promptHash == (common.Hash{}) {
+	if s.input == (common.Hash{}) {
 		return common.Hash{}, ErrEmptyPromptHash
 	}
-	if n < minN || n > maxN {
+	if s.n < minN || s.n > maxN {
 		return common.Hash{}, ErrBadN
 	}
 	// Strict majority floor(N/2)+1 <= threshold <= N.
-	if threshold < n/2+1 || threshold > n {
+	if s.threshold < s.n/2+1 || s.threshold > s.n {
 		return common.Hash{}, ErrBadThreshold
 	}
 
-	// Total reward escrow = N * rewardPerOperator (checked).
+	// Total reward escrow = N * reward (checked).
 	totalEscrow := new(uint256.Int)
-	if _, overflow := totalEscrow.MulOverflow(rewardPerOperator, uint256.NewInt(uint64(n))); overflow {
+	if _, overflow := totalEscrow.MulOverflow(s.reward, uint256.NewInt(uint64(s.n))); overflow {
 		return common.Hash{}, ErrRewardOverflow
 	}
 
-	// ELIGIBLE-SET MARGIN: build the eligible universe ONCE and require it to be
-	// strictly larger than the draw by requiredMargin(N). Enforced BEFORE any
-	// money moves (fail-closed).
-	eligible := eligibleSet(st, modelSpecHash)
-	if uint32(len(eligible)) < n {
+	// CANDIDATE MARGIN: the pool must exceed the draw by requiredMargin(N).
+	// Enforced BEFORE any money moves (fail-closed).
+	if uint32(len(s.candidates)) < s.n {
 		return common.Hash{}, ErrNotEnoughEligible
 	}
-	if uint32(len(eligible)) < n+requiredMargin(n) {
+	if uint32(len(s.candidates)) < s.n+requiredMargin(s.n) {
 		return common.Hash{}, ErrEligibleBelowMargin
 	}
 
 	// Derive the task id from the requester's monotonic nonce, then draw N from
-	// the SAME eligible set we just margin-checked (one scan, shared) — BEFORE
-	// moving money so a selection failure leaves balances untouched.
-	nonceSlot := slotAddr(nsReqNonce, requester)
+	// the SAME pool we just margin-checked — BEFORE moving money so a selection
+	// failure leaves balances untouched.
+	nonceSlot := slotAddr(nsReqNonce, s.requester)
 	nonce := st.GetState(nonceSlot)
-	taskID := computeTaskID(requester, nonce, modelSpecHash, promptHash, height, n, threshold)
+	taskID := computeTaskID(s.requester, nonce, s.code, s.input, height, s.n, s.threshold)
 
-	selected, err := drawFromEligible(eligible, taskID, n)
+	selected, err := drawFromEligible(s.candidates, taskID, s.n)
 	if err != nil {
 		return common.Hash{}, err
 	}
@@ -189,23 +210,23 @@ func (e *Engine) createTask(st QuorumState, lg QuorumLedger, requester common.Ad
 	// Combined affordability check (escrow + fee) BEFORE any move, so the two
 	// money operations are all-or-nothing.
 	needed := new(uint256.Int)
-	if _, overflow := needed.AddOverflow(totalEscrow, fee); overflow {
+	if _, overflow := needed.AddOverflow(totalEscrow, s.fee); overflow {
 		return common.Hash{}, ErrRewardOverflow
 	}
-	if lg.GetBalance(requester).Lt(needed) {
+	if lg.GetBalance(s.requester).Lt(needed) {
 		return common.Hash{}, ErrInsufficientFunds
 	}
 
 	// Escrow the reward (refundable). Fails closed.
-	if err := lg.Pull(requester, totalEscrow); err != nil {
+	if err := lg.Pull(s.requester, totalEscrow); err != nil {
 		return common.Hash{}, err
 	}
 	// Burn the non-refundable fee: requester -> EscrowAccount -> BurnAddress.
-	if !fee.IsZero() {
-		if err := lg.Pull(requester, fee); err != nil {
+	if !s.fee.IsZero() {
+		if err := lg.Pull(s.requester, s.fee); err != nil {
 			return common.Hash{}, err
 		}
-		if err := lg.Pay(BurnAddress, fee); err != nil {
+		if err := lg.Pay(BurnAddress, s.fee); err != nil {
 			return common.Hash{}, err
 		}
 	}
@@ -213,22 +234,22 @@ func (e *Engine) createTask(st QuorumState, lg QuorumLedger, requester common.Ad
 	// Persist the task + escrow + reward-per-operator + fee-paid.
 	task := taskRecord{
 		Status:         TaskCommitting,
-		N:              n,
-		Threshold:      threshold,
-		Requester:      requester,
+		N:              s.n,
+		Threshold:      s.threshold,
+		Requester:      s.requester,
 		CommitDeadline: height + CommitBlocks,
 		RevealDeadline: height + CommitBlocks + RevealBlocks,
 		RequestHeight:  height,
-		ModelSpecHash:  modelSpecHash,
-		PromptHash:     promptHash,
+		ModelSpecHash:  s.code,
+		PromptHash:     s.input,
 	}
 	writeTask(st, taskID, task)
 	// The task now awaits a verdict, and settling one means being able to find
 	// it: engine state is keyed by slot hash and cannot be walked otherwise.
 	trackLive(st, taskID)
-	st.SetState(slotHash(nsTaskReward, taskID), h32(rewardPerOperator))
+	st.SetState(slotHash(nsTaskReward, taskID), h32(s.reward))
 	st.SetState(slotHash(nsTaskEscrow, taskID), h32(totalEscrow))
-	st.SetState(slotHash(nsTaskFee, taskID), h32(fee))
+	st.SetState(slotHash(nsTaskFee, taskID), h32(s.fee))
 
 	// Record the selected set: a membership flag (O(1) "are you selected") AND
 	// an indexed list (reproducibility / enumeration), index 0..N-1.
