@@ -13,10 +13,18 @@ operator daemons (no luxd validator required), the same way `mpcd` and
 | R-Chain (relay) | `chains/relayvm/` (shim) | `luxfi/relay/vm/` | `luxfi/relay/cmd/relayd` |
 | O-Chain (oracle) | `chains/oraclevm/` (shim) | `luxfi/oracle/vm/` | `luxfi/oracle/cmd/oracled` |
 | M-Chain (MPC threshold) | `luxfi/chains/mpcvm/` (canonical, MPC mode) | (same) | n/a — runs in luxd |
-| F-Chain (FHE) | `luxfi/chains/mpcvm/` (canonical, FHE mode) | (same) | `luxfi/fhe/cmd/fhed` (standalone FHE daemon) |
+| F-Chain (FHE) | `luxfi/chains/fhevm/` (canonical) | (same) | n/a — runs in luxd |
 | C-Chain (EVM) | `chains/evm/` | uses `chains/evm/cevm` (C++/GPU FFI shim) or pure-Go (default) via build tags | n/a — runs in luxd |
 | A-Chain (AI) | `chains/aivm/` | `luxfi/ai` | n/a |
 | I-Chain (identity) | `chains/identityvm/` | `luxfi/id` | n/a |
+
+M and F are both canonical here — they are written in this repo, not shimmed
+from another. They divide the work LP-134 took off T-Chain: M does threshold
+signing and bridge custody, F coordinates confidential compute. F wraps the FHE
+runtime library at `mpcvm/fhe/`, which stays where it is because `mpcvm` also
+uses it; F reuses that package's types and threshold parameters and owns its own
+persistence, since the runtime's `Registry` stamps `time.Now()` and cannot back
+a state root.
 
 The shim pattern is uniform:
 
