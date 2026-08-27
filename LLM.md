@@ -35,20 +35,43 @@ domain-execution chain that MUST consume UTXO settlement via the
 | `aivm/` | **A** | Inference receipt + attestation. Rides B's settlement engine (LP-0130 §9) | LP-5000 |
 | `bridgevm/` | **B** | Cross-chain message lifecycle. Fees deducted from bridged amount (LP-0130 §8) | LP-6000 |
 | `mpcvm/` | **M** | MPC signing / custody. Service fees paid by originating chain (LP-0130 §7); no user M-balance | LP-7100 |
-| `mpcvm/fhe/` | **F** | FHE runtime **library** — a package inside `mpcvm`, not a chain. See the deployment note below. | LP-8200 |
+| `fhevm/` | **F** | Confidential-compute coordination: ciphertext handles, access permits, threshold decryption | LP-8200 |
+| `mpcvm/fhe/` | — | FHE runtime **library** — a package inside `mpcvm`, wrapped by `fhevm/`, not itself a chain | LP-8200 |
 
 **Deployment reality (probed on mainnet 96369, `platform.getBlockchains`).** Ten
-chains are live: P X + C D Q Z A B G K. **M and F are NOT deployed**, and the
-two are not equally close to shipping:
+chains are live: P X + C D Q Z A B G K. **M and F are NOT deployed**; both now
+build and ship a plugin binary, and neither has a chain registered on any
+network. `make` produces `build/mpcvm` and `build/fhevm`, and luxd's
+`--plugin-dir` scan (`node/node/vms.go` `OptionalVMs`) finds each under the CB58
+of its vmID — `qCURact1n41FcoNBch8iMVBwc9AWie48D118ZNJ5tBdWrvryS` for M,
+`n6sSsSfbpQBrU9sY4R29U6z8VrmnTo2CntW6da4rRS7qmnGdv` for F.
 
-- **M** has a full VM (`mpcvm/`, `mpcvm/cmd/plugin`) — it builds, it just has no
-  chain registered on any network.
-- **F** has **no VM at all**. `luxfi/constants` reserves
-  `FHEVMID = {'f','h','e','v','m'}` and `luxfi/node/node/vms.go` lists it in
-  `OptionalVMs` as plugin `fhevm`, so luxd scans `--plugin-dir` for a binary
-  that this repo never produces (no `fhevm/` directory ⇒ no `make` target ⇒ no
-  binary). `mpcvm/fhe/` above is the FHE runtime library, not a standalone
-  F-Chain. **F-Chain is a spec (LP-8200, LP-167) with no shipping VM.**
+### F-Chain (`fhevm/`)
+
+F is the coordination plane for confidential compute, modelled on `keyvm/`: the
+chain of record for encrypted values that it never holds. It stores a
+ciphertext's 32-byte handle, the digest of the off-chain body, its owner, the
+capability permits granted over it, and the threshold decryptions asked for and
+answered. It stores no ciphertext body, no plaintext, no FHE secret key and no
+decryption share — `fhevm/invariant_test.go` proves that by walking the type
+graph and scanning the package source.
+
+Six operations, each fee-settled through consensus and priced by scheme and ring
+dimension (`fhevm/gas.go`): register a ciphertext, grant a permit, revoke a
+permit, request a decryption, attest its result, advance the epoch. The last two
+are threshold decisions — a request completes when `Threshold` distinct members
+of the epoch's committee attest the *same* result handle, and an epoch installs
+when `Threshold` members of the sitting committee attest the same successor. A
+member votes once, and votes are tallied per value, so one member naming a false
+result delays nothing and pays for the attempt.
+
+F **wraps** `mpcvm/fhe/` rather than restating it: its records embed that
+package's types and its public parameters come from `DefaultThresholdConfig()`.
+It does **not** use that package's `Registry`, which stamps records with
+`time.Now()` — right for the off-chain daemon it was written for, wrong for a
+state root, because two validators replaying one block would write different
+bytes. F owns its persistence and every timestamp it writes comes from the
+accepting block.
 
 T-Chain is gone entirely — LP-134 dissolves it with zero remainder (threshold
 signing → M, FHE → F, cross-chain messaging/teleport → B). There is no
