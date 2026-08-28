@@ -238,10 +238,14 @@ func acceptQueued(t *testing.T, vm *VM) *Block {
 	return blk
 }
 
+// mustJSON encodes a payload. t may be nil where the caller is not a test body
+// (a table built at the top of one), since these values never fail to encode.
 func mustJSON(t *testing.T, v any) []byte {
-	t.Helper()
 	b, err := json.Marshal(v)
-	require.NoError(t, err)
+	if t != nil {
+		t.Helper()
+		require.NoError(t, err)
+	}
 	return b
 }
 
@@ -332,34 +336,39 @@ func TestHeightIndex(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestBlockRejectRequeues proves a rejected block returns its transactions to
-// the mempool and leaves state untouched.
-func TestBlockRejectRequeues(t *testing.T) {
+// TestBlockDiscardKeepsTheQueue proves a proposal that never lands costs
+// nothing. BuildBlock SELECTS from the mempool rather than draining it, so a
+// block that is rejected — or that the engine simply discards, which it may do
+// without ever calling Reject — cannot take the queue with it.
+func TestBlockDiscardKeepsTheQueue(t *testing.T) {
 	k := newTestKey(t)
 	committee, _ := newCommittee(t, 1)
 	vm := newTestVM(t, map[string]uint64{k.hexAddr(): testFund}, committee, 1)
 
-	tx := registerTx(t, k, testScheme, digestOf("rejected"), 1)
+	tx := registerTx(t, k, testScheme, digestOf("discarded"), 1)
 	_, err := vm.SubmitTx(tx)
 	require.NoError(t, err)
 
 	blkIntf, err := vm.BuildBlock(context.Background())
 	require.NoError(t, err)
 	blk := blkIntf.(*Block)
-	require.Empty(t, vm.mempool, "building drains the mempool")
+	require.Len(t, vm.mempool, 1, "building selects, it does not drain")
+	require.Len(t, vm.claims, 1)
 
 	require.NoError(t, blk.Reject(context.Background()))
-	require.Len(t, vm.mempool, 1, "reject must requeue")
+	require.Len(t, vm.mempool, 1, "reject leaves the queue alone")
 
 	_, ok := vm.Ciphertext(tx.Subject)
 	require.False(t, ok, "a rejected block must apply nothing")
 	burned, _ := vm.Burned()
 	require.Zero(t, burned, "a rejected block must burn nothing")
 
-	// The requeued transaction still works in a later block.
+	// The transaction is still good and the next block carries it.
 	acceptQueued(t, vm)
 	_, ok = vm.Ciphertext(tx.Subject)
 	require.True(t, ok)
+	require.Empty(t, vm.mempool, "acceptance is the only thing that clears the queue")
+	require.Empty(t, vm.claims, "and the only thing that releases a claim")
 }
 
 // TestBlockStatus proves a block reports processing until it is accepted.

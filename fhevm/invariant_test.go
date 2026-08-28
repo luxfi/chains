@@ -40,11 +40,9 @@ var secretTokens = []string{
 	"plaintext", "cleartext", "body", "blob",
 }
 
-// idSizes are the byte-array lengths F legitimately uses for identifiers: a
-// selector, an address, and a hash. A byte array of any other length is treated
-// as a potential opaque carrier and must not be named like a secret.
-var idSizes = map[int]bool{4: true, 20: true, 32: true}
-
+// isByteBearing reports whether a field can carry opaque bytes. Fixed-size byte
+// arrays count: being id-sized is not being an id, and a scalar share is
+// exactly 32 bytes.
 func isByteBearing(ft reflect.Type) bool {
 	switch ft.Kind() {
 	case reflect.String:
@@ -59,7 +57,7 @@ func isByteBearing(ft reflect.Type) bool {
 		}
 		return false
 	case reflect.Array:
-		return ft.Elem().Kind() == reflect.Uint8 && !idSizes[ft.Len()]
+		return ft.Elem().Kind() == reflect.Uint8
 	}
 	return false
 }
@@ -74,6 +72,10 @@ func walkType(typ reflect.Type, path string, seen map[reflect.Type]bool) []strin
 
 	var bad []string
 	switch typ.Kind() {
+	case reflect.Interface:
+		// A field typed as an interface holds whatever it is handed, which is
+		// the opposite of an enumerable record.
+		bad = append(bad, fmt.Sprintf("%s is an interface and can hold anything", path))
 	case reflect.Ptr, reflect.Slice, reflect.Array:
 		bad = append(bad, walkType(typ.Elem(), path, seen)...)
 	case reflect.Map:
@@ -101,23 +103,97 @@ func walkType(typ reflect.Type, path string, seen map[reflect.Type]bool) []strin
 	return bad
 }
 
-func TestNoSecretFieldsInState(t *testing.T) {
-	roots := []reflect.Type{
+// persistedTypes is exactly what F writes to its database. putCiphertext,
+// putPermit, putDecrypt and putEpoch are the only writers of a record, and
+// these are the four types they write.
+func persistedTypes() []reflect.Type {
+	return []reflect.Type{
 		reflect.TypeOf(CiphertextRecord{}),
 		reflect.TypeOf(PermitRecord{}),
 		reflect.TypeOf(DecryptRecord{}),
 		reflect.TypeOf(EpochRecord{}),
+	}
+}
+
+// persistedSchema pins every field F persists, flattened through the embedded
+// runtime types, with the type of each.
+//
+// The walk below is a name DENYLIST, and a denylist cannot be complete — a
+// field called Material carries exactly as much as one called Secret. This pin
+// is the check that actually holds: a field added, removed or retyped anywhere
+// in a persisted record fails here until someone writes it down, at which point
+// the question "should F be storing that?" is asked deliberately rather than
+// answered by omission.
+var persistedSchema = map[string][]string{
+	"CiphertextRecord": {
+		"Handle [32]uint8", "Owner [20]uint8", "Type uint8", "Level int",
+		"Epoch uint64", "RegisteredAt int64", "Size uint32", "ChainID ids.ID",
+		"Scheme string", "Digest [32]uint8",
+	},
+	"PermitRecord": {
+		"PermitID [32]uint8", "Handle [32]uint8", "Grantee [20]uint8",
+		"Grantor [20]uint8", "Operations uint32", "Expiry int64",
+		"CreatedAt int64", "Attestation []uint8", "ChainID ids.ID",
+		"Status string",
+	},
+	"DecryptRecord": {
+		"RequestID [32]uint8", "CiphertextHandle [32]uint8", "Requester [20]uint8",
+		"Callback [20]uint8", "CallbackSelector [4]uint8", "SourceChain ids.ID",
+		"Epoch uint64", "Nonce uint64", "Expiry int64", "Status fhe.RequestStatus",
+		"CreatedAt int64", "CompletedAt int64", "ResultHandle [32]uint8",
+		"Error string", "PermitID [32]uint8", "Attestations []fhevm.Attestation",
+	},
+	"EpochRecord": {
+		"Epoch uint64", "StartTime int64", "EndTime int64",
+		"Committee []fhe.CommitteeMember", "Threshold int", "PublicKey []uint8",
+		"Status fhe.EpochStatus", "Attestations []fhevm.Attestation",
+	},
+}
+
+// flatten lists a struct's fields, descending through embedded structs so an
+// embedded runtime type cannot hide a field behind its own name.
+func flatten(typ reflect.Type) []string {
+	var out []string
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		if f.Anonymous && f.Type.Kind() == reflect.Struct {
+			out = append(out, flatten(f.Type)...)
+			continue
+		}
+		out = append(out, f.Name+" "+f.Type.String())
+	}
+	return out
+}
+
+func TestPersistedSchemaIsPinned(t *testing.T) {
+	require.Len(t, persistedSchema, len(persistedTypes()))
+	for _, typ := range persistedTypes() {
+		want, ok := persistedSchema[typ.Name()]
+		require.Truef(t, ok, "%s is persisted but not pinned", typ.Name())
+		require.Equalf(t, want, flatten(typ),
+			"%s no longer stores what it was written down as storing.\n"+
+				"If the change is intended, update persistedSchema — and while you are\n"+
+				"there, answer the question it exists to force: should F be storing that?",
+			typ.Name())
+	}
+}
+
+// TestNoSecretFieldsInState walks everything F SERIALIZES — what it persists,
+// what it accepts on the wire, and what it reads from genesis. Those are the
+// shapes that must be enumerable: each field is a coordinate F chose to keep,
+// and none of them may be, or hold, the encrypted part.
+func TestNoSecretFieldsInState(t *testing.T) {
+	roots := append(persistedTypes(),
 		reflect.TypeOf(Attestation{}),
 		reflect.TypeOf(RegisterPayload{}),
 		reflect.TypeOf(GrantPayload{}),
+		reflect.TypeOf(RevokePayload{}),
 		reflect.TypeOf(RequestPayload{}),
 		reflect.TypeOf(FulfillPayload{}),
 		reflect.TypeOf(AdvancePayload{}),
 		reflect.TypeOf(Transaction{}),
-		reflect.TypeOf(Block{}),
 		reflect.TypeOf(Genesis{}),
-		reflect.TypeOf(VM{}), // the VM itself must hold no secret field
-	}
+	)
 	seen := make(map[reflect.Type]bool)
 	var bad []string
 	for _, r := range roots {
@@ -126,9 +202,25 @@ func TestNoSecretFieldsInState(t *testing.T) {
 	require.Emptyf(t, bad, "F-Chain state can reach secret material:\n%s", strings.Join(bad, "\n"))
 }
 
+// TestBlockHoldsOnlyItsHeaderAndItsTransactions pins Block by hand rather than
+// walking it. A Block carries a back-pointer to the VM, so a walk of its type
+// graph reaches every piece of runtime plumbing the VM holds — loggers,
+// databases, an RPC server — and says nothing about the block. What matters
+// about a Block is that it holds a header, its transactions, and nothing else.
+func TestBlockHoldsOnlyItsHeaderAndItsTransactions(t *testing.T) {
+	require.Equal(t, []string{
+		"id ids.ID",
+		"parentID ids.ID",
+		"height uint64",
+		"timestamp time.Time",
+		"transactions []*fhevm.Transaction",
+		"vm *fhevm.VM",
+	}, flatten(reflect.TypeOf(Block{})))
+}
+
 // TestWalkerRejectsSecretBearingType is the control for the test above: a walk
 // that flags nothing proves nothing unless the walker can be shown to flag
-// something. These two shapes are exactly what the invariant forbids.
+// something.
 func TestWalkerRejectsSecretBearingType(t *testing.T) {
 	type withNamedSecret struct {
 		Handle         [32]byte
@@ -137,12 +229,20 @@ func TestWalkerRejectsSecretBearingType(t *testing.T) {
 	type withShare struct {
 		Share []byte
 	}
+	type withIdSizedShare struct {
+		SecretShare [32]byte // a scalar share is exactly 32 bytes
+	}
+	type withInterface struct {
+		Extra any // holds whatever it is handed
+	}
 	for _, tc := range []struct {
 		name string
 		typ  reflect.Type
 	}{
 		{"named body", reflect.TypeOf(withNamedSecret{})},
 		{"named share", reflect.TypeOf(withShare{})},
+		{"id-sized share", reflect.TypeOf(withIdSizedShare{})},
+		{"interface field", reflect.TypeOf(withInterface{})},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			require.NotEmpty(t, walkType(tc.typ, tc.name, map[reflect.Type]bool{}),

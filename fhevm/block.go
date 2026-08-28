@@ -53,83 +53,64 @@ func (b *Block) Parent() ids.ID       { return b.parentID }
 func (b *Block) Height() uint64       { return b.height }
 func (b *Block) Timestamp() time.Time { return b.timestamp }
 
-// Verify checks the block can be accepted WITHOUT mutating state: the parent
-// exists, every transaction is well-formed and authenticated, no two
-// transactions bring about the same effect, and every payer can afford its fee
-// — including the cumulative fees of multiple transactions from the same payer
-// within this block. A block that fails any check is never accepted (fail
-// closed); verifying a block never moves funds.
+// MaxFutureSkew is how far ahead of the verifying node's clock a block's
+// timestamp may be. Chain time drives every expiry F enforces, so without a cap
+// a proposer stamping year 36812 would expire every permit and every pending
+// request at once.
+const MaxFutureSkew = 60 * time.Second
+
+// Verify checks the block can be accepted WITHOUT mutating state: it sits
+// correctly on its parent in height and time, and every transaction is
+// well-formed, authenticated, correctly ordered and paid for. A block that
+// fails any check is never accepted (fail closed); verifying a block never
+// moves funds.
+//
+// Verify does NOT decide authorization. That verdict depends on state earlier
+// transactions in the same block may change, so a block-time verdict can differ
+// from the application-time one — and a block every validator certifies and no
+// validator can apply halts the chain. Authorization is decided once, in
+// Accept, where failing it reverts the one transaction instead of the block.
 func (b *Block) Verify(ctx context.Context) error {
-	if b.height > 0 {
-		if _, err := b.vm.GetBlock(ctx, b.parentID); err != nil {
-			return fmt.Errorf("fhevm: verify parent: %w", err)
-		}
+	if b.height == 0 {
+		return fmt.Errorf("fhevm: %w: genesis is not a proposed block", ErrInvalidBlock)
+	}
+	parent, err := b.vm.GetBlock(ctx, b.parentID)
+	if err != nil {
+		return fmt.Errorf("fhevm: verify parent: %w", err)
+	}
+	// Chain time and height are the parent's, advanced. Without this a proposer
+	// picks both freely: it can rewind time to revive an expired permit, or jump
+	// forward to expire everything at once.
+	if b.height != parent.Height()+1 {
+		return fmt.Errorf("fhevm: %w: height %d does not follow parent %d",
+			ErrInvalidBlock, b.height, parent.Height())
+	}
+	if b.timestamp.Before(parent.Timestamp()) {
+		return fmt.Errorf("fhevm: %w: timestamp %d precedes parent %d",
+			ErrInvalidBlock, b.timestamp.Unix(), parent.Timestamp().Unix())
+	}
+	if b.timestamp.After(b.vm.clock.Time().Add(MaxFutureSkew)) {
+		return fmt.Errorf("fhevm: %w: timestamp %d is beyond the %s skew allowance",
+			ErrInvalidBlock, b.timestamp.Unix(), MaxFutureSkew)
+	}
+	if len(b.transactions) == 0 {
+		return fmt.Errorf("fhevm: %w: empty block", ErrInvalidBlock)
+	}
+	if len(b.transactions) > MaxBlockTxs {
+		return fmt.Errorf("fhevm: %w: %d transactions exceeds %d",
+			ErrInvalidBlock, len(b.transactions), MaxBlockTxs)
 	}
 
 	b.vm.stateLock.RLock()
 	defer b.vm.stateLock.RUnlock()
 
-	spent := make(map[fee.Account]uint64)         // running per-payer debit within this block
-	expectedNonce := make(map[fee.Account]uint64) // running per-payer nonce within this block
-	effects := make(map[[32]byte]struct{})        // effects already claimed within this block
+	batch := newBatch(b.vm)
 	for _, tx := range b.transactions {
-		if err := tx.SyntacticVerify(); err != nil {
+		if err := batch.admit(tx); err != nil {
 			return err
 		}
-		if err := tx.authenticate(); err != nil {
-			return err
-		}
-		// Replay/order guard runs BEFORE authorization so a replayed tx is
-		// rejected as such regardless of the operation's other preconditions.
-		expN, ok := expectedNonce[tx.Payer]
-		if !ok {
-			expN = b.vm.nonceOf(tx.Payer) + 1
-		}
-		if tx.Nonce != expN {
-			return ErrBadNonce
-		}
-		expectedNonce[tx.Payer] = expN + 1
-		// Uniqueness guard: checkAuth reads COMMITTED state, so two transactions
-		// claiming the same effect both pass it and only collide in Accept,
-		// where the collision aborts the whole block. Catch it here instead, so
-		// a block carrying such a pair is refused rather than accepted and then
-		// failed.
-		eff := tx.effect()
-		if _, dup := effects[eff]; dup {
-			return ErrDuplicateEffect
-		}
-		effects[eff] = struct{}{}
-		if err := tx.checkAuth(b.vm, b.timestamp.Unix()); err != nil {
-			return err
-		}
-		gasUsed, err := GasFor(tx)
-		if err != nil {
-			return err
-		}
-		if uint64(gasUsed) > tx.GasLimit {
-			return fmt.Errorf("fhevm: %w: gas %d > limit %d", fee.ErrOutOfGas, gasUsed, tx.GasLimit)
-		}
-		feeAmt, err := fee.Cost(gasUsed, GasPrice)
-		if err != nil {
-			return err
-		}
-		bal, err := b.vm.ledger.Balance(tx.Payer)
-		if err != nil {
-			return err
-		}
-		prev := spent[tx.Payer]
-		next, over := addBlockSpend(prev, feeAmt)
-		if over || bal < next {
-			return fee.ErrInsufficientFunds
-		}
-		spent[tx.Payer] = next
 	}
 	return nil
-}
-
-func addBlockSpend(a, b uint64) (uint64, bool) {
-	s := a + b
-	return s, s < a
 }
 
 // Accept settles and applies the block atomically. For each transaction it
@@ -170,10 +151,8 @@ func (b *Block) Accept(ctx context.Context) error {
 	b.vm.lastAccepted = b.id
 	b.vm.lastBlock = b
 	b.vm.height = b.height
-	b.vm.shutdownLock.Lock()
 	delete(b.vm.pendingBlocks, b.id)
-	b.vm.shutdownLock.Unlock()
-	b.vm.dropFromMempool(b.transactions)
+	b.vm.release(b.transactions)
 
 	b.vm.log.Info("F-Chain block accepted",
 		log.String("blockID", b.id.String()),
@@ -194,6 +173,18 @@ func (b *Block) abort() {
 
 // settleAndApply burns each tx fee and applies its effect. Caller holds
 // stateLock and is responsible for Abort on error.
+//
+// A transaction that fails AUTHORIZATION here REVERTS rather than aborting the
+// block: its fee is burned, its nonce is consumed, and its state effect does
+// not happen. Every validator reaches that verdict from the same committed
+// state in the same order, so a reverted transaction is not a disagreement —
+// and the alternative, aborting, would mean a block every validator certified
+// and no validator could apply, which halts the chain at that height. The payer
+// pays for the block space it used either way, so a revert is not free.
+//
+// The error return is therefore reserved for what a validator genuinely cannot
+// proceed past: a failed write, a failed burn, a nonce that Verify should have
+// caught. Those abort the block and roll it back whole.
 func (b *Block) settleAndApply(now int64) error {
 	for _, tx := range b.transactions {
 		// Replay/order guard: nonce must be exactly the payer's next. Reads the
@@ -218,8 +209,9 @@ func (b *Block) settleAndApply(now int64) error {
 		if err := fee.Charge(b.vm.ledger, tx.Payer, feeAmt); err != nil {
 			return err
 		}
-		// Apply the operation's state effect (atomically with the burn).
-		if err := tx.Apply(b.vm, now); err != nil {
+		// Apply the operation's state effect (atomically with the burn) — or, if
+		// authorization refuses it, leave state untouched. Apply reports which.
+		if _, err := tx.Apply(b.vm, now); err != nil {
 			return err
 		}
 		// Advance the payer's nonce (atomically with the burn + effect).
@@ -230,13 +222,14 @@ func (b *Block) settleAndApply(now int64) error {
 	return nil
 }
 
-// Reject discards the block and returns its transactions to the mempool so they
-// can be retried in a later block.
+// Reject discards the block. Its transactions were never removed from the
+// mempool — BuildBlock selects from the mempool rather than draining it — so
+// there is nothing to give back and nothing that can be lost by an engine that
+// drops a block without rejecting it.
 func (b *Block) Reject(ctx context.Context) error {
-	b.vm.shutdownLock.Lock()
+	b.vm.stateLock.Lock()
 	delete(b.vm.pendingBlocks, b.id)
-	b.vm.shutdownLock.Unlock()
-	b.vm.requeue(b.transactions)
+	b.vm.stateLock.Unlock()
 	return nil
 }
 

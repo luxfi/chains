@@ -23,11 +23,25 @@ import (
 // committee, whose members are named here only by public node ID and public
 // signing key.
 //
-// The invariant is structural, not a matter of discipline. The four record
-// types below are everything F persists, and each of their fields is a public
-// coordinate: hashes, addresses, bitmasks, sizes, epochs, timestamps. There is
-// no field whose type can carry ciphertext, plaintext, or a share.
-// ciphertext_test.go proves this by walking the types reflectively.
+// Three things hold that line, because none of them holds it alone.
+//
+// The four record types below are everything F persists, and every field of
+// them is a public coordinate: hashes, addresses, bitmasks, sizes, epochs,
+// timestamps. invariant_test.go PINS that field list exactly — a field added,
+// removed or retyped fails the test until someone writes it down, which is what
+// makes "should F be storing that?" a question somebody has to answer rather
+// than one omission answers.
+//
+// Second, a transaction's payload decodes as EXACTLY its schema: a member the
+// schema does not describe is refused, not ignored (transaction.go decode). A
+// megabyte of ciphertext body in a "body" member used to decode fine, cost
+// nothing extra, and come back out of the block store.
+//
+// Third, the bytes a transaction does carry are bounded and priced by the byte
+// (gas.go GasPerByte), so bulk is refused before it is stored and paid for when
+// it is. A reflective walk over field names is a fourth check and the weakest —
+// a denylist cannot be complete — so it is kept as a tripwire for new types,
+// not relied on.
 //
 // The records embed the FHE runtime's own types (github.com/luxfi/chains/
 // mpcvm/fhe) so the chain and the runtime speak one vocabulary. F owns the
@@ -111,16 +125,23 @@ func tally(as []Attestation, value [32]byte) int {
 	return len(seen)
 }
 
-// attested reports whether member already voted, whatever it voted for. One
-// member, one vote: a member cannot raise a value's count by repeating itself,
-// and cannot hedge by attesting two different values.
-func attested(as []Attestation, member fee.Account) bool {
-	for _, a := range as {
-		if a.Member == member {
-			return true
+// vote records member's choice, REPLACING whatever it chose before. One member,
+// one vote — so a member can neither raise a value's count by repeating itself
+// nor hedge across two values — but a vote is not spent by being cast.
+//
+// It used to be spent. A committee that split its vote could then never
+// converge: no proposal reached the threshold, nobody could change their mind,
+// nothing timed out, and the tally cleared only on the advance that could not
+// happen. At unanimity one member wedged rotation alone; below it, an honest
+// race between two DKG results did the same with no adversary at all.
+func vote(as []Attestation, member fee.Account, value [32]byte) []Attestation {
+	for i := range as {
+		if as[i].Member == member {
+			as[i].Value = value
+			return as
 		}
 	}
-	return false
+	return append(as, Attestation{Member: member, Value: value})
 }
 
 // memberOf reports whether acct is a committee member of this epoch. A member's

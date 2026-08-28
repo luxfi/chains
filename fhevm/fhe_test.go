@@ -135,11 +135,15 @@ func TestOnlyCommitteeAnswers(t *testing.T) {
 
 	acceptOne(t, vm, fulfillTx(t, members[0], requestID, result, 1))
 
-	// One member, one vote — including a member trying to change its mind.
-	_, err = vm.SubmitTx(fulfillTx(t, members[0], requestID, result, 2))
-	require.ErrorIs(t, err, ErrAlreadyAttested)
-	_, err = vm.SubmitTx(fulfillTx(t, members[0], requestID, digestOf("other"), 2))
-	require.ErrorIs(t, err, ErrAlreadyAttested)
+	// One member, one vote — but the vote is not spent by being cast. A second
+	// attestation REPLACES the first rather than adding to the tally, so a
+	// member can correct itself without ever counting twice.
+	acceptOne(t, vm, fulfillTx(t, members[0], requestID, digestOf("other"), 2))
+	rec, _ := vm.Decrypt(requestID)
+	require.Len(t, rec.Attestations, 1, "one entry per member, however often it votes")
+	require.Equal(t, digestOf("other"), rec.Attestations[0].Value)
+	require.Zero(t, tally(rec.Attestations, result), "the withdrawn vote counts for nothing")
+	require.Equal(t, fhe.RequestPending, rec.Status, "and one member is still not a threshold")
 }
 
 // TestUnknownRequestCannotBeAnswered proves an attestation to a request that
@@ -381,14 +385,18 @@ func TestEpochAdvanceRefusals(t *testing.T) {
 	_, err = vm.SubmitTx(advanceTx(t, members[0], 0, next, 2, pk, 1))
 	require.ErrorIs(t, err, ErrEpochMismatch)
 
-	// One member, one vote — and voting for a rival proposal is still a second
-	// vote, so a member cannot split the tally by itself.
+	// One member, one vote — a member that moves to a rival proposal moves its
+	// single vote rather than splitting the tally in its own favour.
 	acceptOne(t, vm, advanceTx(t, members[0], 1, next, 2, pk, 1))
-	_, err = vm.SubmitTx(advanceTx(t, members[0], 1, next, 2, pk, 2))
-	require.ErrorIs(t, err, ErrAlreadyAttested)
 	rival, _ := newCommittee(t, 3)
-	_, err = vm.SubmitTx(advanceTx(t, members[0], 1, rival, 2, pk, 2))
-	require.ErrorIs(t, err, ErrAlreadyAttested)
+	acceptOne(t, vm, advanceTx(t, members[0], 1, rival, 2, pk, 2))
+
+	ep, _ := vm.Epoch(0)
+	require.Len(t, ep.Attestations, 1, "one entry per member, however often it votes")
+	require.Zero(t, tally(ep.Attestations, committeeDigest(1, 2, pk, next)),
+		"the abandoned proposal keeps none of its support")
+	require.Equal(t, 1, tally(ep.Attestations, committeeDigest(1, 2, pk, rival)))
+	require.Equal(t, uint64(0), vm.CurrentEpoch(), "and one member is still not a threshold")
 }
 
 // TestRequestBindsToTheSeatedEpoch proves an answer comes from the committee

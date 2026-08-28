@@ -14,9 +14,18 @@
 // public parameters come from the runtime's threshold configuration. What F
 // does NOT reuse is the runtime's Registry, and the reason is consensus. The
 // Registry stamps records with time.Now(), which is right for the off-chain
-// daemon it was written for and wrong for a state root: two validators
-// replaying one block would write different bytes and diverge. So F owns its
-// persistence, and every timestamp it writes comes from the accepting block.
+// daemon it was written for and wrong here: two validators replaying one block
+// would store different bytes, so they would return different answers to the
+// same query and neither would be wrong to. So F owns its persistence, and
+// every timestamp it writes comes from the accepting block.
+//
+// F COMMITS NO STATE ROOT, so nothing in consensus would catch that divergence
+// if it happened. What stands in its place is replay_test.go, which replays a
+// chain onto independently-built nodes running different clocks and requires
+// their databases to be byte-identical. Putting a root in consensus needs a
+// state layer per in-flight block, which this VM does not have — see LLM.md,
+// where the same missing layer is why a child of a verified-but-unaccepted
+// block cannot be verified.
 //
 // Mutating operations take effect only through fee-settled consensus blocks
 // (block.go), priced by a per-scheme gas schedule (gas.go) and burned from the
@@ -34,6 +43,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/rpc/v2"
@@ -64,6 +74,10 @@ const (
 	DecryptPrefix    = "dr:"
 	EpochPrefix      = "ep:"
 	BlockPrefix      = "block:"
+
+	// MaxMempool bounds the queue. Admission is open to anyone who can pay, so
+	// without a bound the queue is whatever an adversary chooses to make it.
+	MaxMempool = 4096
 )
 
 var (
@@ -82,7 +96,10 @@ var (
 	errVMShutdown    = errors.New("fhevm: shutting down")
 	errNoPendingTxs  = errors.New("fhevm: no pending transactions")
 	errNoParentBlock = errors.New("fhevm: no parent block")
+	errClockBehind   = errors.New("fhevm: local clock trails the chain tip by more than the skew allowance")
 
+	ErrInvalidBlock     = errors.New("fhevm: malformed block")
+	ErrMempoolFull      = errors.New("fhevm: mempool is full")
 	ErrInvalidTxType    = errors.New("fhevm: invalid transaction type")
 	ErrInvalidPayload   = errors.New("fhevm: invalid transaction payload")
 	ErrUnknownScheme    = errors.New("fhevm: unsupported FHE scheme")
@@ -106,10 +123,9 @@ var (
 	ErrRequestClosed   = errors.New("fhevm: decrypt request already answered")
 	ErrRequestExpired  = errors.New("fhevm: decrypt request expired")
 
-	ErrEpochNotFound   = errors.New("fhevm: epoch not found")
-	ErrEpochMismatch   = errors.New("fhevm: epoch is not the next one")
-	ErrNotCommittee    = errors.New("fhevm: payer is not a committee member")
-	ErrAlreadyAttested = errors.New("fhevm: member already attested")
+	ErrEpochNotFound = errors.New("fhevm: epoch not found")
+	ErrEpochMismatch = errors.New("fhevm: epoch is not the next one")
+	ErrNotCommittee  = errors.New("fhevm: payer is not a committee member")
 
 	ErrUnauthorized = errors.New("fhevm: payer not authorized for operation")
 
@@ -166,11 +182,25 @@ type VM struct {
 	// through `ledger`.
 	feePolicy nodefee.Policy
 
-	// Consensus mempool + block bookkeeping. `pending` holds the effect of every
-	// queued transaction so admission can refuse a second claim on it.
-	mempoolLock   sync.Mutex
-	mempool       []*Transaction
-	pending       map[[32]byte]struct{}
+	// Consensus mempool. `claims` holds the effect of every queued transaction
+	// so admission can refuse a second claim on it, and `queued` the highest
+	// nonce queued per payer so admission demands the same consecutive nonces
+	// consensus does. Both are derived from `mempool` and rebuilt from it
+	// whenever it shrinks, so neither can drift away from the queue it
+	// describes.
+	//
+	// LOCK ORDER, everywhere, without exception: stateLock then mempoolLock.
+	// Accept holds stateLock and releases from the mempool inside it, so any
+	// path taking them the other way round would deadlock.
+	mempoolLock sync.Mutex
+	mempool     []*Transaction
+	claims      map[[32]byte]struct{}
+	queued      map[fee.Account]uint64
+
+	// Block bookkeeping, under stateLock with the rest of the chain state. It
+	// was under a second mutex, which meant one map with two owners: BuildBlock
+	// wrote it under one and the Accept-abort path read it under the other,
+	// which is a data race and in Go a fatal, unrecoverable throw.
 	pendingBlocks map[ids.ID]*Block
 	lastAccepted  ids.ID
 	lastBlock     *Block
@@ -178,8 +208,10 @@ type VM struct {
 
 	rpcServer *rpc.Server
 
-	shutdownLock sync.RWMutex
-	shuttingDown bool
+	// shuttingDown is read on every build and health check and written once, so
+	// it is a flag rather than a lock — and one fewer lock is one fewer ordering
+	// to get wrong.
+	shuttingDown atomic.Bool
 }
 
 // Genesis is the F-Chain genesis: a funding allocation (address hex -> nLUX)
@@ -230,7 +262,8 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	vm.epochs = make(map[uint64]*EpochRecord)
 	vm.stateLock.Unlock()
 	vm.pendingBlocks = make(map[ids.ID]*Block)
-	vm.pending = make(map[[32]byte]struct{})
+	vm.claims = make(map[[32]byte]struct{})
+	vm.queued = make(map[fee.Account]uint64)
 
 	if init.Runtime != nil {
 		vm.networkID = init.Runtime.NetworkID
@@ -603,9 +636,16 @@ func (vm *VM) Burned() (uint64, error) {
 
 // ---- Mempool / consensus driver ----
 
-// SubmitTx validates, authenticates, and admission-checks a transaction, then
-// enqueues it and signals the engine to build a block. The fee is SETTLED
-// later, in block Accept — never here. Returns the transaction ID.
+// SubmitTx admits a transaction to this node's mempool. Admission is a FILTER,
+// not a consensus rule: it refuses what this node can already tell will not
+// work, so the queue stays useful. The rules consensus actually enforces live
+// in batch.admit, and the fee is SETTLED later, in block Accept — never here.
+//
+// The nonce rule is the same one consensus applies, counted over what is
+// already queued. It used to be the looser "greater than the last committed
+// one", which let a payer queue a gap: admission took it, Verify refused the
+// block for it, and since a Verify-failed block is dropped rather than
+// rejected, the queue behind it went with it.
 func (vm *VM) SubmitTx(tx *Transaction) (ids.ID, error) {
 	if err := tx.SyntacticVerify(); err != nil {
 		return ids.Empty, err
@@ -617,34 +657,41 @@ func (vm *VM) SubmitTx(tx *Transaction) (ids.ID, error) {
 	if err != nil {
 		return ids.Empty, err
 	}
+
 	vm.stateLock.RLock()
-	if tx.Nonce <= vm.nonceOf(tx.Payer) {
-		vm.stateLock.RUnlock()
+	defer vm.stateLock.RUnlock()
+	vm.mempoolLock.Lock()
+	defer vm.mempoolLock.Unlock()
+
+	if len(vm.mempool) >= MaxMempool {
+		return ids.Empty, ErrMempoolFull
+	}
+	// The replay/order guard runs BEFORE authorization, so a replayed
+	// transaction is reported as replayed whatever else is true of it.
+	want := vm.nonceOf(tx.Payer) + 1
+	if q, ok := vm.queued[tx.Payer]; ok && q >= want {
+		want = q + 1
+	}
+	if tx.Nonce != want {
 		return ids.Empty, ErrBadNonce
 	}
-	if err := tx.checkAuth(vm, vm.clock.Time().Unix()); err != nil {
-		vm.stateLock.RUnlock()
-		return ids.Empty, err
-	}
-	err = fee.CanPay(vm.ledger, tx.Payer, feeAmt)
-	vm.stateLock.RUnlock()
-	if err != nil {
-		return ids.Empty, err
-	}
-
 	// Refuse a second claim on an effect already queued. Without this a payer
 	// could enqueue two transactions that each pass every check alone and
-	// together abort the block that carries them.
+	// together spend a block on work only one of them can do.
 	eff := tx.effect()
-	vm.mempoolLock.Lock()
-	if _, dup := vm.pending[eff]; dup {
-		vm.mempoolLock.Unlock()
+	if _, dup := vm.claims[eff]; dup {
 		return ids.Empty, ErrDuplicateEffect
 	}
-	vm.pending[eff] = struct{}{}
-	vm.mempool = append(vm.mempool, tx)
-	vm.mempoolLock.Unlock()
+	if err := tx.checkAuth(vm, vm.clock.Time().Unix()); err != nil {
+		return ids.Empty, err
+	}
+	if err := fee.CanPay(vm.ledger, tx.Payer, feeAmt); err != nil {
+		return ids.Empty, err
+	}
 
+	vm.claims[eff] = struct{}{}
+	vm.queued[tx.Payer] = tx.Nonce
+	vm.mempool = append(vm.mempool, tx)
 	vm.work.Signal()
 	return tx.ID(), nil
 }
@@ -654,66 +701,78 @@ func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
 	return vm.work.WaitForEvent(ctx)
 }
 
-// BuildBlock drains the mempool into a new block extending the last accepted
-// block. The block is not yet verified or accepted — settlement happens in
-// Verify/Accept.
+// BuildBlock proposes a block from the mempool. It SELECTS rather than drains:
+// a transaction stays queued until the block carrying it is accepted, so an
+// engine that discards a proposal — which it may do without ever calling Reject
+// — cannot take the queue with it.
+//
+// Selection runs the same batch.admit that Verify runs, and simply skips what
+// does not fit. A proposer therefore cannot build a block its own Verify would
+// reject, and one unfit transaction no longer takes the rest down with it.
 func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
-	vm.shutdownLock.RLock()
-	down := vm.shuttingDown
-	vm.shutdownLock.RUnlock()
-	if down {
+	if vm.shuttingDown.Load() {
 		return nil, errVMShutdown
 	}
 
-	vm.mempoolLock.Lock()
-	txs := vm.mempool
-	vm.mempool = nil
-	vm.mempoolLock.Unlock()
-	if len(txs) == 0 {
-		return nil, errNoPendingTxs
-	}
+	vm.stateLock.Lock()
+	defer vm.stateLock.Unlock()
 
-	vm.stateLock.RLock()
 	parent := vm.lastBlock
-	parentID := vm.lastAccepted
-	vm.stateLock.RUnlock()
 	if parent == nil {
-		vm.requeue(txs)
 		return nil, errNoParentBlock
 	}
 
+	// Chain time never runs backwards, so a proposer whose clock has not moved
+	// since its own tip advances by the smallest step instead of proposing a
+	// block its own Verify would refuse. A clock so far behind that even that
+	// step lands outside the skew allowance is a broken clock: such a node
+	// declines to propose rather than produce a block nobody can verify.
+	ts := vm.clock.Time()
+	if !ts.After(parent.timestamp) {
+		ts = parent.timestamp.Add(time.Second)
+	}
+	if ts.After(vm.clock.Time().Add(MaxFutureSkew)) {
+		return nil, errClockBehind
+	}
+
+	vm.mempoolLock.Lock()
+	queued := append([]*Transaction(nil), vm.mempool...)
+	vm.mempoolLock.Unlock()
+	if len(queued) == 0 {
+		return nil, errNoPendingTxs
+	}
+
+	batch := newBatch(vm)
+	picked := make([]*Transaction, 0, len(queued))
+	for _, tx := range queued {
+		if len(picked) == MaxBlockTxs {
+			break
+		}
+		if err := batch.admit(tx); err != nil {
+			continue
+		}
+		picked = append(picked, tx)
+	}
+	if len(picked) == 0 {
+		return nil, errNoPendingTxs
+	}
+
 	blk := &Block{
-		parentID:     parentID,
+		parentID:     vm.lastAccepted,
 		height:       parent.height + 1,
-		timestamp:    vm.clock.Time(),
-		transactions: txs,
+		timestamp:    ts,
+		transactions: picked,
 		vm:           vm,
 	}
 	blk.id = blk.computeID()
-
-	vm.shutdownLock.Lock()
 	vm.pendingBlocks[blk.id] = blk
-	vm.shutdownLock.Unlock()
 	return blk, nil
 }
 
-// requeue returns transactions to the front of the mempool (on build/reject).
-// Their effects stay claimed — they are still in flight.
-func (vm *VM) requeue(txs []*Transaction) {
-	if len(txs) == 0 {
-		return
-	}
-	vm.mempoolLock.Lock()
-	vm.mempool = append(txs, vm.mempool...)
-	vm.mempoolLock.Unlock()
-	vm.work.Signal()
-}
-
-// dropFromMempool removes accepted transactions from the mempool by ID and
-// releases the effects they claimed — they have taken place, so any later
-// transaction claiming the same effect is now refused by checkAuth against
-// committed state instead.
-func (vm *VM) dropFromMempool(txs []*Transaction) {
+// release drops accepted transactions from the mempool and rebuilds the indexes
+// from what remains, so a claim or a queued nonce cannot outlive the
+// transaction that put it there. Caller holds stateLock.
+func (vm *VM) release(txs []*Transaction) {
 	if len(txs) == 0 {
 		return
 	}
@@ -721,7 +780,10 @@ func (vm *VM) dropFromMempool(txs []*Transaction) {
 	for _, tx := range txs {
 		accepted[tx.ID()] = struct{}{}
 	}
+
 	vm.mempoolLock.Lock()
+	defer vm.mempoolLock.Unlock()
+
 	kept := vm.mempool[:0]
 	for _, tx := range vm.mempool {
 		if _, ok := accepted[tx.ID()]; !ok {
@@ -729,10 +791,14 @@ func (vm *VM) dropFromMempool(txs []*Transaction) {
 		}
 	}
 	vm.mempool = kept
-	for _, tx := range txs {
-		delete(vm.pending, tx.effect())
+	vm.claims = make(map[[32]byte]struct{}, len(kept))
+	vm.queued = make(map[fee.Account]uint64, len(kept))
+	for _, tx := range kept {
+		vm.claims[tx.effect()] = struct{}{}
+		if n, ok := vm.queued[tx.Payer]; !ok || tx.Nonce > n {
+			vm.queued[tx.Payer] = tx.Nonce
+		}
 	}
-	vm.mempoolLock.Unlock()
 }
 
 // ---- Block storage ----
@@ -744,8 +810,8 @@ func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (chain.Block, e
 
 // GetBlock returns a block by ID.
 func (vm *VM) GetBlock(ctx context.Context, blockID ids.ID) (chain.Block, error) {
-	vm.shutdownLock.RLock()
-	defer vm.shutdownLock.RUnlock()
+	vm.stateLock.RLock()
+	defer vm.stateLock.RUnlock()
 	return vm.getBlockLocked(blockID)
 }
 
@@ -825,10 +891,12 @@ func (vm *VM) Connected(ctx context.Context, nodeID ids.NodeID, ver *chain.Versi
 func (vm *VM) Disconnected(ctx context.Context, nodeID ids.NodeID) error { return nil }
 
 func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
-	vm.shutdownLock.RLock()
-	down := vm.shuttingDown
-	vm.shutdownLock.RUnlock()
+	down := vm.shuttingDown.Load()
 
+	// Every field is read under ONE hold of the lock, including height and the
+	// burned counter. Reading any of them after releasing it is the same bug as
+	// two mutexes over one map: a reader racing the Accept-abort path, which
+	// rewrites all of this from the database.
 	vm.stateLock.RLock()
 	cts := len(vm.ciphertexts)
 	permits := len(vm.permits)
@@ -836,8 +904,9 @@ func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
 	epoch := vm.currentEpoch()
 	committee := len(epoch.Committee)
 	threshold := epoch.Threshold
+	height := vm.height
+	burned, _ := vm.ledger.Burned()
 	vm.stateLock.RUnlock()
-	burned, _ := vm.Burned()
 
 	return chain.HealthResult{
 		// A committee is what makes F answerable: with none seated, decryptions
@@ -852,7 +921,7 @@ func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
 			"epoch":       fmt.Sprintf("%d", epoch.Epoch),
 			"committee":   fmt.Sprintf("%d", committee),
 			"threshold":   fmt.Sprintf("%d", threshold),
-			"height":      fmt.Sprintf("%d", vm.height),
+			"height":      fmt.Sprintf("%d", height),
 			"burnedNLUX":  fmt.Sprintf("%d", burned),
 		},
 	}, nil
@@ -861,9 +930,7 @@ func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
 // Shutdown stops the VM. There is no secret material to zero — by construction
 // the VM never held any.
 func (vm *VM) Shutdown(ctx context.Context) error {
-	vm.shutdownLock.Lock()
-	vm.shuttingDown = true
-	vm.shutdownLock.Unlock()
+	vm.shuttingDown.Store(true)
 
 	if vm.cancel != nil {
 		vm.cancel()

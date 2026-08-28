@@ -255,15 +255,27 @@ func TestTallyCountsDistinctMembers(t *testing.T) {
 	a, b := newTestKey(t).addr, newTestKey(t).addr
 	x, y := [32]byte{1}, [32]byte{2}
 
-	as := []Attestation{{Member: a, Value: x}, {Member: a, Value: x}}
-	require.Equal(t, 1, tally(as, x), "a repeated member counts once")
+	// vote() is the only writer, and it replaces rather than appends, so one
+	// member holds exactly one entry however often it votes.
+	var as []Attestation
+	as = vote(as, a, x)
+	as = vote(as, a, x)
+	require.Len(t, as, 1, "a repeated member holds one entry")
+	require.Equal(t, 1, tally(as, x), "and counts once")
 
-	as = append(as, Attestation{Member: b, Value: x})
+	as = vote(as, b, x)
 	require.Equal(t, 2, tally(as, x))
-
 	require.Zero(t, tally(as, y), "votes for another value do not count")
-	require.True(t, attested(as, a))
-	require.False(t, attested(as, newTestKey(t).addr))
+
+	// Moving a vote moves it: the old value keeps nothing.
+	as = vote(as, a, y)
+	require.Len(t, as, 2, "still one entry per member")
+	require.Equal(t, 1, tally(as, x))
+	require.Equal(t, 1, tally(as, y))
+
+	// And the count is over DISTINCT members whatever the slice holds, so a
+	// record that somehow carried a duplicate could not inflate a threshold.
+	require.Equal(t, 1, tally([]Attestation{{Member: a, Value: x}, {Member: a, Value: x}}, x))
 }
 
 // TestEffectDistinguishesOperations proves the in-flight uniqueness key names
@@ -298,6 +310,26 @@ func TestEffectDistinguishesOperations(t *testing.T) {
 	g1 := grantTx(t, k, handle, other.addr, fhe.PermitOpDecrypt, 0, 1)
 	g2 := grantTx(t, k, handle, other.addr, fhe.PermitOpDecrypt, 0, 2)
 	require.NotEqual(t, g1.effect(), g2.effect())
+
+	// An epoch advance is a vote on the DECISION, and exactly one epoch is ever
+	// open, so one member's two votes are one effect however they differ. The
+	// proposal must not enter the effect: if it did, a member could vote twice,
+	// both votes would pass Verify against committed state, and Accept would
+	// apply one and refuse the other — a block every validator certifies and no
+	// validator can apply.
+	cA, _ := newCommittee(t, 3)
+	cB, _ := newCommittee(t, 3)
+	a1 := advanceTx(t, k, 1, cA, 2, []byte("k"), 1)
+	a2 := advanceTx(t, k, 1, cB, 2, []byte("k"), 2)
+	require.NotEqual(t, a1.Subject, a2.Subject, "two genuinely different proposals")
+	require.Equal(t, a1.effect(), a2.effect(), "but one member, one vote")
+
+	// A different member voting on the same decision is a different effect.
+	a3 := advanceTx(t, other, 1, cA, 2, []byte("k"), 1)
+	require.NotEqual(t, a1.effect(), a3.effect())
+
+	// A vote and an attestation never collide across operation kinds.
+	require.NotEqual(t, a1.effect(), v1.effect())
 }
 
 // TestTransactionIDIsContentHash proves the id is the hash of the canonical
