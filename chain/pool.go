@@ -114,14 +114,6 @@ func (p *Pool[T, K]) Drop(entries []T) {
 	}
 }
 
-// Holds reports whether a queued entry already claims c.
-func (p *Pool[T, K]) Holds(c K) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	_, ok := p.held[c]
-	return ok
-}
-
 // Len is how many entries are waiting.
 func (p *Pool[T, K]) Len() int {
 	p.mu.Lock()
