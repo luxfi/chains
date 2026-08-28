@@ -65,9 +65,10 @@ type Store[B Block] struct {
 
 	reload func() error
 
-	flight map[ids.ID]B
-	tip    ids.ID
-	height uint64
+	flight    map[ids.ID]B
+	tip       ids.ID
+	height    uint64
+	preferred ids.ID
 }
 
 // Key namespaces. Blocks, the height index and the tip pointer are the store's
@@ -183,10 +184,20 @@ func (s *Store[B]) Seed(write func(database.Database) error) error {
 	return nil
 }
 
-// Propose hands the caller the tip to build on and tracks whatever it builds,
-// in one step. Reading the tip and registering the child as two steps leaves a
-// window in which a block is accepted between them, and the proposal is then
-// built on a parent that is no longer the tip.
+// Prefer records the block the engine wants the next one built on. It is the
+// tip until the engine says otherwise, and a preference the store no longer
+// holds — pruned, or never tracked — falls back to the tip rather than naming
+// a parent nothing can resolve.
+func (s *Store[B]) Prefer(id ids.ID) {
+	s.Lock()
+	defer s.Unlock()
+	s.preferred = id
+}
+
+// Propose hands the caller the block to build on and tracks whatever it
+// builds, in one step. Reading the parent and registering the child as two
+// steps leaves a window in which a block is accepted between them, and the
+// proposal is then built on a parent that has moved.
 //
 // A build with nothing to propose says so with an error, and nothing is
 // tracked.
@@ -194,7 +205,12 @@ func (s *Store[B]) Propose(build func(parent ids.ID, height uint64) (B, error)) 
 	s.Lock()
 	defer s.Unlock()
 
-	b, err := build(s.tip, s.height)
+	parent, height := s.tip, s.height
+	if b, ok := s.flight[s.preferred]; ok {
+		parent, height = b.ID(), b.Height()
+	}
+
+	b, err := build(parent, height)
 	if err != nil {
 		var nothing B
 		return nothing, err

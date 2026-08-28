@@ -491,3 +491,39 @@ func TestConcurrentReadersDoNotRaceAnAccept(t *testing.T) {
 	_, height := f.store.Tip()
 	require.Equal(t, uint64(50), height)
 }
+
+func TestAProposalFollowsTheEnginesPreference(t *testing.T) {
+	f := newFixture(t)
+	one := newBlock(1, f.genesis.ID(), 1)
+	require.NoError(t, f.store.Accept(one))
+
+	// A second block in flight above the tip, which the engine prefers.
+	two := newBlock(2, one.ID(), 2)
+	f.store.Track(two)
+	f.store.Prefer(two.ID())
+
+	var sawParent ids.ID
+	var sawHeight uint64
+	_, err := f.store.Propose(func(parent ids.ID, height uint64) (*testBlock, error) {
+		sawParent, sawHeight = parent, height
+		return newBlock(3, parent, height+1), nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, two.ID(), sawParent, "a proposal extends the preferred fork")
+	require.Equal(t, uint64(2), sawHeight)
+}
+
+func TestAPreferenceTheStoreCannotResolveFallsBackToTheTip(t *testing.T) {
+	f := newFixture(t)
+	one := newBlock(1, f.genesis.ID(), 1)
+	require.NoError(t, f.store.Accept(one))
+	f.store.Prefer(ids.ID{99})
+
+	var sawParent ids.ID
+	_, err := f.store.Propose(func(parent ids.ID, height uint64) (*testBlock, error) {
+		sawParent = parent
+		return newBlock(3, parent, height+1), nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, one.ID(), sawParent)
+}

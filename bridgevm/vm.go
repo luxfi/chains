@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/chains/internal/warpmsg"
-	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/version"
@@ -27,12 +27,12 @@ import (
 	"github.com/luxfi/threshold/pkg/pool"
 	"github.com/luxfi/threshold/protocols/cmp/config"
 	vmcore "github.com/luxfi/vm"
-	"github.com/luxfi/vm/chain"
+	vmchain "github.com/luxfi/vm/chain"
 	"github.com/luxfi/warp"
 )
 
 var (
-	_ chain.ChainVM = (*VM)(nil)
+	_ vmchain.ChainVM = (*VM)(nil)
 
 	Version = &version.Semantic{
 		Major: 1,
@@ -180,7 +180,6 @@ const maxRequestsPerBlock = 100
 // VM implements the Bridge VM for cross-chain interoperability
 type VM struct {
 	rt       *runtime.Runtime
-	db       database.Database
 	config   BridgeConfig
 	toEngine chan<- vmcore.Message
 	log      log.Logger
@@ -226,17 +225,23 @@ type VM struct {
 	// source chain reports a lock.
 	work vmcore.Latch
 
-	// Block management
-	preferred      ids.ID
-	lastAcceptedID ids.ID
-	pendingBlocks  map[ids.ID]*Block
+	// chain is the durable state, the blocks in flight and the tip, under its
+	// own lock. What a block decides is written and committed there.
+	chain        *chain.Store[*Block]
+	genesisBlock *Block
 
-	// Fee policy gating user-submitted bridge transfers
-	// (InitiateBridgeTransfer). FlatPolicy at MinTxFeeFloor;
-	// consensus-internal paths bypass.
-	feePolicy fee.Policy
-	networkID uint32
+	// fee is what this chain charges to admit a user-submitted transfer, before
+	// any M-Chain signing capacity is consumed.
+	fee chain.Fee
 
+	// mu guards the bridge's own state above — the transfers in flight, the
+	// signer set, the chain clients, the release plumbing. That is not the
+	// chain's state and does not share the chain's lock.
+	//
+	// LOCK ORDER, without exception: the chain's lock, then this one, then the
+	// registry's. A block publishes under the chain's lock and completes its
+	// transfers inside it, so any path taking them the other way round would
+	// deadlock.
 	mu sync.RWMutex
 }
 
@@ -308,7 +313,6 @@ func (vm *VM) Initialize(
 ) error {
 	// Convert chain runtime to Runtime.
 	vm.rt = vmInit.Runtime
-	vm.db = vmInit.DB
 	vm.toEngine = vmInit.ToEngine
 
 	if logger, ok := vm.rt.Log.(log.Logger); ok {
@@ -317,19 +321,18 @@ func (vm *VM) Initialize(
 		return errors.New("invalid logger type")
 	}
 
-	vm.pendingBlocks = make(map[ids.ID]*Block)
 	vm.pendingBridges = make(map[ids.ID]*BridgeRequest)
 	vm.chainClients = make(map[string]ChainClient)
 	vm.evmByChainID = make(map[uint32]ChainClient)
 
-	// Pin fee policy. B-Chain accepts user-submitted bridge transfers
-	// so attach the canonical FlatPolicy at MinTxFeeFloor; fee.Validate
-	// refuses zero-fee user-facing chains at boot.
+	// B-Chain accepts user-submitted bridge transfers, so it declares the
+	// floor; the node's boot-time Validate refuses a zero-fee user-facing chain.
+	var networkID uint32
 	if vm.rt != nil {
-		vm.networkID = vm.rt.NetworkID
+		networkID = vm.rt.NetworkID
 	}
-	vm.feePolicy = newFeePolicy(vm.networkID)
-	if err := fee.Validate(vm.feePolicy); err != nil {
+	vm.fee = chain.Floor(networkID)
+	if err := fee.Validate(vm.fee.Policy()); err != nil {
 		return fmt.Errorf("bridgevm: fee policy: %w", err)
 	}
 
@@ -419,97 +422,95 @@ func (vm *VM) Initialize(
 	}
 
 	genesisBlock.ID_ = genesisBlock.computeID()
-	vm.lastAcceptedID = genesisBlock.ID()
+	vm.genesisBlock = genesisBlock
 
-	return vm.putBlock(genesisBlock)
+	_, _, err := vm.chain.Open(genesisBlock, vm.parseBlock)
+	return err
 }
 
-// BuildBlock implements the chain.ChainVM interface
-func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	// Check if we have pending bridge requests
-	if len(vm.pendingBridges) == 0 {
-		return nil, errors.New("no pending bridge requests")
+// parseBlock decodes a block belonging to this VM. The store reads accepted
+// blocks back through it, so there is one decoder rather than one per caller.
+func (vm *VM) parseBlock(raw []byte) (*Block, error) {
+	blk := &Block{vm: vm}
+	if err := parseBlockBytes(raw, blk); err != nil {
+		return nil, err
 	}
-
-	// Get parent block
-	parentID := vm.preferred
-	if parentID == ids.Empty {
-		parentID = vm.lastAcceptedID
-	}
-
-	parent, err := vm.getBlock(parentID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get parent block: %w", err)
-	}
-
-	// Collect bridge requests that are ready, then order them by request id.
-	// pendingBridges is a map, and Go randomises map iteration: taking the first
-	// maxRequestsPerBlock straight out of the range made both the ORDER of the
-	// block's requests and, once more than that many are ready, WHICH requests it
-	// carries vary run to run. That order is hashed into the block id
-	// (block.go computeID) and written to the wire, so the same pending set
-	// produced a different block every time and a request could be starved at
-	// random. Sorting first makes the block a function of its inputs and the cap a
-	// deterministic prefix.
-	requests := make([]*BridgeRequest, 0, len(vm.pendingBridges))
-	for _, req := range vm.pendingBridges {
-		if req.Confirmations >= vm.config.MinConfirmations {
-			requests = append(requests, req)
-		}
-	}
-	sort.Slice(requests, func(i, j int) bool {
-		return bytes.Compare(requests[i].ID[:], requests[j].ID[:]) < 0
-	})
-	if len(requests) > maxRequestsPerBlock {
-		requests = requests[:maxRequestsPerBlock]
-	}
-
-	if len(requests) == 0 {
-		return nil, errors.New("no ready bridge requests")
-	}
-
-	// Create new block
-	blk := &Block{
-		ParentID_:      parentID,
-		BlockHeight:    parent.Height() + 1,
-		BlockTimestamp: time.Now().Unix(),
-		BridgeRequests: requests,
-		vm:             vm,
-	}
-
 	blk.ID_ = blk.computeID()
-
-	// Store pending block
-	vm.pendingBlocks[blk.ID()] = blk
-
-	vm.log.Info("built bridge block",
-		log.Stringer("blockID", blk.ID()),
-		log.Int("numRequests", len(requests)),
-	)
-
 	return blk, nil
 }
 
-// GetBlock implements the chain.ChainVM interface
-func (vm *VM) GetBlock(ctx context.Context, id ids.ID) (chain.Block, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-
-	// Check pending blocks first (nil-safe for early calls before initialization)
-	if vm.pendingBlocks != nil {
-		if blk, exists := vm.pendingBlocks[id]; exists {
-			return blk, nil
+// BuildBlock implements the chain.ChainVM interface
+func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
+	built, err := vm.chain.Propose(func(parentID ids.ID, parentHeight uint64) (*Block, error) {
+		// The transfers in flight are the bridge's state, so they are read under
+		// the bridge's lock — taken here, inside the chain's, which is the one
+		// order these are ever taken in.
+		vm.mu.RLock()
+		if len(vm.pendingBridges) == 0 {
+			vm.mu.RUnlock()
+			return nil, errors.New("no pending bridge requests")
 		}
-	}
 
-	return vm.getBlock(id)
+		// Collect bridge requests that are ready, then order them by request id.
+		// pendingBridges is a map, and Go randomises map iteration: taking the
+		// first maxRequestsPerBlock straight out of the range made both the ORDER
+		// of the block's requests and, once more than that many are ready, WHICH
+		// requests it carries vary run to run. That order is hashed into the block
+		// id (block.go computeID) and written to the wire, so the same pending set
+		// produced a different block every time and a request could be starved at
+		// random. Sorting first makes the block a function of its inputs and the
+		// cap a deterministic prefix.
+		requests := make([]*BridgeRequest, 0, len(vm.pendingBridges))
+		for _, req := range vm.pendingBridges {
+			if req.Confirmations >= vm.config.MinConfirmations {
+				requests = append(requests, req)
+			}
+		}
+		vm.mu.RUnlock()
+
+		sort.Slice(requests, func(i, j int) bool {
+			return bytes.Compare(requests[i].ID[:], requests[j].ID[:]) < 0
+		})
+		if len(requests) > maxRequestsPerBlock {
+			requests = requests[:maxRequestsPerBlock]
+		}
+
+		if len(requests) == 0 {
+			return nil, errors.New("no ready bridge requests")
+		}
+
+		// Create new block
+		blk := &Block{
+			ParentID_:      parentID,
+			BlockHeight:    parentHeight + 1,
+			BlockTimestamp: time.Now().Unix(),
+			BridgeRequests: requests,
+			vm:             vm,
+		}
+		blk.ID_ = blk.computeID()
+
+		vm.log.Info("built bridge block",
+			log.Stringer("blockID", blk.ID()),
+			log.Int("numRequests", len(requests)),
+		)
+		return blk, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return built, nil
+}
+
+// GetBlock implements the chain.ChainVM interface
+func (vm *VM) GetBlock(ctx context.Context, id ids.ID) (vmchain.Block, error) {
+	if vm.genesisBlock != nil && id == vm.genesisBlock.ID() {
+		return vm.genesisBlock, nil
+	}
+	return vm.chain.Block(id, vm.parseBlock)
 }
 
 // ParseBlock implements the chain.ChainVM interface
-func (vm *VM) ParseBlock(ctx context.Context, bytes []byte) (chain.Block, error) {
+func (vm *VM) ParseBlock(ctx context.Context, bytes []byte) (vmchain.Block, error) {
 	blk := &Block{vm: vm}
 	if err := parseBlockBytes(bytes, blk); err != nil {
 		return nil, err
@@ -521,19 +522,14 @@ func (vm *VM) ParseBlock(ctx context.Context, bytes []byte) (chain.Block, error)
 
 // SetPreference implements the chain.ChainVM interface
 func (vm *VM) SetPreference(ctx context.Context, id ids.ID) error {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	vm.preferred = id
+	vm.chain.Prefer(id)
 	return nil
 }
 
 // LastAccepted implements the chain.ChainVM interface
 func (vm *VM) LastAccepted(ctx context.Context) (ids.ID, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-
-	return vm.lastAcceptedID, nil
+	id, _ := vm.chain.Tip()
+	return id, nil
 }
 
 // CreateHandlers implements the common.VM interface. The bridge's API is the
@@ -572,9 +568,9 @@ func (vm *VM) readiness() (ready bool, reason string, chains int) {
 
 // HealthCheck implements the common.VM interface, reporting what this node can
 // do so traffic reaches one that can bridge.
-func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
+func (vm *VM) HealthCheck(ctx context.Context) (vmchain.HealthResult, error) {
 	ready, reason, chains := vm.readiness()
-	return chain.HealthResult{
+	return vmchain.HealthResult{
 		Healthy: ready,
 		Details: map[string]string{
 			"status": reason,
@@ -597,7 +593,7 @@ func (vm *VM) CreateStaticHandlers(ctx context.Context) (map[string]http.Handler
 }
 
 // Connected implements the common.VM interface
-func (vm *VM) Connected(ctx context.Context, nodeID ids.NodeID, nodeVersion *chain.VersionInfo) error {
+func (vm *VM) Connected(ctx context.Context, nodeID ids.NodeID, nodeVersion *vmchain.VersionInfo) error {
 	return nil
 }
 
@@ -684,32 +680,6 @@ func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
 // called, so no lock the watcher found would ever reach a block.
 func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
 	return vm.work.WaitForEvent(ctx)
-}
-
-// Helper methods
-
-func (vm *VM) putBlock(blk *Block) error {
-	bytes, err := blk.Marshal()
-	if err != nil {
-		return err
-	}
-	id := blk.ID()
-	return vm.db.Put(id[:], bytes)
-}
-
-func (vm *VM) getBlock(id ids.ID) (*Block, error) {
-	bytes, err := vm.db.Get(id[:])
-	if err != nil {
-		return nil, err
-	}
-
-	blk := &Block{vm: vm}
-	if err := parseBlockBytes(bytes, blk); err != nil {
-		return nil, err
-	}
-
-	blk.ID_ = id
-	return blk, nil
 }
 
 // HTTP handler methods
