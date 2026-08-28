@@ -104,8 +104,18 @@ func TestAnAttestationCannotDeclareItsOwnQuorum(t *testing.T) {
 	require.NoError(t, vm.VerifyAttestation(att))
 
 	// A real signature by the real custody key, re-labelled as a 2-of-3 key
-	// signed by two parties. Under the old rule this passed.
+	// signed by two parties. Under the old rule — len(Signers) against the
+	// attestation's OWN Policy — this passed, because both halves of the
+	// comparison were the attacker's.
 	att.Policy = quorum.MustNew(2, 3)
+	att.Signers = key.rec.Participants[:2]
+	require.ErrorIs(t, vm.VerifyAttestation(att), ErrInvalidOperation)
+	require.ErrorContains(t, vm.VerifyAttestation(att), "key vault is 3-of-5")
+
+	// The declared policy is not merely required to be self-consistent: it must
+	// be the policy the key was GENERATED under. A quorum big enough for the
+	// declaration and too small for the key is the whole attack.
+	att.Policy = quorum.MustNew(2, 5)
 	att.Signers = key.rec.Participants[:2]
 	require.ErrorIs(t, vm.VerifyAttestation(att), ErrInvalidOperation)
 }

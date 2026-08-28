@@ -142,8 +142,9 @@ type GPUMPCVMTransitionResult struct {
 	MPCVMStateRoot         [32]byte
 }
 
-// GPUBackend is the no-op nocgo placeholder. Every method returns
-// ErrGPUNotAvailable; IsAvailable() returns false.
+// GPUBackend under !cgo has no plugin to reach. Every method returns
+// ErrGPUNotAvailable and IsAvailable reports false, so a caller written against
+// the cgo surface compiles and routes to the CPU reference unchanged.
 type GPUBackend struct {
 	Kind GPUBackendKind
 	Path string

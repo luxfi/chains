@@ -56,6 +56,20 @@ resolves a `CreateChainTx`'s vmID. `TestVMID_IsCanonicalAndStable` pins it.
 - Do **not** derive an external custody address with anything but Keccak-256.
   It was SHA-256 once; the published address then belongs to no one, and funds
   sent to it are unspendable.
+- Do **not** make a consensus bound configurable. `maxOpsPerBlock`,
+  `maxBlockBytes` and `maxFutureSkew` are constants because `Verify` enforces
+  them: a bound each operator could set would let two honestly-configured
+  validators reach opposite verdicts on one block. `ThresholdConfig` had a
+  `MaxOpsPerBlock` knob that was read only by the builder, one edit away from
+  being the split.
+- Do **not** trust a field of the document you are checking against another
+  field of the same document. `VerifyAttestation` compared `len(Signers)` to
+  the attestation's own `Policy` and therefore held for every attestation ever
+  written. The quorum comes from the key's record in consensus state.
+- Do **not** deliver a ceremony message without binding it to the peer that
+  sent it. `party.ID` IS the `NodeID` string, so `Gossip` refuses a message
+  whose `From` is not the authenticated sender. The threshold library carries
+  the sender as plain data and expects its transport to authenticate it.
 
 ## Invariants worth knowing before editing
 
@@ -79,10 +93,41 @@ resolves a `CreateChainTx`'s vmID. `TestVMID_IsCanonicalAndStable` pins it.
   `TestBridgeCustody_ThreeOfFive` runs a real 5-validator CGGMP21 DKG at
   degree 2 with a genuine 3-of-5 signature verified and recorded on-chain.
 - **Not** yet proven: a DKG across five separate luxd OS processes over real
-  sockets, and resharing/refresh (`ReshareKey`/`RefreshKey` are not
-  implemented — a validator joining after a key exists is not yet shared in).
+  sockets. Resharing does not exist at all — no ceremony, and `State.ReplaceKey`
+  (a second writer into the key registry, with no caller) was deleted. A key's
+  participant set is fixed at the DKG that created it, so a key survives only
+  while K of its original N remain. `KeyRecord.Validate` therefore rejects a
+  nonzero `Generation`.
 - Cert-lane enums `MChainCGGMP21=5`, `MChainFROST=6`, `MChainCoronaGen=7`,
   `FChainTFHE=8`, `FChainBootstrap=9`. Never reorder; appends only.
-- `types/`, `cert/`, `runtime/` hold the shared ceremony state machine that
-  F-Chain will also consume. `types` is wired (the custody floor); `cert/` and
-  `runtime/` are **not** yet consumed by the VM.
+- `types/` and `cert/` hold the shared ceremony state machine. `types` is wired
+  (`HasUniqueQuorum` is the custody floor `KeyRecord.Validate` reads); `cert/`
+  has **no consumer anywhere in the repo** — it is the M/F lane-ownership
+  registry, kept and fully tested, but nothing constructs one. `runtime/` and
+  `protocol/{cggmp21,frost,corona_general,tfhe_keygen}` were interface-only
+  packages with no implementation and no importer, and are gone; `docs/` and
+  `DESIGN.md` documented them and a `chains/mchain/` tree that never existed.
+
+## What one boot fault looked like
+
+`parseHeldShare` handed `cmpconfig.EmptyConfig` a **nil curve**, which that
+constructor exists to refuse — so it could not succeed for any input. Every
+validator that actually held a share failed `Initialize` with
+`load key shares: config must be initialized using EmptyConfig`; a validator
+holding none restarted fine, so the path that broke was the one only real
+committee members took. Nothing caught it because no test had ever stored a
+real share and restarted. `realShare` in `harness_test.go` now generates one
+genuine CMP config per package run for exactly that reason: the share store
+round-trips through the library's encoding, which validates a Paillier secret
+on the way back in, so a hand-assembled config cannot stand in.
+
+## Where the state root is load-bearing
+
+Linearity is not enforced by a tip check; it is enforced by the root chain, and
+`Block.Verify` compares `parent.StateRoot` to this node's applied root. That
+single predicate is what refuses a stale sibling, a block from another chain
+(the genesis root is seeded from the chain id), and — the one that halted the
+chain — a block built on a parent still in flight. Every check in
+`verifyOperation` reads APPLIED state, so a block built on an unapplied parent
+claims a root that skips the parent's operations: it verifies on every peer,
+wins consensus, and fails at `Accept` once the parent lands.
