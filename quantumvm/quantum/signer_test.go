@@ -5,6 +5,7 @@ package quantum
 
 import (
 	"bytes"
+	"errors"
 	"runtime"
 	"testing"
 	"time"
@@ -23,7 +24,16 @@ func runtimeCollect() {
 
 func signer(t *testing.T) *QuantumSigner {
 	t.Helper()
-	return NewQuantumSigner(log.NewNoOpLogger(), AlgorithmMLDSA65, time.Minute)
+	return newSigner(t, AlgorithmMLDSA65, time.Minute)
+}
+
+func newSigner(t *testing.T, version uint32, window time.Duration) *QuantumSigner {
+	t.Helper()
+	qs, err := NewQuantumSigner(log.NewNoOpLogger(), version, window)
+	if err != nil {
+		t.Fatalf("NewQuantumSigner(%d): %v", version, err)
+	}
+	return qs
 }
 
 // stored is a validator key in the shape it takes coming back from storage or
@@ -130,7 +140,7 @@ func TestSignRejectsUnparseableSecret(t *testing.T) {
 // window is the whole reason a stamp exists — without the check, a signature
 // captured once is replayable for as long as the chain runs.
 func TestVerifyRefusesAnExpiredStamp(t *testing.T) {
-	qs := NewQuantumSigner(log.NewNoOpLogger(), AlgorithmMLDSA65, 50*time.Millisecond)
+	qs := newSigner(t, AlgorithmMLDSA65, 50*time.Millisecond)
 	key := stored(t, qs)
 	msg := []byte("round digest")
 
@@ -153,8 +163,8 @@ func TestVerifyRefusesAnExpiredStamp(t *testing.T) {
 // signature widths differ, so accepting one would mean verifying against a
 // truncated key.
 func TestVerifyRefusesAnotherAlgorithm(t *testing.T) {
-	weak := NewQuantumSigner(log.NewNoOpLogger(), AlgorithmMLDSA44, time.Minute)
-	strong := NewQuantumSigner(log.NewNoOpLogger(), AlgorithmMLDSA87, time.Minute)
+	weak := newSigner(t, AlgorithmMLDSA44, time.Minute)
+	strong := newSigner(t, AlgorithmMLDSA87, time.Minute)
 
 	sig, err := weak.Sign([]byte("digest"), stored(t, weak))
 	if err != nil {
@@ -249,9 +259,8 @@ func TestParallelVerifyRefusesMismatchedInputs(t *testing.T) {
 func TestSignerReportsItsWidths(t *testing.T) {
 	for _, tc := range []struct{ version uint32 }{
 		{AlgorithmMLDSA44}, {AlgorithmMLDSA65}, {AlgorithmMLDSA87},
-		{99}, // anything unknown settles on the level-3 default
 	} {
-		qs := NewQuantumSigner(log.NewNoOpLogger(), tc.version, time.Minute)
+		qs := newSigner(t, tc.version, time.Minute)
 		key, err := qs.GenerateCoronaKey()
 		if err != nil {
 			t.Fatalf("GenerateCoronaKey: %v", err)
@@ -268,7 +277,7 @@ func TestSignerReportsItsWidths(t *testing.T) {
 		}
 		// A second signer named the same way agrees on the mode, so it can
 		// verify what the first produced.
-		peer := NewQuantumSigner(log.NewNoOpLogger(), tc.version, time.Minute)
+		peer := newSigner(t, tc.version, time.Minute)
 		if peer.GetMode() != qs.GetMode() {
 			t.Fatalf("version %d resolved to two different modes", tc.version)
 		}
@@ -315,5 +324,140 @@ func TestGPUVerifyFailsClosedWhenThereIsNoGPU(t *testing.T) {
 	sigs[1].Signature[0] ^= 0xFF
 	if err := qs.ParallelVerifyWithThreshold(msgs, sigs, 1); err == nil {
 		t.Fatal("the fallback accepted a forged signature")
+	}
+}
+
+// TestTheStampTimeIsSigned.
+//
+// Freshness was decided by a plain field on the signature — Sign covered
+// message || stamp and NOT the Timestamp — so the holder of an expired stamp
+// revived it by writing the current time into it, and the same edit forward
+// produced one that never expired at all. The window is the only thing standing
+// between a captured signature and unlimited replay, so the value it reads has
+// to be one the signature covers.
+func TestTheStampTimeIsSigned(t *testing.T) {
+	qs := newSigner(t, AlgorithmMLDSA65, 50*time.Millisecond)
+	key := stored(t, qs)
+	msg := []byte("round digest")
+
+	sig, err := qs.Sign(msg, key)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if err := qs.Verify(msg, sig); err != nil {
+		t.Fatalf("a fresh signature did not verify: %v", err)
+	}
+
+	time.Sleep(120 * time.Millisecond)
+	if err := qs.Verify(msg, sig); err != ErrQuantumStampExpired {
+		t.Fatalf("precondition: the stamp should have expired, got %v", err)
+	}
+
+	// Rewrite the field to now. The window is satisfied — and the signature is
+	// not, because the field is part of what was signed.
+	sig.Timestamp = time.Now()
+	if err := qs.Verify(msg, sig); err != ErrQuantumVerificationFailed {
+		t.Fatalf("an expired stamp was revived by rewriting its timestamp: %v", err)
+	}
+}
+
+// TestVerifyRefusesAFutureStamp. time.Since goes NEGATIVE for a date ahead of
+// now, so a stamp dated forward compared as arbitrarily fresh and never expired
+// — one write to an unsigned field bought a signature that is valid forever.
+func TestVerifyRefusesAFutureStamp(t *testing.T) {
+	qs := newSigner(t, AlgorithmMLDSA65, time.Minute)
+	key := stored(t, qs)
+	msg := []byte("round digest")
+
+	sig, err := qs.Sign(msg, key)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+
+	for _, ahead := range []time.Duration{2 * time.Minute, time.Hour, 24 * 365 * time.Hour} {
+		sig.Timestamp = time.Now().Add(ahead)
+		if err := qs.Verify(msg, sig); err != ErrQuantumStampExpired {
+			t.Fatalf("a stamp dated %s ahead was accepted: %v", ahead, err)
+		}
+	}
+}
+
+// TestNewQuantumSignerRefusesAnAlgorithmThatDoesNotExist.
+//
+// It fell through to ML-DSA-65 for anything unrecognised, so a caller that
+// asked for something else got a signer running a parameter set nobody chose
+// and never heard about it — and the config and the signer disagreed about what
+// an unset version means.
+func TestNewQuantumSignerRefusesAnAlgorithmThatDoesNotExist(t *testing.T) {
+	for _, version := range []uint32{0, 4, 7, 42, 99, ^uint32(0)} {
+		qs, err := NewQuantumSigner(log.NewNoOpLogger(), version, time.Minute)
+		if err == nil {
+			t.Fatalf("version %d was accepted and resolved to %v", version, qs.GetMode())
+		}
+		if !errors.Is(err, ErrUnsupportedAlgorithm) {
+			t.Fatalf("version %d: %v, want ErrUnsupportedAlgorithm", version, err)
+		}
+		if qs != nil {
+			t.Fatalf("version %d returned a signer alongside its refusal", version)
+		}
+	}
+}
+
+// TestBatchPackingKeepsEveryEntryInItsOwnRow.
+//
+// The rows are fixed-width and were copied with the low end bounded only, so an
+// over-long signature or public key at index i ran off its row and overwrote
+// index i+1's. A caller supplying a matching over-long pair chose the key that
+// entry i+1 would be verified under. ML-DSA widths are fixed by the parameter
+// set, so an off-width input is refused rather than trusted to fit.
+func TestBatchPackingKeepsEveryEntryInItsOwnRow(t *testing.T) {
+	qs := signer(t)
+	sigSize, pkSize := qs.GetSignatureSize(), qs.GetPublicKeySize()
+
+	msgs := [][]byte{[]byte("one"), []byte("two")}
+	sigs := make([]*QuantumSignature, len(msgs))
+	for i := range msgs {
+		sig, err := qs.Sign(msgs[i], stored(t, qs))
+		if err != nil {
+			t.Fatalf("Sign: %v", err)
+		}
+		sigs[i] = sig
+	}
+
+	_, sigBuf, pkBuf, _, err := qs.packBatch(msgs, sigs)
+	if err != nil {
+		t.Fatalf("a well-formed batch was refused: %v", err)
+	}
+	if len(sigBuf) != len(msgs)*sigSize || len(pkBuf) != len(msgs)*pkSize {
+		t.Fatalf("rows are %d/%d bytes, want %d/%d", len(sigBuf), len(pkBuf), len(msgs)*sigSize, len(msgs)*pkSize)
+	}
+	if !bytes.Equal(pkBuf[pkSize:], sigs[1].PublicKey) {
+		t.Fatal("entry 1's key is not in entry 1's row")
+	}
+
+	// An over-long signature at index 0 would reach into index 1's row.
+	oversized := *sigs[0]
+	oversized.Signature = bytes.Repeat([]byte{0xAA}, sigSize+64)
+	if _, _, _, _, err := qs.packBatch(msgs, []*QuantumSignature{&oversized, sigs[1]}); err == nil {
+		t.Fatal("an over-long signature was packed, overwriting the next entry's row")
+	}
+
+	// So would an over-long public key — which is the half that decides what
+	// the next entry is verified against.
+	forged := *sigs[0]
+	forged.PublicKey = bytes.Repeat([]byte{0xBB}, pkSize+pkSize)
+	if _, _, _, _, err := qs.packBatch(msgs, []*QuantumSignature{&forged, sigs[1]}); err == nil {
+		t.Fatal("an over-long public key was packed, choosing the key the next entry verifies under")
+	}
+
+	// Short is refused too: padding it would verify against a key nobody sent.
+	short := *sigs[0]
+	short.Signature = sigs[0].Signature[:sigSize-1]
+	if _, _, _, _, err := qs.packBatch(msgs, []*QuantumSignature{&short, sigs[1]}); err == nil {
+		t.Fatal("a short signature was padded into a row")
+	}
+
+	if _, _, _, _, err := qs.packBatch(msgs, []*QuantumSignature{nil, sigs[1]}); err == nil {
+		t.Fatal("a nil signature was packed")
 	}
 }

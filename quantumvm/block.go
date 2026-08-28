@@ -19,12 +19,15 @@ var (
 	errInvalidParentID         = errors.New("quantumvm: parent block not found")
 	errTimeBeforeParent        = errors.New("quantumvm: block timestamp precedes its parent")
 	errTimeTooFarAhead         = errors.New("quantumvm: block timestamp is beyond the skew allowance")
+	errEmptyBlock              = errors.New("quantumvm: block carries no transactions")
+	errForeignChain            = errors.New("quantumvm: block belongs to another chain")
+	errExecute                 = errors.New("quantumvm: block transaction could not be applied")
 )
 
 // MaxFutureSkew is how far ahead of the verifying node's clock a proposer may
-// stamp a block. Chain time is what the quantum stamp window is measured
-// against, so an uncapped timestamp lets one proposer expire every stamp in
-// flight by jumping forward, or revive expired ones by rewinding.
+// stamp a block. Peers' clocks differ, and this is the allowance for that; an
+// uncapped timestamp is a proposer writing chain time, which is what decides
+// whether the NEXT block may be stamped at all.
 const MaxFutureSkew = 60 * time.Second
 
 // Block represents a QVM block with quantum features
@@ -33,6 +36,8 @@ type Block struct {
 	timestamp    time.Time
 	height       uint64
 	parentID     ids.ID
+	chainID      ids.ID
+	networkID    uint32
 	transactions []Transaction
 	vm           *VM
 	bytes        []byte
@@ -43,13 +48,11 @@ func (b *Block) ID() ids.ID {
 	return b.id
 }
 
-// Accept persists the block and advances the tip. Every write lands in one
-// versiondb commit: the block, its height index and the last-accepted pointer
-// move together or not at all. A failure anywhere rolls the whole set back, so
-// a node never restarts holding a tip pointer to a block it did not store.
+// Accept makes the block the tip: commitBlock admits it, applies it and
+// persists it as one step.
 //
-// Nothing is dropped from the mempool until the commit succeeds. Evicting
-// first would lose the transactions of a block that then failed to persist.
+// Nothing is dropped from the mempool until that succeeds. Evicting first would
+// lose the transactions of a block that then failed to persist.
 func (b *Block) Accept(ctx context.Context) error {
 	b.vm.lock.Lock()
 	defer b.vm.lock.Unlock()
@@ -73,12 +76,45 @@ func (b *Block) Accept(ctx context.Context) error {
 	return nil
 }
 
-// Reject discards the block. Its transactions are still in the mempool —
-// BuildBlock copies from the queue rather than draining it, and only Accept
-// removes anything — so there is nothing to give back, and nothing is lost when
-// the engine drops a block it never rejects either.
+// Reject discards the block. Nothing ran — execution belongs to Accept — and
+// its transactions are still in the mempool, because BuildBlock copies from the
+// queue rather than draining it and only Accept removes anything. So there is
+// nothing to undo and nothing to give back.
 func (b *Block) Reject(context.Context) error {
 	b.vm.log.Debug("block rejected", "blockID", b.id, "height", b.height)
+	return nil
+}
+
+// apply runs the block's transactions.
+//
+// They ran at BUILD time. A builder that executed them applied the effects of a
+// block the network may never accept, applied them a second time when it
+// rebuilt, and applied nothing at all on every node that received the block
+// instead of building it — which is every node but one, for every block. They
+// run where the block becomes the tip, on every node, exactly once.
+//
+// A transaction that cannot be applied stops the block. A node that cannot
+// apply an agreed block stops rather than committing a chain its state no
+// longer matches.
+func (b *Block) apply() error {
+	for _, tx := range b.transactions {
+		if err := tx.Execute(); err != nil {
+			return fmt.Errorf("%w %s in block %s: %w", errExecute, tx.ID(), b.id, err)
+		}
+	}
+	return nil
+}
+
+// onThisChain refuses a block that names another chain or another network.
+//
+// Nothing else in the wire is chain-specific, and genesis is a constant, so
+// without this every Q-Chain in existence shares a genesis id and a block built
+// on one is a well-formed block on all of them.
+func (b *Block) onThisChain() error {
+	if b.chainID != b.vm.blockchainID || b.networkID != b.vm.NetworkID {
+		return fmt.Errorf("%w: chain %s network %d, this node serves chain %s network %d",
+			errForeignChain, b.chainID, b.networkID, b.vm.blockchainID, b.vm.NetworkID)
+	}
 	return nil
 }
 
@@ -92,9 +128,25 @@ func (b *Block) Verify(ctx context.Context) error {
 	b.vm.lock.RLock()
 	defer b.vm.lock.RUnlock()
 
+	if err := b.onThisChain(); err != nil {
+		return err
+	}
+
 	// Genesis is written by the VM, never proposed.
 	if b.height == 0 {
 		return errInvalidBlockHeight
+	}
+
+	// A proposed block carries work. Refusing an empty one is also what keeps
+	// the signature check below from being satisfiable by removing its
+	// subject: a parser that dropped the transaction set produces a block that
+	// verifies nothing, and a block that verifies nothing must not verify.
+	if len(b.transactions) == 0 {
+		return errEmptyBlock
+	}
+
+	if len(b.Bytes()) > MaxBlockSize {
+		return fmt.Errorf("%w: %d bytes over %d", errBlockTooLarge, len(b.Bytes()), MaxBlockSize)
 	}
 
 	// blockAt, not vm.GetBlock: GetBlock takes the same read lock this
@@ -119,7 +171,7 @@ func (b *Block) Verify(ctx context.Context) error {
 			errTimeTooFarAhead, b.timestamp.Unix(), MaxFutureSkew)
 	}
 
-	if len(b.transactions) > 0 && b.vm.Config.CoronaEnabled {
+	if b.vm.Config.QuantumStampEnabled {
 		msgs := make([][]byte, len(b.transactions))
 		sigs := make([]*quantum.QuantumSignature, len(b.transactions))
 		for i, tx := range b.transactions {

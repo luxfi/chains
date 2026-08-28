@@ -38,24 +38,45 @@ type Config struct {
 
 	// Minimum batch size before GPU acceleration kicks in
 	GPUBatchThreshold int
+
+	// Committee is how many validators the finality committee holds. The
+	// threshold is derived from it, so it is the one number that decides how
+	// many faults the chain survives. Zero means unset and settles on
+	// CommitteeMin; anything below CommitteeMin is refused.
+	Committee int
 }
 
 // DefaultConfig returns a Config with default values
 func DefaultConfig() Config {
 	return Config{
 		MaxParallelTxs:          100,
-		QuantumAlgorithmVersion: 1,
+		QuantumAlgorithmVersion: AlgorithmDefault,
 		QuantumStampEnabled:     true,
 		QuantumStampWindow:      30 * time.Second,
 		ParallelBatchSize:       10,
 		CoronaEnabled:           true,
 		GPUBatchThreshold:       8,
+		Committee:               CommitteeMin,
 	}
 }
 
 // AlgorithmDefault is the parameter set an unset config settles on: ML-DSA-65,
-// NIST level 3.
+// NIST level 3. DefaultConfig names the same constant, so a config the operator
+// filled in and one left blank land on the same parameter set — two spellings of
+// the default meant a chain signed under ML-DSA-44 or ML-DSA-65 depending on
+// which door it came through.
 const AlgorithmDefault uint32 = 2
+
+// CommitteeMin is the smallest committee that survives one Byzantine validator.
+// BFT tolerates f faults out of n ≥ 3f+1, so f ≥ 1 needs n ≥ 4; below that the
+// quorum ⌊2n/3⌋+1 is the whole committee and one absent validator stops the
+// chain while one dishonest validator decides it.
+const CommitteeMin = 4
+
+// Quorum is how many validators must agree, for a committee of n. It is the
+// classical ⌊2n/3⌋+1, which for n ≥ CommitteeMin always lands strictly between
+// 2 and n — the range the consensus core accepts.
+func Quorum(n int) int { return n*2/3 + 1 }
 
 // Validate replaces any non-positive sizing with its default and refuses an
 // algorithm that does not exist.
@@ -85,6 +106,9 @@ func (c *Config) Validate() error {
 	}
 	if c.QuantumStampWindow <= 0 {
 		c.QuantumStampWindow = 30 * time.Second
+	}
+	if c.Committee == 0 {
+		c.Committee = CommitteeMin
 	}
 	return nil
 }

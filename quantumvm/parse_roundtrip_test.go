@@ -35,10 +35,13 @@ func TestParseAcceptsWhatWeSerialize(t *testing.T) {
 	vm := parseVM(t)
 
 	blk := &Block{
-		timestamp: time.Unix(1000, 0).UTC(),
-		height:    7,
-		parentID:  ids.GenerateTestID(),
-		vm:        vm,
+		timestamp:    time.Unix(1000, 0).UTC(),
+		height:       7,
+		parentID:     ids.GenerateTestID(),
+		chainID:      vm.blockchainID,
+		networkID:    vm.NetworkID,
+		transactions: []Transaction{stampedTx(1, "op")},
+		vm:           vm,
 	}
 	blk.id = blk.computeID()
 
@@ -64,7 +67,7 @@ func TestGenesisParses(t *testing.T) {
 	if err := vm.seedGenesis(); err != nil {
 		t.Fatalf("seedGenesis: %v", err)
 	}
-	gid := vm.getLastAcceptedID()
+	gid := tipOf(t, vm)
 	raw, err := vm.state.Get(gid[:])
 	if err != nil {
 		t.Fatalf("read genesis bytes: %v", err)
@@ -92,10 +95,13 @@ func TestServeAndReceiveAgree(t *testing.T) {
 	}
 
 	blk := &Block{
-		timestamp: time.Unix(2000, 0).UTC(),
-		height:    1,
-		parentID:  vm.getLastAcceptedID(),
-		vm:        vm,
+		timestamp:    time.Unix(2000, 0).UTC(),
+		height:       1,
+		parentID:     tipOf(t, vm),
+		chainID:      vm.blockchainID,
+		networkID:    vm.NetworkID,
+		transactions: []Transaction{stampedTx(1, "op")},
+		vm:           vm,
 	}
 	blk.id = blk.computeID()
 	if err := blk.Accept(context.Background()); err != nil {

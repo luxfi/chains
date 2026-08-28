@@ -37,6 +37,11 @@ var (
 	errVMShutdown               = errors.New("quantumvm: VM is shutting down")
 	errParallelProcessingFailed = errors.New("quantumvm: no pending transaction survived verification")
 	errNoBlockAtHeight          = errors.New("quantumvm: no block at height")
+	errNoIdentity               = errors.New("quantumvm: the node has no identity to sign under")
+	errTipUnreadable            = errors.New("quantumvm: the chain tip cannot be read")
+	errNotTheTip                = errors.New("quantumvm: block does not extend the tip")
+	errClockBehindTip           = errors.New("quantumvm: the node's clock trails its own tip beyond the skew allowance")
+	errNoStamp                  = errors.New("quantumvm: no stamp to check")
 
 	// Compile-time check that *VM satisfies chain.ChainVM (= block.ChainVM)
 	// AND the consensus engine's BlockBuilder. Together these prove Q-Chain
@@ -124,20 +129,25 @@ func (vm *VM) Initialize(ctx context.Context, init luxvm.Init) error {
 	}
 
 	// The node's own identity, which is what a validator signature is
-	// attributed to. Without it every node on the chain signs under the same
-	// name — see the ValidatorID note below.
-	nodeID := ids.EmptyNodeID
-	if init.Runtime != nil {
-		vm.NetworkID = init.Runtime.NetworkID
-		vm.blockchainID = init.Runtime.ChainID
-		nodeID = init.Runtime.NodeID
+	// attributed to, and the chain it is serving, which is what its blocks
+	// belong to. A VM with neither runs, signs as nobody and produces blocks
+	// every other Q-Chain will also accept — so it does not run.
+	if init.Runtime == nil || init.Runtime.NodeID == ids.EmptyNodeID {
+		return errNoIdentity
 	}
+	vm.NetworkID = init.Runtime.NetworkID
+	vm.blockchainID = init.Runtime.ChainID
+	nodeID := init.Runtime.NodeID
 
-	vm.quantumSigner = quantum.NewQuantumSigner(
+	signer, err := quantum.NewQuantumSigner(
 		vm.log,
 		vm.Config.QuantumAlgorithmVersion,
 		vm.Config.QuantumStampWindow,
 	)
+	if err != nil {
+		return fmt.Errorf("quantumvm: signer: %w", err)
+	}
+	vm.quantumSigner = signer
 
 	vm.txPool = NewTransactionPool(vm.Config.MaxParallelTxs, vm.log)
 
@@ -170,14 +180,14 @@ func (vm *VM) Initialize(ctx context.Context, init luxvm.Init) error {
 		return fmt.Errorf("failed to initialize HTTP handlers: %w", err)
 	}
 
-	// ValidatorID is the NODE's id, not the chain's. Both signature legs count
-	// DISTINCT ValidatorIDs against the threshold, so naming the chain here
-	// gave every node on Q-Chain the same signer identity: each peer's
-	// signature arrived as a duplicate of the first, the count never passed
-	// one, and quantum finality was unreachable on any threshold above 1.
+	// ValidatorID is the NODE's id, not the chain's. The threshold counts
+	// DISTINCT ValidatorIDs, so naming the chain here gave every node on
+	// Q-Chain the same signer identity: each peer's signature arrived as a
+	// duplicate of the first, the count never passed one, and quantum finality
+	// was unreachable on any threshold above 1.
 	quasarBridge, err := NewQuasarBridge(QuasarBridgeConfig{
 		ValidatorID: nodeID.String(),
-		TotalNodes:  3, // Default 3-node network, can be updated
+		Committee:   vm.Config.Committee,
 		Logger:      vm.log,
 	})
 	if err != nil {
@@ -188,6 +198,7 @@ func (vm *VM) Initialize(ctx context.Context, init luxvm.Init) error {
 	vm.log.Info("QVM initialized",
 		"quantumStamps", vm.Config.QuantumStampEnabled,
 		"corona", vm.Config.CoronaEnabled,
+		"committee", quasarBridge.Committee(),
 		"threshold", quasarBridge.GetThreshold(),
 		"maxParallel", vm.Config.MaxParallelTxs,
 	)
@@ -240,16 +251,27 @@ func (vm *VM) buildBlock() (*Block, error) {
 		return nil, errParallelProcessingFailed
 	}
 
-	parentID := vm.getLastAcceptedID()
+	parentID, err := vm.tip()
+	if err != nil {
+		return nil, err
+	}
 	parent, err := vm.blockAt(parentID)
 	if err != nil {
 		return nil, fmt.Errorf("quantumvm: read tip %s: %w", parentID, err)
 	}
 
-	// Never stamp behind the parent. Verify rejects a block that moves chain
-	// time backwards, so a node whose clock trails its own tip would otherwise
-	// build blocks that it — and every peer — refuses.
-	timestamp := vm.clock.Time()
+	// Never stamp behind the parent, and never stamp where Verify will refuse
+	// it. A clock that trails the tip by less than the skew allowance is a peer
+	// that ran fast, and clamping forward covers it. A clock that trails by
+	// MORE is this node's clock being wrong: every block it could build now
+	// carries a timestamp its own Verify rejects for exceeding now+skew, so it
+	// says so rather than producing blocks nobody — itself included — accepts.
+	now := vm.clock.Time()
+	if parent.timestamp.After(now.Add(MaxFutureSkew)) {
+		return nil, fmt.Errorf("%w: tip is stamped %s, this node reads %s",
+			errClockBehindTip, parent.timestamp, now)
+	}
+	timestamp := now
 	if timestamp.Before(parent.timestamp) {
 		timestamp = parent.timestamp
 	}
@@ -261,8 +283,13 @@ func (vm *VM) buildBlock() (*Block, error) {
 		timestamp:    timestamp,
 		height:       parent.height + 1,
 		parentID:     parentID,
+		chainID:      vm.blockchainID,
+		networkID:    vm.NetworkID,
 		transactions: validTxs,
 		vm:           vm,
+	}
+	if len(block.Bytes()) > MaxBlockSize {
+		return nil, fmt.Errorf("%w: %d bytes over %d", errBlockTooLarge, len(block.Bytes()), MaxBlockSize)
 	}
 	block.id = block.computeID()
 
@@ -341,9 +368,9 @@ func (vm *VM) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// processTransactionsParallel verifies and executes the batch, reporting both
-// what survived and what did not. The caller needs both: the survivors go in
-// the block, and the rest have to leave the pool.
+// processTransactionsParallel verifies the batch, reporting both what survived
+// and what did not. The caller needs both: the survivors go in the block, and
+// the rest have to leave the pool.
 func (vm *VM) processTransactionsParallel(txs []Transaction) (valid, rejected []Transaction) {
 	batchSize := vm.Config.ParallelBatchSize
 
@@ -395,17 +422,43 @@ func (vm *VM) signBlockWithQuasar(block *Block) {
 		vm.log.Warn("quasar block signing failed", "blockID", block.ID(), "error", err)
 		return
 	}
-	vm.log.Debug("block signed with quasar BLS threshold", "blockID", block.ID(), "height", block.Height())
+	vm.log.Debug("block signed with quasar threshold signature", "blockID", block.ID(), "height", block.Height())
 }
 
-// commitBlock stores the block, indexes it by height and moves the tip — as one
-// versiondb commit. A failure anywhere aborts the whole set, so the pointers can
-// never name a block the store does not hold. Caller holds vm.lock.
+// commitBlock makes a block the tip: it admits the block, applies it, stores
+// it, indexes it by height and moves the tip pointer. Caller holds vm.lock.
 //
-// The commit is what makes the write durable. Buffered in the version layer and
-// never committed, an accepted block is gone at the next start and the node
-// rewinds to genesis, having told its peers it held a tip it cannot serve.
+// One order, one place, so a block cannot be applied without being admitted or
+// stored without being applied. Everything that advances this chain — Accept and
+// the genesis seed — comes through here.
+//
+// A commit EXTENDS the tip: the block names the last-accepted block as its
+// parent and sits one height above it. Without that, any block that merely
+// verified could be committed — a verified sibling of an old block rewound the
+// chain to its height, left every height above indexed to an abandoned branch,
+// and served those to bootstrapping peers as canonical. Re-accepting a block
+// already accepted did the same, and two siblings both verified, both committed,
+// the second silently replacing the first.
+//
+// The writes then land as ONE versiondb commit: block, height index and tip
+// pointer move together or not at all, so a node never restarts holding a tip
+// pointer to a block it did not store. And the version layer holds nothing
+// across this call: staged writes not discarded here are not discarded at all,
+// they are flushed by the next commit that succeeds — an orphan block and a live
+// height index arriving with an unrelated block.
 func (vm *VM) commitBlock(b *Block) error {
+	defer vm.state.Abort()
+
+	if err := b.onThisChain(); err != nil {
+		return err
+	}
+	if err := vm.extendsTip(b); err != nil {
+		return err
+	}
+	if err := b.apply(); err != nil {
+		return err
+	}
+
 	heightBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(heightBytes, b.height)
 
@@ -418,13 +471,37 @@ func (vm *VM) commitBlock(b *Block) error {
 		{tipHeightKey, heightBytes},
 	} {
 		if err := vm.state.Put(w.key, w.value); err != nil {
-			vm.state.Abort()
 			return fmt.Errorf("quantumvm: stage block %s: %w", b.id, err)
 		}
 	}
 	if err := vm.state.Commit(); err != nil {
-		vm.state.Abort()
 		return fmt.Errorf("quantumvm: commit block %s: %w", b.id, err)
+	}
+	return nil
+}
+
+// extendsTip is the linear-chain invariant: exactly one block may follow the
+// one this node last accepted. An empty chain's tip is no block at no height,
+// and the only block that follows it is genesis.
+func (vm *VM) extendsTip(b *Block) error {
+	tip, err := vm.tip()
+	if err != nil {
+		return err
+	}
+	if b.parentID != tip {
+		return fmt.Errorf("%w: parent %s, tip %s", errNotTheTip, b.parentID, tip)
+	}
+
+	next := uint64(0)
+	if tip != ids.Empty {
+		h, err := vm.tipHeight()
+		if err != nil {
+			return err
+		}
+		next = h + 1
+	}
+	if b.height != next {
+		return fmt.Errorf("%w: height %d, tip expects %d", errNotTheTip, b.height, next)
 	}
 	return nil
 }
@@ -441,11 +518,16 @@ func (vm *VM) commitBlock(b *Block) error {
 // but consensus starts by asking what block you hold, and "none" is not an
 // answer it can build a quorum from.
 //
-// The block is a constant, so every node computes one id alone: fixed timestamp,
-// height 0, empty parent, no transactions. Wall-clock time here would give each
-// node a different id for the same block and make the repair a fork.
+// The block is a constant of the chain it belongs to, so every node on that
+// chain computes one id alone: fixed timestamp, height 0, empty parent, no
+// transactions, this chain and this network. Wall-clock time here would give
+// each node a different id for the same block and make the repair a fork.
 func (vm *VM) seedGenesis() error {
-	if vm.getLastAcceptedID() != ids.Empty {
+	tip, err := vm.tip()
+	if err != nil {
+		return err
+	}
+	if tip != ids.Empty {
 		return nil
 	}
 
@@ -453,6 +535,8 @@ func (vm *VM) seedGenesis() error {
 		timestamp: time.Unix(0, 0).UTC(),
 		height:    0,
 		parentID:  ids.Empty,
+		chainID:   vm.blockchainID,
+		networkID: vm.NetworkID,
 		vm:        vm,
 	}
 	block.id = block.computeID()
@@ -484,24 +568,49 @@ func (vm *VM) isShuttingDown() bool {
 	return vm.shuttingDown
 }
 
-// getHeight returns current blockchain height
-func (vm *VM) getHeight() uint64 {
-	heightBytes, err := vm.state.Get(tipHeightKey)
-	if err != nil || len(heightBytes) != 8 {
-		return 0
+// tipHeight is the height of the last accepted block, or 0 on a chain that
+// holds only genesis.
+//
+// A read that failed and a height of zero are different facts and this reports
+// them differently. Answering 0 for both is what let one transient failure look
+// like a chain that had not started: the next block was built at height 1 on a
+// chain a thousand blocks long.
+func (vm *VM) tipHeight() (uint64, error) {
+	raw, err := vm.state.Get(tipHeightKey)
+	if errors.Is(err, database.ErrNotFound) {
+		return 0, nil
 	}
-	return binary.BigEndian.Uint64(heightBytes)
+	if err != nil {
+		return 0, fmt.Errorf("%w: height: %w", errTipUnreadable, err)
+	}
+	if len(raw) != 8 {
+		return 0, fmt.Errorf("%w: height holds %d bytes", errTipUnreadable, len(raw))
+	}
+	return binary.BigEndian.Uint64(raw), nil
 }
 
-// getLastAcceptedID returns the last accepted block ID
-func (vm *VM) getLastAcceptedID() ids.ID {
-	lastAcceptedBytes, err := vm.state.Get(lastAcceptedKey)
-	if err != nil || len(lastAcceptedBytes) != 32 {
-		return ids.Empty
+// tip is the id of the last accepted block. It answers ids.Empty with no error
+// for exactly one reason — the chain holds no block at all — and an error for
+// every other reason it could not read one.
+//
+// Collapsing those was how a single failed read destroyed a chain: seedGenesis
+// reads ids.Empty as "fresh chain" and writes genesis, so one transient error at
+// boot committed genesis over a live tip and Initialize returned success. A
+// short read did it identically.
+func (vm *VM) tip() (ids.ID, error) {
+	raw, err := vm.state.Get(lastAcceptedKey)
+	if errors.Is(err, database.ErrNotFound) {
+		return ids.Empty, nil
+	}
+	if err != nil {
+		return ids.Empty, fmt.Errorf("%w: last accepted: %w", errTipUnreadable, err)
+	}
+	if len(raw) != 32 {
+		return ids.Empty, fmt.Errorf("%w: last accepted holds %d bytes", errTipUnreadable, len(raw))
 	}
 	var id ids.ID
-	copy(id[:], lastAcceptedBytes)
-	return id
+	copy(id[:], raw)
+	return id, nil
 }
 
 // Version returns the version of the VM
@@ -558,7 +667,7 @@ func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
 }
 
 // SetPreference sets the preferred block. Implements chain.ChainVM.
-// Q-Chain uses BLS+Corona threshold finality rather than preference,
+// Q-Chain finalizes on a verified threshold signature rather than preference,
 // so this is a no-op until preference-based fork choice is wired in.
 func (vm *VM) SetPreference(ctx context.Context, blockID ids.ID) error {
 	return nil
@@ -568,7 +677,7 @@ func (vm *VM) SetPreference(ctx context.Context, blockID ids.ID) error {
 func (vm *VM) LastAccepted(ctx context.Context) (ids.ID, error) {
 	vm.lock.RLock()
 	defer vm.lock.RUnlock()
-	return vm.getLastAcceptedID(), nil
+	return vm.tip()
 }
 
 // GetBlockIDAtHeight answers what block this node accepted at a height, from
@@ -599,30 +708,29 @@ func (vm *VM) WaitForEvent(ctx context.Context) (luxvm.Message, error) {
 	return vm.txPool.WaitForEvent(ctx)
 }
 
-// GetQuasarBridge returns the Quasar hybrid consensus bridge
-// This provides BLS + Corona dual threshold signatures for PQ finality
+// GetQuasarBridge returns the Quasar threshold-signature bridge.
 func (vm *VM) GetQuasarBridge() *QuasarBridge {
 	vm.lock.RLock()
 	defer vm.lock.RUnlock()
 	return vm.quasarBridge
 }
 
-// StampBlock implements QChainStamper for hybrid finality: a Quasar BLS+Corona
-// threshold signature when the bridge is up, an ML-DSA signature otherwise.
+// StampBlock attests to a message for the finality bridge: a Quasar validator
+// signature when the bridge is up, an ML-DSA signature otherwise.
 func (vm *VM) StampBlock(blockID ids.ID, pChainHeight uint64, message []byte) (interface{}, error) {
 	ctx := context.Background()
 
 	if bridge := vm.GetQuasarBridge(); bridge != nil && blockID != ids.Empty {
-		hybridSig, err := bridge.SignBlock(ctx, blockID, message, pChainHeight)
+		sig, err := bridge.SignBlock(ctx, blockID, message, pChainHeight)
 		if err == nil {
-			vm.log.Info("Quasar BLS stamp created",
+			vm.log.Info("Quasar stamp created",
 				"blockID", blockID,
 				"pChainHeight", pChainHeight,
 				"threshold", bridge.GetThreshold(),
 			)
-			return hybridSig, nil
+			return sig, nil
 		}
-		vm.log.Warn("Quasar BLS stamp failed, using ML-DSA fallback", "error", err)
+		vm.log.Warn("Quasar stamp failed, using ML-DSA fallback", "error", err)
 	}
 
 	key, err := vm.quantumSigner.GenerateCoronaKey()
@@ -641,33 +749,42 @@ func (vm *VM) StampBlock(blockID ids.ID, pChainHeight uint64, message []byte) (i
 	return sig, nil
 }
 
-// VerifyStamp implements QChainStamper for quasar finality
-// Supports both Quasar QuasarSignature and ML-DSA QuantumSignature
-func (vm *VM) VerifyStamp(stamp interface{}) error {
+// VerifyStamp checks a stamp against the message it claims to attest.
+//
+// The message is the argument that makes this a verification. Without it there
+// was nothing to check a signature against, so each arm could only look at the
+// stamp's own shape — and shape is what the sender chose: a two-byte aggregate
+// declaring three signers passed, and so did a one-byte BLS signature. A
+// self-declared signer count is not evidence of anything.
+func (vm *VM) VerifyStamp(message []byte, stamp interface{}) error {
+	bridge := vm.GetQuasarBridge()
+
 	switch s := stamp.(type) {
-	case *quasar.QuasarSignature:
-		if s.BLS == nil || len(s.BLS.Signature) == 0 {
-			return errors.New("quantumvm: invalid Quasar BLS signature")
+	case *quasar.QuasarSig:
+		if bridge == nil {
+			return errors.New("quantumvm: no Quasar bridge to check the signature against")
+		}
+		if !bridge.VerifySignature(message, s) {
+			return fmt.Errorf("quantumvm: Quasar signature from %s does not check out", s.ValidatorID)
 		}
 		return nil
 
 	case *quasar.AggregatedSignature:
-		bridge := vm.GetQuasarBridge()
 		if bridge == nil {
-			return errors.New("quantumvm: no Quasar bridge to check the threshold against")
+			return errors.New("quantumvm: no Quasar bridge to check the aggregate against")
 		}
-		if len(s.BLSAggregated) == 0 || s.SignerCount < bridge.GetThreshold() {
-			return errors.New("quantumvm: insufficient aggregated signature")
+		if !bridge.VerifyAggregate(context.Background(), message, s) {
+			return errors.New("quantumvm: aggregated signature does not check out")
 		}
 		return nil
 
 	case *quantum.QuantumSignature:
-		if len(s.Signature) == 0 || len(s.QuantumStamp) == 0 {
-			return errors.New("quantumvm: invalid quantum stamp structure")
-		}
-		return nil
+		return vm.quantumSigner.Verify(message, s)
+
+	case nil:
+		return errNoStamp
 
 	default:
-		return errors.New("quantumvm: unsupported stamp type")
+		return fmt.Errorf("quantumvm: unsupported stamp type %T", stamp)
 	}
 }

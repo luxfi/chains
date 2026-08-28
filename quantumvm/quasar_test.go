@@ -8,137 +8,236 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/luxfi/chains/quantumvm/config"
 	"github.com/luxfi/consensus/protocol/quasar"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/stretchr/testify/require"
 )
 
-// engine returns a real Quasar with one block awaiting signatures.
-func engine(t *testing.T, threshold int) (*Quasar, ids.ID) {
+// committee returns a bridge whose core knows every member, plus the block they
+// are all signing. Only a registered validator's signature can verify, so the
+// roster is what decides whose statement counts.
+func committee(t *testing.T, self string, peers ...string) (*Quasar, ids.ID, []byte) {
 	t.Helper()
 	q, err := NewQuasar(QuasarConfig{
-		ValidatorID: "validator-self",
-		Threshold:   threshold,
-		TotalNodes:  3,
+		ValidatorID: self,
+		Committee:   1 + len(peers),
 		Logger:      log.NewNoOpLogger(),
 	})
 	require.NoError(t, err)
+	for _, peer := range peers {
+		require.NoError(t, q.AddValidator(peer, 100))
+	}
 
 	blockID := ids.GenerateTestID()
-	q.pendingBlocks[blockID] = &PendingBlock{
-		BlockID:          blockID,
-		BlockHash:        blockID[:],
-		Height:           1,
-		BLSSignatures:    make([]*quasar.BLSSignature, 0),
-		CoronaSignatures: make([]*quasar.CoronaSignature, 0),
-	}
-	return q, blockID
+	hash := make([]byte, 64)
+	copy(hash, blockID[:])
+	q.pendingBlocks[blockID] = &PendingBlock{BlockID: blockID, BlockHash: hash, Height: 1}
+	return q, blockID, hash
 }
 
-// TestThresholdIsDerivedFromTheCommitteeItGuards.
+// signAs produces a real signature from a committee member over a message.
+func signAs(t *testing.T, q *Quasar, validatorID string, message []byte) *quasar.QuasarSig {
+	t.Helper()
+	sig, err := q.GetQuasar().SignMessageWithContext(context.Background(), validatorID, message)
+	require.NoError(t, err, "a validator the core knows could not sign")
+	return sig
+}
+
+// TestThresholdFollowsTheCommittee.
 //
-// The default threshold was computed from TotalNodes before TotalNodes had been
-// defaulted, so a config that named neither got a threshold of one — and then a
-// committee of three. One validator would have finalized a block alone, on a
-// network built to need three.
-func TestThresholdIsDerivedFromTheCommitteeItGuards(t *testing.T) {
-	q, err := NewQuasar(QuasarConfig{Logger: log.NewNoOpLogger()})
-	require.NoError(t, err)
-	require.Equal(t, 3, q.totalNodes)
-	require.Equal(t, 3, q.GetThreshold(),
-		"a validator could finalize alone on the three-node network this same config assumes")
+// The threshold is derived, never configured, so the two cannot disagree — and
+// the derivation has to land in the range that is actually a quorum. ⌊2n/3⌋+1
+// equals n for every n below four, which is unanimity: zero Byzantine
+// tolerance, one absent validator is a halt, and the consensus core refuses it
+// outright ("threshold must be less than validator count"). So a committee that
+// small is refused where it is named, rather than producing a bridge that
+// cannot rotate a key.
+func TestThresholdFollowsTheCommittee(t *testing.T) {
+	for _, n := range []int{1, 2, 3} {
+		_, err := NewQuasar(QuasarConfig{ValidatorID: "self", Committee: n, Logger: log.NewNoOpLogger()})
+		require.Error(t, err, "a committee of %d tolerates no fault and was accepted", n)
+	}
 
-	// An explicit threshold is honoured, and an explicit committee is what the
-	// default is taken from.
-	q, err = NewQuasar(QuasarConfig{Threshold: 2, TotalNodes: 3, Logger: log.NewNoOpLogger()})
-	require.NoError(t, err)
-	require.Equal(t, 2, q.GetThreshold())
+	for _, tc := range []struct{ committee, threshold int }{
+		{4, 3}, {5, 4}, {7, 5}, {10, 7}, {100, 67},
+	} {
+		q, err := NewQuasar(QuasarConfig{
+			ValidatorID: "self", Committee: tc.committee, Logger: log.NewNoOpLogger(),
+		})
+		require.NoError(t, err)
+		require.Equal(t, tc.threshold, q.GetThreshold(), "⌊2n/3⌋+1 of %d", tc.committee)
+		require.Equal(t, tc.committee, q.Committee())
+		require.Less(t, q.GetThreshold(), q.Committee(), "a quorum of everyone is not a quorum")
+		require.GreaterOrEqual(t, q.GetThreshold(), 2)
+	}
 
-	q, err = NewQuasar(QuasarConfig{TotalNodes: 10, Logger: log.NewNoOpLogger()})
+	// An unset committee settles on the smallest that survives a fault.
+	q, err := NewQuasar(QuasarConfig{ValidatorID: "self"})
 	require.NoError(t, err)
-	require.Equal(t, 7, q.GetThreshold(), "⌊2n/3⌋+1 of ten")
+	require.Equal(t, config.CommitteeMin, q.Committee())
+	require.Equal(t, config.Quorum(config.CommitteeMin), q.GetThreshold())
 
 	// A nil logger is not a reason to crash on the first Debug call.
-	q, err = NewQuasar(QuasarConfig{TotalNodes: 3})
-	require.NoError(t, err)
 	require.NotPanics(t, func() { _ = q.AddValidator("v1", 1) })
 }
 
-// TestOneValidatorCannotReachCoronaThreshold proves the post-quantum finality
-// leg counts distinct validators.
-//
-// TryFinalize finalizes the Corona leg on count alone and verifies none of
-// those signatures — unlike the BLS leg, which aggregates and verifies. A
-// validator resending its signature would drive the count to the threshold on
-// its own and satisfy the post-quantum half of quantum finality alone.
-func TestOneValidatorCannotReachCoronaThreshold(t *testing.T) {
-	q, blockID := engine(t, 3)
-
-	sig := &quasar.CoronaSignature{Signature: []byte{1}, ValidatorID: "validator-1", Round: 1}
-	require.NoError(t, q.AddCoronaSignature(blockID, sig))
-	require.ErrorIs(t, q.AddCoronaSignature(blockID, sig), errDuplicateSigner)
-	require.ErrorIs(t, q.AddCoronaSignature(blockID, sig), errDuplicateSigner)
-
-	// Different bytes under the same name is still one vote.
-	require.ErrorIs(t, q.AddCoronaSignature(blockID, &quasar.CoronaSignature{
-		Signature: []byte{9}, ValidatorID: "validator-1", Round: 2,
-	}), errDuplicateSigner)
-
-	pending := q.pendingBlocks[blockID]
-	require.Len(t, pending.CoronaSignatures, 1)
-	require.Less(t, len(pending.CoronaSignatures), q.threshold)
-
-	_, finalized, err := q.TryFinalize(context.Background(), blockID)
-	require.NoError(t, err)
-	require.False(t, finalized)
-	require.False(t, pending.CoronaFinalized, "the Corona leg was finalized by one validator")
+// TestABridgeWithNoIdentityIsRefused: a signer with no name cannot be one of a
+// number of distinct signers.
+func TestABridgeWithNoIdentityIsRefused(t *testing.T) {
+	_, err := NewQuasar(QuasarConfig{Committee: 4, Logger: log.NewNoOpLogger()})
+	require.ErrorIs(t, err, errNoValidatorID)
 }
 
-// TestOneValidatorCannotReachBLSThreshold is the same rule on the classical leg.
-func TestOneValidatorCannotReachBLSThreshold(t *testing.T) {
-	q, blockID := engine(t, 3)
+// TestTheBridgeSignsForItself.
+//
+// The node was never registered with its own consensus core, so signing
+// answered "validator not found" on every call — and everything downstream
+// followed: the failure path deleted the pending entry, so a peer's signature
+// arriving afterwards found no block to attach to, so the quorum was never
+// reached and finality was unreachable. One missing registration; the whole
+// bridge dead, and quiet about it.
+func TestTheBridgeSignsForItself(t *testing.T) {
+	q, err := NewQuasar(QuasarConfig{ValidatorID: "self", Committee: 4, Logger: log.NewNoOpLogger()})
+	require.NoError(t, err)
 
-	sig := &quasar.BLSSignature{Signature: []byte{1}, ValidatorID: "validator-1"}
-	require.NoError(t, q.AddBLSSignature(blockID, sig))
-	require.ErrorIs(t, q.AddBLSSignature(blockID, sig), errDuplicateSigner)
+	blockID := ids.GenerateTestID()
+	sig, err := q.SignBlock(context.Background(), blockID, blockID[:], 1)
+	require.NoError(t, err, "the node cannot sign for its own identity")
+	require.Equal(t, "self", sig.ValidatorID)
 
-	require.Len(t, q.pendingBlocks[blockID].BLSSignatures, 1)
+	pending := q.pendingBlocks[blockID]
+	require.NotNil(t, pending, "a signed block is not being tracked, so no peer signature can join it")
+	require.Len(t, pending.Signatures, 1)
+
+	// Signing it again is the same statement, not a second signer.
+	again, err := q.SignBlock(context.Background(), blockID, blockID[:], 1)
+	require.NoError(t, err)
+	require.Equal(t, sig, again)
+	require.Len(t, q.pendingBlocks[blockID].Signatures, 1)
+
+	// And a peer's signature now finds the block and joins it.
+	require.NoError(t, q.AddValidator("peer", 1))
+	require.NoError(t, q.AddSignature(blockID, signAs(t, q, "peer", pending.BlockHash)))
+	require.Len(t, q.pendingBlocks[blockID].Signatures, 2)
+}
+
+// TestOnlyAVerifiedSignatureCounts.
+//
+// The quorum was a count of STRINGS: a caller supplied a ValidatorID and it was
+// counted, unverified, against the threshold. So three fabricated ids finalized
+// a block; five spellings of one name — case, a trailing space, an embedded NUL,
+// the fullwidth forms — counted as five distinct signers of one signature; and a
+// signature made for block A was accepted onto block B, because nothing bound a
+// signature to its message.
+//
+// Verification fixes all three at once, because the name is looked up in the
+// committee and the signature is checked against THAT key over THIS block.
+func TestOnlyAVerifiedSignatureCounts(t *testing.T) {
+	q, blockID, hash := committee(t, "validator-a", "validator-b", "validator-c", "validator-d")
+
+	// Names nobody holds a key for.
+	for _, name := range []string{"ghost-1", "ghost-2", "ghost-3"} {
+		require.ErrorIs(t, q.AddSignature(blockID, &quasar.QuasarSig{
+			BLS: []byte("not a signature"), ValidatorID: name,
+		}), errUnverifiedSigner, "a fabricated validator %q was counted", name)
+	}
+	require.Empty(t, q.pendingBlocks[blockID].Signatures)
+
+	// One real signature, re-labelled every way a string can be respelled.
+	real := signAs(t, q, "validator-a", hash)
+	require.NoError(t, q.AddSignature(blockID, real))
+	for _, respelling := range []string{
+		"validator-a ", " validator-a", "Validator-A", "VALIDATOR-A",
+		"validator-a\x00", "ｖａｌｉｄａｔｏｒ－ａ", "validator-a\n", "validator‑a",
+	} {
+		require.ErrorIs(t, q.AddSignature(blockID, &quasar.QuasarSig{
+			BLS: real.BLS, MLDSA: real.MLDSA, ValidatorID: respelling,
+			IsThreshold: real.IsThreshold, SignerIndex: real.SignerIndex,
+		}), errUnverifiedSigner, "%q counted as a second signer of one signature", respelling)
+	}
+
+	// The same name twice is one signer, however the bytes differ.
+	require.ErrorIs(t, q.AddSignature(blockID, real), errDuplicateSigner)
+	require.ErrorIs(t, q.AddSignature(blockID, signAs(t, q, "validator-a", hash)), errDuplicateSigner)
+	require.Len(t, q.pendingBlocks[blockID].Signatures, 1)
+
+	// A signature for another block does not count for this one.
+	other := ids.GenerateTestID()
+	require.ErrorIs(t, q.AddSignature(blockID, signAs(t, q, "validator-b", other[:])),
+		errUnverifiedSigner, "a signature made for another block was accepted onto this one")
+
+	// Nor does no signature at all.
+	require.ErrorIs(t, q.AddSignature(blockID, nil), errUnverifiedSigner)
+	require.Len(t, q.pendingBlocks[blockID].Signatures, 1)
+}
+
+// TestFinalityNeedsAnAggregateThatVerifies.
+//
+// Reaching the count is necessary and not sufficient. The signatures are
+// aggregated and the aggregate is checked against the committee's keys, so a
+// block finalizes on cryptography rather than on arithmetic.
+func TestFinalityNeedsAnAggregateThatVerifies(t *testing.T) {
+	ctx := context.Background()
+	q, blockID, hash := committee(t, "validator-a", "validator-b", "validator-c", "validator-d")
+	require.Equal(t, 3, q.GetThreshold())
+
+	// Below the threshold nothing finalizes and nothing errors: it is simply
+	// not time yet.
+	for _, name := range []string{"validator-a", "validator-b"} {
+		require.NoError(t, q.AddSignature(blockID, signAs(t, q, name, hash)))
+	}
+	agg, finalized, err := q.TryFinalize(ctx, blockID)
+	require.NoError(t, err)
+	require.False(t, finalized, "two of three finalized a block")
+	require.Nil(t, agg)
+	require.False(t, q.IsFinalized(blockID))
+
+	// The third carries it.
+	require.NoError(t, q.AddSignature(blockID, signAs(t, q, "validator-c", hash)))
+	agg, finalized, err = q.TryFinalize(ctx, blockID)
+	require.NoError(t, err)
+	require.True(t, finalized, "a verified quorum did not finalize the block")
+	require.NotNil(t, agg)
+	require.True(t, q.IsFinalized(blockID))
+	require.True(t, q.VerifyAggregate(ctx, hash, agg))
+	require.False(t, q.VerifyAggregate(ctx, []byte("another block"), agg),
+		"the aggregate verified against a message it does not sign")
+
+	// Cleanup below the finalized frontier releases it from both maps.
+	q.Cleanup(2)
+	require.NotContains(t, q.pendingBlocks, blockID)
 	require.False(t, q.IsFinalized(blockID))
 }
 
-// TestDistinctValidatorsReachTheCoronaThreshold is the other half: three
-// different validators do reach a threshold of three, and the leg finalizes.
-func TestDistinctValidatorsReachTheCoronaThreshold(t *testing.T) {
-	q, blockID := engine(t, 3)
+// TestSignaturesThatAreNotSignaturesFinalizeNothing. The set is verified on the
+// way in, so bytes that never came from a signer never reach the threshold.
+func TestSignaturesThatAreNotSignaturesFinalizeNothing(t *testing.T) {
+	q, blockID, _ := committee(t, "validator-a", "validator-b", "validator-c", "validator-d")
 
-	for _, id := range []string{"validator-1", "validator-2", "validator-3"} {
-		require.NoError(t, q.AddCoronaSignature(blockID, &quasar.CoronaSignature{
-			Signature: []byte{1}, ValidatorID: id, Round: 1,
-		}))
+	for _, name := range []string{"validator-b", "validator-c", "validator-d"} {
+		require.ErrorIs(t, q.AddSignature(blockID, &quasar.QuasarSig{
+			BLS: []byte("not a signature"), ValidatorID: name,
+		}), errUnverifiedSigner)
 	}
-	require.Len(t, q.pendingBlocks[blockID].CoronaSignatures, 3)
+	require.Empty(t, q.pendingBlocks[blockID].Signatures)
 
 	_, finalized, err := q.TryFinalize(context.Background(), blockID)
 	require.NoError(t, err)
-	require.True(t, q.pendingBlocks[blockID].CoronaFinalized,
-		"three distinct validators did not carry the Corona leg")
-	// Quantum finality needs BOTH legs, and the BLS aggregate over these
-	// placeholder signatures does not verify, so the block is not final.
-	require.False(t, finalized, "one leg alone must not be quantum finality")
+	require.False(t, finalized, "three forged signatures reached the threshold and finalized")
 	require.False(t, q.IsFinalized(blockID))
 }
 
 // TestSignaturesForAnUnknownBlockAreRefused: an id nobody proposed is not a
 // place to accumulate signatures a peer chose the id of.
 func TestSignaturesForAnUnknownBlockAreRefused(t *testing.T) {
-	q, _ := engine(t, 3)
+	q, _, _ := committee(t, "validator-a", "validator-b", "validator-c", "validator-d")
 	stranger := ids.GenerateTestID()
 
-	require.Error(t, q.AddBLSSignature(stranger, &quasar.BLSSignature{ValidatorID: "v1"}))
-	require.Error(t, q.AddCoronaSignature(stranger, &quasar.CoronaSignature{ValidatorID: "v1"}))
+	require.ErrorIs(t, q.AddSignature(stranger, &quasar.QuasarSig{ValidatorID: "validator-b"}), errUnknownBlock)
 	_, _, err := q.TryFinalize(context.Background(), stranger)
-	require.Error(t, err)
+	require.ErrorIs(t, err, errUnknownBlock)
 }
 
 // TestCleanupReleasesWhatWillNeverFinalize.
@@ -148,7 +247,7 @@ func TestSignaturesForAnUnknownBlockAreRefused(t *testing.T) {
 // that accumulate — every proposal that lost, timed out or failed to sign — and
 // the two maps grew for the life of the process.
 func TestCleanupReleasesWhatWillNeverFinalize(t *testing.T) {
-	q, err := NewQuasar(QuasarConfig{ValidatorID: "self", TotalNodes: 3, Logger: log.NewNoOpLogger()})
+	q, err := NewQuasar(QuasarConfig{ValidatorID: "self", Committee: 4, Logger: log.NewNoOpLogger()})
 	require.NoError(t, err)
 
 	for h := uint64(1); h <= 100; h++ {
@@ -172,25 +271,25 @@ func TestCleanupReleasesWhatWillNeverFinalize(t *testing.T) {
 // TestSignBlockLeavesNothingBehindWhenItFails: the tracking entry is created
 // before signing, so a signing failure must take it away again.
 func TestSignBlockLeavesNothingBehindWhenItFails(t *testing.T) {
-	q, err := NewQuasar(QuasarConfig{ValidatorID: "self", TotalNodes: 3, Logger: log.NewNoOpLogger()})
+	q, err := NewQuasar(QuasarConfig{ValidatorID: "self", Committee: 4, Logger: log.NewNoOpLogger()})
 	require.NoError(t, err)
 
-	// A cancelled context is the cheapest way to make the signing lanes fail.
+	// A cancelled context is the cheapest way to make signing fail.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	blockID := ids.GenerateTestID()
-	if _, err := q.SignBlock(ctx, blockID, blockID[:], 1); err != nil {
-		require.NotContains(t, q.pendingBlocks, blockID,
-			"a block that failed to sign is tracked forever: it can never finalize, so Cleanup never sees it")
-	}
+	_, err = q.SignBlock(ctx, blockID, blockID[:], 1)
+	require.Error(t, err)
+	require.NotContains(t, q.pendingBlocks, blockID,
+		"a block that failed to sign is tracked forever: it can never finalize, so Cleanup never sees it")
 }
 
 // TestSignBlockDoesNotRaceIncomingSignatures. Signing appends to the same slice
-// AddBLSSignature appends to, and the log line afterwards read its length.
-// Under -race that read is a data race against every arriving peer signature.
+// AddSignature appends to, and the log line afterwards read its length. Under
+// -race that read is a data race against every arriving peer signature.
 func TestSignBlockDoesNotRaceIncomingSignatures(t *testing.T) {
-	q, err := NewQuasar(QuasarConfig{ValidatorID: "self", TotalNodes: 3, Logger: log.NewNoOpLogger()})
+	q, err := NewQuasar(QuasarConfig{ValidatorID: "self", Committee: 20, Logger: log.NewNoOpLogger()})
 	require.NoError(t, err)
 
 	blockID := ids.GenerateTestID()
@@ -204,21 +303,21 @@ func TestSignBlockDoesNotRaceIncomingSignatures(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_ = q.AddBLSSignature(blockID, &quasar.BLSSignature{
-				Signature: []byte{byte(i)}, ValidatorID: string(rune('a' + i)),
+			_ = q.AddSignature(blockID, &quasar.QuasarSig{
+				BLS: []byte{byte(i)}, ValidatorID: string(rune('a' + i)),
 			})
 			_ = q.IsFinalized(blockID)
 			q.Cleanup(0)
+			_ = q.GetActiveValidators()
 		}(i)
 	}
 	wg.Wait()
 }
 
-// TestSignBlockAcceptsAnyMessageLength. The Corona lane derives its PRF key
-// from the message; taking a 32-byte prefix instead crashed the process on
-// anything shorter, and StampBlock hands it whatever the bridge supplies.
+// TestSignBlockAcceptsAnyMessageLength. The signer takes whatever the finality
+// bridge supplies, which is not always block-hash shaped.
 func TestSignBlockAcceptsAnyMessageLength(t *testing.T) {
-	q, err := NewQuasar(QuasarConfig{ValidatorID: "self", TotalNodes: 3, Logger: log.NewNoOpLogger()})
+	q, err := NewQuasar(QuasarConfig{ValidatorID: "self", Committee: 4, Logger: log.NewNoOpLogger()})
 	require.NoError(t, err)
 
 	for _, n := range []int{0, 1, 31, 32, 64} {
@@ -229,144 +328,48 @@ func TestSignBlockAcceptsAnyMessageLength(t *testing.T) {
 	}
 }
 
-// TestValidatorsJoinTheCommittee: the active count is what the threshold is
-// measured against, so joining has to move it.
-func TestValidatorsJoinTheCommittee(t *testing.T) {
-	q, err := NewQuasar(QuasarConfig{ValidatorID: "self", TotalNodes: 3, Logger: log.NewNoOpLogger()})
+// TestTheCommitteeIsASetOfADeclaredSize.
+//
+// Registering an id twice hands the core a FRESH key for it, which silently
+// invalidates every signature that validator already contributed; registering
+// more members than the committee declares makes the threshold a quorum of a
+// committee that no longer exists.
+func TestTheCommitteeIsASetOfADeclaredSize(t *testing.T) {
+	q, err := NewQuasar(QuasarConfig{ValidatorID: "self", Committee: 4, Logger: log.NewNoOpLogger()})
 	require.NoError(t, err)
+	require.Equal(t, 1, q.GetActiveValidators(), "the node is a member of its own committee")
 
-	before := q.GetActiveValidators()
 	require.NoError(t, q.AddValidator("validator-1", 100))
-	require.Equal(t, before+1, q.GetActiveValidators())
+	require.Equal(t, 2, q.GetActiveValidators())
+
+	require.ErrorIs(t, q.AddValidator("validator-1", 100), errAlreadyRegistered)
+	require.ErrorIs(t, q.AddValidator("self", 1), errAlreadyRegistered)
+	require.Equal(t, 2, q.GetActiveValidators(),
+		"one validator joining twice moved the count the threshold is measured against")
+
+	require.NoError(t, q.AddValidator("validator-2", 100))
+	require.NoError(t, q.AddValidator("validator-3", 100))
+	require.ErrorIs(t, q.AddValidator("validator-4", 100), errCommitteeFull)
+	require.ErrorIs(t, q.AddValidator("", 100), errNoValidatorID)
+	require.Equal(t, 4, q.GetActiveValidators())
 
 	require.NotNil(t, q.GetQuasar())
 }
 
-// TestTheCoreRefusesAThresholdOfOne. Quantum finality is a quorum's statement;
-// a "threshold" one validator meets alone is a single point of compromise, and
-// the consensus core will not build one.
-func TestTheCoreRefusesAThresholdOfOne(t *testing.T) {
-	_, err := NewQuasar(QuasarConfig{
-		ValidatorID: "self", Threshold: 1, TotalNodes: 1, Logger: log.NewNoOpLogger(),
-	})
-	require.Error(t, err, "a one-of-one quorum was accepted")
-}
+// TestARegisteredKeyIsWhatVerifies: the bridge's own verification helpers agree
+// with what AddSignature admits, so nothing can be verified one way in one place
+// and another way in another.
+func TestARegisteredKeyIsWhatVerifies(t *testing.T) {
+	q, _, hash := committee(t, "validator-a", "validator-b", "validator-c", "validator-d")
 
-// committee returns an engine at threshold 2 whose core knows both validators
-// for BLS, and the block they are all signing.
-func committee(t *testing.T, self string) (*Quasar, ids.ID, []byte) {
-	t.Helper()
-	q, err := NewQuasar(QuasarConfig{
-		ValidatorID: self, Threshold: 2, TotalNodes: 2, Logger: log.NewNoOpLogger(),
-	})
-	require.NoError(t, err)
-	require.NoError(t, q.AddValidator("validator-a", 100))
-	require.NoError(t, q.AddValidator("validator-b", 100))
+	sig := signAs(t, q, "validator-b", hash)
+	require.True(t, q.VerifySignature(hash, sig))
+	require.False(t, q.VerifySignature([]byte("another message"), sig))
+	require.False(t, q.VerifySignature(hash, nil))
+	require.False(t, q.VerifyAggregate(context.Background(), hash, nil))
 
-	blockID := ids.GenerateTestID()
-	hash := make([]byte, 64)
-	copy(hash, blockID[:])
-	q.pendingBlocks[blockID] = &PendingBlock{BlockID: blockID, BlockHash: hash, Height: 1}
-	return q, blockID, hash
-}
-
-// TestQuantumFinalityNeedsBothLegs is the happy path, with real BLS signatures
-// from two validators the core knows.
-//
-// The classical leg aggregates and VERIFIES; the post-quantum leg is counted.
-// Neither alone is quantum finality — the whole point of running two is that a
-// break in one is not a break in the chain.
-func TestQuantumFinalityNeedsBothLegs(t *testing.T) {
-	q, blockID, hash := committee(t, "validator-a")
-	core := q.GetQuasar()
-	ctx := context.Background()
-
-	// Two peers' BLS signatures, as they arrive over the wire.
-	for _, name := range []string{"validator-a", "validator-b"} {
-		sig, err := core.SignMessageWithContext(ctx, name, hash)
-		require.NoError(t, err, "a validator the core knows could not sign")
-		require.NoError(t, q.AddBLSSignature(blockID, &quasar.BLSSignature{
-			Signature:   sig.BLS,
-			ValidatorID: sig.ValidatorID,
-			SignerIndex: sig.SignerIndex,
-			IsThreshold: sig.IsThreshold,
-		}))
-	}
-
-	pending := q.pendingBlocks[blockID]
-	_, finalized, err := q.TryFinalize(ctx, blockID)
-	require.NoError(t, err)
-	require.True(t, pending.BLSFinalized, "two real signatures did not carry the classical leg")
-	require.False(t, finalized, "the classical leg alone was taken for quantum finality")
-	require.False(t, q.IsFinalized(blockID))
-
-	// Now the post-quantum leg, from the same two validators.
-	for _, name := range []string{"validator-a", "validator-b"} {
-		require.NoError(t, q.AddCoronaSignature(blockID, &quasar.CoronaSignature{
-			Signature: []byte{1}, ValidatorID: name, Round: 1,
-		}))
-	}
-
-	agg, finalized, err := q.TryFinalize(ctx, blockID)
-	require.NoError(t, err)
-	require.True(t, finalized, "both legs reached their threshold and the block did not finalize")
-	require.NotNil(t, agg)
-	require.True(t, q.IsFinalized(blockID))
-
-	// Cleanup below the finalized frontier releases it from both maps.
-	q.Cleanup(2)
-	require.NotContains(t, q.pendingBlocks, blockID)
-	require.False(t, q.IsFinalized(blockID))
-}
-
-// TestSignBlockReportsAMissingCoronaShare.
-//
-// A validator joins through AddValidator, which gives it a BLS key and no
-// Corona share — the shares must come from a dealerless DKG, and until one
-// lands there is nothing to sign the post-quantum leg with. What matters is
-// that SignBlock SAYS so: a node that reported success here would be claiming
-// a post-quantum signature it never made.
-func TestSignBlockReportsAMissingCoronaShare(t *testing.T) {
-	q, _, hash := committee(t, "validator-a")
-
-	blockID := ids.GenerateTestID()
-	_, err := q.SignBlock(context.Background(), blockID, hash, 1)
-	require.ErrorContains(t, err, "Corona sign failed",
-		"the post-quantum leg reported success without a share to sign with")
-	require.NotContains(t, q.pendingBlocks, blockID, "the failed block is tracked forever")
-}
-
-// TestAggregationOverSignaturesThatAreNotSignatures fails closed. The BLS leg
-// aggregates and VERIFIES, so bytes that never came from a signer must not
-// carry the classical half of finality.
-func TestAggregationOverSignaturesThatAreNotSignatures(t *testing.T) {
-	q, blockID := engine(t, 3)
-
-	for _, id := range []string{"validator-1", "validator-2", "validator-3"} {
-		require.NoError(t, q.AddBLSSignature(blockID, &quasar.BLSSignature{
-			Signature: []byte("not a signature"), ValidatorID: id,
-		}))
-	}
-	require.Len(t, q.pendingBlocks[blockID].BLSSignatures, 3)
-
-	_, finalized, _ := q.TryFinalize(context.Background(), blockID)
-	require.False(t, finalized, "three forged signatures reached the threshold and finalized")
-	require.False(t, q.pendingBlocks[blockID].BLSFinalized)
-	require.False(t, q.IsFinalized(blockID))
-}
-
-// TestAddValidatorRefusesADuplicate: the active count is what the threshold is
-// measured against, so one validator joining twice would count twice.
-func TestAddValidatorRefusesADuplicate(t *testing.T) {
-	q, err := NewQuasar(QuasarConfig{ValidatorID: "self", TotalNodes: 3, Logger: log.NewNoOpLogger()})
-	require.NoError(t, err)
-
-	require.NoError(t, q.AddValidator("validator-1", 100))
-	after := q.GetActiveValidators()
-	if err := q.AddValidator("validator-1", 100); err != nil {
-		require.Equal(t, after, q.GetActiveValidators())
-		return
-	}
-	require.Equal(t, after, q.GetActiveValidators(),
-		"one validator joining twice moved the count the threshold is measured against")
+	relabelled := *sig
+	relabelled.ValidatorID = "validator-c"
+	require.False(t, q.VerifySignature(hash, &relabelled),
+		"a signature relabelled to another committee member verified")
 }

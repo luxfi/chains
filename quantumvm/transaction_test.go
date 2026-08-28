@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -206,22 +207,34 @@ func TestProcessBatchWithStampsOffSkipsCrypto(t *testing.T) {
 	require.Len(t, rejected, 1)
 }
 
-// TestProcessBatchDropsWhatCannotExecute.
-func TestProcessBatchDropsWhatCannotExecute(t *testing.T) {
+// TestProcessBatchAppliesNothing.
+//
+// Selecting transactions for a block is not applying them. It ran them here, so
+// a block the network never accepted had already applied its effects, a rebuild
+// applied them twice, and a node that received the block rather than building it
+// applied them never. Selection asks whether a signature checks out; nothing
+// more.
+func TestProcessBatchAppliesNothing(t *testing.T) {
 	vm, _ := bootVM(t, quietConfig())
 	worker := &TransactionWorker{vm: vm, quantumSigner: vm.quantumSigner}
 
-	valid, rejected := worker.ProcessBatch([]Transaction{
-		stampedTx(1, "runs"),
-		&failingTx{BaseTransaction: *stampedTx(2, "throws")},
-	})
-	require.Len(t, valid, 1)
-	require.Len(t, rejected, 1)
+	var runs int32
+	refusing := countingTx{
+		BaseTransaction: stampedTx(2, "would refuse"),
+		runs:            &runs,
+		fail:            errors.New("execution refused"),
+	}
+
+	valid, rejected := worker.ProcessBatch([]Transaction{stampedTx(1, "runs"), refusing})
+	require.Len(t, valid, 2, "a transaction was dropped for a reason selection cannot know")
+	require.Empty(t, rejected)
+	require.Zero(t, atomic.LoadInt32(&runs), "selecting a transaction applied it")
+
+	// The same transaction is refused where it is applied — in Accept.
+	blk := buildWith(t, vm, refusing)
+	require.ErrorIs(t, blk.Accept(context.Background()), errExecute)
+	require.Equal(t, int32(1), atomic.LoadInt32(&runs))
 }
-
-type failingTx struct{ BaseTransaction }
-
-func (t *failingTx) Execute() error { return errors.New("execution refused") }
 
 // TestBuildBlockSpansSeveralBatches: the batch size divides the selection, and
 // every batch's survivors reach the block.
@@ -256,4 +269,5 @@ func TestTransactionIdentityIsItsContent(t *testing.T) {
 	require.Equal(t, chainTime, base.Timestamp())
 	require.NotNil(t, base.GetQuantumSignature())
 	require.NoError(t, base.Execute())
+	require.NoError(t, base.Verify())
 }

@@ -14,13 +14,20 @@ import (
 	"github.com/luxfi/log"
 )
 
-// seedVM is the smallest VM seedGenesis needs: a store and a log. Building the
-// whole VM would test the constructor, not the property under test.
+// seedVM is the smallest VM seedGenesis needs: a store, a log and the chain it
+// serves. Building the whole VM would test the constructor, not the property
+// under test.
 func seedVM(t *testing.T) (*VM, *memdb.Database) {
 	t.Helper()
+	return seedVMOn(t, testNetwork, testChain)
+}
+
+func seedVMOn(t *testing.T, networkID uint32, chainID ids.ID) (*VM, *memdb.Database) {
+	t.Helper()
 	db := memdb.New()
-	vm := &VM{log: log.NewNoOpLogger(), db: db}
+	vm := &VM{log: log.NewNoOpLogger(), db: db, blockchainID: chainID, NetworkID: networkID}
 	vm.state = versiondb.New(db)
+	vm.txPool = NewTransactionPool(8, vm.log)
 	return vm, db
 }
 
@@ -33,7 +40,7 @@ func seedVM(t *testing.T) (*VM, *memdb.Database) {
 func TestSeedGenesisNamesATip(t *testing.T) {
 	vm, _ := seedVM(t)
 
-	if got := vm.getLastAcceptedID(); got != ids.Empty {
+	if got := tipOf(t, vm); got != ids.Empty {
 		t.Fatalf("precondition: a fresh VM should name no block, got %s", got)
 	}
 
@@ -41,16 +48,16 @@ func TestSeedGenesisNamesATip(t *testing.T) {
 		t.Fatalf("seedGenesis: %v", err)
 	}
 
-	if got := vm.getLastAcceptedID(); got == ids.Empty {
+	if got := tipOf(t, vm); got == ids.Empty {
 		t.Fatal("VM still names no block after seeding — every beacon reply would " +
 			"be dropped and the chain could never reach its bootstrap quorum")
 	}
-	if got := vm.getHeight(); got != 0 {
+	if got := heightOf(t, vm); got != 0 {
 		t.Fatalf("genesis height = %d, want 0", got)
 	}
 }
 
-// genesisID is the one block every Q-Chain node must name at height 0.
+// genesisID is the one block every node of testChain must name at height 0.
 //
 // It is pinned rather than recomputed because the property is not "two VMs in
 // this test agree" — two VMs seeded in the same second agree even with a
@@ -59,7 +66,7 @@ func TestSeedGenesisNamesATip(t *testing.T) {
 // A constant is the only assertion that fails for every input a node could
 // disagree on. If this value must change, the chain is being re-genesised and
 // every node has to move together.
-const genesisID = "23YdHYkgL766qjZojgBBey3RuvMfuZgtJkvgJ3yEFFVK5UcKEQ"
+const genesisID = "zAaMUekpcRPgjqxqT8kSm9P5xRKJuz2k5v3zN2WfnmwdBdojU"
 
 // TestSeedGenesisAgreesAcrossNodes is the safety half. Each node seeds alone,
 // without talking to any other, so if the block were a function of anything
@@ -76,13 +83,38 @@ func TestSeedGenesisAgreesAcrossNodes(t *testing.T) {
 		t.Fatalf("node b: %v", err)
 	}
 
-	if a.getLastAcceptedID() != b.getLastAcceptedID() {
+	if tipOf(t, a) != tipOf(t, b) {
 		t.Fatalf("nodes disagree on genesis: %s vs %s — this would fork the chain",
-			a.getLastAcceptedID(), b.getLastAcceptedID())
+			tipOf(t, a), tipOf(t, b))
 	}
-	if got := a.getLastAcceptedID().String(); got != genesisID {
+	if got := tipOf(t, a).String(); got != genesisID {
 		t.Fatalf("genesis id = %s, want %s — the block is not a constant, so nodes "+
 			"that start at different times will name different genesis blocks", got, genesisID)
+	}
+}
+
+// TestGenesisIsPerChain is the other half of agreement: nodes of ONE chain
+// agree, and nodes of two chains do not.
+//
+// The block carried nothing chain-specific, so genesis was a global constant and
+// every Q-Chain in existence shared it. Two chains agreeing on their first block
+// is two chains whose blocks are interchangeable from the first height up.
+func TestGenesisIsPerChain(t *testing.T) {
+	mine, _ := seedVMOn(t, testNetwork, testChain)
+	theirs, _ := seedVMOn(t, testNetwork, otherChain)
+	elsewhere, _ := seedVMOn(t, otherNetworkID, testChain)
+
+	for _, vm := range []*VM{mine, theirs, elsewhere} {
+		if err := vm.seedGenesis(); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	if tipOf(t, mine) == tipOf(t, theirs) {
+		t.Fatal("two chains share a genesis block, so a block built on one is a block on the other")
+	}
+	if tipOf(t, mine) == tipOf(t, elsewhere) {
+		t.Fatal("two networks share a genesis block, so testnet blocks are mainnet blocks")
 	}
 }
 
@@ -94,10 +126,16 @@ func TestSeedGenesisLeavesAnExistingChainAlone(t *testing.T) {
 	if err := vm.seedGenesis(); err != nil {
 		t.Fatalf("first seed: %v", err)
 	}
-	first := vm.getLastAcceptedID()
+	first := tipOf(t, vm)
 
 	// Advance the chain, as a running node would.
-	blk := &Block{timestamp: time.Unix(100, 0).UTC(), height: 7, parentID: first, vm: vm}
+	genesis, err := vm.blockAt(first)
+	if err != nil {
+		t.Fatalf("read genesis: %v", err)
+	}
+	blk := blockOn(vm, genesis, stampedTx(1, "op"))
+	blk.timestamp = time.Unix(100, 0).UTC()
+	blk.bytes = nil
 	blk.id = blk.computeID()
 	if err := blk.Accept(context.Background()); err != nil {
 		t.Fatalf("accept: %v", err)
@@ -106,11 +144,11 @@ func TestSeedGenesisLeavesAnExistingChainAlone(t *testing.T) {
 	if err := vm.seedGenesis(); err != nil {
 		t.Fatalf("second seed: %v", err)
 	}
-	if got := vm.getLastAcceptedID(); got != blk.id {
+	if got := tipOf(t, vm); got != blk.id {
 		t.Fatalf("seeding rewound a live chain: tip %s became %s", blk.id, got)
 	}
-	if got := vm.getHeight(); got != 7 {
-		t.Fatalf("seeding rewound height to %d, want 7", got)
+	if got := heightOf(t, vm); got != 1 {
+		t.Fatalf("seeding rewound height to %d, want 1", got)
 	}
 }
 
@@ -122,13 +160,14 @@ func TestSeedGenesisSurvivesRestart(t *testing.T) {
 	if err := vm.seedGenesis(); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	want := vm.getLastAcceptedID()
+	want := tipOf(t, vm)
 
 	// Restart: a new version layer over the SAME underlying store.
-	restarted := &VM{log: log.NewNoOpLogger(), db: db}
+	restarted := &VM{log: log.NewNoOpLogger(), db: db, blockchainID: testChain, NetworkID: testNetwork}
 	restarted.state = versiondb.New(db)
+	restarted.txPool = NewTransactionPool(8, restarted.log)
 
-	if got := restarted.getLastAcceptedID(); got != want {
+	if got := tipOf(t, restarted); got != want {
 		t.Fatalf("genesis did not survive restart: %s != %s (uncommitted)", got, want)
 	}
 }
