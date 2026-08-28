@@ -4,8 +4,8 @@
 package zkvm
 
 import (
-	"encoding/json"
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/luxfi/chains/zkvm/precompiles"
@@ -72,8 +72,13 @@ func TestZChain_DefaultIsStrictPQ(t *testing.T) {
 	if !v.StrictPQ() {
 		t.Fatal("Z-Chain default config must be strict-PQ (StrictPQ==true)")
 	}
-	if v.config.ProofSystem != "stark" {
-		t.Fatalf("Z-Chain default ProofSystem = %q, want \"stark\" (only system accepted under strict-PQ)", v.config.ProofSystem)
+	// Which system a chain accepts is decided per proof by the strict-PQ gate,
+	// not by a config string nothing reads.
+	if err := v.proofVerifier.refuseClassicalUnderStrictPQ("groth16"); err == nil {
+		t.Fatal("Z-Chain default must refuse a classical proof system")
+	}
+	if err := v.proofVerifier.refuseClassicalUnderStrictPQ("stark"); err != nil {
+		t.Fatalf("Z-Chain default must accept STARK: %v", err)
 	}
 }
 
@@ -128,12 +133,9 @@ func TestZChain_StrictPQ_ShieldedRefusesGroth16(t *testing.T) {
 func TestZChain_ExplicitNonStrictGenesisOptsOut(t *testing.T) {
 	// Build a ZConfig with StrictPQ=false and feed it as init.Config.
 	cfg := ZConfig{
-		EnableConfidentialTransfers: true,
-		ProofSystem:                 "groth16",
-		CircuitType:                 "transfer",
-		StrictPQ:                    false,
-		MaxUTXOsPerBlock:            100,
-		ProofCacheSize:              1000,
+		StrictPQ:       false,
+		MaxTxPerBlock:  100,
+		ProofCacheSize: 1000,
 	}
 	cfgBytes, err := json.Marshal(cfg)
 	if err != nil {

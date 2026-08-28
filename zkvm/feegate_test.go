@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/luxfi/database/memdb"
@@ -85,22 +86,66 @@ func TestZKVM_FeePolicy_AcceptsMinFee(t *testing.T) {
 // zero-fee tx with a 4xx; a paying tx admits into the mempool.
 func TestZKVM_HTTP_SendTransaction_FeePolicy(t *testing.T) {
 	v := newZKVMForFeeTest(t)
-	mux := NewRPCHandler(v)
+	handler := v.endpoints()["/sendTransaction"]
 
-	post := func(body []byte) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/sendTransaction", bytes.NewReader(body))
+	post := func(tx *Transaction) *httptest.ResponseRecorder {
+		body, err := json.Marshal(tx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/v1/bc/z/sendTransaction", bytes.NewReader(body))
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, req)
+		handler.ServeHTTP(w, req)
 		return w
 	}
 
-	zero, _ := json.Marshal(&Transaction{ID: ids.GenerateTestID(), Fee: 0})
-	if got := post(zero); got.Code < 400 {
-		t.Fatalf("POST /sendTransaction (zero-fee) status = %d, want >= 400", got.Code)
+	// A transaction with a shape no block can carry.
+	shaped := func(fee uint64) *Transaction {
+		return &Transaction{
+			ID:         ids.GenerateTestID(), // ignored: the id is derived
+			Type:       TransactionTypeTransfer,
+			Nullifiers: [][]byte{[]byte("n")},
+			Outputs:    []*ShieldedOutput{{Commitment: []byte("c")}},
+			Proof:      &ZKProof{ProofType: "stark", ProofData: []byte("p")},
+			Expiry:     100,
+			Fee:        fee,
+		}
 	}
 
-	paid, _ := json.Marshal(&Transaction{ID: ids.GenerateTestID(), Fee: fee.MinTxFeeFloor})
-	if got := post(paid); got.Code != http.StatusOK {
+	if got := post(shaped(0)); got.Code != http.StatusPaymentRequired {
+		t.Fatalf("POST /sendTransaction (zero-fee) status = %d, want 402", got.Code)
+	}
+
+	// A transaction that pays but can never enter a block occupies a slot in a
+	// bounded pool forever, so the door refuses its shape too.
+	empty := &Transaction{Fee: fee.MinTxFeeFloor, Expiry: 100}
+	if got := post(empty); got.Code != http.StatusBadRequest {
+		t.Fatalf("POST /sendTransaction (no inputs) status = %d, want 400", got.Code)
+	}
+
+	noExpiry := shaped(fee.MinTxFeeFloor)
+	noExpiry.Expiry = 0
+	if got := post(noExpiry); got.Code != http.StatusBadRequest {
+		t.Fatalf("POST /sendTransaction (no expiry) status = %d, want 400", got.Code)
+	}
+
+	paid := shaped(fee.MinTxFeeFloor)
+	got := post(paid)
+	if got.Code != http.StatusOK {
 		t.Fatalf("POST /sendTransaction (paid) status = %d body=%q, want 200", got.Code, got.Body.String())
+	}
+	if !strings.Contains(got.Body.String(), paid.ComputeID().String()) {
+		t.Fatalf("the reply must name the derived id, got %q", got.Body.String())
+	}
+	if v.mempool.Size() != 1 {
+		t.Fatalf("mempool size = %d, want 1", v.mempool.Size())
+	}
+
+	// A method the endpoint does not serve is refused, not silently accepted.
+	req := httptest.NewRequest(http.MethodGet, "/v1/bc/z/sendTransaction", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /sendTransaction status = %d, want 405", w.Code)
 	}
 }

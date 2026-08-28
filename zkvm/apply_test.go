@@ -53,7 +53,7 @@ func newRefusingVM(t *testing.T) (*VM, *refusingDB) {
 	genesisBytes, err := json.Marshal(&Genesis{Timestamp: 1607144400, InitialTxs: []*Transaction{}})
 	require.NoError(t, err)
 	configBytes, err := json.Marshal(ZConfig{
-		ProofSystem: "groth16", MaxUTXOsPerBlock: 100, ProofCacheSize: 1000,
+		MaxTxPerBlock: 100, ProofCacheSize: 1000,
 	})
 	require.NoError(t, err)
 
@@ -93,7 +93,7 @@ func TestABlockThatCannotCommitSpendsNothing(t *testing.T) {
 	blk := built.(*Block)
 
 	tipBefore, heightBefore := vmImpl.chain.Tip()
-	rootBefore := append([]byte(nil), vmImpl.stateTree.GetRoot()...)
+	rootBefore := append([]byte(nil), vmImpl.root.Get()...)
 
 	db.refuse = true
 	require.ErrorIs(t, blk.Accept(context.Background()), errRefused)
@@ -109,9 +109,9 @@ func TestABlockThatCannotCommitSpendsNothing(t *testing.T) {
 	// And nothing in memory believes it did. This is the part that mattered:
 	// the nullifier cache is what decides whether a note can be spent, and a
 	// cache holding a spend the database does not have is a note lost forever.
-	require.False(t, vmImpl.nullifierDB.IsNullifierSpent(spent),
+	require.False(t, spentOf(t, vmImpl.nullifierDB, spent),
 		"the spent-nullifier cache must agree with the database")
-	require.True(t, bytes.Equal(rootBefore, vmImpl.stateTree.GetRoot()),
+	require.True(t, bytes.Equal(rootBefore, vmImpl.root.Get()),
 		"the committed state root must not have advanced")
 
 	tip, height := vmImpl.chain.Tip()
@@ -129,8 +129,8 @@ func TestABlockThatCannotCommitSpendsNothing(t *testing.T) {
 	has, err = db.Database.Has(makeNullifierKey(spent))
 	require.NoError(t, err)
 	require.True(t, has)
-	require.True(t, vmImpl.nullifierDB.IsNullifierSpent(spent))
-	require.False(t, bytes.Equal(rootBefore, vmImpl.stateTree.GetRoot()))
+	require.True(t, spentOf(t, vmImpl.nullifierDB, spent))
+	require.False(t, bytes.Equal(rootBefore, vmImpl.root.Get()))
 
 	tip, height = vmImpl.chain.Tip()
 	require.Equal(t, blk.ID(), tip)
@@ -162,7 +162,7 @@ func TestAVertexThatCannotCommitSpendsNothing(t *testing.T) {
 	has, err := db.Database.Has(makeNullifierKey(spent))
 	require.NoError(t, err)
 	require.False(t, has)
-	require.False(t, vmImpl.nullifierDB.IsNullifierSpent(spent))
+	require.False(t, spentOf(t, vmImpl.nullifierDB, spent))
 
 	tip, height := vmImpl.chain.Tip()
 	require.Equal(t, tipBefore, tip)
@@ -171,7 +171,7 @@ func TestAVertexThatCannotCommitSpendsNothing(t *testing.T) {
 
 	db.refuse = false
 	require.NoError(t, vtx.Accept(context.Background()))
-	require.True(t, vmImpl.nullifierDB.IsNullifierSpent(spent))
+	require.True(t, spentOf(t, vmImpl.nullifierDB, spent))
 	tip, _ = vmImpl.chain.Tip()
 	require.Equal(t, vtx.ID(), tip)
 }

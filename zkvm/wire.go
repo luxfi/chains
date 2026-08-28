@@ -14,9 +14,9 @@ import (
 // Native-ZAP struct-is-wire for Z-Chain. No pcodecs, no reflection, no codec
 // registry. Each type owns Marshal() []byte over a zap object; nested slices
 // ([]*Sub) are packed as a u32-length list + concatenated sub Marshal() blobs;
-// optional pointers (*ZKProof/*FHEData) are a single bytes field that is empty
-// iff nil; [][]byte is a length list + concat blob. Parse rejects trailing
-// bytes (canonical). Re-genesis authorized.
+// an optional pointer (*ZKProof) is a single bytes field that is empty iff nil;
+// [][]byte is a length list + concat blob. Parse rejects trailing bytes
+// (canonical). Re-genesis authorized.
 
 var (
 	// errTrailingBytes — the frame declares fewer bytes than were handed to the
@@ -257,42 +257,6 @@ func parseZKProof(data []byte) (*ZKProof, error) {
 	return &ZKProof{ProofType: string(o.Bytes(0)), ProofData: cp(o.Bytes(8)), PublicInputs: pub}, nil
 }
 
-// ================= FHEData: EncInLens list@0, EncInBlob bytes@8, CircuitID bytes@16, EncResult bytes@24, CompProof bytes@32 =================
-
-const fheSize = 40
-
-func marshalFHEData(f *FHEData) []byte {
-	if f == nil {
-		return nil
-	}
-	lens, blob := packBytesList(f.EncryptedInputs)
-	b := zap.NewBuilder(zap.HeaderSize + fheSize + len(blob) + 4*len(lens) + len(f.CircuitID) + len(f.EncryptedResult) + len(f.ComputationProof) + 64)
-	lensOff := writeU32List(b, lens)
-	ob := b.StartObject(fheSize)
-	ob.SetList(0, lensOff, len(lens))
-	ob.SetBytes(8, blob)
-	ob.SetBytes(16, []byte(f.CircuitID))
-	ob.SetBytes(24, f.EncryptedResult)
-	ob.SetBytes(32, f.ComputationProof)
-	ob.FinishAsRoot()
-	return b.Finish()
-}
-
-func parseFHEData(data []byte) (*FHEData, error) {
-	if len(data) == 0 {
-		return nil, nil
-	}
-	o, err := parseFrame(data)
-	if err != nil {
-		return nil, err
-	}
-	in, err := unpackBytesList(readU32List(o, 0), o.Bytes(8))
-	if err != nil {
-		return nil, err
-	}
-	return &FHEData{EncryptedInputs: in, CircuitID: string(o.Bytes(16)), EncryptedResult: cp(o.Bytes(24)), ComputationProof: cp(o.Bytes(32))}, nil
-}
-
 // ================= UTXO: TxID32@0, OutputIndex u32@32, Height u64@36, Commitment bytes@44, Ciphertext bytes@52, EphemeralPK bytes@60 =================
 
 const utxoSize = 68
@@ -324,45 +288,17 @@ func parseUTXO(data []byte, u *UTXO) error {
 	return nil
 }
 
-// ================= PrivateAddress: 5 byte fields @0/8/16/24/32, CreatedAt i64@40 =================
-
-const paSize = 48
-
-func (p *PrivateAddress) Marshal() ([]byte, error) {
-	b := zap.NewBuilder(zap.HeaderSize + paSize + len(p.Address) + len(p.ViewingKey) +
-		len(p.SpendingKey) + len(p.Diversifier) + len(p.IncomingViewKey) + 64)
-	ob := b.StartObject(paSize)
-	ob.SetBytes(0, p.Address)
-	ob.SetBytes(8, p.ViewingKey)
-	ob.SetBytes(16, p.SpendingKey)
-	ob.SetBytes(24, p.Diversifier)
-	ob.SetBytes(32, p.IncomingViewKey)
-	ob.SetInt64(40, p.CreatedAt)
-	ob.FinishAsRoot()
-	return b.Finish(), nil
-}
-
-func parsePrivateAddress(data []byte, p *PrivateAddress) error {
-	o, err := parseFrame(data)
-	if err != nil {
-		return err
-	}
-	p.Address = cp(o.Bytes(0))
-	p.ViewingKey = cp(o.Bytes(8))
-	p.SpendingKey = cp(o.Bytes(16))
-	p.Diversifier = cp(o.Bytes(24))
-	p.IncomingViewKey = cp(o.Bytes(32))
-	p.CreatedAt = o.Int64(40)
-	return nil
-}
-
 // ================= Transaction =================
 //
-//	ID 32B@0, Type u8@32, Version u8@33, Fee u64@34, Expiry u64@42,
-//	TInLens list@50, TInBlob bytes@58, TOutLens list@66, TOutBlob bytes@74,
-//	NullLens list@82, NullBlob bytes@90, SOutLens list@98, SOutBlob bytes@106,
-//	Proof bytes@114, FHE bytes@122, Memo bytes@130, Signature bytes@138
-const txSize = 146
+//	Type u8@0, Version u8@1, Fee u64@2, Expiry u64@10,
+//	TInLens list@18, TInBlob bytes@26, TOutLens list@34, TOutBlob bytes@42,
+//	NullLens list@50, NullBlob bytes@58, SOutLens list@66, SOutBlob bytes@74,
+//	Proof bytes@82, Memo bytes@90
+//
+// The id is NOT here. It is ComputeID() over these fields, so a peer cannot
+// choose it, and the proof cache keyed on it cannot be reached by a
+// transaction other than the one the proof was verified for.
+const txSize = 98
 
 func (tx *Transaction) Marshal() ([]byte, error) {
 	tinLens, tinBlob := packObjs(tx.TransparentInputs, marshalTransparentInput)
@@ -370,10 +306,9 @@ func (tx *Transaction) Marshal() ([]byte, error) {
 	nullLens, nullBlob := packBytesList(tx.Nullifiers)
 	soutLens, soutBlob := packObjs(tx.Outputs, marshalShieldedOutput)
 	proof := marshalZKProof(tx.Proof)
-	fhe := marshalFHEData(tx.FHEData)
 
 	b := zap.NewBuilder(zap.HeaderSize + txSize + len(tinBlob) + len(toutBlob) + len(nullBlob) +
-		len(soutBlob) + len(proof) + len(fhe) + len(tx.Memo) + len(tx.Signature) +
+		len(soutBlob) + len(proof) + len(tx.Memo) +
 		4*(len(tinLens)+len(toutLens)+len(nullLens)+len(soutLens)) + 512)
 	tinOff := writeU32List(b, tinLens)
 	toutOff := writeU32List(b, toutLens)
@@ -381,23 +316,20 @@ func (tx *Transaction) Marshal() ([]byte, error) {
 	soutOff := writeU32List(b, soutLens)
 
 	ob := b.StartObject(txSize)
-	ob.SetBytesFixed(0, tx.ID[:])
-	ob.SetUint8(32, uint8(tx.Type))
-	ob.SetUint8(33, tx.Version)
-	ob.SetUint64(34, tx.Fee)
-	ob.SetUint64(42, tx.Expiry)
-	ob.SetList(50, tinOff, len(tinLens))
-	ob.SetBytes(58, tinBlob)
-	ob.SetList(66, toutOff, len(toutLens))
-	ob.SetBytes(74, toutBlob)
-	ob.SetList(82, nullOff, len(nullLens))
-	ob.SetBytes(90, nullBlob)
-	ob.SetList(98, soutOff, len(soutLens))
-	ob.SetBytes(106, soutBlob)
-	ob.SetBytes(114, proof)
-	ob.SetBytes(122, fhe)
-	ob.SetBytes(130, tx.Memo)
-	ob.SetBytes(138, tx.Signature)
+	ob.SetUint8(0, uint8(tx.Type))
+	ob.SetUint8(1, tx.Version)
+	ob.SetUint64(2, tx.Fee)
+	ob.SetUint64(10, tx.Expiry)
+	ob.SetList(18, tinOff, len(tinLens))
+	ob.SetBytes(26, tinBlob)
+	ob.SetList(34, toutOff, len(toutLens))
+	ob.SetBytes(42, toutBlob)
+	ob.SetList(50, nullOff, len(nullLens))
+	ob.SetBytes(58, nullBlob)
+	ob.SetList(66, soutOff, len(soutLens))
+	ob.SetBytes(74, soutBlob)
+	ob.SetBytes(82, proof)
+	ob.SetBytes(90, tx.Memo)
 	ob.FinishAsRoot()
 	return b.Finish(), nil
 }
@@ -408,37 +340,31 @@ func parseTransaction(data []byte) (*Transaction, error) {
 		return nil, err
 	}
 	tx := &Transaction{
-		ID:        readID(o, 0),
-		Type:      TransactionType(o.Uint8(32)),
-		Version:   o.Uint8(33),
-		Fee:       o.Uint64(34),
-		Expiry:    o.Uint64(42),
-		Memo:      cp(o.Bytes(130)),
-		Signature: cp(o.Bytes(138)),
+		Type:    TransactionType(o.Uint8(0)),
+		Version: o.Uint8(1),
+		Fee:     o.Uint64(2),
+		Expiry:  o.Uint64(10),
+		Memo:    cp(o.Bytes(90)),
 	}
-	if tx.TransparentInputs, err = unpackObjs(readU32List(o, 50), o.Bytes(58), parseTransparentInput); err != nil {
+	if tx.TransparentInputs, err = unpackObjs(readU32List(o, 18), o.Bytes(26), parseTransparentInput); err != nil {
 		return nil, err
 	}
-	if tx.TransparentOutputs, err = unpackObjs(readU32List(o, 66), o.Bytes(74), parseTransparentOutput); err != nil {
+	if tx.TransparentOutputs, err = unpackObjs(readU32List(o, 34), o.Bytes(42), parseTransparentOutput); err != nil {
 		return nil, err
 	}
-	if tx.Nullifiers, err = unpackBytesList(readU32List(o, 82), o.Bytes(90)); err != nil {
+	if tx.Nullifiers, err = unpackBytesList(readU32List(o, 50), o.Bytes(58)); err != nil {
 		return nil, err
 	}
-	if tx.Outputs, err = unpackObjs(readU32List(o, 98), o.Bytes(106), parseShieldedOutput); err != nil {
+	if tx.Outputs, err = unpackObjs(readU32List(o, 66), o.Bytes(74), parseShieldedOutput); err != nil {
 		return nil, err
 	}
-	if tx.Proof, err = parseZKProof(o.Bytes(114)); err != nil {
+	if tx.Proof, err = parseZKProof(o.Bytes(82)); err != nil {
 		return nil, err
 	}
-	if tx.FHEData, err = parseFHEData(o.Bytes(122)); err != nil {
-		return nil, err
-	}
+	// The identity is derived, never read. See ComputeID.
+	tx.ID = tx.ComputeID()
 	return tx, nil
 }
-
-// MarshalTx / ParseTx are the exported tx wire entry points.
-func (tx *Transaction) MarshalTx() ([]byte, error) { return tx.Marshal() }
 
 // ================= Block =================
 //

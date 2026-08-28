@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/luxfi/database/memdb"
-	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 )
 
@@ -87,7 +86,7 @@ func TestRegressionH01_Groth16SubgroupCheck(t *testing.T) {
 		Proof: &ZKProof{
 			ProofType:    "groth16",
 			ProofData:    make([]byte, 256), // zero bytes = invalid curve points
-			PublicInputs: [][]byte{nullifier, commitment},
+			PublicInputs: [][]byte{testBind[:], nullifier, commitment},
 		},
 	}
 	tx.ID = tx.ComputeID()
@@ -187,34 +186,6 @@ func TestRegressionH03_PublicInputsValueEqual(t *testing.T) {
 	}
 }
 
-// TestRegressionH04_HKDFChainBound verifies that deriveEncryptionKey binds the
-// chain ID into the HKDF salt, so the same secret on different chains produces
-// different encryption keys.
-// Finding H-04: HKDF salt was static ("zkvm-v1") without chain binding.
-func TestRegressionH04_HKDFChainBound(t *testing.T) {
-	secret := make([]byte, 32)
-	for i := range secret {
-		secret[i] = byte(i + 1)
-	}
-	chainA := ids.ID{0x0A}
-	chainB := ids.ID{0x0B}
-	txID := ids.ID{0x0C}
-
-	keyA := deriveEncryptionKey(secret, chainA, txID)
-	keyB := deriveEncryptionKey(secret, chainB, txID)
-
-	if bytes.Equal(keyA, keyB) {
-		t.Fatal("keys must differ for different chain IDs -- H-04 regression")
-	}
-
-	// Also verify txID binding
-	txID2 := ids.ID{0x0D}
-	keyC := deriveEncryptionKey(secret, chainA, txID2)
-	if bytes.Equal(keyA, keyC) {
-		t.Fatal("keys must differ for different tx IDs -- H-04 regression")
-	}
-}
-
 // TestRegressionH05_NoMutableVerifiedField verifies that the ZKProof struct
 // does not contain a mutable 'verified' field.
 // Finding H-05: A 'verified' bool on ZKProof allowed bypass of proof
@@ -239,25 +210,9 @@ func TestRegressionH05_NoMutableVerifiedField(t *testing.T) {
 // nullifiers after a time window.
 func TestRegressionM03_NullifierPruningRemoved(t *testing.T) {
 	typ := reflect.TypeOf(&NullifierDB{})
-	_, found := typ.MethodByName("PruneOldNullifiers")
-	if found {
-		t.Fatal("PruneOldNullifiers must be removed -- M-03 regression (enables double-spend)")
-	}
-}
-
-// TestRegressionM04_MerklePositionOrdering verifies that the Merkle proof uses
-// position-based (bit index) ordering, not hash-comparison ordering.
-// Finding M-04: Hash-based left/right ordering in Merkle proof was incorrect
-// for sparse Merkle trees where position determines path direction.
-func TestRegressionM04_MerklePositionOrdering(t *testing.T) {
-	// getBit must extract individual bits at specific positions.
-	// A hash-comparison approach would lose position information.
-	data := []byte{0b10110100, 0b01101001}
-	expected := []byte{1, 0, 1, 1, 0, 1, 0, 0, 0, 1, 1, 0, 1, 0, 0, 1}
-	for i, want := range expected {
-		got := getBit(data, i)
-		if got != want {
-			t.Fatalf("getBit(data, %d) = %d, want %d -- M-04 regression (position ordering broken)", i, got, want)
+	for _, name := range []string{"PruneOldNullifiers", "RemoveNullifier", "Prune", "Delete", "Clear"} {
+		if _, found := typ.MethodByName(name); found {
+			t.Fatalf("%s must not exist -- M-03 regression (enables double-spend)", name)
 		}
 	}
 }
@@ -321,77 +276,6 @@ func TestRegressionM06_FiatShamirFullLength(t *testing.T) {
 // INFO Regressions
 // =============================================================================
 
-// TestRegressionI01_DerivePublicKeyInvalidLength verifies that derivePublicKey
-// returns an error for non-32-byte inputs.
-// Finding I-01: Missing length check caused panic on invalid key lengths.
-func TestRegressionI01_DerivePublicKeyInvalidLength(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		key  []byte
-	}{
-		{"nil", nil},
-		{"empty", []byte{}},
-		{"too_short_16", make([]byte, 16)},
-		{"too_long_64", make([]byte, 64)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := derivePublicKey(tc.key)
-			if err == nil {
-				t.Fatalf("derivePublicKey(%d bytes) must return error -- I-01 regression", len(tc.key))
-			}
-		})
-	}
-
-	validKey := make([]byte, 32)
-	validKey[0] = 1
-	pub, err := derivePublicKey(validKey)
-	if err != nil {
-		t.Fatalf("derivePublicKey(32 bytes) must succeed: %v", err)
-	}
-	if len(pub) != 32 {
-		t.Fatalf("public key must be 32 bytes, got %d", len(pub))
-	}
-}
-
-// TestRegressionI02_UsesCurve25519X25519 verifies that key derivation uses
-// the modern curve25519.X25519 API, not deprecated ScalarMult/ScalarBaseMult.
-// Finding I-02: Deprecated curve25519 functions have subtle edge cases.
-func TestRegressionI02_UsesCurve25519X25519(t *testing.T) {
-	privKey := make([]byte, 32)
-	privKey[0] = 42
-
-	pubKey, err := derivePublicKey(privKey)
-	if err != nil {
-		t.Fatalf("X25519 base mult failed: %v", err)
-	}
-
-	privKey2 := make([]byte, 32)
-	privKey2[0] = 99
-	shared, err := deriveSharedSecret(privKey2, pubKey)
-	if err != nil {
-		t.Fatalf("X25519 key exchange failed: %v", err)
-	}
-	if len(shared) != 32 {
-		t.Fatalf("shared secret must be 32 bytes, got %d", len(shared))
-	}
-}
-
-// TestRegressionI03_DefaultPowerIs20 is a cross-reference to the ceremony
-// package test. The actual flag default verification lives there because
-// the ceremony is package main (cannot be imported).
-// Finding I-03: Default power of 10 was too small for production circuits.
-func TestRegressionI03_DefaultPowerIs20(t *testing.T) {
-	// See cmd/ceremony/security_regression_test.go TestRegressionI03
-	// for the actual verification. Here we verify the ceremony
-	// constraint count math: 2^20 + 1 = 1048577 powers.
-	power := 20
-	numConstraints := 1 << power
-	powersNeeded := numConstraints + 1
-	if powersNeeded != 1048577 {
-		t.Fatalf("2^20 + 1 must equal 1048577, got %d -- I-03 regression", powersNeeded)
-	}
-}
-
 // =============================================================================
 // LOW Regressions
 // =============================================================================
@@ -418,13 +302,13 @@ func TestRegressionL02_LoadNullifiersPopulatesCache(t *testing.T) {
 	}
 
 	// Cache must contain the nullifier loaded from disk
-	if !ndb.IsNullifierSpent(nullifier) {
+	if !spentOf(t, ndb, nullifier) {
 		t.Fatal("loadNullifiers must populate cache from database -- L-02 regression")
 	}
 
-	height, err := ndb.GetNullifierHeight(nullifier)
+	height, _, err := ndb.Spent(nullifier)
 	if err != nil {
-		t.Fatalf("GetNullifierHeight: %v", err)
+		t.Fatalf("Spent: %v", err)
 	}
 	if height != 42 {
 		t.Fatalf("expected height 42, got %d -- L-02 regression", height)
@@ -438,10 +322,9 @@ func TestRegressionL02_LoadNullifiersPopulatesCache(t *testing.T) {
 func newTestProofVerifier(t *testing.T) *ProofVerifier {
 	t.Helper()
 	config := ZConfig{
-		ProofSystem:    "groth16",
 		ProofCacheSize: 100,
 	}
-	pv, err := NewProofVerifier(config, log.NoLog{})
+	pv, err := NewProofVerifier(config, [32]byte{}, log.NoLog{})
 	if err != nil {
 		t.Fatalf("NewProofVerifier: %v", err)
 	}

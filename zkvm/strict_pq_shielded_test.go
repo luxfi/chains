@@ -28,10 +28,9 @@ import (
 func strictPQVerifier(t *testing.T) *ProofVerifier {
 	t.Helper()
 	pv, err := NewProofVerifier(ZConfig{
-		ProofSystem:    "stark",
 		ProofCacheSize: 100,
 		StrictPQ:       true,
-	}, log.NoLog{})
+	}, [32]byte{}, log.NoLog{})
 	if err != nil {
 		t.Fatalf("NewProofVerifier(strictPQ): %v", err)
 	}
@@ -51,7 +50,7 @@ func shieldedTx(proofType string, proofData []byte) *Transaction {
 		Proof: &ZKProof{
 			ProofType:    proofType,
 			ProofData:    proofData,
-			PublicInputs: [][]byte{nullifier, commitment},
+			PublicInputs: [][]byte{testBind[:], nullifier, commitment},
 		},
 	}
 	tx.ID = tx.ComputeID()
@@ -92,13 +91,12 @@ func TestStrictPQ_RealBN254VKLoadErrors(t *testing.T) {
 	realVK[0] = 0x01 // non-zero ⇒ a real (non-dummy) bn254 verifying key
 
 	_, err := NewProofVerifier(ZConfig{
-		ProofSystem:    "stark",
 		ProofCacheSize: 100,
 		StrictPQ:       true,
 		VerifyingKeys: map[string][]byte{
 			string(TransactionTypeTransfer): realVK,
 		},
-	}, log.NoLog{})
+	}, [32]byte{}, log.NoLog{})
 	if !errors.Is(err, errStrictPQRealVKForbidden) {
 		t.Fatalf("strict-PQ chain must error on real bn254 VK loaded by the production loadVerifyingKeys, got: %v", err)
 	}
@@ -122,13 +120,12 @@ func TestNonStrict_RealVKConstructs(t *testing.T) {
 	realVK := make([]byte, 1024)
 	realVK[0] = 0x01
 	pv, err := NewProofVerifier(ZConfig{
-		ProofSystem:    "groth16",
 		ProofCacheSize: 100,
 		StrictPQ:       false,
 		VerifyingKeys: map[string][]byte{
 			string(TransactionTypeTransfer): realVK,
 		},
-	}, log.NoLog{})
+	}, [32]byte{}, log.NoLog{})
 	if err != nil {
 		t.Fatalf("non-strict chain must accept a real bn254 VK, got: %v", err)
 	}
@@ -165,9 +162,11 @@ func TestStrictPQ_STARKIsOnlyAcceptedSystem(t *testing.T) {
 	if err := pv.VerifyTransactionProof(tx); err != nil {
 		t.Fatalf("bound STARK accept path returned error: %v", err)
 	}
-	// 1 nullifier (32) + 1 commitment (32) = 64 bytes of bound public input.
-	if len(sawPub) != 64 {
-		t.Fatalf("STARK public inputs must bind nullifiers+commitments (64 bytes), got %d", len(sawPub))
+	// chain bind (32) + 1 nullifier (32) + 1 commitment (32) = 96 bytes. The
+	// chain goes first, so a proof made for another chain does not verify here
+	// even when the notes it names are unspent on both.
+	if len(sawPub) != 96 {
+		t.Fatalf("STARK public inputs must bind chain+nullifiers+commitments (96 bytes), got %d", len(sawPub))
 	}
 
 	// Bound + reject: a non-verifying proof is rejected.
@@ -177,36 +176,15 @@ func TestStrictPQ_STARKIsOnlyAcceptedSystem(t *testing.T) {
 	}
 }
 
-// TestStrictPQ_GPUBatchPathRefusesClassical proves the strict-PQ gate is
-// ALSO enforced on the GPU batch verification path (which deserializes
-// and verifies Groth16 INLINE, bypassing VerifyTransactionProof). A
-// strict-PQ chain must refuse a classical proof regardless of path.
-func TestStrictPQ_GPUBatchPathRefusesClassical(t *testing.T) {
-	pv := strictPQVerifier(t)
-
-	// Two groth16 txs to exercise the batch collector.
-	txs := []*Transaction{
-		shieldedTx("groth16", make([]byte, 256)),
-		shieldedTx("groth16", make([]byte, 256)),
-	}
-	results := batchVerifyProofsGPU(pv, txs)
-	for i, err := range results {
-		if !errors.Is(err, errStrictPQClassicalForbidden) {
-			t.Fatalf("batch tx %d: strict-PQ must refuse groth16, got: %v", i, err)
-		}
-	}
-}
-
 // TestNonStrict_ClassicalPathUnchanged confirms a NON-strict chain is
 // unaffected: a groth16 proof reaches the classical verification body
 // (and is rejected only on its own merits / dummy keys, NOT by a
 // strict-PQ refusal).
 func TestNonStrict_ClassicalPathUnchanged(t *testing.T) {
 	pv, err := NewProofVerifier(ZConfig{
-		ProofSystem:    "groth16",
 		ProofCacheSize: 100,
 		StrictPQ:       false,
-	}, log.NoLog{})
+	}, [32]byte{}, log.NoLog{})
 	if err != nil {
 		t.Fatalf("NewProofVerifier: %v", err)
 	}

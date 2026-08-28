@@ -22,6 +22,7 @@ func shieldedTransfer(fee uint64, n byte) *Transaction {
 		Nullifiers: [][]byte{{n}},
 		Outputs:    []*ShieldedOutput{{Commitment: []byte{n}}},
 		Proof:      &ZKProof{ProofType: "groth16", ProofData: []byte("p")},
+		Expiry:     1 << 20,
 	}
 	tx.ID = tx.ComputeID()
 	return tx

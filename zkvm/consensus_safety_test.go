@@ -30,8 +30,9 @@ func spendTx(nullifiers ...[]byte) *Transaction {
 				OutputProof:     make([]byte, 32),
 			},
 		},
-		Proof: &ZKProof{ProofType: "groth16", ProofData: make([]byte, 32)},
-		Fee:   1,
+		Proof:  &ZKProof{ProofType: "groth16", ProofData: make([]byte, 32)},
+		Fee:    1,
+		Expiry: 1 << 20,
 	}
 	tx.ID = tx.ComputeID()
 	return tx
@@ -51,7 +52,7 @@ func acceptProofs(vmImpl *VM, txs ...*Transaction) {
 	pv := vmImpl.proofVerifier
 	pv.dummyKeys = false
 	for _, tx := range txs {
-		pv.proofCache.Add(string(pv.hashProof(tx)), true)
+		pv.proofCache.Add(tx.ComputeID(), true)
 	}
 }
 
@@ -92,7 +93,7 @@ func TestStateRootHasOneDefinition(t *testing.T) {
 	txs := []*Transaction{spendTx(nullifier(1), nullifier(2)), spendTx(nullifier(3))}
 
 	h := sha256.New()
-	h.Write(vmImpl.stateTree.GetRoot())
+	h.Write(vmImpl.root.Get())
 	for _, tx := range txs {
 		for _, out := range tx.Outputs {
 			h.Write(out.Commitment)
@@ -114,14 +115,14 @@ func TestStateRootAdvancesOnlyOnFinalize(t *testing.T) {
 	vmImpl := setupTestVM(t)
 	defer vmImpl.Shutdown(context.Background())
 
-	before := append([]byte(nil), vmImpl.stateTree.GetRoot()...)
+	before := append([]byte(nil), vmImpl.root.Get()...)
 	txs := []*Transaction{spendTx(nullifier(4))}
 
 	root := vmImpl.computeStateRoot(txs)
-	require.Equal(before, vmImpl.stateTree.GetRoot(), "computing a root must not advance it")
+	require.Equal(before, vmImpl.root.Get(), "computing a root must not advance it")
 
-	require.NoError(vmImpl.stateTree.Finalize(root))
-	require.Equal(root, vmImpl.stateTree.GetRoot())
+	require.NoError(vmImpl.root.Finalize(root))
+	require.Equal(root, vmImpl.root.Get())
 	require.NotEqual(root, vmImpl.computeStateRoot(txs),
 		"the next block folds the same txs onto the new committed root")
 }
@@ -136,7 +137,7 @@ func TestBlockVerifyRejectsDuplicateNullifier(t *testing.T) {
 	defer vmImpl.Shutdown(context.Background())
 
 	reused := nullifier(7)
-	require.False(vmImpl.nullifierDB.IsNullifierSpent(reused), "precondition: not yet spent")
+	require.False(spentOf(t, vmImpl.nullifierDB, reused), "precondition: not yet spent")
 
 	first, second := spendTx(reused), spendTx(reused)
 	second.Fee = 2 // distinct tx, same spent note

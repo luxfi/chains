@@ -5,14 +5,12 @@ package zkvm
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/big"
 	"sync"
 
-	"github.com/luxfi/accel"
 	"github.com/luxfi/log"
 	"github.com/luxfi/precompile/starkfri"
 
@@ -42,6 +40,11 @@ type ProofVerifier struct {
 	config ZConfig
 	log    log.Logger
 
+	// bind is sha256(ChainID ‖ NetworkID). It is the first public input every
+	// proof is checked against, so a proof made for another chain does not
+	// verify here even when the notes it names are unspent on both.
+	bind [32]byte
+
 	// Proof verification cache
 	proofCache *lru.Cache
 
@@ -58,7 +61,7 @@ type ProofVerifier struct {
 }
 
 // NewProofVerifier creates a new proof verifier
-func NewProofVerifier(config ZConfig, log log.Logger) (*ProofVerifier, error) {
+func NewProofVerifier(config ZConfig, bind [32]byte, log log.Logger) (*ProofVerifier, error) {
 	// Create LRU cache for proof verification results
 	cache, err := lru.New(int(config.ProofCacheSize))
 	if err != nil {
@@ -67,6 +70,7 @@ func NewProofVerifier(config ZConfig, log log.Logger) (*ProofVerifier, error) {
 
 	pv := &ProofVerifier{
 		config:        config,
+		bind:          bind,
 		log:           log,
 		proofCache:    cache,
 		verifyingKeys: make(map[string][]byte),
@@ -110,13 +114,23 @@ func (pv *ProofVerifier) VerifyTransactionProof(tx *Transaction) error {
 		return errors.New("zkvm: proof verification disabled — no real verifying keys loaded")
 	}
 
-	// Check cache first — include tx ID to bind proof to specific transaction
-	proofHash := pv.hashProof(tx)
+	// The cache is keyed on the transaction's CONTENT — ComputeID covers the
+	// nullifiers, the outputs and the proof — so a hit means this exact
+	// transaction verified before.
+	//
+	// It used to be keyed on tx.ID as READ OFF THE WIRE, plus the proof and
+	// its public inputs. All four were the peer's to choose: copy an accepted
+	// transaction's id, proof type, proof and public inputs onto a transaction
+	// spending entirely different notes, and the key matched. The hit returned
+	// nil from here — before verifyPublicInputs, the only thing tying the
+	// public inputs to what the transaction spends — and the shielded pool
+	// gained value backed by a proof that attests to nothing about it.
+	key := tx.ComputeID()
 
 	pv.mu.Lock()
 	pv.verifyCount++
 
-	if cached, ok := pv.proofCache.Get(string(proofHash)); ok {
+	if cached, ok := pv.proofCache.Get(key); ok {
 		pv.cacheHits++
 		pv.mu.Unlock()
 
@@ -142,7 +156,7 @@ func (pv *ProofVerifier) VerifyTransactionProof(tx *Transaction) error {
 	}
 
 	// Cache result
-	pv.proofCache.Add(string(proofHash), err == nil)
+	pv.proofCache.Add(key, err == nil)
 
 	return err
 }
@@ -190,7 +204,8 @@ func (pv *ProofVerifier) refuseClassicalUnderStrictPQ(proofType string) error {
 func (pv *ProofVerifier) verifySTARKProof(tx *Transaction) error {
 	// Bind the proof to this tx's shielded value via the public inputs:
 	// nullifiers (spends) ‖ output commitments (outputs).
-	pub := make([]byte, 0, 64)
+	pub := make([]byte, 0, 96)
+	pub = append(pub, pv.bind[:]...)
 	for _, n := range tx.Nullifiers {
 		pub = append(pub, n...)
 	}
@@ -214,24 +229,17 @@ func (pv *ProofVerifier) verifySTARKProof(tx *Transaction) error {
 }
 
 // VerifyBlockProof verifies an aggregated block proof.
-// When GPU is available and multiple proofs exist, uses batch MSM acceleration.
+//
+// There is ONE verification path. It used to take a batch path when
+// accel.Available() and more than one transaction — a second, inline copy of
+// the Groth16 checks that consulted neither the proof cache nor the dummy-key
+// refusal — so whether a node accepted a block turned on whether that node had
+// an accelerator, and validators with and without one rejected each other.
 func (pv *ProofVerifier) VerifyBlockProof(block *Block) error {
 	if block.BlockProof == nil {
 		return nil // Block proof is optional
 	}
 
-	// Batch verify when multiple transactions and GPU available
-	if len(block.Txs) > 1 && accel.Available() {
-		results := batchVerifyProofsGPU(pv, block.Txs)
-		for i, err := range results {
-			if err != nil {
-				return fmt.Errorf("tx %d proof verification failed: %w", i, err)
-			}
-		}
-		return nil
-	}
-
-	// Sequential fallback
 	for _, tx := range block.Txs {
 		if err := pv.VerifyTransactionProof(tx); err != nil {
 			return err
@@ -305,26 +313,32 @@ func (pv *ProofVerifier) verifyPLONKProof(tx *Transaction) error {
 	return nil
 }
 
-// verifyPublicInputs verifies that public inputs match transaction data
+// verifyPublicInputs verifies that public inputs match transaction data.
+//
+// The first input is the chain binding, so a proof made for another chain does
+// not verify here even when the notes it names happen to be unspent on both.
 func (pv *ProofVerifier) verifyPublicInputs(tx *Transaction) error {
 	if len(tx.Proof.PublicInputs) == 0 {
 		return errors.New("no public inputs provided")
 	}
+	if !bytes.Equal(tx.Proof.PublicInputs[0], pv.bind[:]) {
+		return errors.New("public input mismatch for chain binding")
+	}
 
 	// Verify nullifiers are included in public inputs (exact byte comparison)
 	for i, nullifier := range tx.Nullifiers {
-		if i >= len(tx.Proof.PublicInputs) {
+		if i+1 >= len(tx.Proof.PublicInputs) {
 			return errors.New("missing public input for nullifier")
 		}
 
-		if !bytes.Equal(tx.Proof.PublicInputs[i], nullifier) {
+		if !bytes.Equal(tx.Proof.PublicInputs[i+1], nullifier) {
 			return errors.New("public input mismatch for nullifier")
 		}
 	}
 
 	// Verify output commitments are included (exact byte comparison)
 	outputCommitments := tx.GetOutputCommitments()
-	offset := len(tx.Nullifiers)
+	offset := len(tx.Nullifiers) + 1
 
 	for i, commitment := range outputCommitments {
 		idx := offset + i
@@ -376,7 +390,6 @@ func (pv *ProofVerifier) loadVerifyingKeys() error {
 
 	pv.log.Info("Loaded verifying keys",
 		log.Int("count", len(pv.verifyingKeys)),
-		log.String("proofSystem", pv.config.ProofSystem),
 		log.Bool("strictPQ", pv.config.StrictPQ),
 	)
 
@@ -386,22 +399,6 @@ func (pv *ProofVerifier) loadVerifyingKeys() error {
 // VerifyingKeysLoaded returns true if real (non-dummy) verifying keys are loaded.
 func (pv *ProofVerifier) VerifyingKeysLoaded() bool {
 	return !pv.dummyKeys
-}
-
-// hashProof computes a hash of a proof for caching.
-// Includes the transaction ID to bind the proof to a specific transaction,
-// preventing a valid proof from being replayed for a different tx.
-func (pv *ProofVerifier) hashProof(tx *Transaction) []byte {
-	h := sha256.New()
-	h.Write(tx.ID[:])
-	h.Write([]byte(tx.Proof.ProofType))
-	h.Write(tx.Proof.ProofData)
-
-	for _, input := range tx.Proof.PublicInputs {
-		h.Write(input)
-	}
-
-	return h.Sum(nil)
 }
 
 // GetCacheSize returns the current size of the proof cache
@@ -415,18 +412,6 @@ func (pv *ProofVerifier) GetStats() (verifyCount, cacheHits, cacheMisses uint64)
 	defer pv.mu.RUnlock()
 
 	return pv.verifyCount, pv.cacheHits, pv.cacheMisses
-}
-
-// ClearCache clears the proof verification cache
-func (pv *ProofVerifier) ClearCache() {
-	pv.proofCache.Purge()
-
-	pv.mu.Lock()
-	pv.cacheHits = 0
-	pv.cacheMisses = 0
-	pv.mu.Unlock()
-
-	pv.log.Info("Cleared proof verification cache")
 }
 
 // Groth16Proof represents a Groth16 proof structure

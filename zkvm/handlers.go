@@ -5,338 +5,163 @@ package zkvm
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/luxfi/ids"
 )
 
-// NewRPCHandler creates the main RPC handler
-func NewRPCHandler(vm *VM) http.Handler {
-	mux := http.NewServeMux()
+var (
+	errUnknownTransaction = errors.New("transaction not found")
+	errNoCommitment       = errors.New("commitment required")
+	errNoNullifier        = errors.New("nullifier required")
+)
 
-	// Transaction endpoints
-	mux.HandleFunc("/sendTransaction", handleSendTransaction(vm))
-	mux.HandleFunc("/getTransaction", handleGetTransaction(vm))
-	mux.HandleFunc("/createShieldedTransaction", handleCreateShieldedTransaction(vm))
-
-	// Block endpoints
-	mux.HandleFunc("/getBlock", handleGetBlock(vm))
-	mux.HandleFunc("/getLatestBlock", handleGetLatestBlock(vm))
-
-	// UTXO endpoints
-	mux.HandleFunc("/getUTXO", handleGetUTXO(vm))
-	mux.HandleFunc("/getUTXOCount", handleGetUTXOCount(vm))
-
-	// Status endpoints
-	mux.HandleFunc("/getStatus", handleGetStatus(vm))
-
-	return mux
-}
-
-// NewPrivacyHandler creates the privacy-specific handler
-func NewPrivacyHandler(vm *VM) http.Handler {
-	mux := http.NewServeMux()
-
-	// Address management
-	mux.HandleFunc("/generateAddress", handleGenerateAddress(vm))
-	mux.HandleFunc("/getAddress", handleGetAddress(vm))
-
-	// Note decryption
-	mux.HandleFunc("/decryptNote", handleDecryptNote(vm))
-
-	// Nullifier queries
-	mux.HandleFunc("/isNullifierSpent", handleIsNullifierSpent(vm))
-
-	return mux
-}
-
-// NewProofHandler creates the proof-specific handler
-func NewProofHandler(vm *VM) http.Handler {
-	mux := http.NewServeMux()
-
-	// Proof generation
-	mux.HandleFunc("/generateTransferProof", handleGenerateTransferProof(vm))
-	mux.HandleFunc("/generateShieldProof", handleGenerateShieldProof(vm))
-
-	// Proof verification
-	mux.HandleFunc("/verifyProof", handleVerifyProof(vm))
-
-	// Proof statistics
-	mux.HandleFunc("/getProofStats", handleGetProofStats(vm))
-
-	return mux
-}
-
-// Transaction handlers
-
-func handleSendTransaction(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var tx Transaction
-		if err := json.NewDecoder(r.Body).Decode(&tx); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		// Fee policy: refuse zero-fee user txs at the public entry
-		// before mempool/heap pressure. Internal callers (consensus
-		// replay) bypass this gate by reaching Mempool directly.
-		if err := vm.gateUserTx(&tx); err != nil {
-			http.Error(w, err.Error(), http.StatusPaymentRequired)
-			return
-		}
-
-		// Add to mempool
-		if err := vm.mempool.AddTransaction(&tx); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		resp := map[string]interface{}{
-			"txID":    tx.ID.String(),
-			"success": true,
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+// The node mounts each CreateHandlers key under /v1/bc/<chainID> and matches
+// that full path EXACTLY, then hands the handler the request with the path it
+// arrived on. A mux behind one key therefore serves nothing: it dispatches on
+// r.URL.Path, which is the mounted path and never the route it registered. The
+// key IS the route; one handler per key.
+func (vm *VM) endpoints() map[string]http.Handler {
+	return map[string]http.Handler{
+		"/sendTransaction":  post(vm.sendTransaction),
+		"/getTransaction":   get(vm.getTransaction),
+		"/getBlock":         get(vm.getBlock),
+		"/getLatestBlock":   get(vm.getLatestBlock),
+		"/getUTXO":          get(vm.getUTXO),
+		"/getUTXOCount":     get(vm.getUTXOCount),
+		"/isNullifierSpent": get(vm.isNullifierSpent),
+		"/getStatus":        get(vm.getStatus),
+		"/getProofStats":    get(vm.getProofStats),
 	}
 }
 
-func handleGetTransaction(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		txIDStr := r.URL.Query().Get("txID")
-		if txIDStr == "" {
-			http.Error(w, "txID required", http.StatusBadRequest)
+// handler is what an endpoint answers: a value to encode, or an error and the
+// status that names it.
+type handler func(*http.Request) (interface{}, int, error)
+
+func get(h handler) http.Handler  { return method(http.MethodGet, h) }
+func post(h handler) http.Handler { return method(http.MethodPost, h) }
+
+func method(verb string, h handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != verb {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-
-		txID, err := ids.FromString(txIDStr)
+		v, status, err := h(r)
 		if err != nil {
-			http.Error(w, "Invalid txID", http.StatusBadRequest)
+			http.Error(w, err.Error(), status)
 			return
 		}
-
-		// Check mempool first
-		if vm.mempool.HasTransaction(txID) {
-			resp := map[string]interface{}{
-				"status": "pending",
-				"txID":   txID.String(),
-			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(resp)
-			return
-		}
-
-		http.Error(w, "Transaction not found", http.StatusNotFound)
-	}
+		json.NewEncoder(w).Encode(v)
+	})
 }
 
-func handleCreateShieldedTransaction(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		resp := map[string]interface{}{
-			"error": "Not implemented",
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+func (vm *VM) sendTransaction(r *http.Request) (interface{}, int, error) {
+	var tx Transaction
+	if err := json.NewDecoder(http.MaxBytesReader(nil, r.Body, MaxTxSize)).Decode(&tx); err != nil {
+		return nil, http.StatusBadRequest, err
 	}
+
+	// Fee policy: refuse zero-fee user txs at the public entry before
+	// mempool pressure. Internal callers reach Mempool directly.
+	if err := vm.gateUserTx(&tx); err != nil {
+		return nil, http.StatusPaymentRequired, err
+	}
+
+	// Shape too. A transaction that cannot be built into any block must not
+	// occupy a slot in a bounded pool; assembly drops what it cannot build,
+	// and this stops the obvious garbage arriving in the first place.
+	if err := tx.ValidateBasic(); err != nil {
+		return nil, http.StatusBadRequest, err
+	}
+	if err := vm.mempool.AddTransaction(&tx); err != nil {
+		return nil, http.StatusBadRequest, err
+	}
+
+	// AddTransaction derives the id from the content, so this reports the
+	// transaction the chain will carry rather than the one the caller named.
+	return map[string]interface{}{"txID": tx.ID.String(), "success": true}, 0, nil
 }
 
-// Block handlers
-
-func handleGetBlock(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		blockIDStr := r.URL.Query().Get("blockID")
-		if blockIDStr == "" {
-			http.Error(w, "blockID required", http.StatusBadRequest)
-			return
-		}
-
-		blockID, err := ids.FromString(blockIDStr)
-		if err != nil {
-			http.Error(w, "Invalid blockID", http.StatusBadRequest)
-			return
-		}
-
-		block, err := vm.GetBlock(r.Context(), blockID)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
-			return
-		}
-
-		zkBlock := block.(*Block)
-		resp := zkBlock.ToSummary()
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+func (vm *VM) getTransaction(r *http.Request) (interface{}, int, error) {
+	txID, err := ids.FromString(r.URL.Query().Get("txID"))
+	if err != nil {
+		return nil, http.StatusBadRequest, err
 	}
+	if !vm.mempool.HasTransaction(txID) {
+		return nil, http.StatusNotFound, errUnknownTransaction
+	}
+	return map[string]interface{}{"status": "pending", "txID": txID.String()}, 0, nil
 }
 
-func handleGetLatestBlock(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id, _ := vm.chain.Tip()
-		block, err := vm.GetBlock(r.Context(), id)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
-			return
-		}
-
-		resp := block.(*Block).ToSummary()
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+func (vm *VM) getBlock(r *http.Request) (interface{}, int, error) {
+	blockID, err := ids.FromString(r.URL.Query().Get("blockID"))
+	if err != nil {
+		return nil, http.StatusBadRequest, err
 	}
+	block, err := vm.GetBlock(r.Context(), blockID)
+	if err != nil {
+		return nil, http.StatusNotFound, err
+	}
+	return block.(*Block).ToSummary(), 0, nil
 }
 
-// UTXO handlers
-
-func handleGetUTXO(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		commitment := r.URL.Query().Get("commitment")
-		if commitment == "" {
-			http.Error(w, "commitment required", http.StatusBadRequest)
-			return
-		}
-
-		utxo, err := vm.utxoDB.GetUTXO([]byte(commitment))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(utxo)
+func (vm *VM) getLatestBlock(r *http.Request) (interface{}, int, error) {
+	id, _ := vm.chain.Tip()
+	block, err := vm.GetBlock(r.Context(), id)
+	if err != nil {
+		return nil, http.StatusNotFound, err
 	}
+	return block.(*Block).ToSummary(), 0, nil
 }
 
-func handleGetUTXOCount(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		count := vm.utxoDB.GetUTXOCount()
-
-		resp := map[string]interface{}{
-			"count": count,
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+func (vm *VM) getUTXO(r *http.Request) (interface{}, int, error) {
+	commitment := r.URL.Query().Get("commitment")
+	if commitment == "" {
+		return nil, http.StatusBadRequest, errNoCommitment
 	}
+	utxo, err := vm.utxoDB.GetUTXO([]byte(commitment))
+	if err != nil {
+		return nil, http.StatusNotFound, err
+	}
+	return utxo, 0, nil
 }
 
-// Status handler
-
-func handleGetStatus(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		health, err := vm.HealthCheck(r.Context())
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(health)
-	}
+func (vm *VM) getUTXOCount(*http.Request) (interface{}, int, error) {
+	return map[string]interface{}{"count": vm.utxoDB.GetUTXOCount()}, 0, nil
 }
 
-// Privacy handlers
-
-func handleGenerateAddress(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		addr, err := vm.addressManager.GenerateAddress()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		resp := map[string]interface{}{
-			"address":         addr.Address,
-			"viewingKey":      addr.ViewingKey,
-			"incomingViewKey": addr.IncomingViewKey,
-			"diversifier":     addr.Diversifier,
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+// isNullifierSpent reports a READ FAILURE as a failure. Answering "not spent"
+// for a set that could not be read is the answer that reopens a double spend.
+func (vm *VM) isNullifierSpent(r *http.Request) (interface{}, int, error) {
+	nullifier := r.URL.Query().Get("nullifier")
+	if nullifier == "" {
+		return nil, http.StatusBadRequest, errNoNullifier
 	}
+	height, spent, err := vm.nullifierDB.Spent([]byte(nullifier))
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+	return map[string]interface{}{"nullifier": nullifier, "isSpent": spent, "height": height}, 0, nil
 }
 
-func handleGetAddress(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Would implement address lookup
-		http.Error(w, "Not implemented", http.StatusNotImplemented)
+func (vm *VM) getStatus(r *http.Request) (interface{}, int, error) {
+	health, err := vm.HealthCheck(r.Context())
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
 	}
+	return health, 0, nil
 }
 
-func handleDecryptNote(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Would implement note decryption
-		http.Error(w, "Not implemented", http.StatusNotImplemented)
-	}
-}
-
-func handleIsNullifierSpent(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		nullifier := r.URL.Query().Get("nullifier")
-		if nullifier == "" {
-			http.Error(w, "nullifier required", http.StatusBadRequest)
-			return
-		}
-
-		isSpent := vm.nullifierDB.IsNullifierSpent([]byte(nullifier))
-
-		resp := map[string]interface{}{
-			"nullifier": nullifier,
-			"isSpent":   isSpent,
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	}
-}
-
-// Proof handlers
-
-func handleGenerateTransferProof(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Would implement proof generation
-		http.Error(w, "Not implemented", http.StatusNotImplemented)
-	}
-}
-
-func handleGenerateShieldProof(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Would implement shield proof generation
-		http.Error(w, "Not implemented", http.StatusNotImplemented)
-	}
-}
-
-func handleVerifyProof(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Would implement proof verification endpoint
-		http.Error(w, "Not implemented", http.StatusNotImplemented)
-	}
-}
-
-func handleGetProofStats(vm *VM) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		verifyCount, cacheHits, cacheMisses := vm.proofVerifier.GetStats()
-
-		resp := map[string]interface{}{
-			"verifyCount": verifyCount,
-			"cacheHits":   cacheHits,
-			"cacheMisses": cacheMisses,
-			"cacheSize":   vm.proofVerifier.GetCacheSize(),
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	}
+func (vm *VM) getProofStats(*http.Request) (interface{}, int, error) {
+	verifyCount, cacheHits, cacheMisses := vm.proofVerifier.GetStats()
+	return map[string]interface{}{
+		"verifyCount": verifyCount,
+		"cacheHits":   cacheHits,
+		"cacheMisses": cacheMisses,
+		"cacheSize":   vm.proofVerifier.GetCacheSize(),
+	}, 0, nil
 }

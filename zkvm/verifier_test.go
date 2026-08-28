@@ -6,7 +6,6 @@ package zkvm
 import (
 	"encoding/binary"
 	"errors"
-	"math/big"
 	"strings"
 	"testing"
 
@@ -74,56 +73,16 @@ func plonkFrame() []byte {
 	return append(out, make([]byte, 160)...)
 }
 
-func keyedVerifier(t *testing.T, system string, keys map[string][]byte) *ProofVerifier {
+func keyedVerifier(t *testing.T, keys map[string][]byte) *ProofVerifier {
 	t.Helper()
 	pv, err := NewProofVerifier(ZConfig{
-		ProofSystem:    system,
 		ProofCacheSize: 16,
 		VerifyingKeys:  keys,
-	}, log.NoLog{})
+	}, [32]byte{}, log.NoLog{})
 	if err != nil {
 		t.Fatalf("NewProofVerifier: %v", err)
 	}
 	return pv
-}
-
-// TestMSMAgreesWithRepeatedAddition. The multi-scalar multiplication carries
-// the public-input linear combination, so everything a classical proof is
-// judged on rests on it equalling the sum it stands for.
-func TestMSMAgreesWithRepeatedAddition(t *testing.T) {
-	_, _, g1, _ := bn254.Generators()
-
-	scalars := make([]fr.Element, 4)
-	bases := make([]bn254.G1Affine, 4)
-	for i := range scalars {
-		scalars[i].SetUint64(uint64(i + 3))
-		bases[i].Set(&g1)
-	}
-
-	var want bn254.G1Affine
-	for i := range scalars {
-		var term bn254.G1Affine
-		term.ScalarMultiplication(&bases[i], scalars[i].BigInt(new(big.Int)))
-		want.Add(&want, &term)
-	}
-
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("computing an MSM must not panic: %v", r)
-		}
-	}()
-
-	if got := msmCPU(scalars, bases); !got.Equal(&want) {
-		t.Fatalf("msmCPU = %v, want %v", got, want)
-	}
-
-	got, err := msmGPU(scalars, bases, log.NoLog{})
-	if err != nil {
-		t.Fatalf("msmGPU: %v", err)
-	}
-	if !got.Equal(&want) {
-		t.Fatalf("msmGPU = %v, want %v — the accelerated path disagrees with the plain one", got, want)
-	}
 }
 
 // TestWitnessMustFitTheVerifyingKey. A peer chooses how many public inputs its
@@ -175,11 +134,12 @@ func TestWitnessMustFitTheVerifyingKey(t *testing.T) {
 // supported deployment and its whole point is that a groth16 proof is accepted
 // or rejected on the arithmetic. Any proof that decodes must produce a verdict.
 func TestGroth16ReachesItsPairing(t *testing.T) {
-	// Three K points is a circuit taking two public inputs, which is what this
+	// Four K points is a circuit taking three public inputs — the chain
+	// binding, one nullifier and one commitment — which is what this
 	// transaction supplies. A key that spoke about a different number would be
 	// refused before the pairing, and this test is about the pairing.
-	pv := keyedVerifier(t, "groth16", map[string][]byte{
-		string(TransactionTypeTransfer): groth16Key(3),
+	pv := keyedVerifier(t, map[string][]byte{
+		string(TransactionTypeTransfer): groth16Key(4),
 	})
 	if !pv.VerifyingKeysLoaded() {
 		t.Fatal("precondition: the chain holds a real verifying key")
@@ -198,7 +158,7 @@ func TestGroth16ReachesItsPairing(t *testing.T) {
 		Proof: &ZKProof{
 			ProofType:    "groth16",
 			ProofData:    groth16Frame(),
-			PublicInputs: [][]byte{nullifier, commitment},
+			PublicInputs: [][]byte{testBind[:], nullifier, commitment},
 		},
 	}
 	tx.ID = tx.ComputeID()
@@ -224,7 +184,7 @@ func TestGroth16ReachesItsPairing(t *testing.T) {
 // TestPLONKReachesItsPairing is the same property for the other classical
 // system a non-strict chain may be configured with.
 func TestPLONKIsRefusedForTheStatedReason(t *testing.T) {
-	pv := keyedVerifier(t, "plonk", map[string][]byte{
+	pv := keyedVerifier(t, map[string][]byte{
 		string(TransactionTypeTransfer): plonkKey(),
 	})
 
@@ -241,7 +201,7 @@ func TestPLONKIsRefusedForTheStatedReason(t *testing.T) {
 		Proof: &ZKProof{
 			ProofType:    "plonk",
 			ProofData:    plonkFrame(),
-			PublicInputs: [][]byte{nullifier, commitment},
+			PublicInputs: [][]byte{testBind[:], nullifier, commitment},
 		},
 	}
 	tx.ID = tx.ComputeID()
@@ -296,7 +256,7 @@ func TestInfinityIsNotAUsablePoint(t *testing.T) {
 // empty — every proof valid, value minted from nothing. A circuit with no key
 // must be refused instead.
 func TestCircuitWithoutAKeyIsRefused(t *testing.T) {
-	pv := keyedVerifier(t, "plonk", map[string][]byte{
+	pv := keyedVerifier(t, map[string][]byte{
 		string(TransactionTypeTransfer): plonkKey(), // shield and unshield keyed with zeros
 	})
 
@@ -325,7 +285,7 @@ func TestCircuitWithoutAKeyIsRefused(t *testing.T) {
 // the operator did not key is refused by name rather than judged against
 // whatever stands in for a key.
 func TestKeyingOneCircuitDoesNotEnableTheOthers(t *testing.T) {
-	pv := keyedVerifier(t, "groth16", map[string][]byte{
+	pv := keyedVerifier(t, map[string][]byte{
 		string(TransactionTypeTransfer): groth16Key(4),
 	})
 
@@ -431,3 +391,9 @@ func TestWitnessMustMatchWhatTheKeysCircuitTakes(t *testing.T) {
 		t.Fatalf("the count the key states must reach the pairing, got: %v", err)
 	}
 }
+
+// testBind is the chain binding a test verifier is built with: the zero bind,
+// which is what NewProofVerifier(cfg, [32]byte{}, …) carries. Every proof's
+// public inputs lead with it, so a proof made for one chain does not verify on
+// another.
+var testBind [32]byte

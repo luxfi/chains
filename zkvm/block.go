@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/luxfi/log"
@@ -48,19 +49,26 @@ func (b *Block) ID() ids.ID {
 	return b.ID_
 }
 
-// computeID computes the block ID
+// computeID computes the block ID.
+//
+// It opens with the chain's binding — sha256(ChainID ‖ NetworkID), which is NOT
+// on the wire — so the same bytes name a different block on a different chain.
+// Two chains with different ids and an identical genesis config would otherwise
+// derive the same genesis id, and one chain's blocks would then chain onto the
+// other's verbatim.
+//
+// Each transaction contributes ComputeID() rather than tx.ID: an id is a
+// function of content, and a block whose identity depended on an id a peer
+// supplied would have as many identities as the peer cared to send.
 func (b *Block) computeID() ids.ID {
 	h := sha256.New()
+	h.Write(b.vm.bind[:])
 	h.Write(b.ParentID_[:])
 	binary.Write(h, binary.BigEndian, b.BlockHeight)
 	binary.Write(h, binary.BigEndian, b.BlockTimestamp)
 
-	// Include transaction IDs
 	for _, tx := range b.Txs {
-		txID := tx.ID
-		if txID == ids.Empty {
-			txID = tx.ComputeID()
-		}
+		txID := tx.ComputeID()
 		h.Write(txID[:])
 	}
 
@@ -101,11 +109,18 @@ func (b *Block) Status() uint8 {
 	return uint8(b.status)
 }
 
-// Verify verifies the block
+// Verify verifies the block.
 func (b *Block) Verify(ctx context.Context) error {
 	// Basic validation
 	if b.BlockHeight == 0 && b.ParentID_ != ids.Empty {
 		return errInvalidBlock
+	}
+
+	// A block off the wire is held to the bound a block this node builds is
+	// held to, so a proposer cannot produce one its own peers refuse.
+	if uint32(len(b.Txs)) > b.vm.config.MaxTxPerBlock {
+		return fmt.Errorf("%w: %d transactions over the %d cap",
+			errInvalidBlock, len(b.Txs), b.vm.config.MaxTxPerBlock)
 	}
 
 	// Verify timestamp
@@ -128,14 +143,9 @@ func (b *Block) Verify(ctx context.Context) error {
 		}
 	}
 
-	// Verify each transaction
+	// Verify each transaction against the SAME predicate assembly ran.
 	for _, tx := range b.Txs {
-		if err := tx.ValidateBasic(); err != nil {
-			return err
-		}
-
-		// Verify transaction proof
-		if err := b.vm.verifyTransaction(tx); err != nil {
+		if err := b.vm.admit(tx, b.BlockHeight); err != nil {
 			return err
 		}
 	}
@@ -159,6 +169,18 @@ func (b *Block) Verify(ctx context.Context) error {
 			return errors.New("invalid parent block type")
 		}
 
+		// The parent must be one this chain can still build on: the accepted
+		// tip, or a block verified above it and not yet decided. Height alone
+		// is not that check — a block whose parent is an OLD accepted block
+		// satisfies height == parent+1 perfectly well, and accepting it rewinds
+		// the tip and leaves the height index naming an orphan as the block at
+		// that height to every peer that bootstraps from it.
+		tip, tipHeight := b.vm.chain.Tip()
+		if parentBlock.ID() != tip && parentBlock.BlockHeight <= tipHeight {
+			return fmt.Errorf("%w: parent %s at height %d is beneath the tip at %d",
+				ErrNotOnTip, parentBlock.ID(), parentBlock.BlockHeight, tipHeight)
+		}
+
 		if b.BlockHeight != parentBlock.BlockHeight+1 {
 			return errInvalidHeight
 		}
@@ -173,6 +195,11 @@ func (b *Block) Verify(ctx context.Context) error {
 		return errInvalidStateRoot
 	}
 
+	// A block that verifies is one the engine may build on, so it has to be
+	// findable by id — including one parsed from a peer rather than built here.
+	// Tracking only self-built blocks leaves a follower able to verify the
+	// first block of a run and unable to verify the second.
+	b.vm.chain.Track(b)
 	return nil
 }
 
@@ -186,6 +213,15 @@ func (b *Block) Verify(ctx context.Context) error {
 // under a tip the chain had already advanced — a shielded pool half applied,
 // with no way back and no way to apply the block again.
 func (b *Block) Accept(ctx context.Context) error {
+	// A block extends the tip or it is not accepted. Verify reached the same
+	// verdict earlier, against the tip AT THAT TIME; the tip moves between the
+	// two, and a block whose parent has since been buried would otherwise write
+	// the height index and the tip pointer for an abandoned branch.
+	tip, _ := b.vm.chain.Tip()
+	if b.ParentID_ != tip {
+		return fmt.Errorf("%w: %s extends %s, which is not the tip %s",
+			ErrNotOnTip, b.ID(), b.ParentID_, tip)
+	}
 	return b.vm.chain.Accept(b)
 }
 
@@ -212,7 +248,7 @@ func (b *Block) Write(database.Database) error {
 			}
 		}
 	}
-	return b.vm.stateTree.Finalize(b.StateRoot)
+	return b.vm.root.Finalize(b.StateRoot)
 }
 
 // Publish marks the block accepted and releases the transactions it carried.
@@ -223,6 +259,11 @@ func (b *Block) Publish() {
 	for _, tx := range b.Txs {
 		b.vm.mempool.RemoveTransaction(tx.ID)
 	}
+
+	// The chain has passed this height, so anything expiring at or below it
+	// can never enter a block. Nothing else drops those, and a pool full of
+	// them refuses every honest arrival paying the same floor.
+	b.vm.mempool.PruneExpired(b.BlockHeight)
 
 	b.vm.log.Info("Block accepted",
 		log.Uint64("height", b.BlockHeight),
@@ -292,10 +333,10 @@ func ParseGenesis(genesisBytes []byte) (*Genesis, error) {
 		}
 	}
 
-	if genesis.Timestamp == 0 {
-		genesis.Timestamp = time.Now().Unix()
-	}
-
+	// A genesis that names no timestamp is stamped 0, not "now". The genesis
+	// timestamp is hashed into the genesis block id, so reading the wall clock
+	// here gave every node a different genesis id — a different chain — for the
+	// same genesis file, and a different one again after each restart.
 	return &genesis, nil
 }
 
@@ -329,6 +370,10 @@ var (
 	errInvalidHeight    = errors.New("invalid block height")
 	errInvalidTimestamp = errors.New("invalid block timestamp")
 	errInvalidStateRoot = errors.New("invalid state root")
+
+	// ErrNotOnTip refuses a block that does not extend the chain: one whose
+	// parent is neither the accepted tip nor a block verified above it.
+	ErrNotOnTip = errors.New("zkvm: block does not extend the accepted tip")
 
 	// errDuplicateNullifier — the same nullifier appears twice inside one block or
 	// vertex, i.e. one shielded note spent twice. Fail closed.

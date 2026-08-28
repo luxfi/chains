@@ -5,6 +5,8 @@ package zkvm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,22 +37,11 @@ var (
 		Minor: 0,
 		Patch: 0,
 	}
-
-	errNotImplemented = errors.New("not implemented")
 )
 
-// ZConfig contains VM configuration
+// ZConfig contains VM configuration. Every field here is read; a knob that
+// changes nothing reads as a control and is not one.
 type ZConfig struct {
-	// Privacy configuration
-	EnableConfidentialTransfers bool `json:"enableConfidentialTransfers"`
-	EnablePrivateAddresses      bool `json:"enablePrivateAddresses"`
-
-	// ZK proof configuration
-	ProofSystem      string `json:"proofSystem"` // groth16, plonk, etc.
-	CircuitType      string `json:"circuitType"` // transfer, mint, burn
-	VerifyingKeyPath string `json:"verifyingKeyPath"`
-	TrustedSetupPath string `json:"trustedSetupPath"`
-
 	// VerifyingKeys supplies real (non-dummy) verifying keys per circuit
 	// type (keyed by the TransactionType string), in-memory at genesis.
 	// When empty, loadVerifyingKeys installs all-zero dummy keys (proof
@@ -69,16 +60,22 @@ type ZConfig struct {
 	// shield/unshield proof to mint or steal shielded value.
 	StrictPQ bool `json:"strictPQ"`
 
-	// FHE configuration
-	EnableFHE     bool   `json:"enableFHE"`
-	FHEScheme     string `json:"fheScheme"`     // BFV, CKKS, etc.
-	SecurityLevel uint32 `json:"securityLevel"` // 128, 192, 256
+	// MaxTxPerBlock bounds a block from either direction: what a proposer
+	// assembles and what Verify accepts off the wire. One number, so a peer
+	// cannot send a block larger than this node would ever build.
+	MaxTxPerBlock uint32 `json:"maxTxPerBlock"`
 
-	// Performance
-	MaxUTXOsPerBlock         uint32        `json:"maxUtxosPerBlock"`
-	ProofVerificationTimeout time.Duration `json:"proofVerificationTimeout"`
-	ProofCacheSize           uint32        `json:"proofCacheSize"`
+	// ProofCacheSize bounds the verified-proof cache.
+	ProofCacheSize uint32 `json:"proofCacheSize"`
 }
+
+// Defaults for a config that names no bound. Zero would mean a block of
+// unbounded size and a cache of unbounded growth, which is not "no limit
+// configured" but "no limit".
+const (
+	defaultMaxTxPerBlock  = 100
+	defaultProofCacheSize = 1000
+)
 
 // VM implements the Zero-Knowledge UTXO Chain VM
 type VM struct {
@@ -96,12 +93,10 @@ type VM struct {
 	chain       *chain.Store[chain.Block]
 	utxoDB      *UTXODB
 	nullifierDB *NullifierDB
-	stateTree   *StateTree
+	root        *Root
 
 	// Privacy components
-	proofVerifier  *ProofVerifier
-	fheProcessor   *FHEProcessor
-	addressManager *AddressManager
+	proofVerifier *ProofVerifier
 
 	// zkPrecompiles holds the Z-Chain ZK verifier precompiles. It is
 	// populated in Initialize by precompiles.RegisterZKPrecompiles, with
@@ -128,6 +123,13 @@ type VM struct {
 	// HTTP entry, before it reaches the mempool. Consensus-internal paths
 	// bypass it.
 	fee chain.Fee
+
+	// bind is sha256(ChainID ‖ NetworkID). It is hashed into every block and
+	// vertex id and into the public inputs every shielded proof is checked
+	// against, and it is NOT on the wire — so a block or a proof made for
+	// another chain does not name a block of this one and does not verify
+	// here, rather than passing a check someone could forget to write.
+	bind [32]byte
 }
 
 // Initialize initializes the VM
@@ -153,6 +155,12 @@ func (vm *VM) Initialize(
 			return errors.New("invalid logger type")
 		}
 	}
+	// Bind this chain's identity into every id and every proof preimage.
+	bind := sha256.New()
+	bind.Write(vm.rt.ChainID[:])
+	binary.Write(bind, binary.BigEndian, vm.rt.NetworkID)
+	copy(vm.bind[:], bind.Sum(nil))
+
 	vm.chain = chain.New[chain.Block](init.DB, vm.reload)
 
 	// Parse configuration or use defaults
@@ -169,20 +177,17 @@ func (vm *VM) Initialize(
 		// permissive deployment MUST set StrictPQ=false explicitly in
 		// genesis; it is never the default for this chain.
 		vm.config = ZConfig{
-			EnableConfidentialTransfers: true,
-			EnablePrivateAddresses:      true,
-			ProofSystem:                 "stark",
-			CircuitType:                 "transfer",
-			StrictPQ:                    true,
-			EnableFHE:                   false,
-			MaxUTXOsPerBlock:            100,
-			ProofCacheSize:              1000,
+			StrictPQ:       true,
+			MaxTxPerBlock:  defaultMaxTxPerBlock,
+			ProofCacheSize: defaultProofCacheSize,
 		}
 	}
 
-	// Ensure ProofCacheSize is positive
-	if vm.config.ProofCacheSize <= 0 {
-		vm.config.ProofCacheSize = 1000
+	if vm.config.ProofCacheSize == 0 {
+		vm.config.ProofCacheSize = defaultProofCacheSize
+	}
+	if vm.config.MaxTxPerBlock == 0 {
+		vm.config.MaxTxPerBlock = defaultMaxTxPerBlock
 	}
 
 	// Initialize UTXO database
@@ -200,14 +205,14 @@ func (vm *VM) Initialize(
 	vm.nullifierDB = nullifierDB
 
 	// Initialize state tree
-	stateTree, err := NewStateTree(vm.chain.View(), vm.log)
+	root, err := NewRoot(vm.chain.View(), vm.log)
 	if err != nil {
-		return fmt.Errorf("failed to initialize state tree: %w", err)
+		return fmt.Errorf("failed to initialize state root: %w", err)
 	}
-	vm.stateTree = stateTree
+	vm.root = root
 
 	// Initialize proof verifier
-	proofVerifier, err := NewProofVerifier(vm.config, vm.log)
+	proofVerifier, err := NewProofVerifier(vm.config, vm.bind, vm.log)
 	if err != nil {
 		return fmt.Errorf("failed to initialize proof verifier: %w", err)
 	}
@@ -226,22 +231,6 @@ func (vm *VM) Initialize(
 	vm.log.Info("Registered Z-Chain ZK precompiles",
 		log.Bool("strictPQ", vm.config.StrictPQ),
 	)
-
-	// Initialize FHE processor if enabled
-	if vm.config.EnableFHE {
-		fheProcessor, err := NewFHEProcessor(vm.config, vm.log)
-		if err != nil {
-			return fmt.Errorf("failed to initialize FHE processor: %w", err)
-		}
-		vm.fheProcessor = fheProcessor
-	}
-
-	// Initialize address manager
-	addressManager, err := NewAddressManager(vm.chain.Base(), vm.config.EnablePrivateAddresses, vm.log)
-	if err != nil {
-		return fmt.Errorf("failed to initialize address manager: %w", err)
-	}
-	vm.addressManager = addressManager
 
 	// Initialize mempool
 	vm.mempool = NewMempool(1000, vm.log) // Max 1000 pending txs
@@ -271,7 +260,7 @@ func (vm *VM) Initialize(
 	}
 	vm.genesisBlock.ID_ = vm.genesisBlock.computeID()
 
-	_, fresh, err := vm.chain.Open(vm.genesisBlock, vm.parseBlock)
+	_, fresh, err := vm.chain.Open(vm.genesisBlock, func(raw []byte) (chain.Block, error) { return vm.parseBlock(raw) })
 	if err != nil {
 		return err
 	}
@@ -288,10 +277,7 @@ func (vm *VM) Initialize(
 
 	vm.log.Info("ZK UTXO VM initialized",
 		log.String("version", Version.String()),
-		log.Bool("confidentialTransfers", vm.config.EnableConfidentialTransfers),
-		log.Bool("privateAddresses", vm.config.EnablePrivateAddresses),
-		log.String("proofSystem", vm.config.ProofSystem),
-		log.Bool("fheEnabled", vm.config.EnableFHE),
+		log.Bool("strictPQ", vm.config.StrictPQ),
 	)
 
 	return nil
@@ -313,32 +299,47 @@ func (vm *VM) StrictPQ() bool { return vm.config.StrictPQ }
 func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
 	built, err := vm.chain.Propose(func(parent chain.Block) (chain.Block, error) {
 		// Get transactions from mempool
-		txs := vm.mempool.GetPendingTransactions(int(vm.config.MaxUTXOsPerBlock))
+		txs := vm.mempool.GetPendingTransactions(int(vm.config.MaxTxPerBlock))
 		if len(txs) == 0 {
-			return nil, errors.New("no transactions to include in block")
+			return nil, errNoTransactions
 		}
 
-		// Verify all transactions
+		// Assembly runs the SAME predicate Verify runs, and drops what it
+		// cannot build. It used to skip ValidateBasic, so a transaction with
+		// an out-of-range Type — which the parser reads straight off the wire
+		// — was assembled into every block and then refused by every node's
+		// Verify, including the proposer's. Nothing evicted it, so that
+		// proposer never produced another block.
 		validTxs := make([]*Transaction, 0, len(txs))
 		for _, tx := range txs {
-			if err := vm.verifyTransaction(tx); err != nil {
-				vm.log.Debug("Transaction verification failed",
+			if err := vm.admit(tx, parent.Height()+1); err != nil {
+				vm.log.Debug("Transaction not admitted",
 					log.String("txID", tx.ID.String()),
 					log.Reflect("error", err),
 				)
+				vm.mempool.RemoveTransaction(tx.ID)
 				continue
 			}
 			validTxs = append(validTxs, tx)
 		}
 
 		if len(validTxs) == 0 {
-			return nil, errors.New("no valid transactions to include in block")
+			return nil, errNoTransactions
+		}
+
+		// Chain time only moves forward, and Verify refuses a block below its
+		// parent. A parent may legally be up to maxClockSkew ahead of this
+		// node's clock, so an unclamped time.Now() here builds a block this
+		// node's own Verify then refuses.
+		timestamp := time.Now().Unix()
+		if parentBlock, ok := parent.(*Block); ok && timestamp < parentBlock.BlockTimestamp {
+			timestamp = parentBlock.BlockTimestamp
 		}
 
 		block := &Block{
 			ParentID_:      parent.ID(),
 			BlockHeight:    parent.Height() + 1,
-			BlockTimestamp: time.Now().Unix(),
+			BlockTimestamp: timestamp,
 			Txs:            validTxs,
 			vm:             vm,
 		}
@@ -358,23 +359,21 @@ func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
 	return built.(*Block), nil
 }
 
-// ParseBlock parses a block from bytes
+// ParseBlock parses a block from bytes.
 func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (vmchain.Block, error) {
-	block := &Block{vm: vm}
-	if err := parseBlockBytes(blockBytes, block); err != nil {
-		return nil, err
-	}
-	block.ID_ = block.computeID()
-	return block, nil
+	return vm.parseBlock(blockBytes)
 }
 
 // parseBlock decodes a block belonging to this VM. The store reads accepted
-// blocks back through it, so there is one decoder rather than one per caller.
-func (vm *VM) parseBlock(raw []byte) (chain.Block, error) {
+// blocks back through it, and ParseBlock hands peer bytes to it, so there is
+// one decoder rather than one per caller — and one place where the id is
+// derived from the content rather than read off the wire.
+func (vm *VM) parseBlock(raw []byte) (*Block, error) {
 	block := &Block{vm: vm}
 	if err := parseBlockBytes(raw, block); err != nil {
 		return nil, err
 	}
+	block.bytes = raw
 	block.ID_ = block.computeID()
 	return block, nil
 }
@@ -384,7 +383,7 @@ func (vm *VM) GetBlock(ctx context.Context, blkID ids.ID) (vmchain.Block, error)
 	if blkID == vm.genesisBlock.ID() {
 		return vm.genesisBlock, nil
 	}
-	decided, err := vm.chain.Block(blkID, vm.parseBlock)
+	decided, err := vm.chain.Block(blkID, func(raw []byte) (chain.Block, error) { return vm.parseBlock(raw) })
 	if err != nil {
 		return nil, err
 	}
@@ -408,7 +407,7 @@ func (vm *VM) reload() error {
 	if err := vm.utxoDB.reload(); err != nil {
 		return err
 	}
-	return vm.stateTree.reload()
+	return vm.root.reload()
 }
 
 // SetState sets the VM state
@@ -430,12 +429,8 @@ func (vm *VM) Shutdown(ctx context.Context) error {
 		vm.nullifierDB.Close()
 	}
 
-	if vm.stateTree != nil {
-		vm.stateTree.Close()
-	}
-
-	if vm.addressManager != nil {
-		vm.addressManager.Close()
+	if vm.root != nil {
+		vm.root.Close()
 	}
 
 	if err := vm.chain.Close(); err != nil {
@@ -464,29 +459,18 @@ func (vm *VM) HealthCheck(ctx context.Context) (vmchain.HealthResult, error) {
 	}, nil
 }
 
-// Health represents VM health status
-type Health struct {
-	DatabaseHealthy   bool   `json:"databaseHealthy"`
-	UTXOCount         uint64 `json:"utxoCount"`
-	NullifierCount    uint64 `json:"nullifierCount"`
-	LastBlockHeight   uint64 `json:"lastBlockHeight"`
-	PendingBlockCount int    `json:"pendingBlockCount"`
-	MempoolSize       int    `json:"mempoolSize"`
-	ProofCacheSize    int    `json:"proofCacheSize"`
-}
-
-// CreateHandlers returns the VM handlers
+// CreateHandlers returns the VM handlers, one per route. See endpoints.
 func (vm *VM) CreateHandlers(context.Context) (map[string]http.Handler, error) {
-	return map[string]http.Handler{
-		"/rpc":     NewRPCHandler(vm),
-		"/privacy": NewPrivacyHandler(vm),
-		"/proof":   NewProofHandler(vm),
-	}, nil
+	return vm.endpoints(), nil
 }
 
-// NewHTTPHandler returns HTTP handlers for the VM
+// NewHTTPHandler mounts the same routes by path.
 func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
-	return NewRPCHandler(vm), nil
+	mux := http.NewServeMux()
+	for route, h := range vm.endpoints() {
+		mux.Handle(route, h)
+	}
+	return mux, nil
 }
 
 // WaitForEvent blocks until there is a transaction to build a block from, or
@@ -497,25 +481,38 @@ func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
 	return vm.mempool.WaitForEvent(ctx)
 }
 
+// admit is the ONE predicate. Assembly (BuildBlock, BuildVertex) and consensus
+// (Block.Verify, Vertex.Verify) both ask it, so a proposer cannot assemble a
+// transaction its own peers refuse — which is a halt, free, for whoever sends
+// the transaction.
+func (vm *VM) admit(tx *Transaction, height uint64) error {
+	if err := tx.ValidateBasic(); err != nil {
+		return err
+	}
+	if tx.Expiry < height {
+		return errExpired
+	}
+	return vm.verifyTransaction(tx)
+}
+
 // verifyTransaction verifies a transaction including ZK proofs
 func (vm *VM) verifyTransaction(tx *Transaction) error {
-	// Check nullifiers aren't already spent
+	// Check nullifiers aren't already spent. A read that FAILED refuses the
+	// transaction: reporting "not spent" for a set that could not be read is
+	// how an already-spent note gets spent again.
 	for _, nullifier := range tx.Nullifiers {
-		if vm.nullifierDB.IsNullifierSpent(nullifier) {
-			return errors.New("nullifier already spent")
+		_, spent, err := vm.nullifierDB.Spent(nullifier)
+		if err != nil {
+			return fmt.Errorf("zkvm: read spent set: %w", err)
+		}
+		if spent {
+			return errNullifierSpent
 		}
 	}
 
 	// Verify ZK proof
 	if err := vm.proofVerifier.VerifyTransactionProof(tx); err != nil {
 		return fmt.Errorf("proof verification failed: %w", err)
-	}
-
-	// Verify FHE operations if enabled
-	if vm.config.EnableFHE && tx.HasFHEOperations() {
-		if err := vm.fheProcessor.VerifyFHEOperations(tx); err != nil {
-			return fmt.Errorf("FHE verification failed: %w", err)
-		}
 	}
 
 	return nil
@@ -525,7 +522,7 @@ func (vm *VM) verifyTransaction(tx *Transaction) error {
 // reads the tree without mutating it, so BuildBlock and Verify agree and a
 // rejected block leaves nothing behind.
 func (vm *VM) computeStateRoot(txs []*Transaction) []byte {
-	return vm.stateTree.RootAfter(txs)
+	return vm.root.After(txs)
 }
 
 // processGenesisTransactions processes initial transactions from genesis
@@ -549,11 +546,14 @@ func (vm *VM) processGenesisTransactions(genesis *Genesis) error {
 
 	// Commit genesis to the root so block 1 builds on it, rather than leaving
 	// genesis to be re-folded into every later block's root.
-	return vm.stateTree.Finalize(vm.stateTree.RootAfter(genesis.InitialTxs))
+	return vm.root.Finalize(vm.root.After(genesis.InitialTxs))
 }
 
-// Additional interface implementations
+// SetPreference records the block the engine wants the next one built on.
+// Dropping it meant Propose always built on the accepted tip, so a node with
+// two blocks in flight re-proposed a height it had already proposed.
 func (vm *VM) SetPreference(ctx context.Context, blkID ids.ID) error {
+	vm.chain.Prefer(blkID)
 	return nil
 }
 

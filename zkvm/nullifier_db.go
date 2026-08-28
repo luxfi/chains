@@ -13,24 +13,21 @@ import (
 	"github.com/luxfi/database"
 )
 
-const (
-	// Database prefixes
-	nullifierPrefix    = 0x20
-	nullifierHeightKey = "nullifier_height_"
-)
+// nullifierPrefix keys the spent set. A nullifier record is the height of the
+// block that spent it.
+const nullifierPrefix = 0x20
 
-// NullifierDB manages spent nullifiers
+var errNullifierSpent = errors.New("zkvm: nullifier already spent")
+
+// NullifierDB is the spent set: the whole of what stops a shielded note being
+// spent twice.
 type NullifierDB struct {
 	db  database.Database
 	log log.Logger
 
-	// Caches. Every nullifier record is loaded at startup and nullifiers are
-	// never pruned, so this is the whole set, not a sample of it — which is why
-	// the count is read off it rather than kept beside it.
-	nullifierCache map[string]uint64 // nullifier -> height when spent
-
-	// Indexes
-	heightIndex map[uint64][]string // height -> nullifiers
+	// spent is the entire set, loaded at startup and never pruned — which is
+	// why the count is read off it rather than kept beside it and reconciled.
+	spent map[string]uint64 // nullifier -> height when spent
 
 	mu sync.RWMutex
 }
@@ -38,118 +35,77 @@ type NullifierDB struct {
 // NewNullifierDB creates a new nullifier database
 func NewNullifierDB(db database.Database, log log.Logger) (*NullifierDB, error) {
 	ndb := &NullifierDB{
-		db:             db,
-		log:            log,
-		nullifierCache: make(map[string]uint64),
-		heightIndex:    make(map[uint64][]string),
+		db:    db,
+		log:   log,
+		spent: make(map[string]uint64),
 	}
 
-	if err := ndb.loadNullifiers(); err != nil {
+	if err := ndb.load(); err != nil {
 		return nil, err
 	}
 
 	return ndb, nil
 }
 
-// MarkNullifierSpent marks a nullifier as spent
+// MarkNullifierSpent records a spend.
 func (ndb *NullifierDB) MarkNullifierSpent(nullifier []byte, height uint64) error {
 	ndb.mu.Lock()
 	defer ndb.mu.Unlock()
 
-	nullifierStr := string(nullifier)
-
-	// Check if already spent
-	if _, exists := ndb.nullifierCache[nullifierStr]; exists {
-		return errors.New("nullifier already spent")
+	key := string(nullifier)
+	if _, exists := ndb.spent[key]; exists {
+		return errNullifierSpent
 	}
 
-	// Store in database
-	key := makeNullifierKey(nullifier)
 	heightBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(heightBytes, height)
-
-	if err := ndb.db.Put(key, heightBytes); err != nil {
+	if err := ndb.db.Put(makeNullifierKey(nullifier), heightBytes); err != nil {
 		return err
 	}
-
-	// Update cache
-	ndb.nullifierCache[nullifierStr] = height
-
-	// Update height index
-	ndb.heightIndex[height] = append(ndb.heightIndex[height], nullifierStr)
+	ndb.spent[key] = height
 
 	ndb.log.Debug("Marked nullifier as spent",
 		log.Uint64("height", height),
-		log.Int("nullifiers", len(ndb.nullifierCache)),
+		log.Int("nullifiers", len(ndb.spent)),
 	)
 
 	return nil
 }
 
-// IsNullifierSpent checks if a nullifier has been spent
-func (ndb *NullifierDB) IsNullifierSpent(nullifier []byte) bool {
-	ndb.mu.RLock()
-	defer ndb.mu.RUnlock()
-
-	nullifierStr := string(nullifier)
-
-	// Check cache
-	if _, exists := ndb.nullifierCache[nullifierStr]; exists {
-		return true
-	}
-
-	// Check database
-	key := makeNullifierKey(nullifier)
-	_, err := ndb.db.Get(key)
-	return err == nil
-}
-
-// GetNullifierHeight returns the height when a nullifier was spent.
+// Spent reports whether a nullifier has been spent and at what height.
+//
+// It is ONE question with one answer, because the two it used to be —
+// IsNullifierSpent returning a bool and GetNullifierHeight returning a height —
+// could not report a failed read at all. `_, err := Get(key); return err == nil`
+// answers "not spent" for a set that could not be read, and that answer is what
+// lets an already-spent note be spent again. A read that failed is an error
+// here, and verifyTransaction refuses the transaction rather than admitting it.
 //
 // A miss falls through to the records and returns what it finds without
-// memoising it. Memoising here would be a write on a path that holds only the
-// read lock, and a read lock promises every other reader that nothing is
-// changing: two callers missing at once would write the same map at the same
-// time, which is a runtime throw, not a returned error. The write lock is not
-// the answer either — it would serialise every reader of a path consensus and
-// RPC both sit on, to save a lookup the set already answers.
-func (ndb *NullifierDB) GetNullifierHeight(nullifier []byte) (uint64, error) {
+// memoising it. Memoising would be a write on a path that holds only the read
+// lock, and a read lock promises every other reader that nothing is changing:
+// two callers missing at once would write the same map at the same time, which
+// is a runtime throw, not a returned error. The write lock is not the answer
+// either — it would serialise every reader of a path consensus and RPC both sit
+// on, to save a lookup the set already answers.
+func (ndb *NullifierDB) Spent(nullifier []byte) (uint64, bool, error) {
 	ndb.mu.RLock()
 	defer ndb.mu.RUnlock()
 
-	nullifierStr := string(nullifier)
-
-	// Check cache
-	if height, exists := ndb.nullifierCache[nullifierStr]; exists {
-		return height, nil
+	if height, exists := ndb.spent[string(nullifier)]; exists {
+		return height, true, nil
 	}
 
-	// Load from database
-	key := makeNullifierKey(nullifier)
-	heightBytes, err := ndb.db.Get(key)
-	if err != nil || len(heightBytes) != 8 {
-		return 0, errors.New("nullifier not found")
+	raw, err := ndb.db.Get(makeNullifierKey(nullifier))
+	switch {
+	case errors.Is(err, database.ErrNotFound):
+		return 0, false, nil
+	case err != nil:
+		return 0, false, err
+	case len(raw) != 8:
+		return 0, false, errors.New("zkvm: nullifier record is not a height")
 	}
-
-	return binary.BigEndian.Uint64(heightBytes), nil
-}
-
-// GetNullifiersByHeight returns all nullifiers spent at a specific height
-func (ndb *NullifierDB) GetNullifiersByHeight(height uint64) [][]byte {
-	ndb.mu.RLock()
-	defer ndb.mu.RUnlock()
-
-	nullifierStrs, exists := ndb.heightIndex[height]
-	if !exists {
-		return nil
-	}
-
-	nullifiers := make([][]byte, len(nullifierStrs))
-	for i, nullifierStr := range nullifierStrs {
-		nullifiers[i] = []byte(nullifierStr)
-	}
-
-	return nullifiers
+	return binary.BigEndian.Uint64(raw), true, nil
 }
 
 // GetNullifierCount returns the number of spent nullifiers, counted off the set
@@ -160,89 +116,40 @@ func (ndb *NullifierDB) GetNullifiersByHeight(height uint64) [][]byte {
 func (ndb *NullifierDB) GetNullifierCount() uint64 {
 	ndb.mu.RLock()
 	defer ndb.mu.RUnlock()
-	return uint64(len(ndb.nullifierCache))
+	return uint64(len(ndb.spent))
 }
 
-// RemoveNullifier removes a nullifier (used for reorg)
-func (ndb *NullifierDB) RemoveNullifier(nullifier []byte) error {
-	ndb.mu.Lock()
-	defer ndb.mu.Unlock()
+// Nullifiers are permanent and MUST NOT be pruned or removed. Deleting a spent
+// nullifier lets a previously spent note be spent again, so there is no
+// removal path here — not for reorg, not for compaction. If storage becomes a
+// concern, a Merkle accumulator is the compaction.
 
-	nullifierStr := string(nullifier)
-
-	// Get height from cache
-	height, exists := ndb.nullifierCache[nullifierStr]
-	if !exists {
-		// Try loading from DB
-		key := makeNullifierKey(nullifier)
-		heightBytes, err := ndb.db.Get(key)
-		if err != nil {
-			return errors.New("nullifier not found")
-		}
-		height = binary.BigEndian.Uint64(heightBytes)
-	}
-
-	// Remove from database
-	key := makeNullifierKey(nullifier)
-	if err := ndb.db.Delete(key); err != nil {
-		return err
-	}
-
-	// Remove from cache
-	delete(ndb.nullifierCache, nullifierStr)
-
-	// Update height index
-	if heightNullifiers, exists := ndb.heightIndex[height]; exists {
-		for i, n := range heightNullifiers {
-			if n == nullifierStr {
-				ndb.heightIndex[height] = append(heightNullifiers[:i], heightNullifiers[i+1:]...)
-				break
-			}
-		}
-	}
-
-	return nil
-}
-
-// Nullifiers are permanent and MUST NOT be pruned. Deleting spent nullifiers
-// would allow double-spending of previously spent notes. If storage becomes
-// a concern, a Merkle accumulator should be used for compaction.
-
-// loadNullifiers loads nullifiers from database to cache
-func (ndb *NullifierDB) loadNullifiers() error {
-	prefix := []byte{nullifierPrefix}
-	it := ndb.db.NewIteratorWithPrefix(prefix)
+// load reads the whole set from the database.
+func (ndb *NullifierDB) load() error {
+	it := ndb.db.NewIteratorWithPrefix([]byte{nullifierPrefix})
 	defer it.Release()
 
 	for it.Next() {
-		key := it.Key()
-		val := it.Value()
-
+		key, val := it.Key(), it.Value()
 		if len(key) < 2 || len(val) != 8 {
 			continue
 		}
-
-		nullifier := string(key[1:]) // strip prefix byte
-		height := binary.BigEndian.Uint64(val)
-
-		ndb.nullifierCache[nullifier] = height
-		ndb.heightIndex[height] = append(ndb.heightIndex[height], nullifier)
+		ndb.spent[string(key[1:])] = binary.BigEndian.Uint64(val)
 	}
 
 	return it.Error()
 }
 
-// reload rebuilds the cache from what the database now says. A block whose
-// writes were discarded has had its nullifiers discarded with them, so a cache
+// reload rebuilds the set from what the database now says. A block whose
+// writes were discarded has had its nullifiers discarded with them, so a set
 // that already recorded them must stop claiming those notes are spent —
 // otherwise the block can never be applied again.
 func (ndb *NullifierDB) reload() error {
 	ndb.mu.Lock()
 	defer ndb.mu.Unlock()
 
-	ndb.nullifierCache = make(map[string]uint64)
-	ndb.heightIndex = make(map[uint64][]string)
-	return ndb.loadNullifiers()
+	ndb.spent = make(map[string]uint64)
+	return ndb.load()
 }
 
 // makeNullifierKey creates a database key for a nullifier
@@ -258,6 +165,5 @@ func (ndb *NullifierDB) Close() {
 	ndb.mu.Lock()
 	defer ndb.mu.Unlock()
 
-	ndb.nullifierCache = nil
-	ndb.heightIndex = nil
+	ndb.spent = nil
 }
