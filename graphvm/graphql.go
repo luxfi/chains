@@ -9,11 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/luxfi/database"
-	"github.com/luxfi/ids"
 )
 
 var (
@@ -21,13 +19,18 @@ var (
 	errQueryTooComplex = errors.New("query exceeds max depth")
 	errResultTooLarge  = errors.New("result exceeds max size")
 	errUnknownField    = errors.New("unknown field requested")
-	errUnsupportedType = errors.New("unsupported query type")
 	errQueryTooLong    = errors.New("query exceeds maximum length")
+	errQueryTooWide    = errors.New("query requests too many fields")
 )
 
 const (
-	// Maximum query length to prevent DoS
+	// maxQueryLength bounds the bytes a caller may send.
 	maxQueryLength = 100000 // 100KB
+
+	// maxFields bounds the resolvers one query may run. Length and depth do not
+	// bound breadth: `{ a b c ... }` is shallow, short per field, and each field
+	// is a database scan.
+	maxFields = 100
 )
 
 // GraphQLRequest represents an incoming GraphQL request
@@ -45,33 +48,23 @@ type GraphQLResponse struct {
 
 // GraphQLError represents a GraphQL error
 type GraphQLError struct {
-	Message   string     `json:"message"`
-	Locations []Location `json:"locations,omitempty"`
-	Path      []string   `json:"path,omitempty"`
+	Message string `json:"message"`
 }
 
-// Location represents a location in the query
-type Location struct {
-	Line   int `json:"line"`
-	Column int `json:"column"`
-}
-
-// QueryExecutor executes GraphQL queries against the shared database
+// QueryExecutor executes GraphQL queries against the shared database. Its
+// resolver table is built once in NewQueryExecutor and read-only thereafter, so
+// concurrent requests need no lock.
 type QueryExecutor struct {
 	db        database.Database
 	maxDepth  int
 	maxResult int
 	timeout   time.Duration
 
-	// Schema registry
-	schemaMu sync.RWMutex
-	schemas  map[string]*GraphSchema
-
-	// Read-only resolvers for each data type
 	resolvers map[string]ResolverFunc
 }
 
-// ResolverFunc resolves a field from the database
+// ResolverFunc resolves a field from the database. What it returns must be
+// JSON-encodable: the response is measured and sent by encoding it.
 type ResolverFunc func(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error)
 
 // NewQueryExecutor creates a new GraphQL query executor
@@ -97,7 +90,6 @@ func NewQueryExecutor(db database.Database, config *GConfig) *QueryExecutor {
 		maxDepth:  maxDepth,
 		maxResult: maxResult,
 		timeout:   timeout,
-		schemas:   make(map[string]*GraphSchema),
 		resolvers: make(map[string]ResolverFunc),
 	}
 
@@ -124,7 +116,6 @@ func (e *QueryExecutor) registerBuiltinResolvers() {
 
 	// Chain info
 	e.resolvers["chainInfo"] = e.resolveChainInfo
-	e.resolvers["chains"] = e.resolveChains
 
 	// Database key-value queries (generic read access)
 	e.resolvers["get"] = e.resolveGet
@@ -168,15 +159,23 @@ func (e *QueryExecutor) Execute(ctx context.Context, req *GraphQLRequest) *Graph
 		}
 	}
 
+	// MaxResultSize is a promise about the response, so it is measured on the
+	// response. Bounding the row count instead would let one wide row past it.
+	// A result the response cannot carry and a result too big to send are the
+	// same answer — no answer fits — so they are one refusal, not two.
+	if encoded, err := json.Marshal(data); err != nil || len(encoded) > e.maxResult {
+		return &GraphQLResponse{
+			Errors: []GraphQLError{{Message: errResultTooLarge.Error()}},
+		}
+	}
+
 	return &GraphQLResponse{Data: data}
 }
 
 // parsedQuery represents a parsed GraphQL query
 type parsedQuery struct {
-	operation string        // query, mutation (rejected for read-only)
-	name      string        // operation name
-	fields    []parsedField // requested fields
-	depth     int           // max nesting depth
+	fields []parsedField // requested fields
+	depth  int           // max nesting depth
 }
 
 // parsedField represents a field in the query
@@ -204,11 +203,6 @@ func (e *QueryExecutor) parseQuery(query string) (*parsedQuery, error) {
 		return nil, err
 	}
 
-	parsed := &parsedQuery{
-		operation: "query",
-		fields:    make([]parsedField, 0),
-	}
-
 	// Check for mutation (not allowed for read-only)
 	if strings.HasPrefix(strings.ToLower(query), "mutation") {
 		return nil, fmt.Errorf("mutations not allowed: G-chain is read-only")
@@ -229,15 +223,20 @@ func (e *QueryExecutor) parseQuery(query string) (*parsedQuery, error) {
 		return nil, err
 	}
 
-	parsed.fields = fields
-	parsed.depth = depth
+	if len(fields) > maxFields {
+		return nil, errQueryTooWide
+	}
 
-	return parsed, nil
+	return &parsedQuery{fields: fields, depth: depth}, nil
 }
 
-// validateQuerySafety checks for potentially malicious query patterns
+// validateQuerySafety bounds the shape of a query before it is parsed.
+//
+// It used to also reject "suspicious repetitive patterns" — any aligned 10-byte
+// window recurring 100 times. That guard never held: `{ a b a b ... }` repeats
+// no aligned window, and every field in it is still a database scan. The bound
+// that does hold is maxFields, on the count of resolvers a query runs.
 func validateQuerySafety(query string) error {
-	// Check for excessive nesting indicators
 	openBraces := strings.Count(query, "{")
 	closeBraces := strings.Count(query, "}")
 
@@ -249,184 +248,215 @@ func validateQuerySafety(query string) error {
 		return fmt.Errorf("query has too many nested levels")
 	}
 
-	// Check for excessively repeated patterns (potential DoS)
-	// Simple heuristic: if any 10-char substring appears more than 100 times, reject
-	if len(query) > 100 {
-		counts := make(map[string]int)
-		for i := 0; i <= len(query)-10; i += 10 {
-			substr := query[i : i+10]
-			counts[substr]++
-			if counts[substr] > 100 {
-				return fmt.Errorf("query contains suspicious repetitive patterns")
-			}
-		}
-	}
-
 	return nil
 }
 
-// parseFields extracts fields from a GraphQL selection set
+// parseFields extracts the top-level selection set from a query.
 func (e *QueryExecutor) parseFields(query string) ([]parsedField, int, error) {
-	// Find the main braces
 	start := strings.Index(query, "{")
 	if start == -1 {
 		return nil, 0, errInvalidQuery
 	}
 	end := strings.LastIndex(query, "}")
-	if end == -1 || end <= start {
+	if end <= start {
 		return nil, 0, errInvalidQuery
 	}
-
-	content := query[start+1 : end]
-	fields, depth := e.parseFieldList(content, 1)
-
-	return fields, depth, nil
+	return e.parseFieldList(query[start+1:end], 1)
 }
 
-// parseFieldList parses a comma/newline separated list of fields
-func (e *QueryExecutor) parseFieldList(content string, currentDepth int) ([]parsedField, int) {
+// parseFieldList reads a selection set: a sequence of
+//
+//	[alias:] name [(args)] [{ subfields }]
+//
+// separated by whitespace or commas. Splitting on commas and NEWLINES alone —
+// which is what this did — makes `{ a b }` a single field named "a b", so a
+// query written the way every GraphQL client prints it came back "unknown field
+// requested: a b".
+func (e *QueryExecutor) parseFieldList(content string, depth int) ([]parsedField, int, error) {
 	fields := make([]parsedField, 0)
-	maxDepth := currentDepth
+	maxDepth := depth
 
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return fields, maxDepth
-	}
-
-	// Tokenize by finding top-level fields (respecting nested braces)
-	i := 0
-	for i < len(content) {
-		// Skip whitespace
-		for i < len(content) && (content[i] == ' ' || content[i] == '\t' || content[i] == '\n' || content[i] == '\r' || content[i] == ',') {
+	for i := 0; i < len(content); {
+		if isSpace(content[i]) || content[i] == ',' {
 			i++
+			continue
 		}
-		if i >= len(content) {
-			break
-		}
-
-		// Skip comments
-		if content[i] == '#' {
+		if content[i] == '#' { // comment to end of line
 			for i < len(content) && content[i] != '\n' {
 				i++
 			}
 			continue
 		}
 
-		// Find end of this field (next top-level comma/newline or end)
-		start := i
-		depth := 0
-		inParen := 0
-		for i < len(content) {
-			c := content[i]
-			if c == '(' {
-				inParen++
-			} else if c == ')' {
-				inParen--
-			} else if c == '{' {
-				depth++
-			} else if c == '}' {
-				depth--
-			} else if (c == ',' || c == '\n') && depth == 0 && inParen == 0 {
-				break
-			}
+		name, next := readName(content, i)
+		if next == i { // not a name: step over the byte so the scan advances
 			i++
-		}
-
-		part := strings.TrimSpace(content[start:i])
-		if part == "" || strings.HasPrefix(part, "#") {
 			continue
 		}
+		i = skipSpace(content, next)
 
-		field := parsedField{
-			args: make(map[string]interface{}),
-		}
+		field := parsedField{name: name, args: make(map[string]interface{})}
 
-		// Check for subfields
-		braceIdx := strings.Index(part, "{")
-		if braceIdx > 0 {
-			// Has subfields
-			header := part[:braceIdx]
-			field.name, field.alias, field.args = e.parseFieldHeader(header)
-
-			// Find matching closing brace
-			braceDepth := 1
-			endBrace := braceIdx
-			for j := braceIdx + 1; j < len(part); j++ {
-				if part[j] == '{' {
-					braceDepth++
-				} else if part[j] == '}' {
-					braceDepth--
-					if braceDepth == 0 {
-						endBrace = j
-						break
-					}
-				}
+		if i < len(content) && content[i] == ':' { // what was read is the alias
+			field.alias = name
+			i = skipSpace(content, i+1)
+			if field.name, next = readName(content, i); next == i {
+				return nil, 0, errInvalidQuery
 			}
+			i = skipSpace(content, next)
+		}
 
-			if endBrace > braceIdx+1 {
-				subfieldContent := part[braceIdx+1 : endBrace]
-				subfields, subDepth := e.parseFieldList(subfieldContent, currentDepth+1)
-				field.subfields = subfields
-				if subDepth > maxDepth {
-					maxDepth = subDepth
-				}
+		if i < len(content) && content[i] == '(' {
+			args, next, ok := readBalanced(content, i, '(', ')')
+			if !ok {
+				return nil, 0, errInvalidQuery
 			}
-		} else {
-			// Simple field
-			field.name, field.alias, field.args = e.parseFieldHeader(part)
+			field.args = parseArgs(args)
+			i = skipSpace(content, next)
 		}
 
-		if field.name != "" {
-			fields = append(fields, field)
+		if i < len(content) && content[i] == '{' {
+			sub, next, ok := readBalanced(content, i, '{', '}')
+			if !ok {
+				return nil, 0, errInvalidQuery
+			}
+			subfields, subDepth, err := e.parseFieldList(sub, depth+1)
+			if err != nil {
+				return nil, 0, err
+			}
+			field.subfields = subfields
+			if subDepth > maxDepth {
+				maxDepth = subDepth
+			}
+			i = next
 		}
+
+		fields = append(fields, field)
 	}
 
-	return fields, maxDepth
+	return fields, maxDepth, nil
 }
 
-// parseFieldHeader parses "alias: fieldName(arg: value)"
-func (e *QueryExecutor) parseFieldHeader(header string) (name, alias string, args map[string]interface{}) {
-	args = make(map[string]interface{})
-	header = strings.TrimSpace(header)
+func isSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
 
-	// Check for alias
-	if idx := strings.Index(header, ":"); idx > 0 && !strings.Contains(header[:idx], "(") {
-		alias = strings.TrimSpace(header[:idx])
-		header = strings.TrimSpace(header[idx+1:])
+func skipSpace(s string, i int) int {
+	for i < len(s) && isSpace(s[i]) {
+		i++
 	}
-
-	// Check for arguments
-	if idx := strings.Index(header, "("); idx > 0 {
-		name = strings.TrimSpace(header[:idx])
-		argsEnd := strings.LastIndex(header, ")")
-		if argsEnd > idx {
-			argsStr := header[idx+1 : argsEnd]
-			args = e.parseArgs(argsStr)
-		}
-	} else {
-		name = strings.TrimSpace(header)
-	}
-
-	return name, alias, args
+	return i
 }
 
-// parseArgs parses "key: value, key2: value2"
-func (e *QueryExecutor) parseArgs(argsStr string) map[string]interface{} {
+// readName reads a GraphQL name — letters, digits and underscore — returning it
+// and the index just past it.
+func readName(s string, i int) (string, int) {
+	start := i
+	for i < len(s) && (s[i] == '_' || (s[i] >= 'a' && s[i] <= 'z') || (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= '0' && s[i] <= '9')) {
+		i++
+	}
+	return s[start:i], i
+}
+
+// readBalanced takes the opening delimiter at i and returns what it encloses
+// plus the index just past its match. An unterminated group is not a group.
+func readBalanced(s string, i int, open, close byte) (string, int, bool) {
+	start, depth := i, 0
+	for ; i < len(s); i++ {
+		switch s[i] {
+		case open:
+			depth++
+		case close:
+			if depth--; depth == 0 {
+				return s[start+1 : i], i + 1, true
+			}
+		}
+	}
+	return "", 0, false
+}
+
+// parseArgs reads "key: value, key2: {k: v}, key3: [a, b]".
+//
+// A nested object is the `where:` filter every subgraph client sends. Splitting
+// the argument list on commas made `where: {token0: "0x1"}` the STRING
+// "{token0", which no resolver recognised as a filter — so `pools(where: ...)`
+// answered with every pool on the chain and reported no error.
+func parseArgs(s string) map[string]interface{} {
 	args := make(map[string]interface{})
-	parts := strings.Split(argsStr, ",")
 
-	for _, part := range parts {
-		kv := strings.SplitN(part, ":", 2)
-		if len(kv) == 2 {
-			key := strings.TrimSpace(kv[0])
-			value := strings.TrimSpace(kv[1])
-			// Remove quotes from string values
-			value = strings.Trim(value, `"'`)
-			args[key] = value
+	for i := 0; i < len(s); {
+		if isSpace(s[i]) || s[i] == ',' {
+			i++
+			continue
 		}
+		key, next := readName(s, i)
+		if next == i { // not a name: step over it
+			i++
+			continue
+		}
+		i = skipSpace(s, next)
+		if i >= len(s) || s[i] != ':' {
+			continue // a bare token is not an argument, and i is past it
+		}
+		args[key], i = readValue(s, i+1)
 	}
 
 	return args
+}
+
+// readValue reads one argument value: an object, a list, a quoted string, or a
+// bare token.
+func readValue(s string, i int) (interface{}, int) {
+	i = skipSpace(s, i)
+	if i >= len(s) {
+		return "", i
+	}
+
+	switch s[i] {
+	case '{':
+		body, next, ok := readBalanced(s, i, '{', '}')
+		if !ok {
+			return "", len(s)
+		}
+		return parseArgs(body), next
+
+	case '[':
+		body, next, ok := readBalanced(s, i, '[', ']')
+		if !ok {
+			return "", len(s)
+		}
+		list := []interface{}{}
+		for j := 0; j < len(body); {
+			if isSpace(body[j]) || body[j] == ',' {
+				j++
+				continue
+			}
+			var v interface{}
+			v, j = readValue(body, j)
+			list = append(list, v)
+		}
+		return list, next
+
+	case '"', '\'':
+		quote := s[i]
+		var out []byte
+		for j := i + 1; j < len(s); j++ {
+			if s[j] == '\\' && j+1 < len(s) {
+				j++
+				out = append(out, s[j])
+				continue
+			}
+			if s[j] == quote {
+				return string(out), j + 1
+			}
+			out = append(out, s[j])
+		}
+		return string(out), len(s)
+	}
+
+	start := i
+	for i < len(s) && s[i] != ',' && s[i] != '}' && s[i] != ']' && !isSpace(s[i]) {
+		i++
+	}
+	return s[start:i], i
 }
 
 // executeQuery executes a parsed query
@@ -434,6 +464,10 @@ func (e *QueryExecutor) executeQuery(ctx context.Context, parsed *parsedQuery, v
 	result := make(map[string]interface{})
 
 	for _, field := range parsed.fields {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		// Merge variables into args
 		args := make(map[string]interface{})
 		for k, v := range field.args {
@@ -482,20 +516,11 @@ func (e *QueryExecutor) resolveBlock(ctx context.Context, db database.Database, 
 }
 
 func (e *QueryExecutor) resolveBlocks(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	// Get range of blocks
-	limit := 10
-	if l, ok := args["limit"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-	if limit > 100 {
-		limit = 100
-	}
-
-	return e.getLatestBlocks(db, limit)
+	return e.getLatestBlocks(ctx, db, bound(args, "limit", 10, 100))
 }
 
 func (e *QueryExecutor) resolveLatestBlock(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	return e.getLatestBlocks(db, 1)
+	return e.getLatestBlocks(ctx, db, 1)
 }
 
 func (e *QueryExecutor) resolveTransaction(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
@@ -506,15 +531,7 @@ func (e *QueryExecutor) resolveTransaction(ctx context.Context, db database.Data
 }
 
 func (e *QueryExecutor) resolveTransactions(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	limit := 10
-	if l, ok := args["limit"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-	if limit > 100 {
-		limit = 100
-	}
-
-	return e.getLatestTransactions(db, limit)
+	return e.getLatestTransactions(ctx, db, bound(args, "limit", 10, 100))
 }
 
 func (e *QueryExecutor) resolveAccount(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
@@ -531,22 +548,14 @@ func (e *QueryExecutor) resolveBalance(ctx context.Context, db database.Database
 	return nil, fmt.Errorf("balance: requires 'address' argument")
 }
 
+// resolveChainInfo describes this VM. It carries no clock: a wall-clock reading
+// is the server's, not the chain's, and two nodes answering the same query
+// differently is the thing this chain exists to avoid.
 func (e *QueryExecutor) resolveChainInfo(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
 	return map[string]interface{}{
-		"vmName":    "graphvm",
-		"version":   Version.String(),
-		"readOnly":  true,
-		"timestamp": time.Now().Unix(),
-	}, nil
-}
-
-func (e *QueryExecutor) resolveChains(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	// Return list of connected chain data sources
-	return []map[string]interface{}{
-		{"id": "C", "name": "C-Chain", "type": "EVM"},
-		{"id": "P", "name": "P-Chain", "type": "Platform"},
-		{"id": "X", "name": "X-Chain", "type": "Exchange"},
-		{"id": "D", "name": "D-Chain", "type": "DEX"},
+		"vmName":   "graphvm",
+		"version":  Version.String(),
+		"readOnly": true,
 	}, nil
 }
 
@@ -558,7 +567,7 @@ func (e *QueryExecutor) resolveGet(ctx context.Context, db database.Database, ar
 
 	value, err := db.Get([]byte(key))
 	if err != nil {
-		if err == database.ErrNotFound {
+		if errors.Is(err, database.ErrNotFound) {
 			return nil, nil
 		}
 		return nil, err
@@ -582,32 +591,21 @@ func (e *QueryExecutor) resolveHas(ctx context.Context, db database.Database, ar
 }
 
 func (e *QueryExecutor) resolveIterate(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	prefix := ""
-	if p, ok := args["prefix"].(string); ok {
-		prefix = p
-	}
+	prefix, _ := args["prefix"].(string)
+	limit := bound(args, "limit", 100, 1000)
 
-	limit := 100
-	if l, ok := args["limit"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
-
-	// Use database iterator
 	iter := db.NewIteratorWithPrefix([]byte(prefix))
 	defer iter.Release()
 
 	results := make([]map[string]interface{}, 0, limit)
-	count := 0
-
-	for iter.Next() && count < limit {
+	for iter.Next() && len(results) < limit {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		results = append(results, map[string]interface{}{
 			"key":   string(iter.Key()),
 			"value": string(iter.Value()),
 		})
-		count++
 	}
 
 	return results, iter.Error()
@@ -671,22 +669,7 @@ func (e *QueryExecutor) resolveType(ctx context.Context, db database.Database, a
 // Database access helpers (use prefixed keys for cross-chain data)
 
 func (e *QueryExecutor) getBlockByHash(db database.Database, hash string) (interface{}, error) {
-	// Try to load from database
-	key := []byte("block:hash:" + hash)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var block map[string]interface{}
-	if err := json.Unmarshal(data, &block); err != nil {
-		return nil, err
-	}
-
-	return block, nil
+	return object(db, "block:hash:"+hash)
 }
 
 func (e *QueryExecutor) getBlockByHeight(db database.Database, height interface{}) (interface{}, error) {
@@ -699,106 +682,32 @@ func (e *QueryExecutor) getBlockByHeight(db database.Database, height interface{
 	case int:
 		h = uint64(v)
 	}
-
-	key := []byte(fmt.Sprintf("block:height:%d", h))
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var block map[string]interface{}
-	if err := json.Unmarshal(data, &block); err != nil {
-		return nil, err
-	}
-
-	return block, nil
+	return object(db, fmt.Sprintf("block:height:%d", h))
 }
 
-func (e *QueryExecutor) getLatestBlocks(db database.Database, limit int) (interface{}, error) {
-	// Iterate over blocks prefix
-	iter := db.NewIteratorWithPrefix([]byte("block:height:"))
-	defer iter.Release()
-
-	blocks := make([]map[string]interface{}, 0, limit)
-
-	// Move to end and iterate backwards (newest first)
-	for iter.Next() {
-		if len(blocks) >= limit {
-			break
-		}
-
-		var block map[string]interface{}
-		if err := json.Unmarshal(iter.Value(), &block); err != nil {
-			continue
-		}
-		blocks = append(blocks, block)
-	}
-
-	return blocks, iter.Error()
+func (e *QueryExecutor) getLatestBlocks(ctx context.Context, db database.Database, limit int) (interface{}, error) {
+	return scan[map[string]interface{}](ctx, db, "block:height:", limit)
 }
 
 func (e *QueryExecutor) getTransactionByHash(db database.Database, hash string) (interface{}, error) {
-	key := []byte("tx:hash:" + hash)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var tx map[string]interface{}
-	if err := json.Unmarshal(data, &tx); err != nil {
-		return nil, err
-	}
-
-	return tx, nil
+	return object(db, "tx:hash:"+hash)
 }
 
-func (e *QueryExecutor) getLatestTransactions(db database.Database, limit int) (interface{}, error) {
-	iter := db.NewIteratorWithPrefix([]byte("tx:"))
-	defer iter.Release()
-
-	txs := make([]map[string]interface{}, 0, limit)
-
-	for iter.Next() {
-		if len(txs) >= limit {
-			break
-		}
-
-		var tx map[string]interface{}
-		if err := json.Unmarshal(iter.Value(), &tx); err != nil {
-			continue
-		}
-		txs = append(txs, tx)
-	}
-
-	return txs, iter.Error()
+func (e *QueryExecutor) getLatestTransactions(ctx context.Context, db database.Database, limit int) (interface{}, error) {
+	return scan[map[string]interface{}](ctx, db, "tx:", limit)
 }
 
-func (e *QueryExecutor) getAccountByAddress(db database.Database, addr string) (interface{}, error) {
-	key := []byte("account:" + addr)
-	data, err := db.Get(key)
+// getAccountByAddress answers a zero account for an address with no record —
+// an address that has never been seen has a balance, and it is zero.
+func (e *QueryExecutor) getAccountByAddress(db database.Database, addr string) (map[string]interface{}, error) {
+	acct, err := object(db, "account:"+addr)
 	if err != nil {
-		if err == database.ErrNotFound {
-			return map[string]interface{}{
-				"address": addr,
-				"balance": "0",
-				"nonce":   0,
-			}, nil
-		}
 		return nil, err
 	}
-
-	var account map[string]interface{}
-	if err := json.Unmarshal(data, &account); err != nil {
-		return nil, err
+	if acct == nil {
+		return map[string]interface{}{"address": addr, "balance": "0", "nonce": 0}, nil
 	}
-
-	return account, nil
+	return acct.(map[string]interface{}), nil
 }
 
 func (e *QueryExecutor) getBalanceByAddress(db database.Database, addr string) (interface{}, error) {
@@ -806,27 +715,25 @@ func (e *QueryExecutor) getBalanceByAddress(db database.Database, addr string) (
 	if err != nil {
 		return nil, err
 	}
+	return account["balance"], nil
+}
 
-	if acc, ok := account.(map[string]interface{}); ok {
-		return acc["balance"], nil
+// scan reads one bounded window of JSON records under a prefix. It is `list`
+// without the ordering and where-narrowing the subgraph surface adds.
+func scan[T any](ctx context.Context, db database.Database, prefix string, limit int) ([]T, error) {
+	iter := db.NewIteratorWithPrefix([]byte(prefix))
+	defer iter.Release()
+
+	out := make([]T, 0, limit)
+	for iter.Next() && len(out) < limit {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var v T
+		if err := json.Unmarshal(iter.Value(), &v); err != nil {
+			continue
+		}
+		out = append(out, v)
 	}
-
-	return "0", nil
-}
-
-// RegisterResolver allows adding custom resolvers
-func (e *QueryExecutor) RegisterResolver(name string, resolver ResolverFunc) {
-	e.resolvers[name] = resolver
-}
-
-// GetDB returns the underlying database (read-only access)
-func (e *QueryExecutor) GetDB() database.Database {
-	return e.db
-}
-
-// SubscribeChain connects a chain as a data source for cross-chain queries
-func (e *QueryExecutor) SubscribeChain(chainID ids.ID, chainName string, prefix string) error {
-	// Create prefixed database view for this chain
-	// This allows querying data from multiple chains
-	return nil
+	return out, iter.Error()
 }

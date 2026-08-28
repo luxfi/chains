@@ -22,186 +22,67 @@ import (
 // compile time so GetBlock can actually return a *Block.
 var _ block.Block = (*Block)(nil)
 
-var (
-	errInvalidBlock = errors.New("invalid block")
-)
-
-// Block represents a block in the Graph Chain
+// Block is the G-Chain's genesis block, which is the only block it has. Its
+// fields are fixed at construction and it is accepted by definition, so there
+// is no mutable status to keep in step with consensus.
 type Block struct {
 	vm *VM
 
-	id        ids.ID
-	parentID  ids.ID
-	height    uint64
-	timestamp time.Time
-
-	// Graph-specific block data
-	schemaUpdates   []*SchemaUpdate
-	queryResults    []*QueryResult
-	indexUpdates    []*IndexUpdate
-	chainSyncEvents []*ChainSyncEvent
-
-	status choices.Status
-	bytes  []byte
-}
-
-// SchemaUpdate represents an update to a GraphQL schema
-type SchemaUpdate struct {
-	SchemaID   string `json:"schemaId"`
-	Operation  string `json:"operation"` // create, update, delete
-	NewVersion string `json:"newVersion,omitempty"`
-	Schema     string `json:"schema,omitempty"`
-}
-
-// QueryResult represents a query result to be committed
-type QueryResult struct {
-	QueryID    ids.ID `json:"queryId"`
-	ResultHash []byte `json:"resultHash"`
-	Status     string `json:"status"`
-}
-
-// IndexUpdate represents an index update
-type IndexUpdate struct {
-	IndexID   string `json:"indexId"`
-	ChainID   ids.ID `json:"chainId"`
-	Operation string `json:"operation"` // create, update, rebuild
-	Status    string `json:"status"`
-}
-
-// ChainSyncEvent represents a chain synchronization event
-type ChainSyncEvent struct {
-	ChainID     ids.ID `json:"chainId"`
-	BlockHeight uint64 `json:"blockHeight"`
-	BlockHash   ids.ID `json:"blockHash"`
-	Timestamp   int64  `json:"timestamp"`
+	id    ids.ID
+	bytes []byte
 }
 
 // ID implements the chain.Block interface
-func (b *Block) ID() ids.ID {
-	return b.id
-}
+func (b *Block) ID() ids.ID { return b.id }
 
-// Accept implements the chain.Block interface
-func (b *Block) Accept(context.Context) error {
-	b.status = choices.Accepted
+// Parent implements the chain.Block interface. Genesis has none.
+func (b *Block) Parent() ids.ID { return ids.Empty }
 
-	// Process schema updates
-	b.vm.schemaMu.Lock()
-	for _, update := range b.schemaUpdates {
-		switch update.Operation {
-		case "create", "update":
-			if schema, exists := b.vm.schemas[update.SchemaID]; exists {
-				schema.Version = update.NewVersion
-				schema.Schema = update.Schema
-				schema.UpdatedAt = b.timestamp.Unix()
-			} else {
-				b.vm.schemas[update.SchemaID] = &GraphSchema{
-					ID:        update.SchemaID,
-					Version:   update.NewVersion,
-					Schema:    update.Schema,
-					CreatedAt: b.timestamp.Unix(),
-					UpdatedAt: b.timestamp.Unix(),
-				}
-			}
-		case "delete":
-			delete(b.vm.schemas, update.SchemaID)
-		}
-	}
-	b.vm.schemaMu.Unlock()
+// ParentID returns the parent block ID
+func (b *Block) ParentID() ids.ID { return ids.Empty }
 
-	// Process query results
-	b.vm.queryMu.Lock()
-	for _, result := range b.queryResults {
-		if query, exists := b.vm.queries[result.QueryID]; exists {
-			query.Status = QueryCompleted
-			query.CompletedAt = b.timestamp.Unix()
-		}
-	}
-	b.vm.queryMu.Unlock()
+// Height implements the chain.Block interface
+func (b *Block) Height() uint64 { return 0 }
 
-	// Process index updates
-	for _, indexUpdate := range b.indexUpdates {
-		if index, exists := b.vm.dataIndexes[indexUpdate.IndexID]; exists {
-			index.Status = indexUpdate.Status
-		}
-	}
-
-	// Process chain sync events
-	for _, syncEvent := range b.chainSyncEvents {
-		if source, exists := b.vm.chainSources[syncEvent.ChainID]; exists {
-			source.LastSync = syncEvent.Timestamp
-			source.BlockHeight = syncEvent.BlockHeight
-		}
-	}
-
-	// Update last accepted
-	b.vm.lastAcceptedID = b.id
-	b.vm.preferredID = b.id
-
-	return nil
-}
-
-// Reject implements the chain.Block interface
-func (b *Block) Reject(context.Context) error {
-	b.status = choices.Rejected
-	return nil
-}
+// Timestamp implements the chain.Block interface
+func (b *Block) Timestamp() time.Time { return genesisTimestamp }
 
 // Status implements the block.Block interface. The interface requires a
 // concrete uint8; choices.Status is `type Status uint8`, so a method returning
 // the named type would NOT satisfy block.Block — which is why GetBlock could
 // never have returned a *Block before this fix.
-func (b *Block) Status() uint8 {
-	return uint8(b.status)
-}
-
-// Parent implements the chain.Block interface
-func (b *Block) Parent() ids.ID {
-	return b.parentID
-}
-
-// ParentID returns the parent block ID
-func (b *Block) ParentID() ids.ID {
-	return b.parentID
-}
-
-// Height implements the chain.Block interface
-func (b *Block) Height() uint64 {
-	return b.height
-}
-
-// Timestamp implements the chain.Block interface
-func (b *Block) Timestamp() time.Time {
-	return b.timestamp
-}
-
-// Verify implements the chain.Block interface
-func (b *Block) Verify(ctx context.Context) error {
-	if b.height == 0 && b.parentID != ids.Empty {
-		return errInvalidBlock
-	}
-
-	for _, update := range b.schemaUpdates {
-		if update.Operation != "create" && update.Operation != "update" && update.Operation != "delete" {
-			return errors.New("invalid schema operation")
-		}
-	}
-
-	for _, result := range b.queryResults {
-		if _, exists := b.vm.queries[result.QueryID]; !exists {
-			return errors.New("result for unknown query")
-		}
-	}
-
-	b.status = choices.Processing
-	return nil
-}
+func (b *Block) Status() uint8 { return uint8(choices.Accepted) }
 
 // Bytes implements the block.Block interface. It returns the deterministic
 // canonical encoding set at construction; the block ID is the SHA-256 of
 // exactly these bytes, so ParseBlock(b.Bytes()).ID() == b.ID().
-func (b *Block) Bytes() []byte {
-	return b.bytes
+func (b *Block) Bytes() []byte { return b.bytes }
+
+// Verify implements the chain.Block interface. Genesis is the root of trust and
+// nothing else can reach here — ParseBlock and GetBlock hand out no other block
+// — so this asks the one question the chain answers.
+func (b *Block) Verify(context.Context) error {
+	if b.id != b.vm.genesis.ID() {
+		return errReadOnlyChain
+	}
+	return nil
+}
+
+// Accept implements the chain.Block interface. Genesis is already the accepted
+// frontier, so accepting it changes nothing; accepting anything else would move
+// the frontier to a block GetBlock cannot return, which is the shape that
+// leaves a node unable to boot.
+func (b *Block) Accept(context.Context) error {
+	if b.id != b.vm.genesis.ID() {
+		return errReadOnlyChain
+	}
+	return nil
+}
+
+// Reject implements the chain.Block interface. The frontier is the only block
+// there is, and rejecting it would leave the chain without one.
+func (b *Block) Reject(context.Context) error {
+	return errReadOnlyChain
 }
 
 // genesisTimestamp is the deterministic timestamp of the G-Chain genesis block.
@@ -259,43 +140,29 @@ func parseGBlock(raw []byte) (parentID ids.ID, height uint64, timestamp int64, p
 	return
 }
 
-// newGenesisBlock builds the G-Chain genesis block (height 0) deterministically
-// from the genesis config bytes. The G-Chain is a read-only query/index chain —
-// it never builds blocks past genesis — so this is its permanent last-accepted
-// block, the one GetBlock(LastAccepted()) must return during Initialize.
-func newGenesisBlock(vm *VM, genesisBytes []byte) (*Block, error) {
-	return newBlock(vm, ids.Empty, 0, genesisTimestamp, genesisBytes)
-}
-
-// newBlock constructs a block, computes its canonical bytes and content-
-// addressed ID, and returns it ready to serve.
-func newBlock(vm *VM, parentID ids.ID, height uint64, timestamp time.Time, payload []byte) (*Block, error) {
-	raw := marshalGBlock(parentID, height, timestamp.Unix(), payload)
+// newBlock builds the G-Chain genesis block (height 0) deterministically from
+// the genesis config bytes. The G-Chain is a read-only query chain — it never
+// builds blocks past genesis — so this is its permanent last-accepted block,
+// the one GetBlock(LastAccepted()) must return during Initialize.
+func newBlock(vm *VM, genesisBytes []byte) *Block {
+	raw := marshalGBlock(ids.Empty, 0, genesisTimestamp.Unix(), genesisBytes)
 	return &Block{
-		vm:        vm,
-		id:        ids.ID(hash.ComputeHash256(raw)),
-		parentID:  parentID,
-		height:    height,
-		timestamp: timestamp,
-		status:    choices.Accepted,
-		bytes:     raw,
-	}, nil
+		vm:    vm,
+		id:    ids.ID(hash.ComputeHash256(raw)),
+		bytes: raw,
+	}
 }
 
-// parseBlock decodes the canonical wire bytes produced by newBlock back into a
-// Block whose ID is recomputed from those exact bytes.
+// parseBlock decodes canonical block wire and returns the genesis block those
+// bytes name. Wire that decodes but names some other block is refused: this
+// chain builds nothing, so there is no other block to name, and admitting one
+// would hand the engine a frontier that GetBlock reports as not found.
 func parseBlock(vm *VM, raw []byte) (*Block, error) {
-	parentID, height, timestamp, _, err := parseGBlock(raw)
-	if err != nil {
+	if _, _, _, _, err := parseGBlock(raw); err != nil {
 		return nil, err
 	}
-	return &Block{
-		vm:        vm,
-		id:        ids.ID(hash.ComputeHash256(raw)),
-		parentID:  parentID,
-		height:    height,
-		timestamp: time.Unix(timestamp, 0).UTC(),
-		status:    choices.Accepted,
-		bytes:     raw,
-	}, nil
+	if ids.ID(hash.ComputeHash256(raw)) != vm.genesis.ID() {
+		return nil, errReadOnlyChain
+	}
+	return vm.genesis, nil
 }
