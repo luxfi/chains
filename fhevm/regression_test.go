@@ -714,3 +714,64 @@ func blockBytesWithBlobPadding(b *Block, pad []byte) []byte {
 	ob.FinishAsRoot()
 	return bld.Finish()
 }
+
+// M3: a follower could not verify a block whose parent it had only parsed. The
+// in-flight block set was written in exactly one place — BuildBlock — so a block
+// arriving from a peer was never findable by id, and its child failed with
+// "verify parent: not found" no matter what it contained.
+//
+// The parent lookup is what this fixes. Note what it does NOT fix: Verify checks
+// nonces against COMMITTED state, so two blocks in flight from the SAME payer
+// still cannot both verify — the second reads a nonce the first has not yet
+// committed. Verifying against the parent's resulting state needs a per-block
+// overlay and is a separate change; keyvm has the same limit.
+func TestM3_AFollowerCanVerifyAgainstAParentItOnlyParsed(t *testing.T) {
+	first, second := newTestKey(t), newTestKey(t)
+	committee, _ := newCommittee(t, 1)
+	proposer := newTestVM(t, fundAll(first, second), committee, 1)
+	follower := newTestVM(t, fundAll(first, second), committee, 1)
+
+	build := func(k testKey, handle string) *Block {
+		_, err := proposer.SubmitTx(registerTx(t, k, testScheme, digestOf(handle), 1))
+		require.NoError(t, err)
+		blk, err := proposer.BuildBlock(context.Background())
+		require.NoError(t, err)
+		return blk.(*Block)
+	}
+
+	b1 := build(first, "one")
+	require.NoError(t, b1.Accept(context.Background()))
+	b2 := build(second, "two") // built on b1, still in flight
+
+	// The follower accepts neither. b2 must still verify: its parent is a block
+	// the follower has only parsed.
+	p1, err := follower.ParseBlock(context.Background(), b1.Bytes())
+	require.NoError(t, err)
+	require.NoError(t, p1.Verify(context.Background()))
+
+	p2, err := follower.ParseBlock(context.Background(), b2.Bytes())
+	require.NoError(t, err)
+	require.NoError(t, p2.Verify(context.Background()),
+		"a verified parent must be findable, whoever built it")
+}
+
+// M3: the tracker must not become the leak that an unreleased claim was. The
+// engine may drop a block it never accepts and never rejects, so nothing else
+// removes it — anything at or below the last accepted height is decided or
+// orphaned and must not be retained.
+func TestM3_TheInFlightSetIsBounded(t *testing.T) {
+	k := newTestKey(t)
+	committee, _ := newCommittee(t, 1)
+	vm := newTestVM(t, fundAll(k), committee, 1)
+
+	for nonce := uint64(1); nonce <= 4; nonce++ {
+		acceptOne(t, vm, registerTx(t, k, testScheme, digestOf(string(rune('a'+nonce))), nonce))
+	}
+
+	vm.stateLock.RLock()
+	defer vm.stateLock.RUnlock()
+	for id, blk := range vm.pendingBlocks {
+		require.Greater(t, blk.height, vm.height,
+			"block %s at height %d is at or below the accepted height %d", id, blk.height, vm.height)
+	}
+}
