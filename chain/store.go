@@ -189,8 +189,6 @@ func (s *Store[B]) Seed(write func(database.Database) error) error {
 // tip until the engine says otherwise, and a preference the store no longer
 // holds — pruned, or never tracked — falls back to the tip rather than naming
 // a parent nothing can resolve.
-//
-//nolint:unused // Prefer is the ChainVM SetPreference surface.
 func (s *Store[B]) Prefer(id ids.ID) {
 	s.Lock()
 	defer s.Unlock()
