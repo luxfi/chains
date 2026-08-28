@@ -9,10 +9,14 @@ import (
 	"errors"
 	"time"
 
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/consensus/core/choices"
+	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 )
+
+var _ chain.Block = (*Block)(nil)
 
 // Block represents a block in the IdentityVM chain
 type Block struct {
@@ -134,88 +138,60 @@ func (b *Block) verifyCredential(cred *Credential) error {
 	return nil
 }
 
-// Accept accepts the block
+// Accept applies the block. The store commits everything below in one batch,
+// so a credential that cannot be written takes the whole block with it rather
+// than leaving the chain holding half of one.
 func (b *Block) Accept(ctx context.Context) error {
-	b.status = choices.Accepted
+	return b.vm.chain.Accept(b)
+}
 
-	b.vm.mu.Lock()
-	defer b.vm.mu.Unlock()
-
-	// Update VM state
-	b.vm.lastAccepted = b
-	b.vm.lastAcceptedID = b.ID()
-
-	// Save last accepted
-	id := b.ID()
-	if err := b.vm.db.Put(lastAcceptedKey, id[:]); err != nil {
-		return err
-	}
-
-	// Save block
-	blockBytes := b.Bytes()
-	if blockBytes == nil {
-		return errors.New("failed to serialize block")
-	}
-
-	if err := b.vm.db.Put(id[:], blockBytes); err != nil {
-		return err
-	}
-
-	// Process credentials
+// Write records every credential the block carries. The error a Put returns
+// used to be dropped here, which meant a credential silently missing from the
+// database while the chain went on believing the block had been applied.
+func (b *Block) Write(db database.Database) error {
 	for _, cred := range b.Credentials {
-		b.vm.credentials[cred.ID] = cred
-
-		// Persist credential (native ZAP wire)
-		credBytes := marshalCredential(cred)
-		credKey := append(credentialPrefix, cred.ID[:]...)
-		b.vm.db.Put(credKey, credBytes)
-
-		// Remove from pending
-		for i, pending := range b.vm.pendingCreds {
-			if pending.ID == cred.ID {
-				b.vm.pendingCreds = append(b.vm.pendingCreds[:i], b.vm.pendingCreds[i+1:]...)
-				break
-			}
+		if err := db.Put(credentialKey(cred.ID), marshalCredential(cred)); err != nil {
+			return err
 		}
 	}
+	return nil
+}
 
-	// Process revocations
+// Publish makes the block's effects visible: the credentials it carries, the
+// revocations it applies, the identities it introduces, and the block's own
+// status. It runs after the commit, so nothing here can be believed and then
+// lost — which is what setting them first did.
+func (b *Block) Publish() {
+	vm := b.vm
+
+	for _, cred := range b.Credentials {
+		vm.credentials[cred.ID] = cred
+	}
 	for _, rev := range b.Revocations {
-		b.vm.revocations[rev.CredentialID] = rev
-
-		// Update credential status
-		if cred, ok := b.vm.credentials[rev.CredentialID]; ok {
+		vm.revocations[rev.CredentialID] = rev
+		if cred, ok := vm.credentials[rev.CredentialID]; ok {
 			cred.Status = CredentialRevoked
 		}
 	}
-
-	// Process new identities
 	for _, identity := range b.Identities {
-		b.vm.identities[identity.ID] = identity
+		vm.identities[identity.ID] = identity
 	}
 
-	// Remove from pending blocks
-	delete(b.vm.pendingBlocks, b.ID())
+	vm.pending.Drop(b.Credentials)
+	b.status = choices.Accepted
 
-	b.vm.log.Info("Block accepted",
+	vm.log.Info("Block accepted",
 		log.Uint64("height", b.BlockHeight),
 		log.String("id", b.ID().String()),
 		log.Int("credentials", len(b.Credentials)),
 	)
-
-	return nil
 }
 
-// Reject rejects the block
+// Reject discards the block. It wrote nothing, so there is nothing to undo;
+// its credentials stay queued for a later block.
 func (b *Block) Reject(ctx context.Context) error {
 	b.status = choices.Rejected
-
-	b.vm.mu.Lock()
-	defer b.vm.mu.Unlock()
-
-	// Remove from pending blocks
-	delete(b.vm.pendingBlocks, b.ID())
-
+	b.vm.chain.Drop(b.ID())
 	return nil
 }
 

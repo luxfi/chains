@@ -78,11 +78,11 @@ func TestRequireZKProofsCannotBeSkippedByOmittingTheProof(t *testing.T) {
 	withProof := credentialExpiringAt(time.Now().Add(time.Hour))
 	withProof.Proof = &CredentialProof{Type: "zk", ZKProof: []byte("proof-bytes")}
 
-	vm.mu.Lock()
+	vm.chain.Lock()
 	for _, c := range []*Credential{noProof, emptyProof, withProof} {
 		vm.credentials[c.ID] = c
 	}
-	vm.mu.Unlock()
+	vm.chain.Unlock()
 
 	ok, err := vm.VerifyCredential(noProof.ID)
 	require.False(ok, "a credential with no proof must not satisfy RequireZKProofs")
