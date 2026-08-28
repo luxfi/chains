@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/database/memdb"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
@@ -22,18 +23,17 @@ func vmWithPending(t *testing.T, n int) (*VM, []ids.ID) {
 	t.Helper()
 
 	vm := &VM{
-		db:             memdb.New(),
 		log:            log.NewNoOpLogger(),
 		config:         BridgeConfig{MinConfirmations: 1, MaxBridgeAmount: 1 << 40, DailyBridgeLimit: 1 << 40},
 		pendingBridges: make(map[ids.ID]*BridgeRequest, n),
-		pendingBlocks:  make(map[ids.ID]*Block),
 		bridgeRegistry: &BridgeRegistry{DailyVolume: make(map[string]uint64)},
 	}
+	vm.chain = chain.New[*Block](memdb.New(), nil)
 
 	parent := &Block{BlockHeight: 0, BlockTimestamp: 0, ParentID_: ids.Empty, BridgeRequests: []*BridgeRequest{}, vm: vm}
 	parent.ID_ = parent.computeID()
-	require.NoError(t, vm.putBlock(parent))
-	vm.lastAcceptedID = parent.ID()
+	_, _, err := vm.chain.Open(parent, vm.parseBlock)
+	require.NoError(t, err)
 
 	want := make([]ids.ID, 0, n)
 	for i := 0; i < n; i++ {

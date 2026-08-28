@@ -84,8 +84,9 @@ func newReleaser(vm *VM) *releaser {
 	return r
 }
 
-// enqueue is a non-blocking submit called from Block.Accept (under vm.mu). If the
-// queue is full the request is dropped with a warning; it will be re-observed.
+// enqueue is a non-blocking submit, called once a block carrying the transfer
+// has committed. If the queue is full the request is dropped with a warning; it
+// will be re-observed.
 func (r *releaser) enqueue(req *BridgeRequest) {
 	select {
 	case r.queue <- req:

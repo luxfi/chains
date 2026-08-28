@@ -7,6 +7,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/vms/types/fee"
 )
@@ -16,8 +17,7 @@ import (
 // custody keygen handshake, 1M LUX bond validation, etc.).
 func newBridgeVMWithPolicy(networkID uint32) *VM {
 	v := &VM{log: log.NewNoOpLogger()}
-	v.networkID = networkID
-	v.feePolicy = newFeePolicy(networkID)
+	v.fee = chain.Floor(networkID)
 	return v
 }
 

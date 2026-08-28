@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/consensus/core/choices"
+	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/threshold/pkg/ecdsa"
@@ -72,37 +74,47 @@ func (b *Block) computeID() ids.ID {
 	return ids.ID(h.Sum(nil))
 }
 
-// Accept marks the block as accepted
+// Accept records the block and everything it decides, in one commit.
+//
+// It used to credit the daily volume, complete the requests, advance
+// lastAcceptedID and hand the transfers to the release worker — which
+// broadcasts on an external chain — and only then write the block. A write
+// that failed left every one of those done and the block missing, including a
+// release already in flight for a transfer no block records.
 func (b *Block) Accept(ctx context.Context) error {
-	b.vm.mu.Lock()
-	defer b.vm.mu.Unlock()
+	return b.vm.chain.Accept(b)
+}
 
-	// Process bridge requests
+// Write records nothing beyond the block itself, which the store writes. The
+// bridge registry and the daily volume this block advances are held in memory
+// only — see the note on BridgeRegistry — so they are published, not written.
+func (b *Block) Write(database.Database) error { return nil }
+
+// Publish completes the block's transfers and hands them to the release
+// worker. It runs after the commit, so an external release is only ever
+// started for a transfer the chain has durably recorded.
+func (b *Block) Publish() {
+	b.status = choices.Accepted
+
 	for _, req := range b.BridgeRequests {
-		// Update bridge registry
-		b.vm.bridgeRegistry.mu.Lock()
-
 		completed := &CompletedBridge{
 			RequestID:   req.ID,
 			SourceTxID:  req.SourceTxID,
-			CompletedAt: time.Now(),
+			CompletedAt: b.Timestamp(),
 		}
-
 		// Collect MPC signatures
 		if len(req.MPCSignatures) > 0 {
 			completed.MPCSignature = req.MPCSignatures[0] // Use aggregated signature
 		}
 
+		b.vm.bridgeRegistry.mu.Lock()
 		b.vm.bridgeRegistry.CompletedBridges[req.ID] = completed
-
-		// Update daily volume
-		volume := b.vm.bridgeRegistry.DailyVolume[req.DestChain]
-		b.vm.bridgeRegistry.DailyVolume[req.DestChain] = volume + req.Amount
-
+		b.vm.bridgeRegistry.DailyVolume[req.DestChain] += req.Amount
 		b.vm.bridgeRegistry.mu.Unlock()
 
-		// Remove from pending
+		b.vm.mu.Lock()
 		delete(b.vm.pendingBridges, req.ID)
+		b.vm.mu.Unlock()
 
 		b.vm.log.Info("completed bridge request",
 			log.Stringer("requestID", req.ID),
@@ -111,33 +123,19 @@ func (b *Block) Accept(ctx context.Context) error {
 		)
 
 		// Hand the confirmed transfer to the release worker (relayer nodes only).
-		// Non-blocking: the actual attestation + EVM broadcast happen off the
-		// consensus path so Accept never waits on network I/O. Every relayer
+		// Non-blocking: the attestation and EVM broadcast happen off the
+		// consensus path so this never waits on network I/O. Every relayer
 		// broadcasts; the on-chain nonce replay-guard collapses duplicates.
 		if b.vm.releaser != nil {
 			b.vm.releaser.enqueue(req)
 		}
 	}
-
-	// Update state
-	b.status = choices.Accepted
-	b.vm.lastAcceptedID = b.ID()
-
-	// Remove from pending blocks
-	delete(b.vm.pendingBlocks, b.ID())
-
-	// Persist block
-	return b.vm.putBlock(b)
 }
 
 // Reject marks the block as rejected
 func (b *Block) Reject(ctx context.Context) error {
-	b.vm.mu.Lock()
-	defer b.vm.mu.Unlock()
-
 	b.status = choices.Rejected
-	delete(b.vm.pendingBlocks, b.ID())
-
+	b.vm.chain.Drop(b.ID())
 	return nil
 }
 
@@ -329,3 +327,5 @@ func (b *Block) Bytes() []byte {
 	b.bytes = bytes
 	return bytes
 }
+
+var _ chain.Block = (*Block)(nil)
