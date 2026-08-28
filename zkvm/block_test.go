@@ -24,6 +24,7 @@ func blockTx(fee uint64) *Transaction {
 		Nullifiers:         [][]byte{[]byte("n1"), []byte("n2")},
 		Outputs:            []*ShieldedOutput{{Commitment: []byte("c"), EncryptedNote: []byte("n"), EphemeralPubKey: []byte("e"), OutputProof: []byte("p")}},
 		Proof:              &ZKProof{ProofType: "groth16", ProofData: []byte("pd"), PublicInputs: [][]byte{[]byte("a"), []byte("bb")}},
+		Expiry:             1 << 20,
 		Memo:               []byte("memo"),
 	}
 	tx.ID = tx.ComputeID()

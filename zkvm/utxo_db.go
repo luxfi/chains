@@ -6,6 +6,7 @@ package zkvm
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/luxfi/log"
@@ -16,6 +17,10 @@ import (
 
 // Database prefix for UTXO records: utxoPrefix || commitment -> marshalled UTXO.
 const utxoPrefix = 0x10
+
+// errNoUTXO — the commitment names no unspent output. Distinct from a read
+// that failed, which is reported as the failure it is.
+var errNoUTXO = errors.New("zkvm: no such utxo")
 
 // UTXO represents an unspent transaction output
 type UTXO struct {
@@ -39,19 +44,15 @@ type UTXODB struct {
 	// the records.
 	utxoCache map[string]uint64
 
-	// Indexes
-	heightIndex map[uint64][]string // height -> commitments
-
 	mu sync.RWMutex
 }
 
 // NewUTXODB creates a new UTXO database
 func NewUTXODB(db database.Database, log log.Logger) (*UTXODB, error) {
 	udb := &UTXODB{
-		db:          db,
-		log:         log,
-		utxoCache:   make(map[string]uint64),
-		heightIndex: make(map[uint64][]string),
+		db:        db,
+		log:       log,
+		utxoCache: make(map[string]uint64),
 	}
 
 	if err := udb.loadUTXOs(); err != nil {
@@ -88,7 +89,6 @@ func (udb *UTXODB) AddUTXO(utxo *UTXO) error {
 
 	// Update the set and the height index
 	udb.utxoCache[commitmentStr] = utxo.Height
-	udb.heightIndex[utxo.Height] = append(udb.heightIndex[utxo.Height], commitmentStr)
 
 	udb.log.Debug("Added UTXO",
 		log.String("txID", utxo.TxID.String()),
@@ -114,63 +114,6 @@ func (udb *UTXODB) GetUTXO(commitment []byte) (*UTXO, error) {
 	return udb.read(commitment)
 }
 
-// RemoveUTXO removes a UTXO from the set
-func (udb *UTXODB) RemoveUTXO(commitment []byte) error {
-	udb.mu.Lock()
-	defer udb.mu.Unlock()
-
-	commitmentStr := string(commitment)
-
-	// The set holds every commitment, so absence here is absence on disk.
-	height, exists := udb.utxoCache[commitmentStr]
-	if !exists {
-		return errors.New("UTXO not found")
-	}
-
-	// Remove from database
-	key := makeUTXOKey(commitment)
-	if err := udb.db.Delete(key); err != nil {
-		return err
-	}
-
-	// Remove from the set
-	delete(udb.utxoCache, commitmentStr)
-
-	// Update height index
-	if heightUTXOs, exists := udb.heightIndex[height]; exists {
-		for i, c := range heightUTXOs {
-			if c == commitmentStr {
-				udb.heightIndex[height] = append(heightUTXOs[:i], heightUTXOs[i+1:]...)
-				break
-			}
-		}
-	}
-
-	return nil
-}
-
-// GetUTXOsByHeight returns all UTXOs created at a specific height
-func (udb *UTXODB) GetUTXOsByHeight(height uint64) ([]*UTXO, error) {
-	udb.mu.RLock()
-	defer udb.mu.RUnlock()
-
-	commitments, exists := udb.heightIndex[height]
-	if !exists {
-		return nil, nil
-	}
-
-	utxos := make([]*UTXO, 0, len(commitments))
-	for _, commitmentStr := range commitments {
-		utxo, err := udb.read([]byte(commitmentStr))
-		if err != nil {
-			return nil, err
-		}
-		utxos = append(utxos, utxo)
-	}
-
-	return utxos, nil
-}
-
 // GetUTXOCount returns the total number of UTXOs.
 //
 // It counts the set rather than reading a running total kept beside it. A total
@@ -182,65 +125,6 @@ func (udb *UTXODB) GetUTXOCount() uint64 {
 	udb.mu.RLock()
 	defer udb.mu.RUnlock()
 	return uint64(len(udb.utxoCache))
-}
-
-// GetAllCommitments returns all UTXO commitments (for Merkle tree)
-func (udb *UTXODB) GetAllCommitments() [][]byte {
-	udb.mu.RLock()
-	defer udb.mu.RUnlock()
-
-	commitments := make([][]byte, 0, len(udb.utxoCache))
-	for commitmentStr := range udb.utxoCache {
-		commitments = append(commitments, []byte(commitmentStr))
-	}
-
-	return commitments
-}
-
-// PruneOldUTXOs removes UTXOs older than a certain height
-func (udb *UTXODB) PruneOldUTXOs(minHeight uint64) error {
-	udb.mu.Lock()
-	defer udb.mu.Unlock()
-
-	pruneCount := 0
-
-	// Find heights to prune
-	var heightsToPrune []uint64
-	for height := range udb.heightIndex {
-		if height < minHeight {
-			heightsToPrune = append(heightsToPrune, height)
-		}
-	}
-
-	// Prune UTXOs at each height
-	for _, height := range heightsToPrune {
-		commitments := udb.heightIndex[height]
-		for _, commitmentStr := range commitments {
-			commitment := []byte(commitmentStr)
-
-			// Remove from database
-			key := makeUTXOKey(commitment)
-			if err := udb.db.Delete(key); err != nil {
-				udb.log.Warn("Failed to prune UTXO", log.Reflect("error", err))
-				continue
-			}
-
-			// Remove from the set
-			delete(udb.utxoCache, commitmentStr)
-			pruneCount++
-		}
-
-		// Remove height index
-		delete(udb.heightIndex, height)
-	}
-
-	udb.log.Info("Pruned old UTXOs",
-		log.Int("pruneCount", pruneCount),
-		log.Uint64("minHeight", minHeight),
-		log.Int("remainingUTXOs", len(udb.utxoCache)),
-	)
-
-	return nil
 }
 
 // loadUTXOs rebuilds the set and the height index from the records.
@@ -269,7 +153,6 @@ func (udb *UTXODB) loadUTXOs() error {
 
 		commitmentStr := string(commitment)
 		udb.utxoCache[commitmentStr] = utxo.Height
-		udb.heightIndex[utxo.Height] = append(udb.heightIndex[utxo.Height], commitmentStr)
 	}
 
 	return it.Error()
@@ -282,17 +165,20 @@ func (udb *UTXODB) reload() error {
 	defer udb.mu.Unlock()
 
 	udb.utxoCache = make(map[string]uint64)
-	udb.heightIndex = make(map[uint64][]string)
 	return udb.loadUTXOs()
 }
 
 // read returns the record for a commitment. It touches no shared state, so it
 // is safe under either lock.
 func (udb *UTXODB) read(commitment []byte) (*UTXO, error) {
-	key := makeUTXOKey(commitment)
-	utxoBytes, err := udb.db.Get(key)
-	if err != nil {
-		return nil, errors.New("UTXO not found")
+	utxoBytes, err := udb.db.Get(makeUTXOKey(commitment))
+	switch {
+	case errors.Is(err, database.ErrNotFound):
+		return nil, errNoUTXO
+	case err != nil:
+		// A read that FAILED is not a UTXO that is absent. Reported as absent
+		// it says a note was never created, rather than that the disk is gone.
+		return nil, fmt.Errorf("zkvm: read utxo: %w", err)
 	}
 
 	var utxo UTXO
@@ -317,5 +203,4 @@ func (udb *UTXODB) Close() {
 	defer udb.mu.Unlock()
 
 	udb.utxoCache = nil
-	udb.heightIndex = nil
 }

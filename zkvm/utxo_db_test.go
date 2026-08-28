@@ -4,6 +4,7 @@
 package zkvm
 
 import (
+	"reflect"
 	"sync"
 	"testing"
 
@@ -51,17 +52,19 @@ func TestUTXOCountIsReadOffTheRecords(t *testing.T) {
 	require.Equal(t, uint64(1), udb.GetUTXOCount(),
 		"the count is read off the records, so it cannot disagree with the set it describes")
 
-	require.NoError(t, udb.RemoveUTXO(utxo.Commitment))
-	require.Zero(t, udb.GetUTXOCount(),
-		"removing the last record must leave zero, not wrap to 2^64-1")
-	require.ErrorContains(t, udb.RemoveUTXO(utxo.Commitment), "not found")
-	require.Zero(t, udb.GetUTXOCount())
+	// There is no removal path: a spend is recorded by its nullifier, and
+	// deleting the output the note names would destroy the record of it.
+	typ := reflect.TypeOf(udb)
+	for _, name := range []string{"RemoveUTXO", "PruneOldUTXOs", "Delete", "Clear"} {
+		_, found := typ.MethodByName(name)
+		require.False(t, found, "%s must not exist", name)
+	}
 }
 
-// TestRestartRebuildsTheHeightIndex. Pruning and the Merkle view read the
-// height index and the commitment list. A restart that left them empty had the
-// node reporting a UTXO set it was still holding.
-func TestRestartRebuildsTheHeightIndex(t *testing.T) {
+// TestRestartRebuildsTheSet. The set decides whether a commitment already
+// exists. It lives in memory, so a restart that left it empty had the node
+// accepting an output it was already holding.
+func TestRestartRebuildsTheSet(t *testing.T) {
 	db := memdb.New()
 	live, err := NewUTXODB(db, log.NoLog{})
 	require.NoError(t, err)
@@ -74,20 +77,18 @@ func TestRestartRebuildsTheHeightIndex(t *testing.T) {
 
 	restarted, err := NewUTXODB(db, log.NoLog{})
 	require.NoError(t, err)
-	require.Len(t, restarted.GetAllCommitments(), 3, "the commitment set is rebuilt from the records")
+	require.Equal(t, uint64(3), restarted.GetUTXOCount(), "the set is rebuilt from the records")
 
-	byHeight, err := restarted.GetUTXOsByHeight(5)
-	require.NoError(t, err)
-	require.Len(t, byHeight, 3, "and so is the height index")
-	for _, utxo := range byHeight {
+	for i := 0; i < 3; i++ {
+		utxo, err := restarted.GetUTXO([]byte{'c', byte(i)})
+		require.NoError(t, err)
 		require.Equal(t, uint64(5), utxo.Height)
-		require.Equal(t, []byte{'n', utxo.Commitment[1]}, utxo.Ciphertext,
+		require.Equal(t, []byte{'n', byte(i)}, utxo.Ciphertext,
 			"the body comes back whole, not just its key")
 	}
 
-	empty, err := restarted.GetUTXOsByHeight(6)
-	require.NoError(t, err)
-	require.Empty(t, empty, "a height nothing was created at holds nothing")
+	_, err = restarted.GetUTXO([]byte("never"))
+	require.ErrorIs(t, err, errNoUTXO)
 }
 
 // TestUTXOReadDoesNotWriteTheSet. GetUTXO must not memoise what it loads while
@@ -138,5 +139,4 @@ func TestForeignRecordIsNotAUTXO(t *testing.T) {
 	udb, err := NewUTXODB(db, log.NoLog{})
 	require.NoError(t, err)
 	require.Zero(t, udb.GetUTXOCount(), "someone else's key is not a commitment")
-	require.Empty(t, udb.GetAllCommitments())
 }

@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"time"
 
 	"github.com/luxfi/log"
 
@@ -37,9 +36,8 @@ type Mempool struct {
 
 // MempoolTx represents a transaction in the mempool
 type MempoolTx struct {
-	tx         *Transaction
-	addedAt    time.Time
-	feePerByte uint64
+	tx  *Transaction
+	fee uint64
 }
 
 // NewMempool creates a new mempool
@@ -53,10 +51,17 @@ func NewMempool(maxSize int, log log.Logger) *Mempool {
 	}
 }
 
-// AddTransaction adds a transaction to the mempool
+// AddTransaction adds a transaction to the mempool.
+//
+// The id is derived here, not read from the caller. An HTTP client decoding
+// straight into a Transaction supplies whatever id it likes, and a proposer
+// that carried that id would compute a block id its own peers do not — the
+// block it built would not be the block they see.
 func (mp *Mempool) AddTransaction(tx *Transaction) error {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
+
+	tx.ID = tx.ComputeID()
 
 	// Check if transaction already exists
 	if _, exists := mp.txs[tx.ID]; exists {
@@ -74,28 +79,20 @@ func (mp *Mempool) AddTransaction(tx *Transaction) error {
 		}
 	}
 
-	// Fixed size estimate for fee calculation
-	txSize := uint64(256)
-	feePerByte := tx.Fee / txSize
-
 	// A full pool gives up whatever pays least, so what it holds is always the
 	// best it has been offered. An arrival that is itself the cheapest is
 	// refused: taking it would mean dropping a better transaction for a worse
-	// one.
+	// one. Ordering is by fee — it used to divide every fee by the same fixed
+	// 256, which orders identically and reads as a rate it is not.
 	if len(mp.txs) >= mp.maxSize {
 		cheapest := mp.cheapest()
-		if cheapest == nil || cheapest.feePerByte >= feePerByte {
+		if cheapest == nil || cheapest.fee >= tx.Fee {
 			return errors.New("mempool is full and the transaction pays less than what it would displace")
 		}
 		mp.removeTxNoLock(cheapest.tx.ID)
 	}
 
-	// Create mempool entry
-	mempoolTx := &MempoolTx{
-		tx:         tx,
-		addedAt:    time.Now(),
-		feePerByte: feePerByte,
-	}
+	mempoolTx := &MempoolTx{tx: tx, fee: tx.Fee}
 
 	// Add to storage
 	mp.txs[tx.ID] = mempoolTx
@@ -132,14 +129,14 @@ func (mp *Mempool) RemoveTransaction(txID ids.ID) {
 	mp.removeTxNoLock(txID)
 }
 
-// cheapest returns the transaction paying least per byte, which is the one a
-// full pool gives up. The heap is ordered highest-first, so the cheapest sits
-// among its leaves rather than at its root; the pool is bounded and this runs
-// only when it is full, so walking it is the whole of the work.
+// cheapest returns the transaction paying least, which is the one a full pool
+// gives up. The heap is ordered highest-first, so the cheapest sits among its
+// leaves rather than at its root; the pool is bounded and this runs only when
+// it is full, so walking it is the whole of the work.
 func (mp *Mempool) cheapest() *MempoolTx {
 	var out *MempoolTx
 	for _, candidate := range mp.txHeap {
-		if out == nil || candidate.feePerByte < out.feePerByte {
+		if out == nil || candidate.fee < out.fee {
 			out = candidate
 		}
 	}
@@ -199,15 +196,6 @@ func (mp *Mempool) HasTransaction(txID ids.ID) bool {
 	return exists
 }
 
-// HasNullifier checks if a nullifier is already in the mempool
-func (mp *Mempool) HasNullifier(nullifier []byte) bool {
-	mp.mu.RLock()
-	defer mp.mu.RUnlock()
-
-	_, exists := mp.nullifiers[string(nullifier)]
-	return exists
-}
-
 // Size returns the number of transactions in the mempool
 func (mp *Mempool) Size() int {
 	mp.mu.RLock()
@@ -216,19 +204,9 @@ func (mp *Mempool) Size() int {
 	return len(mp.txs)
 }
 
-// Clear removes all transactions from the mempool
-func (mp *Mempool) Clear() {
-	mp.mu.Lock()
-	defer mp.mu.Unlock()
-
-	mp.txs = make(map[ids.ID]*MempoolTx)
-	mp.txHeap = make(TxHeap, 0)
-	mp.nullifiers = make(map[string]ids.ID)
-
-	mp.log.Info("Mempool cleared")
-}
-
-// PruneExpired removes expired transactions
+// PruneExpired drops transactions the chain has passed. Nothing else does:
+// a transaction that can never enter a block occupies a slot forever, and a
+// pool full of those refuses every honest arrival that pays the same floor.
 func (mp *Mempool) PruneExpired(currentHeight uint64) {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
@@ -259,8 +237,8 @@ type TxHeap []*MempoolTx
 func (h TxHeap) Len() int { return len(h) }
 
 func (h TxHeap) Less(i, j int) bool {
-	// Higher fee per byte = higher priority
-	return h[i].feePerByte > h[j].feePerByte
+	// Higher fee = higher priority
+	return h[i].fee > h[j].fee
 }
 
 func (h TxHeap) Swap(i, j int) {

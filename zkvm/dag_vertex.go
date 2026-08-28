@@ -7,7 +7,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"time"
+	"errors"
+	"fmt"
 
 	"github.com/luxfi/consensus/core/choices"
 	"github.com/luxfi/consensus/engine/dag/vertex"
@@ -16,6 +17,8 @@ import (
 )
 
 var _ vertex.DAGVM = (*VM)(nil)
+
+var errNoTransactions = errors.New("zkvm: nothing to propose")
 
 // Vertex represents a DAG vertex in the ZK UTXO chain.
 // Conflict key: set of nullifiers spent in the vertex.
@@ -40,11 +43,33 @@ func (v *Vertex) Parents() []ids.ID      { return v.parents }
 func (v *Vertex) Txs() []ids.ID          { return v.txIDs }
 func (v *Vertex) Status() choices.Status { return v.status }
 
+// Verify holds a vertex to what a block is held to. It used to check the
+// transactions and NOTHING ELSE — not the parents, not the height — so a vertex
+// naming no parent at height 1<<40 verified, and accepting it set the store's
+// height to 1<<40, pruned every block in flight, and left the linear chain
+// unable to propose a child ever again.
 func (v *Vertex) Verify(ctx context.Context) error {
-	// Every nullifier in the vertex must be distinct. verifyTransaction only sees
-	// accepted state; BuildVertex already refuses to batch conflicting txs, and a
-	// vertex that arrived on the wire is held to the same rule or one shielded
-	// note is spent twice.
+	if uint32(len(v.txs)) > v.vm.config.MaxTxPerBlock {
+		return fmt.Errorf("%w: %d transactions over the %d cap",
+			errInvalidBlock, len(v.txs), v.vm.config.MaxTxPerBlock)
+	}
+
+	// A vertex extends the frontier. The store keeps one tip for both shapes,
+	// so a vertex that names something else moves the chain sideways.
+	tip, tipHeight := v.vm.chain.Tip()
+	if len(v.parents) != 1 || v.parents[0] != tip {
+		return fmt.Errorf("%w: vertex parents %v do not name the tip %s",
+			ErrNotOnTip, v.parents, tip)
+	}
+	if v.height != tipHeight+1 {
+		return fmt.Errorf("%w: height %d does not follow the tip at %d",
+			errInvalidHeight, v.height, tipHeight)
+	}
+
+	// Every nullifier in the vertex must be distinct. admit only sees
+	// nullifiers already spent in ACCEPTED state; BuildVertex refuses to batch
+	// conflicting txs, and a vertex that arrived on the wire is held to the
+	// same rule or one shielded note is spent twice.
 	spentHere := make(map[string]struct{}, len(v.txs))
 	for _, tx := range v.txs {
 		for _, nullifier := range tx.Nullifiers {
@@ -55,10 +80,7 @@ func (v *Vertex) Verify(ctx context.Context) error {
 		}
 	}
 	for _, tx := range v.txs {
-		if err := tx.ValidateBasic(); err != nil {
-			return err
-		}
-		if err := v.vm.verifyTransaction(tx); err != nil {
+		if err := v.vm.admit(tx, v.height); err != nil {
 			return err
 		}
 	}
@@ -70,6 +92,12 @@ func (v *Vertex) Verify(ctx context.Context) error {
 // the tip. A vertex is not a block — it has several parents and no timestamp —
 // but it changes state the same way, and this is that way.
 func (v *Vertex) Accept(ctx context.Context) error {
+	// The tip moves between Verify and here. See Block.Accept.
+	tip, _ := v.vm.chain.Tip()
+	if len(v.parents) != 1 || v.parents[0] != tip {
+		return fmt.Errorf("%w: vertex %s extends %v, and the tip is %s",
+			ErrNotOnTip, v.id, v.parents, tip)
+	}
 	return v.vm.chain.Accept(v)
 }
 
@@ -147,18 +175,17 @@ func (v *Vertex) ConflictsVertex(other vertex.Vertex) bool {
 	return v.Conflicts(ov)
 }
 
+// computeID binds the chain, the shape and the content. See Block.computeID.
 func (v *Vertex) computeID() ids.ID {
 	h := sha256.New()
+	h.Write(v.vm.bind[:])
 	binary.Write(h, binary.BigEndian, v.height)
 	binary.Write(h, binary.BigEndian, v.epoch)
 	for _, p := range v.parents {
 		h.Write(p[:])
 	}
 	for _, tx := range v.txs {
-		txID := tx.ID
-		if txID == ids.Empty {
-			txID = tx.ComputeID()
-		}
+		txID := tx.ComputeID()
 		h.Write(txID[:])
 	}
 	return ids.ID(h.Sum(nil))
@@ -168,16 +195,19 @@ func (v *Vertex) computeID() ids.ID {
 func (vm *VM) BuildVertex(ctx context.Context) (vertex.Vertex, error) {
 	parent, height := vm.chain.Tip()
 
-	candidates := vm.mempool.GetPendingTransactions(int(vm.config.MaxUTXOsPerBlock))
+	candidates := vm.mempool.GetPendingTransactions(int(vm.config.MaxTxPerBlock))
 	if len(candidates) == 0 {
 		return nil, errNoTransactions
 	}
 
-	// Greedily batch non-conflicting txs: skip any tx whose nullifiers collide with the batch.
+	// Greedily batch non-conflicting txs: skip any tx whose nullifiers collide
+	// with the batch. admit is the same predicate Verify runs, so nothing is
+	// batched that a peer will refuse.
 	usedNullifiers := make(map[string]struct{})
 	var batch []*Transaction
 	for _, tx := range candidates {
-		if err := vm.verifyTransaction(tx); err != nil {
+		if err := vm.admit(tx, height+1); err != nil {
+			vm.mempool.RemoveTransaction(tx.ID)
 			continue
 		}
 		conflict := false
@@ -201,10 +231,7 @@ func (vm *VM) BuildVertex(ctx context.Context) (vertex.Vertex, error) {
 
 	txIDs := make([]ids.ID, len(batch))
 	for i, tx := range batch {
-		if tx.ID == ids.Empty {
-			tx.ID = tx.ComputeID()
-		}
-		txIDs[i] = tx.ID
+		txIDs[i] = tx.ComputeID()
 	}
 
 	v := &Vertex{
@@ -223,23 +250,12 @@ func (vm *VM) BuildVertex(ctx context.Context) (vertex.Vertex, error) {
 
 // ParseVertex deserializes a vertex from bytes.
 func (vm *VM) ParseVertex(ctx context.Context, b []byte) (vertex.Vertex, error) {
-	v, err := deserializeVertex(b, vm)
-	if err != nil {
-		return nil, err
-	}
-	return v, nil
+	return deserializeVertex(b, vm)
 }
 
 func (v *Vertex) serialize() []byte {
 	// Format: height(8) + epoch(4) + parentCount(4) + parents + txCount(4) + txBytes
 	size := 8 + 4 + 4 + len(v.parents)*32 + 4
-	for _, tx := range v.txs {
-		if tx.ID == ids.Empty {
-			tx.ID = tx.ComputeID()
-		}
-	}
-
-	// Estimate: use codec for real txs, here store IDs + raw nullifiers for vertex identity
 	buf := make([]byte, 0, size+len(v.txs)*64)
 
 	b8 := make([]byte, 8)
@@ -320,12 +336,18 @@ func deserializeVertex(data []byte, vm *VM) (*Vertex, error) {
 		if err != nil {
 			return nil, err
 		}
-		if tx.ID == ids.Empty {
-			tx.ID = tx.ComputeID()
-		}
 		txs = append(txs, tx)
 		txIDs = append(txIDs, tx.ID)
 		pos += int(txLen)
+	}
+
+	// Every byte handed in belongs to the vertex, or the value read is not the
+	// value that was sent. Without this, arbitrary trailing bytes rode along in
+	// v.bytes — which is what the store writes to disk — so one logical vertex
+	// had unboundedly many encodings all mapping to the same id, and a peer
+	// could park megabytes under a legitimate one.
+	if pos != len(data) {
+		return nil, errTrailingBytes
 	}
 
 	v := &Vertex{
@@ -341,8 +363,3 @@ func deserializeVertex(data []byte, vm *VM) (*Vertex, error) {
 	v.id = v.computeID()
 	return v, nil
 }
-
-var errNoTransactions = errInvalidBlock // reuse existing sentinel
-
-// compile-time epoch zero for fresh chains
-var _ = time.Now // avoid unused import if time were only in block.go

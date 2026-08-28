@@ -4,17 +4,17 @@
 package zkvm
 
 import (
-	"encoding/json"
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/luxfi/vm"
-	"github.com/luxfi/runtime"
 	"github.com/luxfi/database/memdb"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
+	"github.com/luxfi/runtime"
+	"github.com/luxfi/vm"
 )
 
 func TestVMInitialize(t *testing.T) {
@@ -58,13 +58,8 @@ func TestVMInitialize(t *testing.T) {
 
 	// Create config
 	config := ZConfig{
-		EnableConfidentialTransfers: true,
-		EnablePrivateAddresses:      true,
-		ProofSystem:                 "groth16",
-		CircuitType:                 "transfer",
-		EnableFHE:                   false,
-		MaxUTXOsPerBlock:            100,
-		ProofCacheSize:              1000,
+		MaxTxPerBlock:  100,
+		ProofCacheSize: 1000,
 	}
 
 	configBytes, err := json.Marshal(config)
@@ -86,9 +81,8 @@ func TestVMInitialize(t *testing.T) {
 	// Verify initialization
 	require.NotNil(vmImpl.utxoDB)
 	require.NotNil(vmImpl.nullifierDB)
-	require.NotNil(vmImpl.stateTree)
+	require.NotNil(vmImpl.root)
 	require.NotNil(vmImpl.proofVerifier)
-	require.NotNil(vmImpl.addressManager)
 	require.NotNil(vmImpl.mempool)
 
 	// Test health check
@@ -126,12 +120,13 @@ func TestShieldedTransaction(t *testing.T) {
 			ProofType: "groth16",
 			ProofData: make([]byte, 256),
 			PublicInputs: [][]byte{
+				testBind[:],      // chain binding
 				make([]byte, 32), // nullifier
 				make([]byte, 32), // output commitment
 			},
 		},
 		Fee:    1000,
-		Expiry: 0,
+		Expiry: 1 << 20,
 	}
 
 	// Compute transaction ID
@@ -146,31 +141,6 @@ func TestShieldedTransaction(t *testing.T) {
 	// Verify in mempool
 	require.True(vmImpl.mempool.HasTransaction(tx.ID))
 	require.Equal(1, vmImpl.mempool.Size())
-}
-
-func TestPrivateAddress(t *testing.T) {
-	require := require.New(t)
-
-	// Setup VM with privacy enabled
-	vmImpl := setupTestVMWithPrivacy(t)
-	defer vmImpl.Shutdown(context.Background())
-
-	// Generate a private address
-	addr, err := vmImpl.addressManager.GenerateAddress()
-	require.NoError(err)
-	require.NotNil(addr)
-
-	// Verify address components
-	require.Len(addr.Address, 32)
-	require.Len(addr.ViewingKey, 32)
-	require.Len(addr.SpendingKey, 32)
-	require.Len(addr.Diversifier, 11)
-	require.Len(addr.IncomingViewKey, 32)
-
-	// Test address retrieval
-	retrieved, err := vmImpl.addressManager.GetAddress(addr.Address)
-	require.NoError(err)
-	require.Equal(addr.Address, retrieved.Address)
 }
 
 // Helper functions
@@ -191,46 +161,8 @@ func setupTestVM(t *testing.T) *VM {
 	genesisBytes, _ := json.Marshal(genesis)
 
 	config := ZConfig{
-		ProofSystem:      "groth16",
-		MaxUTXOsPerBlock: 100,
-		ProofCacheSize:   1000,
-	}
-	configBytes, _ := json.Marshal(config)
-
-	vmImpl := &VM{}
-	toEngine := make(chan vm.Message, 1)
-
-	require.NoError(t, vmImpl.Initialize(ctx, vm.Init{
-		Runtime:  chainRuntime,
-		DB:       db,
-		Genesis:  genesisBytes,
-		Config:   configBytes,
-		ToEngine: toEngine,
-	}))
-
-	return vmImpl
-}
-
-func setupTestVMWithPrivacy(t *testing.T) *VM {
-	ctx := context.Background()
-	chainRuntime := &runtime.Runtime{
-		ChainID: ids.GenerateTestID(),
-		Log:     log.NoLog{},
-	}
-
-	db := memdb.New()
-
-	genesis := &Genesis{
-		Timestamp:  1607144400,
-		InitialTxs: []*Transaction{},
-	}
-	genesisBytes, _ := json.Marshal(genesis)
-
-	config := ZConfig{
-		EnablePrivateAddresses: true,
-		ProofSystem:            "groth16",
-		MaxUTXOsPerBlock:       100,
-		ProofCacheSize:         1000,
+		MaxTxPerBlock:  100,
+		ProofCacheSize: 1000,
 	}
 	configBytes, _ := json.Marshal(config)
 

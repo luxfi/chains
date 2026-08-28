@@ -34,7 +34,6 @@ func TestWireRoundTrip_UTXO(t *testing.T) {
 func TestWireRoundTrip_Transaction(t *testing.T) {
 	require := require.New(t)
 	tx := &Transaction{
-		ID:      ids.ID{9},
 		Type:    TransactionTypeShield,
 		Version: 1,
 		Fee:     100,
@@ -49,16 +48,27 @@ func TestWireRoundTrip_Transaction(t *testing.T) {
 		Outputs: []*ShieldedOutput{
 			{Commitment: []byte("c"), EncryptedNote: []byte("n"), EphemeralPubKey: []byte("e"), OutputProof: []byte("p")},
 		},
-		Proof:     &ZKProof{ProofType: "groth16", ProofData: []byte("pd"), PublicInputs: [][]byte{[]byte("pi1"), []byte("pi2")}},
-		FHEData:   &FHEData{EncryptedInputs: [][]byte{[]byte("ei")}, CircuitID: "circ", EncryptedResult: []byte("er"), ComputationProof: []byte("cp")},
-		Memo:      []byte("memo"),
-		Signature: []byte("sig"),
+		Proof: &ZKProof{ProofType: "groth16", ProofData: []byte("pd"), PublicInputs: [][]byte{[]byte("pi1"), []byte("pi2")}},
+		Memo:  []byte("memo"),
 	}
 	b, err := tx.Marshal()
 	require.NoError(err)
 	got, err := parseTransaction(b)
 	require.NoError(err)
+
+	// The id is DERIVED on the way in, not carried. A peer that chooses it
+	// chooses the proof-cache key, and the cache answers before anything binds
+	// the proof to what the transaction spends.
+	require.Equal(tx.ComputeID(), got.ID)
+	tx.ID = got.ID
 	require.Equal(tx, got)
+
+	// Whatever id the sender puts on the value, the wire carries none, so the
+	// bytes and the parsed identity are the same either way.
+	tx.ID = ids.ID{0xFF}
+	forged, err := tx.Marshal()
+	require.NoError(err)
+	require.Equal(b, forged, "the id must not reach the wire")
 
 	// Canonical: one transaction has one byte string, so bytes appended to a
 	// valid frame are refused rather than ignored. Ignoring them would give a
@@ -78,24 +88,20 @@ func txFrame(nullLens []uint32, nullBlob []byte) []byte {
 	nullOff := writeU32List(b, nullLens)
 
 	ob := b.StartObject(txSize)
-	var id ids.ID
-	ob.SetBytesFixed(0, id[:])
-	ob.SetUint8(32, uint8(TransactionTypeTransfer))
-	ob.SetUint8(33, 1)
-	ob.SetUint64(34, 1)
-	ob.SetUint64(42, 0)
-	ob.SetList(50, empty, 0)
-	ob.SetBytes(58, nil)
+	ob.SetUint8(0, uint8(TransactionTypeTransfer))
+	ob.SetUint8(1, 1)
+	ob.SetUint64(2, 1)
+	ob.SetUint64(10, 0)
+	ob.SetList(18, empty, 0)
+	ob.SetBytes(26, nil)
+	ob.SetList(34, empty, 0)
+	ob.SetBytes(42, nil)
+	ob.SetList(50, nullOff, len(nullLens))
+	ob.SetBytes(58, nullBlob)
 	ob.SetList(66, empty, 0)
 	ob.SetBytes(74, nil)
-	ob.SetList(82, nullOff, len(nullLens))
-	ob.SetBytes(90, nullBlob)
-	ob.SetList(98, empty, 0)
-	ob.SetBytes(106, nil)
-	ob.SetBytes(114, nil)
-	ob.SetBytes(122, nil)
-	ob.SetBytes(130, nil)
-	ob.SetBytes(138, nil)
+	ob.SetBytes(82, nil)
+	ob.SetBytes(90, nil)
 	ob.FinishAsRoot()
 	return b.Finish()
 }
@@ -137,7 +143,8 @@ func TestDeclaredLengthNeverSizesAnAllocation(t *testing.T) {
 
 func TestWireRoundTrip_Block(t *testing.T) {
 	require := require.New(t)
-	tx := &Transaction{ID: ids.ID{7}, Type: TransactionTypeTransfer, Fee: 1, Nullifiers: [][]byte{[]byte("x")}}
+	tx := &Transaction{Type: TransactionTypeTransfer, Fee: 1, Nullifiers: [][]byte{[]byte("x")}}
+	tx.ID = tx.ComputeID()
 	blk := &Block{
 		ParentID_:      ids.ID{2},
 		BlockHeight:    5,
@@ -155,6 +162,6 @@ func TestWireRoundTrip_Block(t *testing.T) {
 	require.Equal(blk.BlockTimestamp, got.BlockTimestamp)
 	require.Equal(blk.StateRoot, got.StateRoot)
 	require.Len(got.Txs, 1)
-	require.Equal(tx.ID, got.Txs[0].ID)
+	require.Equal(tx.ComputeID(), got.Txs[0].ID, "a nested transaction's id is derived from its content too")
 	require.Equal(blk.BlockProof, got.BlockProof)
 }
