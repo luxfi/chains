@@ -64,7 +64,7 @@ var (
 	prefixKeyRecord = []byte("c/key/")      // replicated: custody key registry
 	prefixCeremony  = []byte("c/ceremony/") // replicated: ceremony log
 	keyRoot         = []byte("c/root")      // replicated: current state root
-	prefixShare     = []byte("n/share/") // NODE-PRIVATE: this party's key share
+	prefixShare     = []byte("n/share/")    // NODE-PRIVATE: this party's key share
 )
 
 // Domain separation tags. Every hash M-Chain computes is tagged, so a digest
