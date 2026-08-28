@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/rpc/v2"
 	"github.com/luxfi/ids"
 )
 
@@ -32,11 +31,6 @@ type Service struct {
 // NewService returns a new Service instance
 func NewService(vm *VM) *Service {
 	return &Service{vm: vm}
-}
-
-// RegisterService registers the BridgeVM RPC handlers
-func (vm *VM) RegisterService(server *rpc.Server) error {
-	return server.RegisterService(&Service{vm: vm}, "bridge")
 }
 
 // =============================================================================
@@ -192,10 +186,7 @@ func (s *Service) ReplaceSigner(_ *http.Request, args *ReplaceSignerArgs, reply 
 		replacementNodeID = &rid
 	}
 
-	result, err := s.vm.RemoveSigner(nodeID, replacementNodeID)
-	if err != nil {
-		return err
-	}
+	result := s.vm.RemoveSigner(nodeID, replacementNodeID)
 
 	reply.Success = result.Success
 	reply.RemovedNodeID = result.RemovedNodeID
@@ -609,7 +600,11 @@ func (s *Service) GetBridgeInfo(_ *http.Request, _ *GetBridgeInfoArgs, reply *Ge
 	now := time.Now().Unix()
 	for _, cfg := range s.vm.config.ExternalChains {
 		reply.SupportedChains = append(reply.SupportedChains, cfg.Name)
-		totalBridged += s.vm.movedToday(now, uint32(cfg.ChainID))
+		moved, err := s.vm.movedToday(now, uint32(cfg.ChainID))
+		if err != nil {
+			return err
+		}
+		totalBridged += moved
 	}
 	reply.TotalBridged = strconv.FormatUint(totalBridged, 10)
 	// This chain charges its fee at admission, not out of the transfer, so
@@ -749,16 +744,12 @@ func hexEncode(b []byte) string {
 // HTTP Handler Integration
 // =============================================================================
 
+// rpcPath is where the bridge's API is served, and the only place it is.
+const rpcPath = "/rpc"
+
 // CreateRPCHandlers creates HTTP handlers for JSON-RPC endpoints
 func (vm *VM) CreateRPCHandlers() (map[string]http.Handler, error) {
-	service := NewService(vm)
-
-	// Create a simple HTTP handler that wraps the service methods
-	handlers := map[string]http.Handler{
-		"/rpc": &jsonRPCHandler{service: service},
-	}
-
-	return handlers, nil
+	return map[string]http.Handler{rpcPath: &jsonRPCHandler{service: NewService(vm)}}, nil
 }
 
 // jsonRPCHandler handles JSON-RPC requests

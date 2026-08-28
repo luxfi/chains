@@ -40,7 +40,7 @@ func TestABlockThatCannotCommitReleasesNothing(t *testing.T) {
 		"an external release must not start for a block that did not commit")
 
 	// Nor did any of the durable part happen.
-	require.Zero(t, vm.movedToday(blk.BlockTimestamp, dstChain),
+	require.Zero(t, moved(t, vm, blk.BlockTimestamp, dstChain),
 		"none of the amount counts against the daily cap")
 	settled, err := newSpend(vm.chain.Base()).isSettled(req.ID)
 	require.NoError(t, err)
@@ -82,7 +82,7 @@ func TestAnAcceptedBlockIsDurableAndReleased(t *testing.T) {
 
 	require.Len(t, vm.releaser.queue, 1)
 	require.Equal(t, req.ID, (<-vm.releaser.queue).ID)
-	require.Equal(t, uint64(7), vm.movedToday(blk.BlockTimestamp, dstChain))
+	require.Equal(t, uint64(7), moved(t, vm, blk.BlockTimestamp, dstChain))
 
 	tip, height := vm.chain.Tip()
 	require.Equal(t, blk.ID(), tip)
@@ -133,11 +133,11 @@ func TestTheDailyCapSurvivesARestart(t *testing.T) {
 	vm := bootOn(t, db, cfg)
 	pend(vm, requestFor(1, 600))
 	first := buildAndAccept(t, vm)
-	require.Equal(t, uint64(600), vm.movedToday(first.BlockTimestamp, dstChain))
+	require.Equal(t, uint64(600), moved(t, vm, first.BlockTimestamp, dstChain))
 
 	// Restart: a second VM over the same database, exactly as the node does.
 	restarted := bootOn(t, db, cfg)
-	require.Equal(t, uint64(600), restarted.movedToday(first.BlockTimestamp, dstChain),
+	require.Equal(t, uint64(600), moved(t, restarted, first.BlockTimestamp, dstChain),
 		"the day's spend is read back from disk, not started over")
 
 	// 600 already moved against a cap of 1000, so a second 600 does not fit.
@@ -152,7 +152,7 @@ func TestTheDailyCapSurvivesARestart(t *testing.T) {
 	require.Equal(t, uint64(400), blk.BridgeRequests[0].Amount)
 	require.NoError(t, blk.Verify(context.Background()))
 	require.NoError(t, blk.Accept(context.Background()))
-	require.Equal(t, uint64(1000), restarted.movedToday(blk.BlockTimestamp, dstChain))
+	require.Equal(t, uint64(1000), moved(t, restarted, blk.BlockTimestamp, dstChain))
 }
 
 // TestTheCapIsCountedPerDestination keeps one busy route from closing another.
@@ -174,8 +174,8 @@ func TestTheCapIsCountedPerDestination(t *testing.T) {
 
 	blk := buildAndAccept(t, vm)
 	require.Len(t, blk.BridgeRequests, 2, "two destinations each have their own cap")
-	require.Equal(t, uint64(100), vm.movedToday(blk.BlockTimestamp, dstChain))
-	require.Equal(t, uint64(100), vm.movedToday(blk.BlockTimestamp, 777))
+	require.Equal(t, uint64(100), moved(t, vm, blk.BlockTimestamp, dstChain))
+	require.Equal(t, uint64(100), moved(t, vm, blk.BlockTimestamp, 777))
 }
 
 // TestTheWindowReopensOnTheNextDay proves the cap is daily rather than
@@ -206,8 +206,8 @@ func TestTheWindowReopensOnTheNextDay(t *testing.T) {
 	require.NoError(t, next.Verify(context.Background()))
 	require.NoError(t, next.Accept(context.Background()))
 
-	require.Equal(t, uint64(100), vm.movedToday(genesisTime, dstChain))
-	require.Equal(t, uint64(100), vm.movedToday(genesisTime+dayLength, dstChain))
+	require.Equal(t, uint64(100), moved(t, vm, genesisTime, dstChain))
+	require.Equal(t, uint64(100), moved(t, vm, genesisTime+dayLength, dstChain))
 }
 
 // blockOn assembles a block on a chosen parent at a chosen time, which is how

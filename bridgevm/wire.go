@@ -110,7 +110,9 @@ const (
 	blkSize    = 64
 )
 
-func (b *Block) Marshal() ([]byte, error) {
+// Marshal encodes b. It cannot fail: every field is fixed-width or a length
+// the builder is told in advance, so there is nothing here to refuse.
+func (b *Block) Marshal() []byte {
 	var reqBlob []byte
 	reqLens := make([]uint32, 0, len(b.BridgeRequests))
 	for _, r := range b.BridgeRequests {
@@ -129,7 +131,7 @@ func (b *Block) Marshal() ([]byte, error) {
 	ob.SetList(blkReqLens, reqLensOff, len(reqLens))
 	ob.SetBytes(blkReqBlob, reqBlob)
 	ob.FinishAsRoot()
-	return bld.Finish(), nil
+	return bld.Finish()
 }
 
 func parseBlockBytes(data []byte, blk *Block) error {
@@ -166,11 +168,7 @@ func parseBlockBytes(data []byte, blk *Block) error {
 
 	// Canonical form: the bytes must be what encoding what we read produces.
 	// Anything else is a second encoding of one block.
-	again, err := blk.Marshal()
-	if err != nil {
-		return err
-	}
-	if !bytes.Equal(again, data) {
+	if !bytes.Equal(blk.Marshal(), data) {
 		return fmt.Errorf("bridgevm block: encoding is not canonical")
 	}
 	blk.bytes = data

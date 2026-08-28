@@ -159,11 +159,11 @@ var pluginHandle unsafe.Pointer
 // nil entry means the loaded plugin doesn't export that symbol (which fails
 // the probe — we require all five).
 var (
-	fnSignerApply     unsafe.Pointer
-	fnLiquidityApply  unsafe.Pointer
-	fnMessageInbox    unsafe.Pointer
-	fnMessageOutbox   unsafe.Pointer
-	fnBridgeTransit   unsafe.Pointer
+	fnSignerApply    unsafe.Pointer
+	fnLiquidityApply unsafe.Pointer
+	fnMessageInbox   unsafe.Pointer
+	fnMessageOutbox  unsafe.Pointer
+	fnBridgeTransit  unsafe.Pointer
 )
 
 // initOnce guards the probe — even though init() runs at most once, this
@@ -390,9 +390,9 @@ func (b cgoBackend) LiquidityApply(
 			"bridgevm: LiquidityApply requires non-nil desc + non-empty liquidity")
 	}
 	var (
-		applied      uint32
-		totalFeesLo  uint64
-		totalFeesHi  uint64
+		applied     uint32
+		totalFeesLo uint64
+		totalFeesHi uint64
 	)
 	var opsP unsafe.Pointer
 	if len(ops) > 0 {
@@ -430,9 +430,9 @@ func (b cgoBackend) MessageInbox(
 			"bridgevm: MessageInbox requires non-nil desc + non-empty signers/daily/inbox")
 	}
 	var (
-		applied     uint32
-		totalInLo   uint64
-		totalInHi   uint64
+		applied   uint32
+		totalInLo uint64
+		totalInHi uint64
 	)
 	var inMsgsP unsafe.Pointer
 	if len(inMsgs) > 0 {
@@ -476,9 +476,9 @@ func (b cgoBackend) MessageOutbox(
 			"bridgevm: MessageOutbox requires non-nil desc/epoch + non-empty daily/outbox")
 	}
 	var (
-		applied     uint32
-		totalOutLo  uint64
-		totalOutHi  uint64
+		applied    uint32
+		totalOutLo uint64
+		totalOutHi uint64
 	)
 	var reqsP unsafe.Pointer
 	if len(reqs) > 0 {

@@ -26,16 +26,27 @@ type fakeSource struct {
 	head    uint64
 	locks   map[uint64][]lock // block -> what was locked in it
 	asked   [][2]uint64       // ranges asked for, in order
+	reads   int               // how many times the head was asked for
 	headErr error
 }
 
 func (f *fakeSource) HeadBlock(context.Context) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.reads++
 	if f.headErr != nil {
 		return 0, f.headErr
 	}
 	return f.head, nil
+}
+
+// timesRead is how often this chain has been asked where it has got to. The
+// watcher owns its cursor on its own goroutine, so what a running watcher has
+// done is observed here rather than by reaching into it.
+func (f *fakeSource) timesRead() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reads
 }
 
 func (f *fakeSource) FetchLockEvents(_ context.Context, from, to *big.Int) ([]lock, error) {
@@ -273,7 +284,7 @@ func TestALockBecomesABlock(t *testing.T) {
 	built := buildAndAccept(t, vm)
 	require.Len(t, built.BridgeRequests, 1)
 	require.Equal(t, ids.ID(locked.Digest()), built.BridgeRequests[0].ID)
-	require.Equal(t, uint64(1000), vm.movedToday(built.BlockTimestamp, dstChain))
+	require.Equal(t, uint64(1000), moved(t, vm, built.BlockTimestamp, dstChain))
 
 	vm.mu.RLock()
 	defer vm.mu.RUnlock()

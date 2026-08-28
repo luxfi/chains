@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -17,6 +19,9 @@ import (
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/runtime"
+	"github.com/luxfi/threshold/pkg/math/curve"
+	"github.com/luxfi/threshold/pkg/party"
+	"github.com/luxfi/threshold/protocols/cmp/config"
 	vmcore "github.com/luxfi/vm"
 )
 
@@ -180,5 +185,34 @@ func watcherOn(vm *VM, src ChainClient) *watcher {
 	vm.mu.Lock()
 	vm.evmByChainID[srcChain] = src
 	vm.mu.Unlock()
-	return &watcher{vm: vm, cursor: make(map[uint32]uint64), quit: make(chan struct{})}
+	return &watcher{vm: vm, cursor: make(map[uint32]uint64), every: watchInterval, quit: make(chan struct{})}
+}
+
+// moved is what has moved to a destination on the day at falls in, read from
+// committed state.
+func moved(t *testing.T, vm *VM, at int64, dst uint32) uint64 {
+	t.Helper()
+	v, err := vm.movedToday(at, dst)
+	require.NoError(t, err)
+	return v
+}
+
+// serveVM puts this VM's JSON-RPC handler behind an httptest server.
+func serveVM(t *testing.T, vm *VM) (*httptest.Server, *VM) {
+	t.Helper()
+	handlers, err := vm.CreateRPCHandlers()
+	require.NoError(t, err)
+	mux := http.NewServeMux()
+	for path, h := range handlers {
+		mux.Handle(path, h)
+	}
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, vm
+}
+
+// emptyGroupConfig is a CMP config with no public shares: the shape a chain
+// holds before M-Chain's keygen has produced anything.
+func emptyGroupConfig() *config.Config {
+	return &config.Config{Group: curve.Secp256k1{}, Public: map[party.ID]*config.Public{}}
 }

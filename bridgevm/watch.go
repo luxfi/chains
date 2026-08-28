@@ -60,6 +60,7 @@ type lock struct {
 type watcher struct {
 	vm     *VM
 	cursor map[uint32]uint64 // chain id -> last block read
+	every  time.Duration
 	quit   chan struct{}
 	wg     sync.WaitGroup
 	once   sync.Once
@@ -69,6 +70,7 @@ func newWatcher(vm *VM, chains []ExternalChainConfig) *watcher {
 	w := &watcher{
 		vm:     vm,
 		cursor: make(map[uint32]uint64, len(chains)),
+		every:  watchInterval,
 		quit:   make(chan struct{}),
 	}
 	w.wg.Add(1)
@@ -83,7 +85,7 @@ func (w *watcher) stop() {
 
 func (w *watcher) run() {
 	defer w.wg.Done()
-	ticker := time.NewTicker(watchInterval)
+	ticker := time.NewTicker(w.every)
 	defer ticker.Stop()
 	for {
 		select {
@@ -99,7 +101,7 @@ func (w *watcher) run() {
 // the next pass with its cursor untouched, so nothing is skipped by an endpoint
 // having a bad minute.
 func (w *watcher) pass() {
-	ctx, cancel := context.WithTimeout(context.Background(), watchInterval)
+	ctx, cancel := context.WithTimeout(context.Background(), w.every)
 	defer cancel()
 
 	w.vm.mu.RLock()

@@ -111,36 +111,36 @@ var ErrGPUNotAvailable = errors.New("bridgevm: GPU backend not available")
 
 // Signer is the on-arena per-signer record (208 bytes).
 type Signer struct {
-	SignerID         uint64
-	LuxAddress       [20]byte
-	_                uint32   // _pad_addr
-	BondAmountLo     uint64
-	BondAmountHi     uint64
-	OptInHeight      uint64
-	ExitEpoch        uint64
-	SignCount        uint64
-	BLSPubKey        [48]byte
+	SignerID       uint64
+	LuxAddress     [20]byte
+	_              uint32 // _pad_addr
+	BondAmountLo   uint64
+	BondAmountHi   uint64
+	OptInHeight    uint64
+	ExitEpoch      uint64
+	SignCount      uint64
+	BLSPubKey      [48]byte
 	CoronaPubKey   [32]byte
-	MLDSAPubKey      [32]byte
-	Status           uint32
-	JailUntilEpoch   uint32
-	SlashCount       uint32
-	Occupied         uint32
-	_                uint64   // _pad_tail
+	MLDSAPubKey    [32]byte
+	Status         uint32
+	JailUntilEpoch uint32
+	SlashCount     uint32
+	Occupied       uint32
+	_              uint64 // _pad_tail
 }
 
 // LiquidityEntry is the on-arena per-provider liquidity record (80 bytes).
 type LiquidityEntry struct {
-	ProviderAddr   [20]byte
-	_              uint32   // _pad_addr
-	AssetID        uint32
-	Status         uint32
-	AmountLo       uint64
-	AmountHi       uint64
-	FeeAccrualLo   uint64
-	FeeAccrualHi   uint64
-	DepositHeight  uint64
-	_              uint64   // _pad0
+	ProviderAddr  [20]byte
+	_             uint32 // _pad_addr
+	AssetID       uint32
+	Status        uint32
+	AmountLo      uint64
+	AmountHi      uint64
+	FeeAccrualLo  uint64
+	FeeAccrualHi  uint64
+	DepositHeight uint64
+	_             uint64 // _pad0
 }
 
 // DailyLimit is the on-arena per-asset daily cap record (64 bytes).
@@ -178,77 +178,77 @@ type Message struct {
 
 // BridgeVMEpochState is the epoch summary written by transition (240 bytes).
 type BridgeVMEpochState struct {
-	CurrentEpoch        uint64
-	NextEpochHeight     uint64
-	TotalActiveBondLo   uint64
-	TotalActiveBondHi   uint64
-	ActiveSignerCount   uint32
-	PendingDropCount    uint32
-	InboxCount          uint32
-	OutboxCount         uint32
-	SignerSetRoot       [32]byte
-	LiquidityRoot       [32]byte
-	InboxRoot           [32]byte
-	OutboxRoot          [32]byte
-	DailyLimitRoot      [32]byte
-	BridgeVMStateRoot   [32]byte
+	CurrentEpoch      uint64
+	NextEpochHeight   uint64
+	TotalActiveBondLo uint64
+	TotalActiveBondHi uint64
+	ActiveSignerCount uint32
+	PendingDropCount  uint32
+	InboxCount        uint32
+	OutboxCount       uint32
+	SignerSetRoot     [32]byte
+	LiquidityRoot     [32]byte
+	InboxRoot         [32]byte
+	OutboxRoot        [32]byte
+	DailyLimitRoot    [32]byte
+	BridgeVMStateRoot [32]byte
 }
 
 // BridgeVMRoundDescriptor parameterises one round invocation (112 bytes).
 type BridgeVMRoundDescriptor struct {
-	ChainID           uint64
-	Round             uint64
-	TimestampNs       uint64
-	Epoch             uint64
-	Height            uint64
-	Mode              uint32
-	InboundMsgCount   uint32
-	SignerOpCount     uint32
-	LiquidityOpCount  uint32
-	OutboundReqCount  uint32
-	ClosingFlag       uint32
-	_                 uint64 // _pad0
-	_                 uint64 // _pad1
-	ParentStateRoot   [32]byte
+	ChainID          uint64
+	Round            uint64
+	TimestampNs      uint64
+	Epoch            uint64
+	Height           uint64
+	Mode             uint32
+	InboundMsgCount  uint32
+	SignerOpCount    uint32
+	LiquidityOpCount uint32
+	OutboundReqCount uint32
+	ClosingFlag      uint32
+	_                uint64 // _pad0
+	_                uint64 // _pad1
+	ParentStateRoot  [32]byte
 }
 
 // SignerOp is one input to signer_apply (224 bytes).
 type SignerOp struct {
-	SignerID        uint64
-	LuxAddress      [20]byte
-	_               uint32   // _pad_addr
-	BondAmountLo    uint64
-	BondAmountHi    uint64
-	OptInHeight     uint64
-	BLSPubKey       [48]byte
-	CoronaPubKey  [32]byte
-	MLDSAPubKey     [32]byte
-	Kind            uint32
-	JailUntilEpoch  uint32
-	Epoch           uint32
-	SlashAmountLo   uint32
-	SlashAmountHi   uint32
-	_               uint32   // _pad0
-	EvidenceDigest  [32]byte
+	SignerID       uint64
+	LuxAddress     [20]byte
+	_              uint32 // _pad_addr
+	BondAmountLo   uint64
+	BondAmountHi   uint64
+	OptInHeight    uint64
+	BLSPubKey      [48]byte
+	CoronaPubKey   [32]byte
+	MLDSAPubKey    [32]byte
+	Kind           uint32
+	JailUntilEpoch uint32
+	Epoch          uint32
+	SlashAmountLo  uint32
+	SlashAmountHi  uint32
+	_              uint32 // _pad0
+	EvidenceDigest [32]byte
 }
 
 // LiquidityOp is one input to liquidity_apply (64 bytes).
 type LiquidityOp struct {
 	ProviderAddr [20]byte
-	_            uint32   // _pad_addr
+	_            uint32 // _pad_addr
 	AssetID      uint32
 	Kind         uint32
 	AmountLo     uint64
 	AmountHi     uint64
 	Height       uint64
-	_            uint64   // _pad0
+	_            uint64 // _pad0
 }
 
 // OutboundReq is one input to message_outbox (112 bytes).
 type OutboundReq struct {
 	PayloadRoot [32]byte
 	Recipient   [20]byte
-	_           uint32   // _pad_addr
+	_           uint32 // _pad_addr
 	SrcChain    uint32
 	DstChain    uint32
 	Kind        uint32
@@ -257,35 +257,35 @@ type OutboundReq struct {
 	AmountLo    uint64
 	AmountHi    uint64
 	Height      uint64
-	_           uint64   // _pad_tail
+	_           uint64 // _pad_tail
 }
 
 // BridgeVMTransitionResult is the populated result of transition (304 bytes).
 type BridgeVMTransitionResult struct {
-	Status                  uint32
-	InboundApplyCount       uint32
-	SignerApplyCount        uint32
-	LiquidityApplyCount     uint32
-	OutboundApplyCount      uint32
-	ActiveSignerCount       uint32
-	JailedCount             uint32
-	TombstonedCount         uint32
-	TotalActiveBondLo       uint64
-	TotalActiveBondHi       uint64
-	TotalInboundAmountLo    uint64
-	TotalInboundAmountHi    uint64
-	TotalOutboundAmountLo   uint64
-	TotalOutboundAmountHi   uint64
-	TotalFeesAccruedLo      uint64
-	TotalFeesAccruedHi      uint64
-	Epoch                   uint64
-	_                       uint64 // _pad0
-	SignerSetRoot           [32]byte
-	LiquidityRoot           [32]byte
-	InboxRoot               [32]byte
-	OutboxRoot              [32]byte
-	DailyLimitRoot          [32]byte
-	BridgeVMStateRoot       [32]byte
+	Status                uint32
+	InboundApplyCount     uint32
+	SignerApplyCount      uint32
+	LiquidityApplyCount   uint32
+	OutboundApplyCount    uint32
+	ActiveSignerCount     uint32
+	JailedCount           uint32
+	TombstonedCount       uint32
+	TotalActiveBondLo     uint64
+	TotalActiveBondHi     uint64
+	TotalInboundAmountLo  uint64
+	TotalInboundAmountHi  uint64
+	TotalOutboundAmountLo uint64
+	TotalOutboundAmountHi uint64
+	TotalFeesAccruedLo    uint64
+	TotalFeesAccruedHi    uint64
+	Epoch                 uint64
+	_                     uint64 // _pad0
+	SignerSetRoot         [32]byte
+	LiquidityRoot         [32]byte
+	InboxRoot             [32]byte
+	OutboxRoot            [32]byte
+	DailyLimitRoot        [32]byte
+	BridgeVMStateRoot     [32]byte
 }
 
 // =============================================================================

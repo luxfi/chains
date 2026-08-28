@@ -111,8 +111,7 @@ func TestThresholdFollowsTheSetSize(t *testing.T) {
 		require.Equal(t, quorum(i)-1, vm.signerSet.ThresholdT, "after %d signers", i)
 	}
 
-	_, err := vm.RemoveSigner(nodes[0], nil)
-	require.NoError(t, err)
+	vm.RemoveSigner(nodes[0], nil)
 	require.Equal(t, quorum(6)-1, vm.signerSet.ThresholdT)
 }
 
@@ -168,8 +167,7 @@ func TestRemoveSignerTriggersReshare(t *testing.T) {
 	}
 	require.Equal(uint64(0), vm.signerSet.CurrentEpoch)
 
-	result, err := vm.RemoveSigner(nodes[1], nil)
-	require.NoError(err)
+	result := vm.RemoveSigner(nodes[1], nil)
 	require.True(result.Success)
 	require.Equal(uint64(1), result.NewEpoch)
 	require.Equal(2, result.ActiveSigners)
@@ -177,8 +175,7 @@ func TestRemoveSignerTriggersReshare(t *testing.T) {
 	require.False(vm.HasSigner(nodes[1]))
 
 	// Removing someone who is not in the set changes nothing.
-	result, err = vm.RemoveSigner(ids.GenerateTestNodeID(), nil)
-	require.NoError(err)
+	result = vm.RemoveSigner(ids.GenerateTestNodeID(), nil)
 	require.False(result.Success)
 	require.Equal(uint64(1), vm.signerSet.CurrentEpoch)
 }
@@ -198,8 +195,7 @@ func TestReplacementTakesTheVacatedSlot(t *testing.T) {
 	}
 	replacement := ids.GenerateTestNodeID()
 
-	result, err := vm.RemoveSigner(nodes[1], &replacement)
-	require.NoError(err)
+	result := vm.RemoveSigner(nodes[1], &replacement)
 	require.True(result.Success)
 	require.Equal(replacement.String(), result.ReplacementNodeID)
 	require.NotEmpty(result.ReshareSession)
@@ -224,8 +220,7 @@ func TestRemoveSignerWithWaitlistReplacement(t *testing.T) {
 	require.NoError(registerSigner(vm, waiting))
 	require.Len(vm.signerSet.Waitlist, 1)
 
-	result, err := vm.RemoveSigner(first, nil)
-	require.NoError(err)
+	result := vm.RemoveSigner(first, nil)
 	require.Equal(waiting.String(), result.ReplacementNodeID)
 	require.Empty(vm.signerSet.Waitlist)
 	require.True(vm.HasSigner(waiting))
