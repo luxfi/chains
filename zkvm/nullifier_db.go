@@ -232,6 +232,19 @@ func (ndb *NullifierDB) loadNullifiers() error {
 	return it.Error()
 }
 
+// reload rebuilds the cache from what the database now says. A block whose
+// writes were discarded has had its nullifiers discarded with them, so a cache
+// that already recorded them must stop claiming those notes are spent —
+// otherwise the block can never be applied again.
+func (ndb *NullifierDB) reload() error {
+	ndb.mu.Lock()
+	defer ndb.mu.Unlock()
+
+	ndb.nullifierCache = make(map[string]uint64)
+	ndb.heightIndex = make(map[uint64][]string)
+	return ndb.loadNullifiers()
+}
+
 // makeNullifierKey creates a database key for a nullifier
 func makeNullifierKey(nullifier []byte) []byte {
 	key := make([]byte, 1+len(nullifier))

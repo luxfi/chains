@@ -275,6 +275,17 @@ func (udb *UTXODB) loadUTXOs() error {
 	return it.Error()
 }
 
+// reload rebuilds the set and the height index from what the database now
+// says, discarding whatever a block that did not commit had already added.
+func (udb *UTXODB) reload() error {
+	udb.mu.Lock()
+	defer udb.mu.Unlock()
+
+	udb.utxoCache = make(map[string]uint64)
+	udb.heightIndex = make(map[uint64][]string)
+	return udb.loadUTXOs()
+}
+
 // read returns the record for a commitment. It touches no shared state, so it
 // is safe under either lock.
 func (udb *UTXODB) read(commitment []byte) (*UTXO, error) {
