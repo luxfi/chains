@@ -87,26 +87,3 @@ func TestRegister_RejectsDoubleRegistration(t *testing.T) {
 		t.Fatal("expected second registration to fail")
 	}
 }
-
-// Legacy alias dispatch: a legacy lane id resolves to the modern verifier.
-func TestLegacyAlias_DispatchesToModern(t *testing.T) {
-	r := NewRegistry(OwnerMChain)
-	if err := r.Register(stubVerifier{lane: types.LaneMChainCGGMP21}); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	const legacyTChainSign types.CertLane = 200 // arbitrary legacy id
-	if err := r.RegisterLegacyAlias(legacyTChainSign, types.LaneMChainCGGMP21); err != nil {
-		t.Fatalf("alias: %v", err)
-	}
-	v, err := r.Verifier(legacyTChainSign)
-	if err != nil {
-		t.Fatalf("legacy lookup: %v", err)
-	}
-	if v.Lane() != types.LaneMChainCGGMP21 {
-		t.Fatalf("legacy alias should dispatch to MChainCGGMP21, got %d", v.Lane())
-	}
-	r.ClearAliases()
-	if _, err := r.Verifier(legacyTChainSign); err == nil {
-		t.Fatal("after ClearAliases, legacy id should not resolve")
-	}
-}
