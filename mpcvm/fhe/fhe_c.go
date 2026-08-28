@@ -129,21 +129,86 @@ func (g *FHEAccelerator) Stats() FHEStats {
 	return *g.stats
 }
 
-// BatchNTTForward performs forward NTT on multiple polynomials.
-// This is the primary use case for GPU acceleration - batch operations.
-func (g *FHEAccelerator) BatchNTTForward(r *ring.Ring, polys []ring.Poly) error {
-	if len(polys) == 0 {
-		return nil
+// =============================================================================
+// One device round trip, three kernels
+// =============================================================================
+//
+// The three batch entry points below differ in exactly three things: how many
+// polynomials one element reads, which lattice kernel runs, and what the CPU
+// does instead. Everything else — the size floor, the session snapshot, the
+// tensor lifecycle, and the rule that ANY device failure falls back to the CPU
+// rather than failing the batch — used to be written out three times, ~45
+// statements each. Three copies of a resource lifecycle are three places to
+// forget a Close, and a kernel added later is a fourth.
+//
+// The floors are NOT unified, deliberately. Forward NTT goes to the device only
+// at 64 polynomials and ring degree 8192; inverse NTT and multiply go at 4, at
+// any degree. The reasoning written on the forward path — that below some size
+// the host/device transfer costs more than the kernel saves — applies to all
+// three, so the other two look like drift rather than a decision. Changing a
+// performance threshold needs a device to measure on, and this host has none,
+// so the numbers are carried through as parameters and the disagreement is
+// stated rather than guessed at.
+
+// kernel is one lattice operation on operands already resident on the device.
+type kernel func(ops accel.LatticeOps, in []*accel.UntypedTensor, out *accel.UntypedTensor, q uint32) error
+
+// element moves one batch element's operands onto the device, runs k, and
+// brings the result back. Every tensor it opens it closes, on every path,
+// including the ones it never got to use.
+func element(s *accel.Session, n int, q uint32, operands [][]uint64, k kernel) ([]uint64, error) {
+	var open []*accel.Tensor[uint64]
+	defer func() {
+		for _, t := range open {
+			t.Close()
+		}
+	}()
+
+	in := make([]*accel.UntypedTensor, 0, len(operands))
+	for _, src := range operands {
+		t, err := accel.NewTensorWithData[uint64](s, []int{n}, src[:n])
+		if err != nil {
+			return nil, err
+		}
+		open = append(open, t)
+		in = append(in, t.Untyped())
 	}
 
-	// Get parameters from ring
-	N := r.N()
+	out, err := accel.NewTensor[uint64](s, []int{n})
+	if err != nil {
+		return nil, err
+	}
+	open = append(open, out)
 
-	// GPU only beneficial for large batches (>64 polys with N>=8192)
-	// Otherwise CPU is faster due to data transfer overhead
-	if !g.enabled || len(polys) < 64 || N < 8192 {
-		for i := range polys {
-			r.NTT(polys[i], polys[i])
+	if err := k(s.Lattice(), in, out.Untyped(), q); err != nil {
+		return nil, err
+	}
+	if err := s.Sync(); err != nil {
+		return nil, err
+	}
+	return out.ToSlice()
+}
+
+// offload runs k over a batch of count elements, writing each result into the
+// slice dst names, and does cpu(i) instead for any element the device will not
+// take — a short coefficient slice, a failed allocation, a kernel error, a
+// failed readback. A device that cannot do the work is a slower batch, never a
+// failed one.
+func (g *FHEAccelerator) offload(
+	r *ring.Ring,
+	count, minBatch, minDegree int,
+	cpu func(i int),
+	operands func(i int) [][]uint64,
+	dst func(i int) []uint64,
+	k kernel,
+) error {
+	// An empty batch needs no special case: count < minBatch is already true of
+	// it for every floor, so it takes the same path as a batch too small to be
+	// worth a device, and loops zero times.
+	n := r.N()
+	if !g.enabled || count < minBatch || n < minDegree {
+		for i := 0; i < count; i++ {
+			cpu(i)
 		}
 		return nil
 	}
@@ -151,10 +216,9 @@ func (g *FHEAccelerator) BatchNTTForward(r *ring.Ring, polys []ring.Poly) error 
 	g.mu.RLock()
 	session := g.session
 	g.mu.RUnlock()
-
 	if session == nil {
-		for i := range polys {
-			r.NTT(polys[i], polys[i])
+		for i := 0; i < count; i++ {
+			cpu(i)
 		}
 		return nil
 	}
@@ -162,145 +226,63 @@ func (g *FHEAccelerator) BatchNTTForward(r *ring.Ring, polys []ring.Poly) error 
 	if len(r.ModuliChain()) == 0 {
 		return fmt.Errorf("ring has no moduli")
 	}
-	Q := r.ModuliChain()[0]
+	q := uint32(r.ModuliChain()[0])
 
-	// Process each polynomial using GPU
-	for i := range polys {
-		if len(polys[i].Coeffs) == 0 || len(polys[i].Coeffs[0]) < N {
-			r.NTT(polys[i], polys[i])
+	for i := 0; i < count; i++ {
+		src := operands(i)
+		if src == nil {
+			cpu(i)
 			continue
 		}
-
-		inputTensor, err := accel.NewTensorWithData[uint64](session, []int{N}, polys[i].Coeffs[0][:N])
+		result, err := element(session, n, q, src, k)
 		if err != nil {
-			r.NTT(polys[i], polys[i])
+			cpu(i)
 			continue
 		}
-
-		outputTensor, err := accel.NewTensor[uint64](session, []int{N})
-		if err != nil {
-			inputTensor.Close()
-			r.NTT(polys[i], polys[i])
-			continue
-		}
-
-		err = session.Lattice().PolynomialNTT(inputTensor.Untyped(), outputTensor.Untyped(), uint32(Q))
-		if err != nil {
-			inputTensor.Close()
-			outputTensor.Close()
-			r.NTT(polys[i], polys[i])
-			continue
-		}
-
-		if err := session.Sync(); err != nil {
-			inputTensor.Close()
-			outputTensor.Close()
-			r.NTT(polys[i], polys[i])
-			continue
-		}
-
-		result, err := outputTensor.ToSlice()
-		if err != nil {
-			inputTensor.Close()
-			outputTensor.Close()
-			r.NTT(polys[i], polys[i])
-			continue
-		}
-
-		copy(polys[i].Coeffs[0], result)
-		inputTensor.Close()
-		outputTensor.Close()
+		copy(dst(i), result)
 	}
 
 	g.mu.Lock()
 	g.stats.BatchCalls++
 	g.mu.Unlock()
-
 	return nil
+}
+
+// wide returns the coefficient rows of polys[i] if the element is wide enough
+// to move, and nil if it is not — which offload reads as "do this one on the
+// CPU".
+func wide(n int, polys ...ring.Poly) [][]uint64 {
+	out := make([][]uint64, 0, len(polys))
+	for _, p := range polys {
+		if len(p.Coeffs) == 0 || len(p.Coeffs[0]) < n {
+			return nil
+		}
+		out = append(out, p.Coeffs[0])
+	}
+	return out
+}
+
+// BatchNTTForward performs forward NTT on multiple polynomials.
+// This is the primary use case for GPU acceleration - batch operations.
+func (g *FHEAccelerator) BatchNTTForward(r *ring.Ring, polys []ring.Poly) error {
+	return g.offload(r, len(polys), 64, 8192,
+		func(i int) { r.NTT(polys[i], polys[i]) },
+		func(i int) [][]uint64 { return wide(r.N(), polys[i]) },
+		func(i int) []uint64 { return polys[i].Coeffs[0] },
+		func(ops accel.LatticeOps, in []*accel.UntypedTensor, out *accel.UntypedTensor, q uint32) error {
+			return ops.PolynomialNTT(in[0], out, q)
+		})
 }
 
 // BatchNTTInverse performs inverse NTT on multiple polynomials.
 func (g *FHEAccelerator) BatchNTTInverse(r *ring.Ring, polys []ring.Poly) error {
-	if len(polys) == 0 {
-		return nil
-	}
-
-	if !g.enabled || len(polys) < 4 {
-		for i := range polys {
-			r.INTT(polys[i], polys[i])
-		}
-		return nil
-	}
-
-	g.mu.RLock()
-	session := g.session
-	g.mu.RUnlock()
-
-	if session == nil {
-		for i := range polys {
-			r.INTT(polys[i], polys[i])
-		}
-		return nil
-	}
-
-	N := r.N()
-	if len(r.ModuliChain()) == 0 {
-		return fmt.Errorf("ring has no moduli")
-	}
-	Q := r.ModuliChain()[0]
-
-	for i := range polys {
-		if len(polys[i].Coeffs) == 0 || len(polys[i].Coeffs[0]) < N {
-			r.INTT(polys[i], polys[i])
-			continue
-		}
-
-		inputTensor, err := accel.NewTensorWithData[uint64](session, []int{N}, polys[i].Coeffs[0][:N])
-		if err != nil {
-			r.INTT(polys[i], polys[i])
-			continue
-		}
-
-		outputTensor, err := accel.NewTensor[uint64](session, []int{N})
-		if err != nil {
-			inputTensor.Close()
-			r.INTT(polys[i], polys[i])
-			continue
-		}
-
-		err = session.Lattice().PolynomialINTT(inputTensor.Untyped(), outputTensor.Untyped(), uint32(Q))
-		if err != nil {
-			inputTensor.Close()
-			outputTensor.Close()
-			r.INTT(polys[i], polys[i])
-			continue
-		}
-
-		if err := session.Sync(); err != nil {
-			inputTensor.Close()
-			outputTensor.Close()
-			r.INTT(polys[i], polys[i])
-			continue
-		}
-
-		result, err := outputTensor.ToSlice()
-		if err != nil {
-			inputTensor.Close()
-			outputTensor.Close()
-			r.INTT(polys[i], polys[i])
-			continue
-		}
-
-		copy(polys[i].Coeffs[0], result)
-		inputTensor.Close()
-		outputTensor.Close()
-	}
-
-	g.mu.Lock()
-	g.stats.BatchCalls++
-	g.mu.Unlock()
-
-	return nil
+	return g.offload(r, len(polys), 4, 0,
+		func(i int) { r.INTT(polys[i], polys[i]) },
+		func(i int) [][]uint64 { return wide(r.N(), polys[i]) },
+		func(i int) []uint64 { return polys[i].Coeffs[0] },
+		func(ops accel.LatticeOps, in []*accel.UntypedTensor, out *accel.UntypedTensor, q uint32) error {
+			return ops.PolynomialINTT(in[0], out, q)
+		})
 }
 
 // BatchPolyMul performs polynomial multiplication on batches using GPU.
@@ -308,96 +290,13 @@ func (g *FHEAccelerator) BatchPolyMul(r *ring.Ring, a, b, out []ring.Poly) error
 	if len(a) != len(b) || len(a) != len(out) {
 		return fmt.Errorf("batch size mismatch")
 	}
-
-	if !g.enabled || len(a) < 4 {
-		// CPU fallback
-		for i := range a {
-			r.MulCoeffsBarrett(a[i], b[i], out[i])
-		}
-		return nil
-	}
-
-	g.mu.RLock()
-	session := g.session
-	g.mu.RUnlock()
-
-	if session == nil {
-		for i := range a {
-			r.MulCoeffsBarrett(a[i], b[i], out[i])
-		}
-		return nil
-	}
-
-	N := r.N()
-	if len(r.ModuliChain()) == 0 {
-		return fmt.Errorf("ring has no moduli")
-	}
-	Q := r.ModuliChain()[0]
-
-	for i := range a {
-		if len(a[i].Coeffs) == 0 || len(b[i].Coeffs) == 0 || len(out[i].Coeffs) == 0 {
-			r.MulCoeffsBarrett(a[i], b[i], out[i])
-			continue
-		}
-
-		aTensor, err := accel.NewTensorWithData[uint64](session, []int{N}, a[i].Coeffs[0][:N])
-		if err != nil {
-			r.MulCoeffsBarrett(a[i], b[i], out[i])
-			continue
-		}
-
-		bTensor, err := accel.NewTensorWithData[uint64](session, []int{N}, b[i].Coeffs[0][:N])
-		if err != nil {
-			aTensor.Close()
-			r.MulCoeffsBarrett(a[i], b[i], out[i])
-			continue
-		}
-
-		outTensor, err := accel.NewTensor[uint64](session, []int{N})
-		if err != nil {
-			aTensor.Close()
-			bTensor.Close()
-			r.MulCoeffsBarrett(a[i], b[i], out[i])
-			continue
-		}
-
-		err = session.Lattice().PolynomialMul(aTensor.Untyped(), bTensor.Untyped(), outTensor.Untyped(), uint32(Q))
-		if err != nil {
-			aTensor.Close()
-			bTensor.Close()
-			outTensor.Close()
-			r.MulCoeffsBarrett(a[i], b[i], out[i])
-			continue
-		}
-
-		if err := session.Sync(); err != nil {
-			aTensor.Close()
-			bTensor.Close()
-			outTensor.Close()
-			r.MulCoeffsBarrett(a[i], b[i], out[i])
-			continue
-		}
-
-		result, err := outTensor.ToSlice()
-		if err != nil {
-			aTensor.Close()
-			bTensor.Close()
-			outTensor.Close()
-			r.MulCoeffsBarrett(a[i], b[i], out[i])
-			continue
-		}
-
-		copy(out[i].Coeffs[0], result)
-		aTensor.Close()
-		bTensor.Close()
-		outTensor.Close()
-	}
-
-	g.mu.Lock()
-	g.stats.PolyMulCalls++
-	g.mu.Unlock()
-
-	return nil
+	return g.offload(r, len(a), 4, 0,
+		func(i int) { r.MulCoeffsBarrett(a[i], b[i], out[i]) },
+		func(i int) [][]uint64 { return wide(r.N(), a[i], b[i], out[i]) },
+		func(i int) []uint64 { return out[i].Coeffs[0] },
+		func(ops accel.LatticeOps, in []*accel.UntypedTensor, o *accel.UntypedTensor, q uint32) error {
+			return ops.PolynomialMul(in[0], in[1], o, q)
+		})
 }
 
 // ClearCache clears any cached state.
