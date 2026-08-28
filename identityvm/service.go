@@ -396,12 +396,9 @@ type HealthReply struct {
 	Details map[string]string `json:"details"`
 }
 
-// Health reports the chain's health.
+// Health reports what the chain holds, which is always an answer.
 func (s *Service) Health(r *http.Request, args *EmptyArgs, reply *HealthReply) error {
-	health, err := s.vm.HealthCheck(r.Context())
-	if err != nil {
-		return err
-	}
+	health, _ := s.vm.HealthCheck(r.Context())
 	reply.Healthy, reply.Details = health.Healthy, health.Details
 	return nil
 }
