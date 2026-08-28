@@ -65,19 +65,22 @@ func newHarnessWith(t *testing.T, config *Config) *harness {
 func (h *harness) boot(t *testing.T, config *Config) *VM {
 	t.Helper()
 
-	genesis, err := json.Marshal(&Genesis{Timestamp: 1607144400, Config: config})
-	require.NoError(t, err)
-
 	vm := &VM{}
-	require.NoError(t, vm.Initialize(context.Background(), vmcore.Init{
+	require.NoError(t, vm.Initialize(context.Background(), initFor(h, config)))
+	t.Cleanup(func() { _ = vm.Shutdown(context.Background()) })
+	return vm
+}
+
+// initFor is what the node hands a VM at boot.
+func initFor(h *harness, config *Config) vmcore.Init {
+	genesis, _ := json.Marshal(&Genesis{Timestamp: 1607144400, Config: config})
+	return vmcore.Init{
 		Runtime:  &runtime.Runtime{ChainID: h.chainID, NetworkID: h.network, Log: log.NoLog{}},
 		DB:       h.db,
 		Genesis:  genesis,
 		ToEngine: make(chan vmcore.Message, 1),
 		Log:      log.NoLog{},
-	}))
-	t.Cleanup(func() { _ = vm.Shutdown(context.Background()) })
-	return vm
+	}
 }
 
 // restart boots a second VM over the same records. What the chain accepted, a
