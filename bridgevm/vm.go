@@ -644,11 +644,11 @@ func (vm *VM) CrossChainRequestFailed(ctx context.Context, chainID ids.ID, reque
 	return nil
 }
 
-// GetBlockIDAtHeight implements the chain.HeightIndexedChainVM interface
+// GetBlockIDAtHeight answers from the height index the store writes in the
+// same commit as the block itself, so the index can never name a block the
+// chain did not accept.
 func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
-	// For now, return not implemented
-	// In production, maintain a height index
-	return ids.Empty, errors.New("height index not implemented")
+	return vm.chain.IDAtHeight(height)
 }
 
 // SetState implements the common.VM interface

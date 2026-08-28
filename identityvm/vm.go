@@ -668,10 +668,11 @@ func (vm *VM) CreateCredentialProof(credID ids.ID, zkProof []byte, selectiveDisc
 	return proof, nil
 }
 
-// GetBlockIDAtHeight returns the block ID at a given height
+// GetBlockIDAtHeight answers from the height index the store writes in the
+// same commit as the block itself, so the index can never name a block the
+// chain did not accept.
 func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
-	// Height index not implemented - return error
-	return ids.Empty, errors.New("height index not implemented")
+	return vm.chain.IDAtHeight(height)
 }
 
 // WaitForEvent implements chain.ChainVM
