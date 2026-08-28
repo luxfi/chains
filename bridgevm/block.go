@@ -16,32 +16,36 @@ import (
 	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/threshold/pkg/ecdsa"
-	"github.com/luxfi/threshold/pkg/math/curve"
 )
 
-// Block represents a block in the Bridge chain
+// Block is one step of the bridge chain: the transfers it settles, and where
+// it sits in the sequence.
 type Block struct {
 	ParentID_      ids.ID           `json:"parentId"` // Field renamed to avoid method collision
 	BlockHeight    uint64           `json:"height"`
 	BlockTimestamp int64            `json:"timestamp"`
 	BridgeRequests []*BridgeRequest `json:"bridgeRequests"`
 
-	// MPC signatures for this block (NodeID -> signature bytes)
-	MPCSignatures map[ids.NodeID][]byte `json:"mpcSignatures"`
-
 	// Cached values
 	ID_    ids.ID
 	bytes  []byte
 	status choices.Status
 	vm     *VM
+
+	// spend is the bridge's state as of this block, computed when it verified.
+	// A child built on it starts from here; the accepted tip has it on disk
+	// instead, so Publish drops it.
+	spend *spend
 }
 
 var (
-	errInvalidBlock = errors.New("invalid block")
-	errFutureBlock  = errors.New("block timestamp is in the future")
+	errInvalidBlock = errors.New("bridgevm: invalid block")
+	errFutureBlock  = errors.New("bridgevm: block timestamp is in the future")
 
-	maxClockSkew = int64(60) // 60 seconds
+	// maxClockSkew is how far ahead of this node's clock a block may be
+	// stamped. Chain time drives the daily cap, so a proposer that could stamp
+	// freely could jump the window forward and reopen the cap at will.
+	maxClockSkew = int64(60)
 )
 
 // ID returns the block ID
@@ -52,21 +56,27 @@ func (b *Block) ID() ids.ID {
 	return b.ID_
 }
 
-// computeID calculates the block ID
+// computeID calculates the block ID.
+//
+// The chain this block belongs to is the first thing hashed. Without it the
+// same bytes name the same block on every chain that runs this VM, so a block
+// built on one is a block on the other — parent ids resolve, heights line up,
+// and a testnet block is a mainnet block.
 func (b *Block) computeID() ids.ID {
 	h := sha256.New()
 
+	h.Write(b.vm.chainID[:])
 	h.Write(b.ParentID_[:])
 
-	heightBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(heightBytes, b.BlockHeight)
-	h.Write(heightBytes)
+	var num [8]byte
+	binary.BigEndian.PutUint64(num[:], b.BlockHeight)
+	h.Write(num[:])
 
-	timestampBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestampBytes, uint64(b.BlockTimestamp))
-	h.Write(timestampBytes)
+	binary.BigEndian.PutUint64(num[:], uint64(b.BlockTimestamp))
+	h.Write(num[:])
 
-	// Include bridge requests in hash
+	// Each request's id is the digest of the transfer it carries (Verify
+	// refuses one where it is not), so hashing the ids hashes the transfers.
 	for _, req := range b.BridgeRequests {
 		h.Write(req.ID[:])
 	}
@@ -82,13 +92,18 @@ func (b *Block) computeID() ids.ID {
 // that failed left every one of those done and the block missing, including a
 // release already in flight for a transfer no block records.
 func (b *Block) Accept(ctx context.Context) error {
+	tip, _ := b.vm.chain.Tip()
+	if b.ParentID_ != tip {
+		return fmt.Errorf("%w: %s extends %s, which is not the tip %s",
+			errInvalidBlock, b.ID(), b.ParentID_, tip)
+	}
 	return b.vm.chain.Accept(b)
 }
 
-// Write records nothing beyond the block itself, which the store writes. The
-// bridge registry and the daily volume this block advances are held in memory
-// only — see the note on BridgeRegistry — so they are published, not written.
-func (b *Block) Write(database.Database) error { return nil }
+// Write stages what this block settles: the transfers, and the day's running
+// total per destination. Both land in the same commit as the block itself, so
+// the cap the chain enforces is the cap the chain remembers after a restart.
+func (b *Block) Write(db database.Database) error { return b.write(db) }
 
 // Publish completes the block's transfers and hands them to the release
 // worker. It runs after the commit, so an external release is only ever
@@ -96,29 +111,19 @@ func (b *Block) Write(database.Database) error { return nil }
 func (b *Block) Publish() {
 	b.status = choices.Accepted
 
+	// What this block decided is on disk now, so the in-memory answer would
+	// be a second copy of it.
+	b.spend = nil
+
 	for _, req := range b.BridgeRequests {
-		completed := &CompletedBridge{
-			RequestID:   req.ID,
-			SourceTxID:  req.SourceTxID,
-			CompletedAt: b.Timestamp(),
-		}
-		// Collect MPC signatures
-		if len(req.MPCSignatures) > 0 {
-			completed.MPCSignature = req.MPCSignatures[0] // Use aggregated signature
-		}
-
-		b.vm.bridgeRegistry.mu.Lock()
-		b.vm.bridgeRegistry.CompletedBridges[req.ID] = completed
-		b.vm.bridgeRegistry.DailyVolume[req.DestChain] += req.Amount
-		b.vm.bridgeRegistry.mu.Unlock()
-
 		b.vm.mu.Lock()
 		delete(b.vm.pendingBridges, req.ID)
+		releaser := b.vm.releaser
 		b.vm.mu.Unlock()
 
-		b.vm.log.Info("completed bridge request",
+		b.vm.log.Info("bridgevm: transfer settled",
 			log.Stringer("requestID", req.ID),
-			log.String("destChain", req.DestChain),
+			log.Uint32("dst", req.DstChainID),
 			log.Uint64("amount", req.Amount),
 		)
 
@@ -126,15 +131,17 @@ func (b *Block) Publish() {
 		// Non-blocking: the attestation and EVM broadcast happen off the
 		// consensus path so this never waits on network I/O. Every relayer
 		// broadcasts; the on-chain nonce replay-guard collapses duplicates.
-		if b.vm.releaser != nil {
-			b.vm.releaser.enqueue(req)
+		if releaser != nil {
+			releaser.enqueue(req)
 		}
 	}
 }
 
-// Reject marks the block as rejected
+// Reject marks the block as rejected. Its transfers were never removed from
+// the set waiting for a block, so they are proposed again rather than lost.
 func (b *Block) Reject(ctx context.Context) error {
 	b.status = choices.Rejected
+	b.spend = nil
 	b.vm.chain.Drop(b.ID())
 	return nil
 }
@@ -154,153 +161,81 @@ func (b *Block) Parent() ids.ID {
 	return b.ParentID_
 }
 
-// Verify verifies the block
+// Verify decides whether this block may become part of the chain.
+//
+// It answers over the state as of the block's PARENT, not as of the tip: a
+// block whose parent is still in flight is the ordinary shape whenever more
+// than one block is in the air, and checking it against the tip would let two
+// blocks in a row each spend the whole daily cap.
 func (b *Block) Verify(ctx context.Context) error {
-	// Basic validation
-	if b.BlockHeight == 0 && b.ParentID_ != ids.Empty {
-		return errInvalidBlock
+	if b.BlockHeight == 0 {
+		// Genesis is given, not verified. Accepting a second one would let a
+		// peer hand this chain a new beginning.
+		return fmt.Errorf("%w: height 0 is genesis", errInvalidBlock)
+	}
+	if len(b.BridgeRequests) == 0 {
+		return fmt.Errorf("%w: carries no transfers", errInvalidBlock)
+	}
+	if len(b.BridgeRequests) > maxRequestsPerBlock {
+		return fmt.Errorf("%w: %d transfers over the %d cap",
+			errInvalidBlock, len(b.BridgeRequests), maxRequestsPerBlock)
 	}
 
-	// Verify timestamp
-	if b.BlockTimestamp > time.Now().Unix()+maxClockSkew {
-		return errFutureBlock
-	}
-
-	// Verify each bridge request: confirmations, amounts, daily limits
-	for _, req := range b.BridgeRequests {
-		if req.Confirmations < b.vm.config.MinConfirmations {
-			return fmt.Errorf("insufficient confirmations for request %s: %d < %d",
-				req.ID, req.Confirmations, b.vm.config.MinConfirmations)
-		}
-
-		if req.Amount > b.vm.config.MaxBridgeAmount {
-			return fmt.Errorf("bridge amount exceeds maximum: %d > %d",
-				req.Amount, b.vm.config.MaxBridgeAmount)
-		}
-
-		b.vm.bridgeRegistry.mu.RLock()
-		dailyVolume := b.vm.bridgeRegistry.DailyVolume[req.DestChain]
-		b.vm.bridgeRegistry.mu.RUnlock()
-
-		if dailyVolume+req.Amount > b.vm.config.DailyBridgeLimit {
-			return fmt.Errorf("would exceed daily bridge limit for chain %s", req.DestChain)
-		}
-	}
-
-	// Batch verify MPC request signatures (GPU-accelerated when available)
-	if b.vm.mpcConfig != nil {
-		sigErrors := batchVerifyRequestSignaturesGPU(b.BridgeRequests, b.vm.mpcConfig, b.vm.log)
-		for i, err := range sigErrors {
-			if err != nil {
-				return fmt.Errorf("MPC signature verification failed for request %s: %w",
-					b.BridgeRequests[i].ID, err)
-			}
-		}
-	} else {
-		// No MPC config: verify individually (original path)
-		for _, req := range b.BridgeRequests {
-			if len(req.MPCSignatures) > 0 {
-				if err := b.verifyRequestMPCSignatures(req); err != nil {
-					return fmt.Errorf("MPC signature verification failed for request %s: %w", req.ID, err)
-				}
-			}
-		}
-	}
-
-	// Verify MPC block signatures using threshold ECDSA.
-	// Uses GPU-accelerated batch verification when available and multiple sigs exist.
-	blockHash := b.ID()
-	validSignatures := batchVerifyBlockSignatures(blockHash, b.MPCSignatures, b.vm.mpcConfig, b.vm.log)
-
-	// For threshold signature, we only need 1 valid aggregated signature
-	// (the signature itself is produced by t+1 parties collaboratively)
-	if len(b.MPCSignatures) > 0 && validSignatures < 1 {
-		return fmt.Errorf("no valid MPC signature found")
-	}
-
-	return nil
-}
-
-// deserializeSignature deserializes signature bytes into an ecdsa.Signature
-func deserializeSignature(group curve.Curve, data []byte) (*ecdsa.Signature, error) {
-	if len(data) < 64 {
-		return nil, errors.New("signature too short")
-	}
-
-	// Create empty signature for this curve
-	sig := ecdsa.EmptySignature(group)
-
-	// Unmarshal R point (first 33 bytes for compressed, or 65 for uncompressed)
-	// For simplicity, assume first half is R, second half is S
-	rLen := len(data) / 2
-	if err := sig.R.UnmarshalBinary(data[:rLen]); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal R: %w", err)
-	}
-
-	if err := sig.S.UnmarshalBinary(data[rLen:]); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal S: %w", err)
-	}
-
-	return &sig, nil
-}
-
-// verifyRequestMPCSignatures verifies MPC threshold signatures on a bridge request
-// using the CMP ECDSA protocol. The aggregated signature is verified against the
-// group public key derived from Lagrange interpolation of public shares.
-func (b *Block) verifyRequestMPCSignatures(req *BridgeRequest) error {
-	if b.vm.mpcConfig == nil {
-		return errors.New("MPC config not initialized")
-	}
-
-	// Get the group public key using Lagrange interpolation
-	groupPublicKey := b.vm.mpcConfig.PublicPoint()
-	if groupPublicKey == nil {
-		return errors.New("failed to compute group public key")
-	}
-
-	// Compute message hash for verification (request ID serves as unique identifier)
-	messageHash := computeRequestHash(req)
-
-	// For threshold ECDSA, we verify the single aggregated signature
-	// produced by t+1 parties against the combined group public key
-	if len(req.MPCSignatures) == 0 {
-		return errors.New("no MPC signatures present")
-	}
-
-	// The aggregated threshold signature (produced by CMP sign protocol)
-	// is stored as the first entry in MPCSignatures
-	aggregatedSigBytes := req.MPCSignatures[0]
-
-	// Deserialize the ECDSA signature
-	sig, err := deserializeSignature(b.vm.mpcConfig.Group, aggregatedSigBytes)
+	parent, err := b.vm.chain.Block(b.ParentID_, b.vm.parseBlock)
 	if err != nil {
-		return fmt.Errorf("failed to deserialize aggregated signature: %w", err)
+		return fmt.Errorf("bridgevm: parent %s: %w", b.ParentID_, err)
+	}
+	tip, tipHeight := b.vm.chain.Tip()
+	if parent.ID() != tip {
+		// A parent below the accepted tip is a block the chain has already
+		// built past. Building on it rewinds the chain, and the height index
+		// then names an orphan as the block at that height.
+		if parent.Height() <= tipHeight {
+			return fmt.Errorf("%w: parent %s at height %d is beneath the tip at %d",
+				errInvalidBlock, parent.ID(), parent.Height(), tipHeight)
+		}
+		// A parent still in flight carries the state it decided. One that
+		// carries none is a block this node never checked, and guessing what
+		// it spent is how a chain accepts a block it cannot account for.
+		if parent.spend == nil {
+			return fmt.Errorf("%w: parent %s has not been verified here",
+				errInvalidBlock, parent.ID())
+		}
+	}
+	if b.BlockHeight != parent.Height()+1 {
+		return fmt.Errorf("%w: height %d does not follow parent %d",
+			errInvalidBlock, b.BlockHeight, parent.Height())
+	}
+	// Chain time only moves forward. It drives the daily window, so a proposer
+	// free to rewind it reopens a cap that has already been spent.
+	if b.BlockTimestamp < parent.BlockTimestamp {
+		return fmt.Errorf("%w: timestamp %d precedes parent %d",
+			errInvalidBlock, b.BlockTimestamp, parent.BlockTimestamp)
+	}
+	if b.BlockTimestamp > time.Now().Unix()+maxClockSkew {
+		return fmt.Errorf("%w: timestamp %d is more than %ds ahead",
+			errFutureBlock, b.BlockTimestamp, maxClockSkew)
 	}
 
-	// Verify the signature against the group public key
-	if !sig.Verify(groupPublicKey, messageHash) {
-		return errors.New("aggregated MPC signature verification failed")
+	state := b.vm.spendAt(parent)
+	day := b.BlockTimestamp / dayLength
+	for _, req := range b.BridgeRequests {
+		// admit records each transfer as it goes, so a block carrying the same
+		// one twice fails on the second: the first has already been recorded
+		// settled, in this same state.
+		if err := state.admit(&b.vm.config, day, req); err != nil {
+			return err
+		}
 	}
+	b.spend = state
 
+	// A block that verifies is one the engine may build on, so it has to be
+	// findable by id — including one parsed from a peer rather than built
+	// here. Tracking only self-built blocks left a follower able to verify the
+	// first block of a run and unable to verify the second, which is the
+	// ordinary shape whenever more than one block is in flight.
+	b.vm.chain.Track(b)
 	return nil
-}
-
-// computeRequestHash computes a deterministic hash of a bridge request for signing
-func computeRequestHash(req *BridgeRequest) []byte {
-	h := sha256.New()
-	h.Write(req.ID[:])
-	h.Write([]byte(req.SourceChain))
-	h.Write([]byte(req.DestChain))
-	h.Write(req.Asset[:])
-
-	amountBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(amountBytes, req.Amount)
-	h.Write(amountBytes)
-
-	h.Write(req.Recipient)
-	h.Write(req.SourceTxID[:])
-
-	return h.Sum(nil)
 }
 
 // Height returns the block height

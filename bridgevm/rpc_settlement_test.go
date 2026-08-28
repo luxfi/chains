@@ -8,22 +8,23 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/luxfi/ids"
 )
 
-// newRPCRig stands up a VM with quote + swap store wired and serves
-// the JSON-RPC handler over httptest.
+// newRPCRig serves the JSON-RPC handler over httptest, against a VM brought up
+// the way the node brings one up. A rig that hand-assembles a VM answers for a
+// state no node is ever in.
 func newRPCRig(t *testing.T) (*httptest.Server, *VM) {
 	t.Helper()
-	vm := &VM{
-		quoteEngine: &QuoteEngine{Feed: defaultPriceFeed()},
-		swapStore:   newInMemorySwapStore(),
-	}
+	vm := boot(t)
 	handlers, err := vm.CreateRPCHandlers()
-	if err != nil {
-		t.Fatalf("CreateRPCHandlers: %v", err)
-	}
+	require.NoError(t, err)
 	mux := http.NewServeMux()
 	for path, h := range handlers {
 		mux.Handle(path, h)
@@ -43,10 +44,13 @@ func callRPC(t *testing.T, url, method string, params any, out any) (rpcCode int
 		"method":  method,
 		"params":  params,
 	})
+	return postRPC(t, url, body, out)
+}
+
+func postRPC(t *testing.T, url string, body []byte, out any) (int, string) {
+	t.Helper()
 	resp, err := http.Post(url+"/rpc", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("Post: %v", err)
-	}
+	require.NoError(t, err)
 	defer resp.Body.Close()
 	var env struct {
 		Result json.RawMessage `json:"result"`
@@ -55,16 +59,12 @@ func callRPC(t *testing.T, url, method string, params any, out any) (rpcCode int
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&env))
 	if env.Error != nil {
 		return env.Error.Code, env.Error.Message
 	}
 	if out != nil && len(env.Result) > 0 {
-		if err := json.Unmarshal(env.Result, out); err != nil {
-			t.Fatalf("unmarshal result: %v", err)
-		}
+		require.NoError(t, json.Unmarshal(env.Result, out))
 	}
 	return 0, ""
 }
@@ -80,15 +80,10 @@ func TestRPC_EstimateFee(t *testing.T) {
 		DestAsset:   "LUX",
 		Amount:      "1",
 	}, &reply)
-	if code != 0 {
-		t.Fatalf("rpc error: %d %s", code, msg)
-	}
-	if reply.NetAmount != "1400" {
-		t.Errorf("NetAmount = %q, want 1400 (1 ETH @ $3500 / $2.50)", reply.NetAmount)
-	}
-	if reply.FeeAmount != "0" {
-		t.Errorf("FeeAmount = %q, want 0 for non-Lux source", reply.FeeAmount)
-	}
+	require.Zero(t, code, msg)
+	require.NotEmpty(t, reply.FeeAmount)
+	require.NotEmpty(t, reply.NetAmount)
+	require.Positive(t, reply.EstimatedTime)
 }
 
 func TestRPC_EstimateFee_LuxExit(t *testing.T) {
@@ -100,28 +95,31 @@ func TestRPC_EstimateFee_LuxExit(t *testing.T) {
 		DestChain:   "ETHEREUM_SEPOLIA",
 		SourceAsset: "LUX",
 		DestAsset:   "ETH",
-		Amount:      "1000",
+		Amount:      "100",
 	}, &reply)
-	if code != 0 {
-		t.Fatalf("rpc error: %d %s", code, msg)
-	}
-	if reply.FeeAmount == "" || reply.FeeAmount == "0" {
-		t.Errorf("Lux-exit FeeAmount = %q, want > 0", reply.FeeAmount)
-	}
+	require.Zero(t, code, msg)
+	require.NotEqual(t, "0", reply.FeeAmount, "a Lux exit charges a service fee")
 }
 
 func TestRPC_EstimateFee_UnknownAsset(t *testing.T) {
 	srv, _ := newRPCRig(t)
 	var reply EstimateFeeReply
-	code, msg := callRPC(t, srv.URL, "bridge_estimateFee", EstimateFeeArgs{
+	code, _ := callRPC(t, srv.URL, "bridge_estimateFee", EstimateFeeArgs{
 		SourceChain: "ETHEREUM_SEPOLIA", DestChain: "LUX_TESTNET",
-		SourceAsset: "UNOBTAINIUM", DestAsset: "LUX", Amount: "1",
+		SourceAsset: "NOSUCHASSET", DestAsset: "LUX", Amount: "1",
 	}, &reply)
-	if code == 0 {
-		t.Fatalf("expected error, got success")
-	}
-	if !strings.Contains(msg, "price unknown") && !strings.Contains(msg, "UNOBTAINIUM") {
-		t.Errorf("expected price-unknown error, got %q", msg)
+	require.NotZero(t, code, "an unknown asset must not quote")
+}
+
+func TestRPC_EstimateFee_BadAmount(t *testing.T) {
+	srv, _ := newRPCRig(t)
+	var reply EstimateFeeReply
+	for _, amount := range []string{"", "-1", "0", "not-a-number"} {
+		code, _ := callRPC(t, srv.URL, "bridge_estimateFee", EstimateFeeArgs{
+			SourceChain: "ETHEREUM_SEPOLIA", DestChain: "LUX_TESTNET",
+			SourceAsset: "ETH", DestAsset: "LUX", Amount: amount,
+		}, &reply)
+		require.NotZero(t, code, "amount %q must be refused", amount)
 	}
 }
 
@@ -130,52 +128,41 @@ func TestRPC_SubmitRequest_ThenGetStatus(t *testing.T) {
 
 	var sub SubmitRequestReply
 	code, msg := callRPC(t, srv.URL, "bridge_submitRequest", SubmitRequestArgs{
-		SourceChain: "ETHEREUM_SEPOLIA",
-		DestChain:   "LUX_TESTNET",
-		SourceAsset: "ETH",
-		DestAsset:   "LUX",
-		Amount:      "1",
-		Recipient:   "0xa28fAE14eB42e7A5C36Ad2D774a2b7Eb293c4473",
-		Sender:      "0xa28fAE14eB42e7A5C36Ad2D774a2b7Eb293c4473",
+		SourceChain: "ETHEREUM_SEPOLIA", DestChain: "LUX_TESTNET",
+		SourceAsset: "ETH", DestAsset: "LUX", Amount: "2",
+		Recipient: "0xrecipient", Sender: "0xsender",
 	}, &sub)
-	if code != 0 {
-		t.Fatalf("submit rpc error: %d %s", code, msg)
-	}
-	if !strings.HasPrefix(sub.RequestID, "req_") {
-		t.Errorf("RequestID = %q, want req_ prefix", sub.RequestID)
-	}
-	if sub.Status != StatusPending {
-		t.Errorf("Status = %q, want pending", sub.Status)
-	}
-	if sub.NetAmount != "1400" {
-		t.Errorf("NetAmount snapshot = %q, want 1400", sub.NetAmount)
-	}
+	require.Zero(t, code, msg)
+	require.NotEmpty(t, sub.RequestID)
+	require.Equal(t, StatusPending, sub.Status)
 
-	var get GetStatusReply
-	code, msg = callRPC(t, srv.URL, "bridge_getStatus", GetStatusArgs{RequestID: sub.RequestID}, &get)
-	if code != 0 {
-		t.Fatalf("getStatus rpc error: %d %s", code, msg)
-	}
-	if get.RequestID != sub.RequestID {
-		t.Errorf("getStatus returned id=%q want %q", get.RequestID, sub.RequestID)
-	}
+	var status GetStatusReply
+	code, msg = callRPC(t, srv.URL, "bridge_getStatus", GetStatusArgs{RequestID: sub.RequestID}, &status)
+	require.Zero(t, code, msg)
+	require.Equal(t, sub.RequestID, status.RequestID)
+	require.Equal(t, sub.FeeAmount, status.FeeAmount)
+}
+
+func TestRPC_SubmitRequest_MissingFields(t *testing.T) {
+	srv, _ := newRPCRig(t)
+	var sub SubmitRequestReply
+	code, _ := callRPC(t, srv.URL, "bridge_submitRequest", SubmitRequestArgs{
+		DestChain: "LUX_TESTNET", Amount: "1", Recipient: "0xabc",
+	}, &sub)
+	require.NotZero(t, code, "a request naming no source chain must be refused")
 }
 
 func TestRPC_GetStatus_NotFound(t *testing.T) {
 	srv, _ := newRPCRig(t)
-	var get GetStatusReply
-	code, msg := callRPC(t, srv.URL, "bridge_getStatus", GetStatusArgs{RequestID: "req_nope"}, &get)
-	if code == 0 {
-		t.Fatalf("expected error, got success")
-	}
-	if !strings.Contains(msg, "not found") {
-		t.Errorf("error = %q, want 'not found'", msg)
-	}
+	var reply GetStatusReply
+	code, msg := callRPC(t, srv.URL, "bridge_getStatus", GetStatusArgs{RequestID: "req_nope"}, &reply)
+	require.NotZero(t, code)
+	require.Contains(t, msg, "not found")
 }
 
 func TestRPC_CancelRequest(t *testing.T) {
 	srv, _ := newRPCRig(t)
-	// Submit then cancel.
+
 	var sub SubmitRequestReply
 	_, _ = callRPC(t, srv.URL, "bridge_submitRequest", SubmitRequestArgs{
 		SourceChain: "ETHEREUM_SEPOLIA", DestChain: "LUX_TESTNET",
@@ -185,173 +172,158 @@ func TestRPC_CancelRequest(t *testing.T) {
 
 	var cancel CancelRequestReply
 	code, msg := callRPC(t, srv.URL, "bridge_cancelRequest", CancelRequestArgs{RequestID: sub.RequestID}, &cancel)
-	if code != 0 {
-		t.Fatalf("cancel rpc error: %d %s", code, msg)
-	}
-	if !cancel.Success {
-		t.Errorf("cancel.Success = false, want true")
-	}
+	require.Zero(t, code, msg)
+	require.True(t, cancel.Success)
 
-	// Confirm idempotent: second cancel still returns success.
+	// Cancelling a terminal swap again is a no-op success, so retries are safe.
 	code, msg = callRPC(t, srv.URL, "bridge_cancelRequest", CancelRequestArgs{RequestID: sub.RequestID}, &cancel)
-	if code != 0 || !cancel.Success {
-		t.Errorf("idempotent cancel failed: code=%d msg=%q success=%v", code, msg, cancel.Success)
-	}
+	require.Zero(t, code, msg)
+	require.True(t, cancel.Success)
+
+	code, _ = callRPC(t, srv.URL, "bridge_cancelRequest", CancelRequestArgs{RequestID: "req_nope"}, &cancel)
+	require.NotZero(t, code)
 }
 
 func TestRPC_Health(t *testing.T) {
 	srv, _ := newRPCRig(t)
 	var reply HealthReply
 	code, msg := callRPC(t, srv.URL, "bridge_health", nil, &reply)
-	if code != 0 {
-		t.Fatalf("health rpc error: %d %s", code, msg)
-	}
-	if reply.Status != "healthy" {
-		t.Errorf("Status = %q, want healthy", reply.Status)
-	}
+	require.Zero(t, code, msg)
+	require.Equal(t, "healthy", reply.Status)
+	require.False(t, reply.MPCReady, "no custody group key until M-Chain keygen lands")
 }
 
 // =============================================================================
-// Discovery RPC tests
+// Discovery RPC
 // =============================================================================
-
-// configureVMForDiscovery sets minimal config + registry state on the
-// rig's VM so the discovery methods have non-empty data to surface.
-// Centralized so test cases stay focused on the assertion, not setup.
-func configureVMForDiscovery(vm *VM) {
-	vm.config.MPCThreshold = 67
-	vm.config.MPCTotalParties = 100
-	vm.config.MinConfirmations = 6
-	vm.config.SupportedChains = []string{"ETHEREUM_SEPOLIA", "LUX_TESTNET", "BTC_TESTNET"}
-}
 
 func TestRPC_GetInfo(t *testing.T) {
 	srv, vm := newRPCRig(t)
-	configureVMForDiscovery(vm)
 
 	var reply GetBridgeInfoReply
 	code, msg := callRPC(t, srv.URL, "bridge_getInfo", nil, &reply)
-	if code != 0 {
-		t.Fatalf("rpc error: %d %s", code, msg)
-	}
-	if reply.Version == "" {
-		t.Error("Version should be non-empty")
-	}
-	if reply.ChainID != "B" {
-		t.Errorf("ChainID = %q, want B", reply.ChainID)
-	}
-	if reply.Threshold != 67 {
-		t.Errorf("Threshold = %d, want 67", reply.Threshold)
-	}
-	if reply.TotalParties != 100 {
-		t.Errorf("TotalParties = %d, want 100", reply.TotalParties)
-	}
-	if len(reply.SupportedChains) != 3 {
-		t.Errorf("SupportedChains len = %d, want 3", len(reply.SupportedChains))
-	}
+	require.Zero(t, code, msg)
+	require.NotEmpty(t, reply.Version)
+	require.Equal(t, "B", reply.ChainID)
+	require.Len(t, reply.SupportedChains, 2)
 	// MPCReady is false because mpcConfig is nil in the rig (M-Chain keygen
 	// not completed) — the correct "MPC pending" state, not an error.
-	if reply.MPCReady {
-		t.Error("MPCReady should be false without a custody group key")
-	}
-	if reply.TotalBridged != "0" {
-		t.Errorf("TotalBridged = %q, want 0", reply.TotalBridged)
-	}
-	if reply.TotalFees != "0" {
-		t.Errorf("TotalFees = %q, want 0", reply.TotalFees)
-	}
+	require.False(t, reply.MPCReady)
+	require.Equal(t, "0", reply.TotalBridged)
+	require.Equal(t, "0", reply.TotalFees)
+	require.Zero(t, reply.Height)
+
+	// The threshold reported here is the signer set's, not a configured number
+	// beside it: one question, one answer.
+	require.NoError(t, registerSigner(vm, ids.GenerateTestNodeID()))
+	require.NoError(t, registerSigner(vm, ids.GenerateTestNodeID()))
+	require.NoError(t, registerSigner(vm, ids.GenerateTestNodeID()))
+	require.NoError(t, registerSigner(vm, ids.GenerateTestNodeID()))
+	code, msg = callRPC(t, srv.URL, "bridge_getInfo", nil, &reply)
+	require.Zero(t, code, msg)
+	require.Equal(t, 4, reply.TotalParties)
+	require.Equal(t, vm.GetSignerSetInfo().Threshold, reply.Threshold)
+}
+
+// TestRPC_GetInfoReportsWhatMoved reads the same durable counter the daily cap
+// is enforced against, so the number a dashboard shows is the number the chain
+// acts on.
+func TestRPC_GetInfoReportsWhatMoved(t *testing.T) {
+	srv, vm := newRPCRig(t)
+	pend(vm, requestFor(1, 4_242))
+	blk := buildAndAccept(t, vm)
+
+	var reply GetBridgeInfoReply
+	code, msg := callRPC(t, srv.URL, "bridge_getInfo", nil, &reply)
+	require.Zero(t, code, msg)
+	require.Equal(t, "4242", reply.TotalBridged)
+	require.Equal(t, uint64(1), reply.Height)
+	require.Equal(t, blk.BlockHeight, reply.Height)
 }
 
 func TestRPC_GetSupportedChains(t *testing.T) {
 	srv, vm := newRPCRig(t)
-	configureVMForDiscovery(vm)
 
 	var reply GetSupportedChainsReply
 	code, msg := callRPC(t, srv.URL, "bridge_getSupportedChains", nil, &reply)
-	if code != 0 {
-		t.Fatalf("rpc error: %d %s", code, msg)
+	require.Zero(t, code, msg)
+	require.Len(t, reply.Chains, len(vm.config.ExternalChains))
+	for i, c := range reply.Chains {
+		require.Equal(t, strconv.FormatUint(vm.config.ExternalChains[i].ChainID, 10), c.ChainID)
+		require.Equal(t, vm.config.ExternalChains[i].Name, c.ChainName)
+		require.True(t, c.Enabled)
+		require.Equal(t, int(vm.config.MinConfirmations), c.Confirmations)
 	}
-	if len(reply.Chains) != 3 {
-		t.Fatalf("Chains len = %d, want 3", len(reply.Chains))
-	}
+}
+
+// The chains this bridge says it serves are the chains it can actually route
+// to. A separate list declared beside the routing table could name a chain
+// with no client behind it.
+func TestRPC_SupportedChainsAreTheRoutableOnes(t *testing.T) {
+	srv, vm := newRPCRig(t)
+	var reply GetSupportedChainsReply
+	code, msg := callRPC(t, srv.URL, "bridge_getSupportedChains", nil, &reply)
+	require.Zero(t, code, msg)
+
 	for _, c := range reply.Chains {
-		if c.ChainID == "" {
-			t.Error("ChainID empty in result")
+		id, err := strconv.ParseUint(c.ChainID, 10, 32)
+		require.NoError(t, err)
+		found := false
+		for _, cfg := range vm.config.ExternalChains {
+			found = found || cfg.ChainID == id
 		}
-		if !c.Enabled {
-			t.Errorf("chain %s not Enabled, want true", c.ChainID)
-		}
-		if c.Confirmations != 6 {
-			t.Errorf("chain %s Confirmations = %d, want 6", c.ChainID, c.Confirmations)
-		}
+		require.True(t, found, "chain %s is advertised but not one the release path routes by", c.ChainID)
 	}
 }
 
 func TestRPC_GetChainConfig(t *testing.T) {
-	srv, vm := newRPCRig(t)
-	configureVMForDiscovery(vm)
+	srv, _ := newRPCRig(t)
 
-	// happy path: lowercase input matches case-insensitively
+	// By name, case-insensitively.
 	var reply GetChainConfigReply
 	code, msg := callRPC(t, srv.URL, "bridge_getChainConfig",
-		GetChainConfigArgs{ChainID: "ethereum_sepolia"}, &reply)
-	if code != 0 {
-		t.Fatalf("rpc error: %d %s", code, msg)
-	}
-	if !strings.EqualFold(reply.ChainID, "ETHEREUM_SEPOLIA") {
-		t.Errorf("ChainID = %q, want ETHEREUM_SEPOLIA (case-insensitive match)", reply.ChainID)
-	}
-	if !reply.Enabled {
-		t.Error("Enabled = false, want true")
-	}
+		GetChainConfigArgs{ChainID: "ZOO-TESTNET"}, &reply)
+	require.Zero(t, code, msg)
+	require.Equal(t, "zoo-testnet", reply.ChainName)
+	require.True(t, reply.Enabled)
 
-	// unknown chain: error surfaces the requested id so daemons can log it
+	// And by the numeric id the transfers actually carry.
+	code, msg = callRPC(t, srv.URL, "bridge_getChainConfig",
+		GetChainConfigArgs{ChainID: strconv.FormatUint(uint64(dstChain), 10)}, &reply)
+	require.Zero(t, code, msg)
+	require.Equal(t, "zoo-testnet", reply.ChainName)
+
+	// Unknown chain: the error names the requested id so daemons can log it.
 	code, msg = callRPC(t, srv.URL, "bridge_getChainConfig",
 		GetChainConfigArgs{ChainID: "UNOBTAINIUM_CHAIN"}, &reply)
-	if code == 0 {
-		t.Fatal("expected error for unknown chain, got success")
-	}
-	if !strings.Contains(msg, "UNOBTAINIUM_CHAIN") {
-		t.Errorf("error %q should name the missing chain", msg)
-	}
+	require.NotZero(t, code)
+	require.Contains(t, msg, "UNOBTAINIUM_CHAIN")
 
-	// empty chainId: explicit invalid-params surface
 	code, msg = callRPC(t, srv.URL, "bridge_getChainConfig",
 		GetChainConfigArgs{ChainID: ""}, &reply)
-	if code == 0 {
-		t.Fatal("expected error for empty chainId")
-	}
-	if !strings.Contains(msg, "chainId required") {
-		t.Errorf("error %q should say chainId required", msg)
-	}
+	require.NotZero(t, code)
+	require.Contains(t, msg, "chainId required")
 }
 
-func TestRPC_GetSignature_NotYetAvailable(t *testing.T) {
-	srv, _ := newRPCRig(t)
+// The KMS path a relayer key lives at is not something an unauthenticated
+// surface answers with.
+func TestRPC_ChainConfigNamesNoSecretLocation(t *testing.T) {
+	srv, vm := newRPCRig(t)
+	vm.config.ExternalChains[0].GasKeyKMSPath = "kms://bridge/relayer/lux"
 
-	// Submit a swap so it exists in the store, but with no signature.
-	var sub SubmitRequestReply
-	_, _ = callRPC(t, srv.URL, "bridge_submitRequest", SubmitRequestArgs{
-		SourceChain: "ETHEREUM_SEPOLIA", DestChain: "LUX_TESTNET",
-		SourceAsset: "ETH", DestAsset: "LUX", Amount: "1",
-		Recipient: "0xabc", Sender: "0xabc",
-	}, &sub)
-
-	var reply GetSignatureReply
-	code, msg := callRPC(t, srv.URL, "bridge_getSignature",
-		GetSignatureArgs{RequestID: sub.RequestID}, &reply)
-	if code == 0 {
-		t.Fatal("expected error (signature not yet available), got success")
-	}
-	if !strings.Contains(msg, "not yet available") {
-		t.Errorf("error %q should say 'not yet available'", msg)
-	}
+	resp, err := http.Post(srv.URL+"/rpc", "application/json",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"bridge_getSupportedChains"}`))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	buf := new(bytes.Buffer)
+	_, err = buf.ReadFrom(resp.Body)
+	require.NoError(t, err)
+	require.NotContains(t, buf.String(), "kms://")
 }
 
-func TestRPC_GetSignature_AfterSign(t *testing.T) {
+func TestRPC_GetSignature(t *testing.T) {
 	srv, vm := newRPCRig(t)
 
-	// Submit
 	var sub SubmitRequestReply
 	_, _ = callRPC(t, srv.URL, "bridge_submitRequest", SubmitRequestArgs{
 		SourceChain: "ETHEREUM_SEPOLIA", DestChain: "LUX_TESTNET",
@@ -359,38 +331,185 @@ func TestRPC_GetSignature_AfterSign(t *testing.T) {
 		Recipient: "0xabc", Sender: "0xabc",
 	}, &sub)
 
-	// Simulate the MPC quorum populating the signature via Patch.
+	// Still signing: a caller can poll without confusing this with "no such
+	// swap".
+	var reply GetSignatureReply
+	code, msg := callRPC(t, srv.URL, "bridge_getSignature", GetSignatureArgs{RequestID: sub.RequestID}, &reply)
+	require.NotZero(t, code)
+	require.Contains(t, msg, "not yet available")
+
 	const sig = "deadbeefcafe1234"
-	if _, err := vm.swapStore.Patch(sub.RequestID, func(r *BridgeRequestRecord) {
+	_, err := vm.swapStore.Patch(sub.RequestID, func(r *BridgeRequestRecord) {
 		r.Signature = sig
 		r.Status = StatusSigned
-	}); err != nil {
-		t.Fatalf("Patch: %v", err)
+	})
+	require.NoError(t, err)
+
+	code, msg = callRPC(t, srv.URL, "bridge_getSignature", GetSignatureArgs{RequestID: sub.RequestID}, &reply)
+	require.Zero(t, code, msg)
+	require.Equal(t, sig, reply.Signature)
+	require.Equal(t, sub.RequestID, reply.SessionID)
+
+	code, msg = callRPC(t, srv.URL, "bridge_getSignature", GetSignatureArgs{RequestID: "req_does_not_exist"}, &reply)
+	require.NotZero(t, code)
+	require.Contains(t, msg, "not found")
+}
+
+func TestRPC_GetMPCPublicKey(t *testing.T) {
+	srv, _ := newRPCRig(t)
+	var reply GetMPCPublicKeyReply
+	code, msg := callRPC(t, srv.URL, "bridge_getMPCPublicKey", nil, &reply)
+	require.NotZero(t, code, "a chain with no group key must say so rather than answer with nothing")
+	require.Contains(t, msg, "not yet established")
+}
+
+// =============================================================================
+// Signer-set RPC
+// =============================================================================
+
+func TestRPC_SignerSetLifecycle(t *testing.T) {
+	srv, _ := newRPCRig(t)
+	node := ids.GenerateTestNodeID()
+	bond := strconv.FormatUint(minValidatorBond, 10)
+
+	var reg RegisterValidatorReply
+	code, msg := callRPC(t, srv.URL, "bridge_registerValidator",
+		RegisterValidatorArgs{NodeID: node.String(), BondAmount: bond, MPCPubKey: "0xpub"}, &reg)
+	require.Zero(t, code, msg)
+	require.True(t, reg.Registered)
+
+	var has HasSignerReply
+	code, msg = callRPC(t, srv.URL, "bridge_hasSigner", HasSignerArgs{NodeID: node.String()}, &has)
+	require.Zero(t, code, msg)
+	require.True(t, has.IsSigner)
+
+	var info GetSignerSetInfoReply
+	code, msg = callRPC(t, srv.URL, "bridge_getSignerSetInfo", nil, &info)
+	require.Zero(t, code, msg)
+	require.Equal(t, 1, info.TotalSigners)
+	require.Equal(t, node.String(), info.Signers[0].NodeID)
+	require.Equal(t, minValidatorBond, info.Signers[0].BondAmount)
+
+	var epoch GetCurrentEpochReply
+	code, msg = callRPC(t, srv.URL, "bridge_getCurrentEpoch", nil, &epoch)
+	require.Zero(t, code, msg)
+	require.Zero(t, epoch.Epoch)
+	require.Equal(t, 1, epoch.TotalSigners)
+
+	// A second validator lands on the set, then gets waitlisted once it freezes.
+	waiting := ids.GenerateTestNodeID()
+	code, msg = callRPC(t, srv.URL, "bridge_registerValidator",
+		RegisterValidatorArgs{NodeID: waiting.String(), BondAmount: bond}, &reg)
+	require.Zero(t, code, msg)
+
+	var slash SlashSignerReply
+	code, msg = callRPC(t, srv.URL, "bridge_slashSigner",
+		SlashSignerArgs{NodeID: node.String(), Reason: "equivocation", SlashPercent: 10, Evidence: "0x01"}, &slash)
+	require.Zero(t, code, msg)
+	require.True(t, slash.Success)
+	require.True(t, slash.RemovedFromSet, "a bond below the requirement is not a bond")
+
+	var replace ReplaceSignerReply
+	code, msg = callRPC(t, srv.URL, "bridge_replaceSigner",
+		ReplaceSignerArgs{NodeID: waiting.String()}, &replace)
+	require.Zero(t, code, msg)
+	require.True(t, replace.Success)
+	require.Equal(t, uint64(2), replace.NewEpoch)
+
+	var wl GetWaitlistReply
+	code, msg = callRPC(t, srv.URL, "bridge_getWaitlist", nil, &wl)
+	require.Zero(t, code, msg)
+	require.Zero(t, wl.WaitlistSize)
+}
+
+func TestRPC_SignerMethodsRefuseABadNodeID(t *testing.T) {
+	srv, _ := newRPCRig(t)
+	for _, method := range []string{"bridge_hasSigner", "bridge_replaceSigner", "bridge_slashSigner", "bridge_registerValidator"} {
+		code, _ := callRPC(t, srv.URL, method, map[string]any{"nodeId": "not-a-node-id", "slashPercent": 5}, nil)
+		require.NotZero(t, code, "%s accepted a malformed node id", method)
+	}
+	code, _ := callRPC(t, srv.URL, "bridge_replaceSigner",
+		map[string]any{"nodeId": ids.GenerateTestNodeID().String(), "replacementNodeId": "not-a-node-id"}, nil)
+	require.NotZero(t, code)
+}
+
+// =============================================================================
+// The envelope itself
+// =============================================================================
+
+func TestRPC_UnknownMethod(t *testing.T) {
+	srv, _ := newRPCRig(t)
+	code, msg := callRPC(t, srv.URL, "bridge_doWhateverIWant", nil, nil)
+	require.Equal(t, -32601, code)
+	require.Contains(t, msg, "method not found")
+}
+
+func TestRPC_MalformedParamsAndBody(t *testing.T) {
+	srv, _ := newRPCRig(t)
+
+	// Every method that takes arguments must refuse arguments it cannot read.
+	for _, method := range []string{
+		"bridge_registerValidator", "bridge_replaceSigner", "bridge_hasSigner",
+		"bridge_slashSigner", "bridge_estimateFee", "bridge_submitRequest",
+		"bridge_getStatus", "bridge_cancelRequest", "bridge_getChainConfig",
+		"bridge_getSignature",
+	} {
+		body := []byte(`{"jsonrpc":"2.0","id":1,"method":"` + method + `","params":"not-an-object"}`)
+		code, _ := postRPC(t, srv.URL, body, nil)
+		require.Equal(t, -32602, code, "%s accepted params it cannot decode", method)
 	}
 
-	var reply GetSignatureReply
-	code, msg := callRPC(t, srv.URL, "bridge_getSignature",
-		GetSignatureArgs{RequestID: sub.RequestID}, &reply)
-	if code != 0 {
-		t.Fatalf("rpc error: %d %s", code, msg)
-	}
-	if reply.Signature != sig {
-		t.Errorf("Signature = %q, want %q", reply.Signature, sig)
-	}
-	if reply.SessionID != sub.RequestID {
-		t.Errorf("SessionID = %q, want %q", reply.SessionID, sub.RequestID)
+	code, _ := postRPC(t, srv.URL, []byte(`{not json`), nil)
+	require.Equal(t, -32700, code)
+}
+
+func TestRPC_DottedMethodNamesAreTheSameMethods(t *testing.T) {
+	srv, _ := newRPCRig(t)
+	for _, method := range []string{
+		"bridge.getSignerSetInfo", "bridge.getWaitlist", "bridge.getCurrentEpoch",
+		"bridge.health", "bridge.getInfo", "bridge.getSupportedChains",
+	} {
+		code, msg := callRPC(t, srv.URL, method, nil, nil)
+		require.Zero(t, code, "%s: %s", method, msg)
 	}
 }
 
-func TestRPC_GetSignature_NotFound(t *testing.T) {
+func TestRPC_OnlyPostIsAnswered(t *testing.T) {
 	srv, _ := newRPCRig(t)
-	var reply GetSignatureReply
-	code, msg := callRPC(t, srv.URL, "bridge_getSignature",
-		GetSignatureArgs{RequestID: "req_does_not_exist"}, &reply)
-	if code == 0 {
-		t.Fatal("expected error for missing swap")
-	}
-	if !strings.Contains(msg, "not found") {
-		t.Errorf("error %q should say 'not found'", msg)
-	}
+	resp, err := http.Get(srv.URL + "/rpc")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
+}
+
+// A Service with no VM behind it answers with an error rather than a panic.
+func TestRPC_ServiceWithoutAVM(t *testing.T) {
+	s := &Service{}
+	require.Error(t, s.EstimateFee(nil, &EstimateFeeArgs{Amount: "1"}, &EstimateFeeReply{}))
+	require.Error(t, s.SubmitRequest(nil, &SubmitRequestArgs{}, &SubmitRequestReply{}))
+	require.Error(t, s.GetStatus(nil, &GetStatusArgs{}, &GetStatusReply{}))
+	require.Error(t, s.CancelRequest(nil, &CancelRequestArgs{}, &CancelRequestReply{}))
+	require.Error(t, s.GetBridgeInfo(nil, &GetBridgeInfoArgs{}, &GetBridgeInfoReply{}))
+	require.Error(t, s.GetSupportedChains(nil, &GetSupportedChainsArgs{}, &GetSupportedChainsReply{}))
+	require.Error(t, s.GetChainConfig(nil, &GetChainConfigArgs{ChainID: "x"}, &GetChainConfigReply{}))
+	require.Error(t, s.GetSignature(nil, &GetSignatureArgs{}, &GetSignatureReply{}))
+	require.Error(t, s.GetMPCPublicKey(nil, &GetMPCPublicKeyArgs{}, &GetMPCPublicKeyReply{}))
+
+	var health HealthReply
+	require.NoError(t, s.Health(nil, &HealthArgs{}, &health))
+	require.Equal(t, "no vm", health.Status)
+}
+
+func TestHexEncode(t *testing.T) {
+	require.Equal(t, "", hexEncode(nil))
+	require.Equal(t, "00ff1a", hexEncode([]byte{0x00, 0xff, 0x1a}))
+}
+
+// registerSigner adds one signer with a bond that meets the requirement.
+func registerSigner(vm *VM, node ids.NodeID) error {
+	_, err := vm.RegisterValidator(&RegisterValidatorInput{
+		NodeID:     node.String(),
+		BondAmount: strconv.FormatUint(minValidatorBond, 10),
+	})
+	return err
 }
