@@ -28,7 +28,7 @@ import (
 
 var (
 	_ vmchain.ChainVM = (*VM)(nil)
-	_ vertex.DAGVM  = (*VM)(nil)
+	_ vertex.DAGVM    = (*VM)(nil)
 
 	Version = &version.Semantic{
 		Major: 1,
@@ -87,9 +87,13 @@ type VM struct {
 
 	// chain is the durable state, the blocks in flight and the tip — and the
 	// one lock over all of it. The three stores below write through its view,
-	// so their records commit with the block that made them and are discarded
-	// with a block that fails.
-	chain       *chain.Store[*Block]
+	// so their records commit with the decision that made them and are
+	// discarded with one that fails.
+	//
+	// It holds chain.Block rather than *Block because Z-Chain decides in two
+	// shapes: a linear block and a DAG vertex. Both change state the same way,
+	// which is the whole of what the store needs to know about either.
+	chain       *chain.Store[chain.Block]
 	utxoDB      *UTXODB
 	nullifierDB *NullifierDB
 	stateTree   *StateTree
@@ -149,7 +153,7 @@ func (vm *VM) Initialize(
 			return errors.New("invalid logger type")
 		}
 	}
-	vm.chain = chain.New[*Block](init.DB, vm.reload)
+	vm.chain = chain.New[chain.Block](init.DB, vm.reload)
 
 	// Parse configuration or use defaults
 	if len(init.Config) > 0 {
@@ -307,7 +311,7 @@ func (vm *VM) StrictPQ() bool { return vm.config.StrictPQ }
 // it happen in one step, so nothing can be accepted in between and leave the
 // proposal hanging off a parent that is no longer the tip.
 func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
-	built, err := vm.chain.Propose(func(parent ids.ID, height uint64) (*Block, error) {
+	built, err := vm.chain.Propose(func(parent chain.Block) (chain.Block, error) {
 		// Get transactions from mempool
 		txs := vm.mempool.GetPendingTransactions(int(vm.config.MaxUTXOsPerBlock))
 		if len(txs) == 0 {
@@ -332,8 +336,8 @@ func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
 		}
 
 		block := &Block{
-			ParentID_:      parent,
-			BlockHeight:    height + 1,
+			ParentID_:      parent.ID(),
+			BlockHeight:    parent.Height() + 1,
 			BlockTimestamp: time.Now().Unix(),
 			Txs:            validTxs,
 			vm:             vm,
@@ -351,17 +355,22 @@ func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
 	if err != nil {
 		return nil, err
 	}
-	return built, nil
+	return built.(*Block), nil
 }
 
 // ParseBlock parses a block from bytes
 func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (vmchain.Block, error) {
-	return vm.parseBlock(blockBytes)
+	block := &Block{vm: vm}
+	if err := parseBlockBytes(blockBytes, block); err != nil {
+		return nil, err
+	}
+	block.ID_ = block.computeID()
+	return block, nil
 }
 
 // parseBlock decodes a block belonging to this VM. The store reads accepted
 // blocks back through it, so there is one decoder rather than one per caller.
-func (vm *VM) parseBlock(raw []byte) (*Block, error) {
+func (vm *VM) parseBlock(raw []byte) (chain.Block, error) {
 	block := &Block{vm: vm}
 	if err := parseBlockBytes(raw, block); err != nil {
 		return nil, err
@@ -375,7 +384,18 @@ func (vm *VM) GetBlock(ctx context.Context, blkID ids.ID) (vmchain.Block, error)
 	if blkID == vm.genesisBlock.ID() {
 		return vm.genesisBlock, nil
 	}
-	return vm.chain.Block(blkID, vm.parseBlock)
+	decided, err := vm.chain.Block(blkID, vm.parseBlock)
+	if err != nil {
+		return nil, err
+	}
+	// A vertex is a decision this chain makes but not a block the engine can
+	// take, so asking for one by block id is answered as a miss rather than
+	// with something the caller cannot use.
+	blk, ok := decided.(*Block)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s is not a block", chain.ErrNoBlock, blkID)
+	}
+	return blk, nil
 }
 
 // reload rebuilds the caches the three stores keep beside the database. It runs
@@ -435,11 +455,11 @@ func (vm *VM) HealthCheck(ctx context.Context) (vmchain.HealthResult, error) {
 	return vmchain.HealthResult{
 		Healthy: true,
 		Details: map[string]string{
-			"utxoCount":         fmt.Sprintf("%d", vm.utxoDB.GetUTXOCount()),
-			"nullifierCount":    fmt.Sprintf("%d", vm.nullifierDB.GetNullifierCount()),
-			"lastBlockHeight":   fmt.Sprintf("%d", height),
-			"mempoolSize":       fmt.Sprintf("%d", vm.mempool.Size()),
-			"proofCacheSize":    fmt.Sprintf("%d", vm.proofVerifier.GetCacheSize()),
+			"utxoCount":       fmt.Sprintf("%d", vm.utxoDB.GetUTXOCount()),
+			"nullifierCount":  fmt.Sprintf("%d", vm.nullifierDB.GetNullifierCount()),
+			"lastBlockHeight": fmt.Sprintf("%d", height),
+			"mempoolSize":     fmt.Sprintf("%d", vm.mempool.Size()),
+			"proofCacheSize":  fmt.Sprintf("%d", vm.proofVerifier.GetCacheSize()),
 		},
 	}, nil
 }

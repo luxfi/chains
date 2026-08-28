@@ -21,23 +21,23 @@ var _ vertex.DAGVM = (*VM)(nil)
 // Conflict key: set of nullifiers spent in the vertex.
 // Two vertices conflict iff their nullifier sets intersect.
 type Vertex struct {
-	id       ids.ID
-	bytes    []byte
-	height   uint64
-	epoch    uint32
-	parents  []ids.ID
-	txIDs    []ids.ID
-	status   choices.Status
-	txs      []*Transaction
-	vm       *VM
+	id      ids.ID
+	bytes   []byte
+	height  uint64
+	epoch   uint32
+	parents []ids.ID
+	txIDs   []ids.ID
+	status  choices.Status
+	txs     []*Transaction
+	vm      *VM
 }
 
-func (v *Vertex) ID() ids.ID          { return v.id }
-func (v *Vertex) Bytes() []byte        { return v.bytes }
-func (v *Vertex) Height() uint64       { return v.height }
-func (v *Vertex) Epoch() uint32        { return v.epoch }
-func (v *Vertex) Parents() []ids.ID    { return v.parents }
-func (v *Vertex) Txs() []ids.ID        { return v.txIDs }
+func (v *Vertex) ID() ids.ID             { return v.id }
+func (v *Vertex) Bytes() []byte          { return v.bytes }
+func (v *Vertex) Height() uint64         { return v.height }
+func (v *Vertex) Epoch() uint32          { return v.epoch }
+func (v *Vertex) Parents() []ids.ID      { return v.parents }
+func (v *Vertex) Txs() []ids.ID          { return v.txIDs }
 func (v *Vertex) Status() choices.Status { return v.status }
 
 func (v *Vertex) Verify(ctx context.Context) error {
@@ -316,7 +316,7 @@ func deserializeVertex(data []byte, vm *VM) (*Vertex, error) {
 		if pos+int(txLen) > len(data) {
 			return nil, errInvalidBlock
 		}
-		tx, err := parseTransaction(data[pos:pos+int(txLen)])
+		tx, err := parseTransaction(data[pos : pos+int(txLen)])
 		if err != nil {
 			return nil, err
 		}

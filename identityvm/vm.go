@@ -153,7 +153,7 @@ type VM struct {
 
 	// pending holds the credentials waiting for a block, and tells consensus
 	// there is one to build. LOCK ORDER: the chain's lock, then the pool's.
-	pending *chain.Pool[*Credential]
+	pending *chain.Pool[*Credential, ids.ID]
 
 	// fee is what this chain charges to admit a mutating RPC. I-Chain accepts
 	// user-submitted DID and credential calls that produce on-chain effects,
@@ -350,15 +350,15 @@ func (vm *VM) Disconnected(ctx context.Context, nodeID ids.NodeID) error {
 // block on it happen in one step, so nothing can be accepted in between and
 // leave the proposal hanging off a parent that is no longer the tip.
 func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
-	built, err := vm.chain.Propose(func(parent ids.ID, height uint64) (*Block, error) {
+	built, err := vm.chain.Propose(func(parent *Block) (*Block, error) {
 		// A block with nothing in it says nothing and still has to be voted on.
 		creds := vm.pending.Take(0)
 		if len(creds) == 0 {
 			return nil, errNothingToBuild
 		}
 		return &Block{
-			ParentID_:      parent,
-			BlockHeight:    height + 1,
+			ParentID_:      parent.ID(),
+			BlockHeight:    parent.Height() + 1,
 			BlockTimestamp: time.Now().Unix(),
 			Credentials:    creds,
 			vm:             vm,

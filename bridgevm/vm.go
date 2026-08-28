@@ -441,7 +441,7 @@ func (vm *VM) parseBlock(raw []byte) (*Block, error) {
 
 // BuildBlock implements the chain.ChainVM interface
 func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
-	built, err := vm.chain.Propose(func(parentID ids.ID, parentHeight uint64) (*Block, error) {
+	built, err := vm.chain.Propose(func(parent *Block) (*Block, error) {
 		// The transfers in flight are the bridge's state, so they are read under
 		// the bridge's lock — taken here, inside the chain's, which is the one
 		// order these are ever taken in.
@@ -481,8 +481,8 @@ func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
 
 		// Create new block
 		blk := &Block{
-			ParentID_:      parentID,
-			BlockHeight:    parentHeight + 1,
+			ParentID_:      parent.ID(),
+			BlockHeight:    parent.Height() + 1,
 			BlockTimestamp: time.Now().Unix(),
 			BridgeRequests: requests,
 			vm:             vm,

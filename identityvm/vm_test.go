@@ -42,10 +42,10 @@ func TestVMInitialize(t *testing.T) {
 	require := require.New(t)
 
 	vm := &VM{
-		identities:    make(map[ids.ID]*Identity),
-		credentials:   make(map[ids.ID]*Credential),
-		issuers:       make(map[ids.ID]*Issuer),
-		revocations:   make(map[ids.ID]*RevocationEntry),
+		identities:  make(map[ids.ID]*Identity),
+		credentials: make(map[ids.ID]*Credential),
+		issuers:     make(map[ids.ID]*Issuer),
+		revocations: make(map[ids.ID]*RevocationEntry),
 	}
 
 	genesis := &Genesis{
@@ -625,10 +625,10 @@ func setupTestVM(t *testing.T) *VM {
 	t.Helper()
 
 	vm := &VM{
-		identities:    make(map[ids.ID]*Identity),
-		credentials:   make(map[ids.ID]*Credential),
-		issuers:       make(map[ids.ID]*Issuer),
-		revocations:   make(map[ids.ID]*RevocationEntry),
+		identities:  make(map[ids.ID]*Identity),
+		credentials: make(map[ids.ID]*Credential),
+		issuers:     make(map[ids.ID]*Issuer),
+		revocations: make(map[ids.ID]*RevocationEntry),
 	}
 
 	genesis := &Genesis{
