@@ -85,27 +85,23 @@ func TestCaller_PayloadCannotNameItself(t *testing.T) {
 	}
 }
 
-// TestUnboundLabelIsNotCounted is F10: an entry whose chainId is a LABEL binds to
-// no chain, exactly like an empty one, because a label never equals a base58 chain
-// id. Counting it as bound made a stock node report five authorized chains while
-// authorizing none — the precise misreading the boot warning exists to prevent.
-func TestUnboundLabelIsNotCounted(t *testing.T) {
-	real := ids.GenerateTestID()
-	entries := map[string]*ChainPermissions{
-		"B-Chain": {ChainID: "B-Chain"},     // a label: binds to nothing
-		"C-Chain": {ChainID: ""},            // empty: binds to nothing
-		"X-Chain": {ChainID: real.String()}, // an actual chain id
+// An entry whose chainId is a LABEL binds to no chain, exactly like an empty
+// one, because a label never equals a base58 chain id.
+//
+// This test used to re-implement the counting loop it was named for and assert
+// on its own copy, which passes whatever the VM does. The property is held
+// against the VM in TestOnlyAnEntryCarryingARealChainIdCountsAsBound, which
+// boots a node on such a table and asks it who it authorizes. What is left here
+// is the half that is genuinely local: a label is not an id.
+func TestALabelIsNotAChainId(t *testing.T) {
+	if _, err := ids.FromString("B-Chain"); err == nil {
+		t.Fatal("a label parses as a chain id; the whole binding rule rests on it not doing so")
 	}
-	bound := 0
-	for _, p := range entries {
-		if p != nil && p.ChainID != "" {
-			if _, err := ids.FromString(p.ChainID); err == nil {
-				bound++
-			}
-		}
+	if _, err := ids.FromString(""); err == nil {
+		t.Fatal("an empty chainId parses as a chain id")
 	}
-	if bound != 1 {
-		t.Fatalf("bound = %d, want 1 — only an entry carrying a real chain id is bound", bound)
+	if _, err := ids.FromString(ids.GenerateTestID().String()); err != nil {
+		t.Fatalf("a real chain id does not parse: %v", err)
 	}
 }
 
