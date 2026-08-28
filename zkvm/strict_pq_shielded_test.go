@@ -30,7 +30,7 @@ func strictPQVerifier(t *testing.T) *ProofVerifier {
 	pv, err := NewProofVerifier(ZConfig{
 		ProofCacheSize: 100,
 		StrictPQ:       true,
-	}, [32]byte{}, log.NoLog{})
+	}, testBind, log.NoLog{})
 	if err != nil {
 		t.Fatalf("NewProofVerifier(strictPQ): %v", err)
 	}
@@ -96,7 +96,7 @@ func TestStrictPQ_RealBN254VKLoadErrors(t *testing.T) {
 		VerifyingKeys: map[string][]byte{
 			string(TransactionTypeTransfer): realVK,
 		},
-	}, [32]byte{}, log.NoLog{})
+	}, testBind, log.NoLog{})
 	if !errors.Is(err, errStrictPQRealVKForbidden) {
 		t.Fatalf("strict-PQ chain must error on real bn254 VK loaded by the production loadVerifyingKeys, got: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestNonStrict_RealVKConstructs(t *testing.T) {
 		VerifyingKeys: map[string][]byte{
 			string(TransactionTypeTransfer): realVK,
 		},
-	}, [32]byte{}, log.NoLog{})
+	}, testBind, log.NoLog{})
 	if err != nil {
 		t.Fatalf("non-strict chain must accept a real bn254 VK, got: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestNonStrict_ClassicalPathUnchanged(t *testing.T) {
 	pv, err := NewProofVerifier(ZConfig{
 		ProofCacheSize: 100,
 		StrictPQ:       false,
-	}, [32]byte{}, log.NoLog{})
+	}, testBind, log.NoLog{})
 	if err != nil {
 		t.Fatalf("NewProofVerifier: %v", err)
 	}
