@@ -3,7 +3,17 @@
 **Reviewer role:** skeptical cryptographer / protocol auditor
 **Scope:** PQ-readiness + permissionless soundness gate before any public-mainnet move
 **Date of review:** 2026-06-25
-**Verdict (one line):** **GATE FAILS — and the primary finding is that the review subject does not exist in the codebase.** Of the security-bearing questions that *can* be answered against real code, the consensus/identity PQ story is genuinely strong; the data-availability story for a storage VM is entirely unbuilt and is the deepest blocker.
+**Status:** This review was conducted against a different checkout and its headline
+finding — that the review subject is absent — does not hold of the tree it now sits
+in. `vm.go`, `block.go`, `chainvm.go`, `state/`, `txs/`, `pinning/`, `object/` and
+their tests are all present beside this file. Two of its §6 must-fix items are built:
+the state root is a SHAKE256 / SP 800-185 `left_encode` fold under a versioned
+domain string (`state/state.go`), and `Verify` recomputes it and rejects a mismatch
+(`block.go`). Its §4 data-availability findings, its §3.1 censorship finding and its
+§3.3 pin-grinding finding are about properties this chain still does not have, and
+stand. Read the sections below as a review of the DESIGN, not as a report on the tree.
+
+**Verdict (one line):** **GATE FAILS — and the primary finding is that the review subject was absent from the checkout reviewed.** Of the security-bearing questions that *can* be answered against real code, the consensus/identity PQ story is genuinely strong; the data-availability story for a storage VM is entirely unbuilt and is the deepest blocker.
 
 ---
 
@@ -177,4 +187,4 @@ The PQ *consensus* foundation Lux has built is real and good. The S-chain storag
 
 ---
 
-*No production code was modified by this review. The "pinned writer" and HRW state-root constructions could not be tested for collisions because they are unimplemented; §2.4 and §3.3 give the adversarial constructions to test against once the code exists.*
+*No production code was modified by this review. The "pinned writer" and HRW state-root constructions could not be tested for collisions against the checkout reviewed; §2.4 and §3.3 give the adversarial constructions to test against. Both now exist in this tree — see the Status note at the top.*

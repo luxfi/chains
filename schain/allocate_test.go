@@ -28,6 +28,7 @@ package schain
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"testing"
 
@@ -162,10 +163,11 @@ func allocate(t *testing.T, cvm *ChainVM, rng string, count uint32) (base, next 
 	t.Helper()
 	ctx := context.Background()
 
-	base, gerr := cvm.inner.state.GetAlloc(rng)
+	pre, gerr := cvm.inner.state.GetAlloc(rng)
 	if gerr != nil {
 		t.Fatalf("GetAlloc(pre): %v", gerr)
 	}
+	base = pre.Next
 
 	tx := txs.NewAllocateTx(rng, count)
 	if serr := cvm.SubmitTx(tx.Bytes()); serr != nil {
@@ -173,10 +175,13 @@ func allocate(t *testing.T, cvm *ChainVM, rng string, count uint32) (base, next 
 	}
 	blk, berr := cvm.BuildBlock(ctx)
 	if berr != nil {
-		// The gate fires PROPOSER-side too: a non-owner cannot build a block whose
-		// allocate it has no right to authorize. The mempool is drained on a failed
-		// build, so the rejected intent does not leak into a later block.
-		return base, base, unwrapBuild(berr)
+		return base, base, berr
+	}
+	if len(blk.(*Block).txs) == 0 {
+		// The proposer left the allocate out of its own block — a non-owner cannot
+		// authorize a range it does not own, so it does not build a block carrying
+		// one. A builder drops in silence, so ask a verifier WHY: it names the gate.
+		return base, base, refusalFor(t, cvm, rng, count)
 	}
 	if verr := blk.Verify(ctx); verr != nil {
 		return base, base, verr
@@ -184,16 +189,43 @@ func allocate(t *testing.T, cvm *ChainVM, rng string, count uint32) (base, next 
 	if aerr := blk.Accept(ctx); aerr != nil {
 		t.Fatalf("Accept: %v", aerr)
 	}
-	next, gerr = cvm.inner.state.GetAlloc(rng)
+	post, gerr := cvm.inner.state.GetAlloc(rng)
 	if gerr != nil {
 		t.Fatalf("GetAlloc(post): %v", gerr)
 	}
-	return base, next, nil
+	return base, post.Next, nil
 }
 
-// unwrapBuild strips BuildBlock's wrapper so a caller can match on the underlying
-// gate error with errors.Is (which also traverses the %w chain directly).
-func unwrapBuild(err error) error { return err }
+// refusalFor stamps the authorization this node's proposer would have produced
+// for (rng, count) and asks a verifier to judge a block carrying it, returning
+// the gate's verdict. It is how a test recovers the REASON a proposer left an
+// allocate out of its own block.
+func refusalFor(t *testing.T, cvm *ChainVM, rng string, count uint32) error {
+	t.Helper()
+	ctx := context.Background()
+
+	cvm.lock.RLock()
+	height := cvm.lastAcceptedHeight + 1
+	signer := cvm.allocateSigner
+	cvm.lock.RUnlock()
+
+	blockCtx, err := cvm.resolveBlockContext(ctx, height)
+	if err != nil {
+		t.Fatalf("resolve block context: %v", err)
+	}
+	intent := txs.NewAllocateTx(rng, count)
+	if signer == nil || len(blockCtx.Members) == 0 {
+		// No signer or no set: the intent travels unsigned, exactly as
+		// signOwnedAllocates would leave it.
+		return carry(t, cvm, intent.Bytes()).Verify(ctx)
+	}
+	fp := pinning.EpochFingerprint(blockCtx.Epoch, blockCtx.Members)
+	signed, serr := signer.signAllocate(intent, blockCtx.Epoch, height, fp)
+	if serr != nil {
+		t.Fatalf("sign allocate: %v", serr)
+	}
+	return carry(t, cvm, signed.Bytes()).Verify(ctx)
+}
 
 // signAllocateAs signs the canonical allocate bytes with v's ML-DSA-65 key.
 func signAllocateAs(t *testing.T, v testVal, rng string, count uint32, epoch, nonce uint64, fp ids.ID) []byte {
@@ -206,24 +238,64 @@ func signAllocateAs(t *testing.T, v testVal, rng string, count uint32, epoch, no
 	return sig
 }
 
-// buildPreSigned submits an already-signed (possibly adversarial) AllocateTx and
-// attempts to build the block. signOwnedAllocates passes a signed tx through
-// untouched, so ProcessBlock runs the SAME gate Block.Verify runs — the returned
-// error is the gate's verdict. A nil error means the block built (and was accepted).
+// buildPreSigned puts an already-signed (possibly adversarial) AllocateTx into a
+// block DIRECTLY, bypassing the proposer's own selection, and asks a verifier to
+// judge it. That is the safety question the pinned writer exists to answer: a
+// proposer that includes an allocate the owner did not authorize must not get
+// the block accepted. The returned error is the gate's verdict; nil means the
+// block was accepted.
+//
+// A node's own BuildBlock leaves such a transaction OUT rather than failing —
+// that is the liveness half, proven separately in TestBuilderDropsWhatItCannotAuthorize.
 func buildPreSigned(t *testing.T, cvm *ChainVM, signed *txs.AllocateTx) error {
 	t.Helper()
 	ctx := context.Background()
-	if err := cvm.SubmitTx(signed.Bytes()); err != nil {
-		t.Fatalf("SubmitTx: %v", err)
-	}
-	blk, err := cvm.BuildBlock(ctx)
-	if err != nil {
-		return err
-	}
+	blk := carry(t, cvm, signed.Bytes())
 	if err := blk.Verify(ctx); err != nil {
 		return err
 	}
 	return blk.Accept(ctx)
+}
+
+// carry builds a block carrying exactly these transaction bytes on top of the
+// last accepted block, with the same deterministic block context a proposer
+// would resolve. It is how a test plays a proposer that includes whatever it
+// likes — the input a verifier actually has to survive.
+func carry(t *testing.T, cvm *ChainVM, txBytes ...[]byte) *Block {
+	t.Helper()
+	ctx := context.Background()
+
+	cvm.lock.Lock()
+	parentID, height := cvm.lastAcceptedID, cvm.lastAcceptedHeight+1
+	cvm.lock.Unlock()
+
+	blockCtx, err := cvm.resolveBlockContext(ctx, height)
+	if err != nil {
+		t.Fatalf("resolve block context: %v", err)
+	}
+	blk := &Block{
+		vm: cvm, parentID: parentID, height: height,
+		timestamp: cvm.inner.clock.Time(), txs: txBytes,
+		blockCtx: blockCtx, status: StatusProcessing,
+	}
+	hash := sha256.Sum256(blk.Bytes())
+	copy(blk.id[:], hash[:])
+
+	// The proposer's claimed root is the one an honest apply of these exact
+	// transactions produces, so the root check never masks the gate verdict.
+	result, err := cvm.inner.Select(height, blk.timestamp, txBytes, blockCtx)
+	if err != nil {
+		t.Fatalf("compute claimed root: %v", err)
+	}
+	cvm.inner.abort()
+	blk.stateRoot = result.StateRoot
+	hash = sha256.Sum256(blk.Bytes())
+	copy(blk.id[:], hash[:])
+
+	cvm.lock.Lock()
+	cvm.blocks[blk.id] = blk
+	cvm.lock.Unlock()
+	return blk
 }
 
 // TestOwnerSignedAllocatesContiguousMonotonic proves: an AllocateTx signed by the
@@ -255,7 +327,7 @@ func TestOwnerSignedAllocatesContiguousMonotonic(t *testing.T) {
 	if base2 != 8 || next2 != 13 {
 		t.Fatalf("second allocation = [%d,%d), want [8,13)", base2, next2)
 	}
-	if n, _ := cvm.inner.state.GetAlloc(rng); n != 13 {
+	if n, _ := cvm.inner.state.GetAlloc(rng); n.Next != 13 {
 		t.Fatalf("committed counter = %d, want 13", n)
 	}
 }
@@ -290,7 +362,7 @@ func TestNonOwnerWithValidKeyRejected(t *testing.T) {
 	if !errors.Is(err, errNonOwnerAllocate) {
 		t.Fatalf("non-owner-with-valid-key accepted: err = %v, want errNonOwnerAllocate", err)
 	}
-	if n, _ := cvm.inner.state.GetAlloc(rng); n != 0 {
+	if n, _ := cvm.inner.state.GetAlloc(rng); n.Next != 0 {
 		t.Fatalf("rejected adversarial allocate moved the counter to %d, want 0", n)
 	}
 }
@@ -322,7 +394,7 @@ func TestForgedSignatureRejected(t *testing.T) {
 	if !errors.Is(err, errBadAllocateSig) {
 		t.Fatalf("forged signature accepted: err = %v, want errBadAllocateSig", err)
 	}
-	if n, _ := cvm.inner.state.GetAlloc(rng); n != 0 {
+	if n, _ := cvm.inner.state.GetAlloc(rng); n.Next != 0 {
 		t.Fatalf("forged allocate moved the counter to %d, want 0", n)
 	}
 }
@@ -449,7 +521,7 @@ func TestNonOwnerSignedAllocateRejected(t *testing.T) {
 	if !errors.Is(err, errNonOwnerAllocate) {
 		t.Fatalf("non-owner allocate: err = %v, want errNonOwnerAllocate", err)
 	}
-	if n, _ := cvm.inner.state.GetAlloc(rng); n != 0 {
+	if n, _ := cvm.inner.state.GetAlloc(rng); n.Next != 0 {
 		t.Fatalf("rejected allocate moved the counter to %d, want 0", n)
 	}
 }
@@ -505,7 +577,7 @@ func TestVerifierAcceptsOwnerSignedBlockRegardlessOfRelay(t *testing.T) {
 	if err := parsed.Accept(ctx); err != nil {
 		t.Fatalf("verifier Accept: %v", err)
 	}
-	if n, _ := verifier.inner.state.GetAlloc(rng); n != 4 {
+	if n, _ := verifier.inner.state.GetAlloc(rng); n.Next != 4 {
 		t.Fatalf("verifier counter = %d, want 4", n)
 	}
 }
@@ -538,7 +610,7 @@ func TestVerifierRejectsNonOwnerSignedBlock(t *testing.T) {
 	if !errors.Is(err, errNonOwnerAllocate) {
 		t.Fatalf("verifier accepted non-owner-signed block: err = %v, want errNonOwnerAllocate", err)
 	}
-	if n, _ := verifier.inner.state.GetAlloc(rng); n != 0 {
+	if n, _ := verifier.inner.state.GetAlloc(rng); n.Next != 0 {
 		t.Fatalf("rejected block leaked allocation: counter = %d, want 0", n)
 	}
 }
@@ -583,7 +655,7 @@ func TestParallelDistinctRangesIndependentOwners(t *testing.T) {
 	if _, _, err := allocate(t, cvmA, rngB, 3); !errors.Is(err, errNonOwnerAllocate) {
 		t.Fatalf("owner A allocate in range B: err = %v, want errNonOwnerAllocate", err)
 	}
-	if n, _ := cvmA.inner.state.GetAlloc(rngB); n != 0 {
+	if n, _ := cvmA.inner.state.GetAlloc(rngB); n.Next != 0 {
 		t.Fatalf("range B counter moved on owner A's view = %d, want 0", n)
 	}
 
@@ -621,7 +693,7 @@ func TestSameRangeSerializesThroughOneOwner(t *testing.T) {
 	if _, _, err := allocate(t, cvm, rng, 5); !errors.Is(err, errNonOwnerAllocate) {
 		t.Fatalf("non-owner interleave: err = %v, want errNonOwnerAllocate", err)
 	}
-	if n, _ := cvm.inner.state.GetAlloc(rng); n != 20 {
+	if n, _ := cvm.inner.state.GetAlloc(rng); n.Next != 20 {
 		t.Fatalf("counter after rejected non-owner write = %d, want 20", n)
 	}
 }
@@ -683,7 +755,7 @@ func TestStateRootCoversAllocThroughVerify(t *testing.T) {
 	if err := concrete.Verify(ctx); !errors.Is(err, errStateRootMismatch) {
 		t.Fatalf("Verify error = %v, want errStateRootMismatch", err)
 	}
-	if n, _ := bad.inner.state.GetAlloc(rng); n != 0 {
+	if n, _ := bad.inner.state.GetAlloc(rng); n.Next != 0 {
 		t.Fatalf("rejected (bad-root) block leaked an allocation: counter = %d, want 0", n)
 	}
 }

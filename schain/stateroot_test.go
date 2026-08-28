@@ -131,7 +131,7 @@ func TestRootChangeSensitivity(t *testing.T) {
 	baseRoot := root(base())
 
 	cases := []struct {
-		name  string
+		name   string
 		mutate func(*state.State)
 	}{
 		{"new object", func(s *state.State) {

@@ -62,9 +62,6 @@ type Block struct {
 	// verifying wrapper populates it — the safe default).
 	blockCtx BlockContext
 
-	// result is populated after Verify.
-	result *BlockResult
-
 	status Status
 }
 
@@ -138,42 +135,77 @@ func (b *Block) Bytes() []byte {
 // manifest writes land in the in-memory version layer and become durable only at
 // Accept.
 func (b *Block) Verify(ctx context.Context) error {
-	result, err := b.vm.inner.ProcessBlock(ctx, b.height, b.timestamp, b.txs, b.blockCtx)
-	if err != nil {
+	if _, err := b.apply(ctx); err != nil {
 		return err
 	}
-	if result.StateRoot != b.stateRoot {
-		// Drop this block's staged writes; the version layer must not retain a
-		// rejected block's mutations for the next Verify.
-		if b.vm.inner.db != nil {
-			b.vm.inner.db.Abort()
-		}
-		return fmt.Errorf("%w: claimed %s, computed %s", errStateRootMismatch, b.stateRoot, result.StateRoot)
-	}
-	b.result = result
 	b.status = StatusProcessing
 	return nil
 }
 
-// Accept marks the block accepted and commits its state batch in ONE atomic
-// write (the single commit point — dexvm/block.go:159). After this returns, the
-// block's manifests are durable and GetManifest observes them.
-func (b *Block) Accept(ctx context.Context) error {
-	b.status = StatusAccepted
+// apply is what Verify and Accept both do: check the block's POSITION, replay
+// its transactions over COMMITTED state, and check the root it claims against
+// the root that produced. Accept runs it again rather than trusting the version
+// layer Verify left, because that layer belongs to whichever block was processed
+// most recently — verify a sibling between a block's Verify and its Accept and
+// the commit would carry the sibling's writes under this block's id.
+func (b *Block) apply(ctx context.Context) (*BlockResult, error) {
+	if err := b.vm.checkPosition(b); err != nil {
+		return nil, err
+	}
+	result, err := b.vm.inner.ProcessBlock(ctx, b.height, b.timestamp, b.txs, b.blockCtx)
+	if err != nil {
+		return nil, err
+	}
+	if result.StateRoot != b.stateRoot {
+		// Drop this block's staged writes; the version layer must not retain a
+		// rejected block's mutations for the next apply.
+		b.vm.inner.abort()
+		return nil, fmt.Errorf("%w: claimed %s, computed %s", errStateRootMismatch, b.stateRoot, result.StateRoot)
+	}
+	return result, nil
+}
 
+// Accept commits the block's state batch in ONE atomic write (the single commit
+// point — dexvm/block.go:159) and only then advances the chain in memory. The
+// order matters: a tip that moved ahead of its commit is a chain serving reads
+// out of writes that never landed. After this returns, the block's manifests are
+// durable and GetManifest observes them.
+func (b *Block) Accept(ctx context.Context) error {
+	if _, err := b.apply(ctx); err != nil {
+		return err
+	}
+	if err := b.vm.inner.commit(); err != nil {
+		return err
+	}
+
+	b.vm.lock.Lock()
+	defer b.vm.lock.Unlock()
+	b.status = StatusAccepted
 	b.vm.lastAcceptedID = b.id
 	b.vm.lastAcceptedHeight = b.height
 	b.vm.blocks[b.id] = b
-
-	return b.vm.inner.acceptBlock(ctx, b.result)
+	b.vm.heights[b.height] = b.id
+	// A preferred tip at or behind the accepted one can only produce blocks that
+	// will never be accepted — and, since the proposer stamps an allocate's nonce
+	// from the block height, blocks whose allocations look like replays of each
+	// other. The engine normally advances the preference; when it has not, the
+	// block just accepted is the only sensible tip to build on.
+	if pref, ok := b.vm.blocks[b.vm.preferredID]; !ok || pref.height <= b.height {
+		b.vm.preferredID = b.id
+	}
+	b.vm.prune(b.height)
+	return nil
 }
 
-// Reject discards the block's staged version-layer changes (dexvm/block.go:175).
+// Reject discards the block's staged version-layer changes (dexvm/block.go:175)
+// and releases it from the block index.
 func (b *Block) Reject(ctx context.Context) error {
+	b.vm.inner.abort()
+
+	b.vm.lock.Lock()
+	defer b.vm.lock.Unlock()
 	b.status = StatusRejected
-	if b.vm.inner.db != nil {
-		b.vm.inner.db.Abort()
-	}
+	delete(b.vm.blocks, b.id)
 	return nil
 }
 

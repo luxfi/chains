@@ -75,7 +75,7 @@ func TestObjectRoundTripSplit(t *testing.T) {
 	store := object.New(vol, &chainAdapter{t: t, cvm: cvm})
 
 	const (
-		bucket = "photos"
+		bucket    = "photos"
 		objectKey = "cat.jpg"
 	)
 	blob := bytes.Repeat([]byte("LUX-STORAGE-BLOB-"), 4096) // ~68 KiB of real bytes

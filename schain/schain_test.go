@@ -22,6 +22,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/luxfi/database"
 	"github.com/luxfi/database/zapdb"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
@@ -40,7 +41,6 @@ import (
 // would.
 func newTestVM(t *testing.T) (*ChainVM, chan vm.Message) {
 	t.Helper()
-	logger := log.NewNoOpLogger()
 
 	// A REAL on-disk zapdb namespace for this chain (canonical zapdb test
 	// pattern: zapdb.New(dir, nil, namespace, metrics)). This is the storage the
@@ -52,22 +52,32 @@ func newTestVM(t *testing.T) (*ChainVM, chan vm.Message) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	toEngine := make(chan vm.Message, 8)
-	rt := &runtime.Runtime{
-		ChainID:   ids.GenerateTestID(),
-		NetworkID: 96369,
-		Log:       logger,
-	}
-
-	cvm := NewChainVM(logger)
-	if err := cvm.Initialize(context.Background(), vm.Init{
-		Runtime:  rt,
-		DB:       db,
-		ToEngine: toEngine,
-		Log:      logger,
-	}); err != nil {
+	init := initFor(db)
+	init.ToEngine = toEngine
+	cvm := NewChainVM(logNoop())
+	if err := cvm.Initialize(context.Background(), init); err != nil {
 		t.Fatalf("initialize schain VM: %v", err)
 	}
 	return cvm, toEngine
+}
+
+// logNoop is the logger every test chain runs with.
+func logNoop() log.Logger { return log.NewNoOpLogger() }
+
+// initFor builds the (runtime, database, engine channel) triple the chains
+// manager hands a VM.
+func initFor(db database.Database) vm.Init {
+	logger := logNoop()
+	return vm.Init{
+		Runtime: &runtime.Runtime{
+			ChainID:   ids.GenerateTestID(),
+			NetworkID: 96369,
+			Log:       logger,
+		},
+		DB:       db,
+		ToEngine: make(chan vm.Message, 8),
+		Log:      logger,
+	}
 }
 
 // TestManifestRoundTripThroughAccept is the M0 acceptance proof: a manifest is

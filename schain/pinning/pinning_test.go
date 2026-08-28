@@ -159,8 +159,8 @@ func TestZeroWeightNeverOwns(t *testing.T) {
 // churn — the property that makes validator-set change cheap rather than a full
 // reshuffle. Adding back is symmetric.
 func TestMinimalDisruption(t *testing.T) {
-	full := members(10, 10, 10, 10, 10)        // nodes 1..5
-	removed := full[len(full)-1].NodeID          // drop node 5
+	full := members(10, 10, 10, 10, 10) // nodes 1..5
+	removed := full[len(full)-1].NodeID // drop node 5
 	reduced := full[:len(full)-1]
 
 	const trials = 20000
