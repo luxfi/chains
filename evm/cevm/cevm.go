@@ -55,7 +55,22 @@
 // memory, and the call bridge) without error.
 package cevm
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrNotLinked is what every entry point that needs the native luxcpp library
+// returns when this binary was built without it — the default build, and any
+// build on a host lacking the lux-cevm bundle.
+//
+// It is a value rather than a message because a caller has to tell it apart
+// from a bad input, and the two lead to opposite decisions: a build that
+// cannot execute declines the block to whatever else can, while a block that
+// cannot be executed is a hard failure. A caller that could only read the
+// message either treated a missing library as a corrupt block, or — worse —
+// fell back on a signature the library had rejected.
+var ErrNotLinked = errors.New("cevm: native EVM not linked (rebuild with CGO_ENABLED=1 -tags=lux_cevm_native)")
 
 // Backend selects the C++ EVM execution mode.
 // BlockResult extends BlockResult with the V2 ABI fields: per-tx status

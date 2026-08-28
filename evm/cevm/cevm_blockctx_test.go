@@ -2,10 +2,7 @@
 
 package cevm
 
-import (
-	"encoding/binary"
-	"testing"
-)
+import "testing"
 
 // TestBlockContextChainID is the canonical end-to-end check that the
 // dispatcher forwards Config.block_context to whichever backend actually
@@ -120,14 +117,3 @@ func TestBlockContextChainID(t *testing.T) {
 		}
 	})
 }
-
-// encodeBE32 is a helper used by future test extensions that decode RETURN
-// data once we wire output bytes through BlockResult. Kept here so the
-// chain id big-endian encoding stays in one place.
-func encodeBE32(v uint64) [32]byte {
-	var b [32]byte
-	binary.BigEndian.PutUint64(b[24:32], v)
-	return b
-}
-
-var _ = encodeBE32 // not yet used; reserved for output-bytes verification

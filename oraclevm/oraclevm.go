@@ -5,7 +5,9 @@
 package oraclevm
 
 import (
+	"github.com/luxfi/constants"
 	oraclevm "github.com/luxfi/oracle/vm"
+	"github.com/luxfi/vm/chain"
 )
 
 // Re-exported public surface.
@@ -44,5 +46,20 @@ type (
 	HealthReply            = oraclevm.HealthReply
 )
 
-// VMID is the canonical O-Chain VM identifier.
-var VMID = oraclevm.VMID
+// VMID identifies O-Chain. It is constants.OracleVMID and nothing else.
+//
+// A vmID is an immutable one-way door: it is baked into the CreateChainTx at
+// genesis, it is the plugin binary's filename, and it is what the P-Chain
+// stores forever. So it is named from the one source of truth rather than
+// re-exported from luxfi/oracle, which declares it as a private literal
+// (`ids.ID{'o','r','a','c','l','e','v','m'}`) that agrees with constants by
+// coincidence and nothing else. This repo builds the plugin binary, so this
+// repo is where the two must be proven to agree: TestVMID_IsCanonicalAndStable
+// compares all three.
+var VMID = constants.OracleVMID
+
+// Factory.New satisfies the node's vms.Factory and so returns interface{}.
+// What the plugin serves is a chain.ChainVM, and this is where that is
+// established — a build error here rather than a type assertion that fails at
+// the moment an operator starts the chain.
+var _ chain.ChainVM = (*VM)(nil)

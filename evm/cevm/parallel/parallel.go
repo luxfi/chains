@@ -14,29 +14,42 @@
 // The implementation lives WITH cevm (not in luxfi/evm) so the
 // import direction is correct: luxfi/evm declares the interface;
 // luxfi/chains/evm/cevm/parallel imports luxfi/evm to satisfy it.
-// Consumers wire it explicitly:
 //
-//   import _ "github.com/luxfi/chains/evm/cevm/parallel" // registers
+// # Wiring
 //
-// or for explicit control:
+// Explicit, and it has to stay explicit:
 //
-//   import (
-//       "github.com/luxfi/evm/core/parallel"
-//       cevmparallel "github.com/luxfi/chains/evm/cevm/parallel"
-//       "github.com/luxfi/chains/evm/cevm"
-//   )
-//   parallel.RegisterExecutor(&cevmparallel.Executor{
-//       CevmBackend: cevm.GPUMetal,
-//       Threads:     0,
-//   })
+//	import (
+//	    "github.com/luxfi/evm/core/parallel"
+//	    cevmparallel "github.com/luxfi/chains/evm/cevm/parallel"
+//	    "github.com/luxfi/chains/evm/cevm"
+//	)
+//	parallel.RegisterExecutor(&cevmparallel.Executor{
+//	    CevmBackend: cevm.GPUMetal,
+//	    Threads:     0,
+//	})
 //
-// Build with: `go build -tags cgo` (the cgo bridge in cevm/cevm_cgo.go
-// links libcevm.a + libluxgpu).
+// luxfi/evm/core/parallel holds ONE executor: RegisterExecutor is a plain
+// assignment to a package variable, so a second call replaces the first with
+// no complaint. luxfi/evm's own cevmShadowExecutor takes that slot from an
+// init() when the binary is built with -tags cevm. A package that registered
+// itself on import would therefore replace a consensus-gated applier with this
+// one, depending only on link order — so this package has no init().
 //
-// Parity contract: every receipt produced here must byte-equal the
-// receipt produced by Go EVM Block-STM for the same input tuple.
-// Enforced by parity_test.go in this package.
-
+// This doc used to advertise `import _ ".../cevm/parallel" // registers` as an
+// alternative. There is no init() and never was, so that form registers
+// nothing: a caller following it got the Go EVM and no error saying otherwise.
+//
+// # Execution
+//
+// Three orthogonal steps, so that only the middle one needs the C++ library:
+//
+//	shape / blockContext / buildStateSnapshot — the block, in cevm's wire form
+//	cevm.ExecuteBlock                         — one cgo call
+//	assemble                                  — what comes back, as receipts
+//
+// Parity contract: every receipt produced here must byte-equal the receipt
+// produced by Go EVM Block-STM for the same input tuple.
 package parallel
 
 import (
@@ -44,7 +57,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/luxfi/crypto/backend"
 	evmparallel "github.com/luxfi/evm/core/parallel"
@@ -73,32 +85,31 @@ var ErrGPUEVMRequired = errors.New("cevm: GPU EVM cannot execute this block (V4 
 
 const envCEVMStrict = "CEVM_STRICT"
 
-var (
-	strictOnce sync.Once
-	strictMode bool
-)
-
 // strictGPUEVM reports whether the silent Go EVM fallback is disabled.
-// Read once at first call (not init) so test suites can set the env var
-// before exercising ExecuteBlock.
+//
+// Read on every call. It used to be memoized behind a sync.Once, which fixed
+// the answer to whatever the first block that declined happened to see — and
+// which made the two branches unreachable from a single process, so neither
+// was ever exercised.
 func strictGPUEVM() bool {
-	strictOnce.Do(func() {
-		v := strings.ToLower(strings.TrimSpace(os.Getenv(envCEVMStrict)))
-		switch v {
-		case "0", "false", "no", "off":
-			strictMode = false
-		default:
-			// Default ON: do NOT silently shadow-execute on Go EVM. The
-			// fallback was the lie that hid the missing GPU CALL/CREATE.
-			strictMode = true
-		}
-	})
-	return strictMode
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(envCEVMStrict))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		// Default ON: do NOT silently shadow-execute on Go EVM. The
+		// fallback was the lie that hid the missing GPU CALL/CREATE.
+		return true
+	}
 }
 
 // declineBlock is the single fallback exit point. It records the
 // fallback reason for observability, then returns either the strict
 // sentinel error (default) or the legacy (nil, nil) opt-out result.
+//
+// Every "cevm cannot do this" leaves through here. A path that returned its
+// own error instead would be a refusal CEVM_STRICT=0 cannot clear, which is
+// the whole point of the flag — an operator flips it to get the Go EVM back
+// and the block still fails.
 func declineBlock(reason string, blockNumber, txIndex uint64) ([]*types.Receipt, error) {
 	backend.RecordFallback(backend.FallbackUnsupported, "cevm:"+reason)
 	if strictGPUEVM() {
@@ -112,9 +123,6 @@ func declineBlock(reason string, blockNumber, txIndex uint64) ([]*types.Receipt,
 
 // Executor is a luxfi/evm/core/parallel.BlockExecutor that dispatches
 // every block to cevm.ExecuteBlock in one cgo call.
-//
-// Compile-time interface check; the var line below ensures Executor
-// satisfies BlockExecutor.
 type Executor struct {
 	// CevmBackend selects the cevm execution lane:
 	//   cevm.CPUSequential — single-threaded CPU baseline (parity reference)
@@ -135,10 +143,9 @@ var _ evmparallel.BlockExecutor = (*Executor)(nil)
 // receipts.
 //
 // Returns (nil, nil) — the documented "fall through to sequential"
-// signal — when the block contains opcodes cevm GPU can't handle yet
-// (CALL/CREATE family) or non-trivial tx (Data/Code) for which cevm's
-// V2 ABI doesn't yet expose per-tx logs. On hard errors it returns
-// the error.
+// signal — when CEVM_STRICT=0 and the block contains something cevm cannot
+// run yet. Under the default strict mode those cases return
+// ErrGPUEVMRequired instead. On hard errors it returns the error.
 func (e *Executor) ExecuteBlock(
 	config *ethparams.ChainConfig,
 	header *types.Header,
@@ -150,149 +157,193 @@ func (e *Executor) ExecuteBlock(
 		return nil, nil
 	}
 
-	// Stage 1: build cevm.Transaction shape from luxfi/geth Transactions.
-	//
-	// Sender recovery is the dominant cost of Stage 1 — secp256k1 ECDSA
-	// recovery is ~50us per tx in pure Go and dominates block validation
-	// for full-utilization C-Chain blocks. We batch every sender into one
-	// cgo dispatch into the luxcpp/crypto first-party pipeline (see
-	// cevm.BatchRecoverSenders). The batch also primes the per-tx
-	// sigCache via types.CacheSender so any subsequent types.Sender call
-	// is a cache hit.
+	// Sender recovery is the dominant cost of shaping the block — secp256k1
+	// ECDSA recovery is ~50us per tx in pure Go and dominates block validation
+	// for full-utilization C-Chain blocks. Every sender goes into one cgo
+	// dispatch into the luxcpp/crypto first-party pipeline. The batch also
+	// primes the per-tx sigCache via types.CacheSender so any subsequent
+	// types.Sender call is a cache hit.
 	signer := types.MakeSigner(config, header.Number, header.Time)
 	senders, err := cevm.BatchRecoverSenders(txs, signer)
 	if err != nil {
+		if errors.Is(err, cevm.ErrNotLinked) {
+			// This binary has no C++ EVM. That is a property of the build, not
+			// of the block, so it leaves by the one door that consults
+			// CEVM_STRICT. It used to return a hard error from here, which no
+			// CEVM_STRICT=0 could clear: in a build without the library that is
+			// every block, permanently, and the documented rollback to the Go
+			// EVM did not reach this line.
+			return declineBlock("native_evm_not_linked", header.Number.Uint64(), 0)
+		}
 		return nil, fmt.Errorf("cevm: batch sender recovery: %w", err)
 	}
-	cevmTxs := make([]cevm.Transaction, len(txs))
-	for i, tx := range txs {
-		ct := cevm.Transaction{
-			GasLimit: tx.Gas(),
-			Nonce:    tx.Nonce(),
-			Data:     tx.Data(),
-		}
-		copy(ct.From[:], senders[i].Bytes())
-		if to := tx.To(); to != nil {
-			copy(ct.To[:], to.Bytes())
-			ct.HasTo = true
-			// For real GPU execution the receiver's bytecode must be
-			// loaded so the kernel can interpret it. Skip for CALL /
-			// DELEGATECALL targets — cevm GPU returns status=5 for
-			// nested calls, caught at Stage 4.
-			ct.Code = statedb.GetCode(*to)
-		}
-		// Value + GasPrice are uint64 in cevm.Transaction; transactions
-		// with values exceeding uint64 (rare but legal) cannot run
-		// through this backend. Decline the block.
-		if tx.Value().IsUint64() {
-			ct.Value = tx.Value().Uint64()
-		} else {
-			return declineBlock("value_overflow_uint64", header.Number.Uint64(), uint64(i))
-		}
-		if tx.GasPrice() != nil && tx.GasPrice().IsUint64() {
-			ct.GasPrice = tx.GasPrice().Uint64()
-		}
-		cevmTxs[i] = ct
-	}
 
-	// Stage 2: build the BlockContext.
-	blockCtx := cevm.BlockContext{
-		Timestamp: header.Time,
-		Number:    header.Number.Uint64(),
-		GasLimit:  header.GasLimit,
-		ChainID:   config.ChainID.Uint64(),
+	cevmTxs, i := shape(txs, senders, statedb)
+	if i < len(txs) {
+		return declineBlock("value_overflow_uint64", header.Number.Uint64(), uint64(i))
 	}
-	if header.BaseFee != nil && header.BaseFee.IsUint64() {
-		blockCtx.BaseFee = header.BaseFee.Uint64()
-	}
-	if header.ExcessBlobGas != nil {
-		blockCtx.BlobBaseFee = *header.ExcessBlobGas
-	}
-	copy(blockCtx.Coinbase[:], header.Coinbase.Bytes())
-	// Prevrandao = post-merge MixDigest. Pre-merge headers carry zero
-	// MixDigest; the cevm side treats zero as "not set".
-	copy(blockCtx.Prevrandao[:], header.MixDigest.Bytes())
-
-	// Stage 3: build state snapshot of touched accounts.
-	//
-	// The GPU CALL/CREATE path needs target nonce/balance/code on-device.
-	// Walk every (caller, target) tuple, dedupe addresses, and read the
-	// account data from the StateDB. Pre-V4 the kernel returned
-	// CallNotSupported for every CALL → triggered the V3 → cevm CPU
-	// fallback. With V4 we hand the GPU the data it needs and the call
-	// completes on-device for the LP-108 P5 corpus.
+	blockCtx := blockContext(config, header)
 	snapshot := buildStateSnapshot(cevmTxs, statedb)
 
-	// Stage 4: dispatch.
 	threads := e.Threads
 	if threads == 0 {
 		threads = 1
 	}
 	result, err := cevm.ExecuteBlock(e.CevmBackend, threads, cevmTxs, &blockCtx, snapshot)
 	if err != nil {
+		if errors.Is(err, cevm.ErrNotLinked) {
+			return declineBlock("native_evm_not_linked", header.Number.Uint64(), 0)
+		}
 		return nil, fmt.Errorf("cevm: ExecuteBlock: %w", err)
 	}
+	return assemble(txs, statedb, result, header)
+}
+
+// Backend returns the cevm backend lane this Executor dispatches to.
+func (e *Executor) Backend() cevm.Backend { return e.CevmBackend }
+
+// shape converts the block's transactions into cevm's wire form, positionally
+// paired with the recovered senders.
+//
+// It returns the index of the first transaction that cannot be represented, or
+// len(txs) when every one can. cevm.Transaction carries Value and GasPrice as
+// uint64; a value above 2^64-1 is rare but legal, and truncating it would
+// execute a transaction other than the one that was signed.
+func shape(txs types.Transactions, senders []common.Address, statedb *state.StateDB) ([]cevm.Transaction, int) {
+	out := make([]cevm.Transaction, len(txs))
+	for i, tx := range txs {
+		if !tx.Value().IsUint64() {
+			return out, i
+		}
+		ct := cevm.Transaction{
+			GasLimit: tx.Gas(),
+			Nonce:    tx.Nonce(),
+			Data:     tx.Data(),
+			Value:    tx.Value().Uint64(),
+		}
+		copy(ct.From[:], senders[i].Bytes())
+		if to := tx.To(); to != nil {
+			copy(ct.To[:], to.Bytes())
+			ct.HasTo = true
+			// For real GPU execution the receiver's bytecode must be
+			// loaded so the kernel can interpret it.
+			ct.Code = statedb.GetCode(*to)
+		}
+		if tx.GasPrice() != nil && tx.GasPrice().IsUint64() {
+			ct.GasPrice = tx.GasPrice().Uint64()
+		}
+		out[i] = ct
+	}
+	return out, len(txs)
+}
+
+// blockContext is the block-level execution context every transaction in the
+// block sees: what TIMESTAMP, NUMBER, CHAINID, BASEFEE, COINBASE, GASLIMIT,
+// PREVRANDAO and BLOBBASEFEE answer.
+func blockContext(config *ethparams.ChainConfig, header *types.Header) cevm.BlockContext {
+	ctx := cevm.BlockContext{
+		Timestamp: header.Time,
+		Number:    header.Number.Uint64(),
+		GasLimit:  header.GasLimit,
+		ChainID:   config.ChainID.Uint64(),
+	}
+	if header.BaseFee != nil && header.BaseFee.IsUint64() {
+		ctx.BaseFee = header.BaseFee.Uint64()
+	}
+	if header.ExcessBlobGas != nil {
+		ctx.BlobBaseFee = *header.ExcessBlobGas
+	}
+	copy(ctx.Coinbase[:], header.Coinbase.Bytes())
+	// Prevrandao = post-merge MixDigest. Pre-merge headers carry zero
+	// MixDigest; the cevm side treats zero as "not set".
+	copy(ctx.Prevrandao[:], header.MixDigest.Bytes())
+	return ctx
+}
+
+// assemble turns what cevm returned into receipts, or declines the block.
+//
+// It needs no library — only the result — which is why it is separate from the
+// dispatch: this is the parity-critical half and it has to be exercisable in
+// a build that cannot execute anything.
+func assemble(
+	txs types.Transactions,
+	statedb *state.StateDB,
+	result *cevm.BlockResult,
+	header *types.Header,
+) ([]*types.Receipt, error) {
 	if len(result.GasUsed) != len(txs) || len(result.Status) != len(txs) {
 		return nil, fmt.Errorf("cevm: result length mismatch (gas=%d status=%d txs=%d)",
 			len(result.GasUsed), len(result.Status), len(txs))
 	}
 
-	// Stage 5: detect CallNotSupported. The cevm V4 kernel returns
-	// TxCallNotSupported for CALL/CREATE/DELEGATECALL/STATICCALL
-	// opcodes. The V5 kernel (spec at chains/evm/cevm/V5_ABI.md)
-	// implements these on device; until it lands, decline the block
-	// rather than mix backends mid-block.
+	// The cevm V4 kernel returns TxCallNotSupported for
+	// CALL/CREATE/DELEGATECALL/STATICCALL opcodes. The V5 kernel (spec at
+	// chains/evm/cevm/V5_ABI.md) implements these on device; until it lands,
+	// decline the block rather than mix backends mid-block.
 	for i, st := range result.Status {
 		if st == cevm.TxCallNotSupported {
 			return declineBlock("call_or_create_unsupported_v4", header.Number.Uint64(), uint64(i))
 		}
 	}
 
-	// Stage 6: receipt reconstruction.
-	//
-	// IMPORTANT: this stage is the parity-critical seam. Receipt
-	// fields (Status, CumulativeGasUsed, Bloom, Logs, ContractAddress,
-	// GasUsed, BlockHash, BlockNumber, TransactionIndex, EffectiveGasPrice)
-	// must match Go EVM byte-for-byte. The cevm V2 ABI returns
-	// (gas_used, status); logs/bloom/contract-address must be derived
-	// from the StateDB after cevm writes its state-trie deltas. Until
-	// the cevm V3 ABI exposes per-tx logs (open work-item), we cannot
-	// produce parity-compatible receipts for tx that emit LOG opcodes.
-	//
-	// For the safety of this commit: if any tx is non-trivial (has Data
-	// or Code), fall through to Go EVM. The cevm path is enabled only
-	// for value-transfer-only blocks where receipts are deterministic
-	// from (status, gas_used) alone.
-	allValueTransfer := true
-	for _, tx := range txs {
-		if len(tx.Data()) > 0 {
-			allValueTransfer = false
-			break
-		}
-		if to := tx.To(); to != nil && len(statedb.GetCode(*to)) > 0 {
-			allValueTransfer = false
-			break
-		}
+	// The cevm V4 ABI returns (gas_used, status) and nothing else, so a
+	// receipt is only reconstructable where (status, gas_used) determines it
+	// completely. That is a plain value transfer and nothing more.
+	if i := firstBeyondValueTransfer(txs, statedb); i < len(txs) {
+		return declineBlock("non_value_transfer_logs_abi_pending_v5", header.Number.Uint64(), uint64(i))
 	}
-	if !allValueTransfer {
-		return declineBlock("non_value_transfer_logs_abi_pending_v5", header.Number.Uint64(), 0)
-	}
+	return receipts(txs, result, header), nil
+}
 
-	receipts := make([]*types.Receipt, len(txs))
+// firstBeyondValueTransfer returns the index of the first transaction whose
+// receipt does not follow from (status, gas_used) alone, or len(txs) when
+// every one does.
+//
+// Three things put a transaction beyond that:
+//
+//   - calldata, which can reach code that emits LOGs — and the V4 ABI carries
+//     no per-tx logs, so the bloom and the log list would be reconstructed as
+//     empty;
+//   - a recipient that has code, for the same reason;
+//   - no recipient at all, which is a contract CREATION. This one used to be
+//     missed: the check asked `len(tx.Data()) > 0`, and a creation with empty
+//     init code answers no. Its receipt needs a ContractAddress that this
+//     reconstruction does not compute, and creation is charged 53000 intrinsic
+//     gas against a transfer's 21000 — so it would have been receipted, with
+//     the wrong gas, into the cumulative total the block header commits to.
+func firstBeyondValueTransfer(txs types.Transactions, statedb *state.StateDB) int {
+	for i, tx := range txs {
+		to := tx.To()
+		if to == nil || len(tx.Data()) > 0 {
+			return i
+		}
+		if len(statedb.GetCode(*to)) > 0 {
+			return i
+		}
+	}
+	return len(txs)
+}
+
+// receipts reconstructs the block's receipts from cevm's per-tx status and gas.
+//
+// This is the parity-critical seam: every field must match what the Go EVM
+// produces for the same transaction, because the receipt trie hash is in the
+// header. It is only reached for blocks that firstBeyondValueTransfer passed,
+// where there are no logs to carry and no contract address to compute.
+func receipts(txs types.Transactions, result *cevm.BlockResult, header *types.Header) []*types.Receipt {
+	out := make([]*types.Receipt, len(txs))
 	cumulativeGas := uint64(0)
 	for i, tx := range txs {
 		gas := result.GasUsed[i]
 		cumulativeGas += gas
-		var receiptStatus uint64
+		status := uint64(types.ReceiptStatusFailed)
 		switch result.Status[i] {
 		case cevm.TxOK, cevm.TxReturn:
-			receiptStatus = types.ReceiptStatusSuccessful
-		default:
-			receiptStatus = types.ReceiptStatusFailed
+			status = types.ReceiptStatusSuccessful
 		}
-		receipts[i] = &types.Receipt{
+		out[i] = &types.Receipt{
 			Type:              tx.Type(),
-			Status:            receiptStatus,
+			Status:            status,
 			CumulativeGasUsed: cumulativeGas,
 			GasUsed:           gas,
 			TxHash:            tx.Hash(),
@@ -302,12 +353,8 @@ func (e *Executor) ExecuteBlock(
 			Bloom:             types.Bloom{},
 		}
 	}
-
-	return receipts, nil
+	return out
 }
-
-// Backend returns the cevm backend lane this Executor dispatches to.
-func (e *Executor) Backend() cevm.Backend { return e.CevmBackend }
 
 // buildStateSnapshot collects every (caller, target) address touched by the
 // batch and reads its account data from the StateDB. The GPU dispatch hands
@@ -319,9 +366,7 @@ func (e *Executor) Backend() cevm.Backend { return e.CevmBackend }
 // nonce / balance only.
 //
 // Balance encoding: 4×uint64 little-endian limbs (Balance[0] = low 64 bits)
-// to match the kernel's HostStateAccount layout exactly. uint256 → limbs
-// is just `Uint64()` per word; geth's uint256.Int already stores in this
-// order so we copy it verbatim.
+// to match the kernel's HostStateAccount layout exactly.
 func buildStateSnapshot(txs []cevm.Transaction, statedb *state.StateDB) []cevm.StateAccount {
 	if len(txs) == 0 || statedb == nil {
 		return nil
@@ -336,13 +381,10 @@ func buildStateSnapshot(txs []cevm.Transaction, statedb *state.StateDB) []cevm.S
 		acct := cevm.StateAccount{Nonce: statedb.GetNonce(addr)}
 		copy(acct.Address[:], addr.Bytes())
 		if bal := statedb.GetBalance(addr); bal != nil {
-			// uint256.Int is stored as little-endian uint64 limbs:
-			// Uint64() returns word 0; words 1-3 require array
-			// access. The geth API exposes the raw words via .Bytes32
-			// (BE) — we read the LE uint64 limbs through that.
+			// uint256.Int is stored as little-endian uint64 limbs, and the
+			// kernel's HostStateAccount.balance[] expects the same order.
+			// Bytes32 hands them over big-endian, so read each limb back out.
 			b32 := bal.Bytes32()
-			// b32 is big-endian; convert to little-endian limb layout
-			// matching the kernel's HostStateAccount.balance[].
 			for i := 0; i < 4; i++ {
 				var w uint64
 				for j := 0; j < 8; j++ {

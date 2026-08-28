@@ -1,14 +1,24 @@
-// Lux EVM plugin — C-Chain EVM with all precompiles enabled.
+// Command evm serves the C-Chain EVM to a Lux node, with every precompile
+// linked in.
 //
-// Every precompile is explicitly imported. No umbrella packages.
-// Genesis determines which are active at which block/timestamp.
+// Every precompile is explicitly imported. No umbrella packages. Genesis
+// determines which are active at which block/timestamp.
+//
+// The binary's FILENAME must be the CB58 of constants.ContractVMID
+// (mgj786NP7uDwBCcq6YwThhaN8FLyybkCa4zBWTQbNgmK6k9A6) — that is how the node's
+// plugin registry resolves a vmID from a CreateChainTx to an implementation.
+// A binary installed under any other name is invisible and the chain silently
+// never starts, which is why `version` prints the id it must be installed as:
+// the fact an operator needs is in the place an operator already looks.
 package main
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 
+	"github.com/luxfi/constants"
 	"github.com/luxfi/evm/plugin/evm"
 	"github.com/luxfi/log"
 	"github.com/luxfi/sys/ulimit"
@@ -25,12 +35,12 @@ import (
 	_ "github.com/luxfi/precompile/vrf" // 0x3213 ECVRF verify (RFC 9381)
 
 	// ── Post-Quantum (FIPS 203/204/205) — LP-4200 unified block ──────────
-	_ "github.com/luxfi/precompile/mlkem"  // 0x012201 ML-KEM   (FIPS 203 — Module-LWE KEM)
-	_ "github.com/luxfi/precompile/mldsa"  // 0x012202 ML-DSA   (FIPS 204 — Module-LWE signature)
-	_ "github.com/luxfi/precompile/slhdsa" // 0x012203 SLH-DSA  (FIPS 205 — hash-based signature)
-	_ "github.com/luxfi/precompile/pulsar" // 0x012204 Pulsar   (Module-LWE threshold FIPS 204)
-	_ "github.com/luxfi/precompile/p3q"    // 0x012205 P3Q      (strict-PQ STARK / FRI / cSHAKE256)
 	_ "github.com/luxfi/precompile/corona" // 0x012206 Corona   (Ring-LWE threshold)
+	_ "github.com/luxfi/precompile/mldsa"  // 0x012202 ML-DSA   (FIPS 204 — Module-LWE signature)
+	_ "github.com/luxfi/precompile/mlkem"  // 0x012201 ML-KEM   (FIPS 203 — Module-LWE KEM)
+	_ "github.com/luxfi/precompile/p3q"    // 0x012205 P3Q      (strict-PQ STARK / FRI / cSHAKE256)
+	_ "github.com/luxfi/precompile/pulsar" // 0x012204 Pulsar   (Module-LWE threshold FIPS 204)
+	_ "github.com/luxfi/precompile/slhdsa" // 0x012203 SLH-DSA  (FIPS 205 — hash-based signature)
 	_ "github.com/luxfi/precompile/xwing"  // 0x2221   X-Wing hybrid KEM (X25519+ML-KEM)
 
 	// ── Hashing / ZK Curves ─────────────────────────────
@@ -84,16 +94,27 @@ import (
 )
 
 func main() {
-	versionStr := fmt.Sprintf("Lux-EVM/1.0.0 [node=%s, rpcchainvm=%d]", version.Current, version.RPCChainVMProtocol)
+	os.Exit(run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
+}
 
-	if len(os.Args) > 1 && os.Args[1] == "version" {
-		fmt.Println(versionStr)
-		os.Exit(0)
+// run is main with the exit lifted out, so what the plugin does is reachable
+// from a test and only the exit itself is not.
+func run(ctx context.Context, args []string, out, errOut io.Writer) int {
+	if len(args) > 0 && args[0] == "version" {
+		// Every number here is read from the package that declares it. The EVM
+		// version is luxfi/evm's own — this line used to carry a literal
+		// "1.0.0" beside it, and two declarations of one version disagree the
+		// first time either is bumped, with the one an operator reads being
+		// this one. The rpcchainvm protocol comes from the same place the node
+		// reads it, because a plugin whose protocol differs from the node's is
+		// refused at the handshake and this line is where that is diagnosed.
+		fmt.Fprintf(out, "evm/%s %s [node=%s, rpcchainvm=%d]\n",
+			evm.Version, constants.ContractVMID, version.Current, version.RPCChainVMProtocol)
+		return 0
 	}
 
 	if err := ulimit.Set(ulimit.DefaultFDLimit, log.Root()); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to set fd limit: %s\n", err)
-		os.Exit(1)
+		return fail(errOut, err)
 	}
 
 	// Resolve the execution backend before serving. With cgo this links
@@ -101,8 +122,15 @@ func main() {
 	// with -tags cevm; GoEVM otherwise). Without cgo this stays on GoEVM.
 	selectExecutionBackend(log.Root())
 
-	if err := rpc.Serve(context.Background(), log.Root(), &evm.VM{}); err != nil {
-		fmt.Fprintf(os.Stderr, "rpc.Serve error: %s\n", err)
-		os.Exit(1)
+	if err := rpc.Serve(ctx, log.Root(), &evm.VM{}); err != nil {
+		return fail(errOut, err)
 	}
+	return 0
+}
+
+// fail reports why the plugin is not serving and gives the node a non-zero
+// exit. A plugin that dies quietly presents as a chain that never starts.
+func fail(w io.Writer, err error) int {
+	fmt.Fprintf(w, "evm plugin: %s\n", err)
+	return 1
 }

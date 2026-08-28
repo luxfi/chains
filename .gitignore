@@ -2,5 +2,10 @@ build/
 
 # stray local VM build artifacts (never commit binaries)
 /aivm-gov-mcp
-plugin
+# Rooted: `go build ./<vm>/cmd/plugin` from here drops a `plugin` binary in the
+# repo root. Unrooted, this pattern also matched every `<vm>/cmd/plugin`
+# DIRECTORY, so a new file under one was silently unaddable — `git add` printed
+# a hint and staged nothing. mpcvm's and bridgevm's plugin tests were written,
+# pass, and are not in the repository.
+/plugin
 .DS_Store

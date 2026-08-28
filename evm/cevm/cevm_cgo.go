@@ -206,7 +206,7 @@ func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *Bl
 		}
 	}
 
-	result := C.gpu_execute_block(
+	result := C.gpu_execute_block_v4(
 		&ctxs[0],
 		C.uint32_t(len(ctxs)),
 		C.uint8_t(backend),
@@ -218,7 +218,7 @@ func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *Bl
 		codePtr,
 		C.uint32_t(codeSize),
 	)
-	defer C.gpu_free_result(&result)
+	defer C.gpu_free_result_v2(&result)
 	runtime.KeepAlive(ctxs)
 	runtime.KeepAlive(cctxStorage)
 	runtime.KeepAlive(cAccts)

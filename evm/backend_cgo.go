@@ -31,12 +31,22 @@ func selectExecutionBackend(logger log.Logger) {
 		"cevm-backends", cevm.AvailableBackends(),
 	)
 	for _, h := range cevm.Health() {
-		if h.OK {
-			logger.Info("cevm backend healthy",
-				"backend", h.Name, "probes", h.ProbesRun, "gas", h.GasUsed)
-			continue
-		}
-		logger.Warn("cevm backend not healthy",
-			"backend", h.Name, "probe", h.Probe, "err", h.Err)
+		report(logger, h)
 	}
+}
+
+// report says what one cevm backend answered to the health battery.
+//
+// It is separate from the selection because it is the only part that depends
+// on what the health check found: a build with no library linked has exactly
+// one report and it is never healthy, so a check folded into the loop above
+// could only ever be read one way.
+func report(logger log.Logger, h cevm.HealthReport) {
+	if h.OK {
+		logger.Info("cevm backend healthy",
+			"backend", h.Name, "probes", h.ProbesRun, "gas", h.GasUsed)
+		return
+	}
+	logger.Warn("cevm backend not healthy",
+		"backend", h.Name, "probe", h.Probe, "err", h.Err)
 }
