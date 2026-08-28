@@ -8,47 +8,26 @@ import (
 	"context"
 	"sort"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/database/memdb"
 	"github.com/luxfi/ids"
-	"github.com/luxfi/log"
 )
 
-// vmWithPending builds a VM holding n ready bridge requests and a stored parent.
+// vmWithPending builds a VM holding n transfers ready for a block, and the ids
+// they should be carried in.
 func vmWithPending(t *testing.T, n int) (*VM, []ids.ID) {
 	t.Helper()
-
-	vm := &VM{
-		log:            log.NewNoOpLogger(),
-		config:         BridgeConfig{MinConfirmations: 1, MaxBridgeAmount: 1 << 40, DailyBridgeLimit: 1 << 40},
-		pendingBridges: make(map[ids.ID]*BridgeRequest, n),
-		bridgeRegistry: &BridgeRegistry{DailyVolume: make(map[string]uint64)},
-	}
-	vm.chain = chain.New[*Block](memdb.New(), nil)
-
-	parent := &Block{BlockHeight: 0, BlockTimestamp: 0, ParentID_: ids.Empty, BridgeRequests: []*BridgeRequest{}, vm: vm}
-	parent.ID_ = parent.computeID()
-	_, _, err := vm.chain.Open(parent, vm.parseBlock)
-	require.NoError(t, err)
+	cfg := testConfig()
+	cfg.DailyBridgeLimit = 1 << 40
+	vm := bootOn(t, memdb.New(), cfg)
 
 	want := make([]ids.ID, 0, n)
 	for i := 0; i < n; i++ {
-		id := ids.GenerateTestID()
-		vm.pendingBridges[id] = &BridgeRequest{
-			ID:            id,
-			SourceChain:   "C",
-			DestChain:     "eth",
-			Amount:        1,
-			Recipient:     make([]byte, 20),
-			Confirmations: 12,
-			Status:        "pending",
-			CreatedAt:     time.Unix(0, 0),
-		}
-		want = append(want, id)
+		req := requestFor(uint64(i+1), 1)
+		pend(vm, req)
+		want = append(want, req.ID)
 	}
 	sort.Slice(want, func(i, j int) bool { return bytes.Compare(want[i][:], want[j][:]) < 0 })
 	return vm, want
@@ -63,18 +42,19 @@ func TestBuildBlockOrdersRequestsDeterministically(t *testing.T) {
 	require := require.New(t)
 	vm, want := vmWithPending(t, 24)
 
-	blk, err := vm.BuildBlock(context.Background())
-	require.NoError(err)
+	blk := build(t, vm)
 
 	got := make([]ids.ID, 0, len(want))
-	for _, req := range blk.(*Block).BridgeRequests {
+	for _, req := range blk.BridgeRequests {
 		got = append(got, req.ID)
 	}
 	require.Equal(want, got, "requests must be carried in id order")
 
-	// Rebuilding from the same pending set must reproduce the same block.
-	again, err := vm.BuildBlock(context.Background())
-	require.NoError(err)
+	// Rebuilding from the same pending set must reproduce the same block. The
+	// timestamp is the one thing that moves, so it is held still.
+	again := build(t, vm)
+	again.BlockTimestamp = blk.BlockTimestamp
+	again.ID_ = again.computeID()
 	require.Equal(blk.ID(), again.ID(), "the same pending set must build the same block")
 	require.Equal(blk.Bytes(), again.Bytes())
 }
@@ -87,13 +67,52 @@ func TestBuildBlockCapIsADeterministicPrefix(t *testing.T) {
 	require := require.New(t)
 	vm, want := vmWithPending(t, maxRequestsPerBlock+40)
 
-	blk, err := vm.BuildBlock(context.Background())
-	require.NoError(err)
+	blk := build(t, vm)
 
 	got := make([]ids.ID, 0, maxRequestsPerBlock)
-	for _, req := range blk.(*Block).BridgeRequests {
+	for _, req := range blk.BridgeRequests {
 		got = append(got, req.ID)
 	}
 	require.Len(got, maxRequestsPerBlock)
 	require.Equal(want[:maxRequestsPerBlock], got, "the cap must take the lowest ids, not a random draw")
+}
+
+// TestBuildBlockRefusesWhenNothingIsReady keeps an empty block off the chain:
+// Verify refuses one, so building one would wedge the proposer.
+func TestBuildBlockRefusesWhenNothingIsReady(t *testing.T) {
+	vm, _ := vmWithPending(t, 0)
+	_, err := vm.BuildBlock(context.Background())
+	require.Error(t, err)
+}
+
+// TestWhatIsBuiltIsWhatVerifies is the property that keeps the chain moving.
+//
+// Assembly and verification used different rules: the builder filtered on
+// confirmation depth alone while Verify also applied the per-transfer cap and
+// the daily cap. One oversized transfer in the pending set was therefore
+// proposed by the builder, refused by every node, put straight back in the
+// pending set by the rejection, and proposed again — block production stopped
+// and did not resume.
+func TestWhatIsBuiltIsWhatVerifies(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxBridgeAmount = 100
+	cfg.DailyBridgeLimit = 250
+	vm := bootOn(t, memdb.New(), cfg)
+
+	oversized := requestFor(1, 5_000) // over the per-transfer cap
+	fine := requestFor(2, 100)
+	pend(vm, oversized, fine)
+
+	blk := build(t, vm)
+	require.Len(t, blk.BridgeRequests, 1, "the builder must leave behind what Verify would refuse")
+	require.Equal(t, fine.ID, blk.BridgeRequests[0].ID)
+	require.NoError(t, blk.Verify(context.Background()), "what was built must verify")
+	require.NoError(t, blk.Accept(context.Background()))
+
+	// The daily cap is the same rule in the same place: 100 has moved of 250,
+	// so the next block carries what fits and stops there.
+	pend(vm, requestFor(3, 100), requestFor(4, 100))
+	second := build(t, vm)
+	require.Len(t, second.BridgeRequests, 1, "the builder stops at the daily cap, as Verify does")
+	require.NoError(t, second.Verify(context.Background()))
 }

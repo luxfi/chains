@@ -167,7 +167,12 @@ func (r *releaser) releaseOnce(ctx context.Context, req *BridgeRequest, transfer
 	if err != nil {
 		return err
 	}
-	r.vm.recordRelease(req, destTx)
+	// The destination tx hash is this relayer's own broadcast, not a fact the
+	// chain agreed: every relayer signs its own tx and gets its own hash. It
+	// is reported, not recorded.
+	r.vm.log.Info("bridgevm: release settled",
+		log.Stringer("requestID", req.ID),
+		log.Stringer("destTxID", destTx))
 	return nil
 }
 
@@ -207,21 +212,6 @@ func (vm *VM) releaseTransfer(ctx context.Context, transfer bridgeattest.BridgeT
 	return dst.SendTransaction(ctx, &ReleaseCall{Transfer: transfer, Signature: att.Signature})
 }
 
-// recordRelease persists the completed cross-chain settlement.
-func (vm *VM) recordRelease(req *BridgeRequest, destTx ids.ID) {
-	vm.bridgeRegistry.mu.Lock()
-	defer vm.bridgeRegistry.mu.Unlock()
-	cb := vm.bridgeRegistry.CompletedBridges[req.ID]
-	if cb == nil {
-		cb = &CompletedBridge{RequestID: req.ID, SourceTxID: req.SourceTxID, CompletedAt: time.Now()}
-		vm.bridgeRegistry.CompletedBridges[req.ID] = cb
-	}
-	cb.DestTxID = destTx
-	vm.log.Info("bridgevm: release settled",
-		log.Stringer("requestID", req.ID),
-		log.Stringer("destTxID", destTx))
-}
-
 func (vm *VM) evmClientByID(id uint32) ChainClient {
 	vm.mu.RLock()
 	defer vm.mu.RUnlock()
@@ -230,11 +220,10 @@ func (vm *VM) evmClientByID(id uint32) ChainClient {
 
 // EnableBridgeRelease wires the EVM release plumbing: it dials each external
 // chain, resolves that chain's gas-paying relayer key from KMS via kp, records
-// the clients in BOTH the name-keyed ChainClient map (the field the recon
-// flagged as never populated) and the id-keyed routing index, sets the
-// attestation client, and starts the release worker. Idempotent per process:
-// calling it twice replaces the wiring. Fail secure: any misconfigured chain or
-// unresolved key aborts the whole enable — no partial, half-wired bridge.
+// the clients in the id-keyed routing index, sets the attestation client, and
+// starts the release worker. Idempotent per process: calling it twice replaces
+// the wiring. Fail secure: any misconfigured chain or unresolved key aborts the
+// whole enable — no partial, half-wired bridge.
 func (vm *VM) EnableBridgeRelease(ctx context.Context, chains []ExternalChainConfig, kp KeyProvider, ac AttestationClient) error {
 	if len(chains) == 0 {
 		return errors.New("bridgevm: EnableBridgeRelease: no external chains configured")
@@ -246,11 +235,13 @@ func (vm *VM) EnableBridgeRelease(ctx context.Context, chains []ExternalChainCon
 		return errors.New("bridgevm: EnableBridgeRelease: AttestationClient required")
 	}
 
-	byName := make(map[string]ChainClient, len(chains))
 	byID := make(map[uint32]ChainClient, len(chains))
 	for _, cfg := range chains {
 		if cfg.GasKeyKMSPath == "" {
 			return fmt.Errorf("bridgevm: chain %q: gasKeyKmsPath required (KMS only)", cfg.Name)
+		}
+		if _, dup := byID[uint32(cfg.ChainID)]; dup {
+			return fmt.Errorf("bridgevm: duplicate chain id %d", cfg.ChainID)
 		}
 		key, err := kp(ctx, cfg.GasKeyKMSPath)
 		if err != nil {
@@ -260,10 +251,6 @@ func (vm *VM) EnableBridgeRelease(ctx context.Context, chains []ExternalChainCon
 		if err != nil {
 			return err
 		}
-		if _, dup := byID[uint32(cfg.ChainID)]; dup {
-			return fmt.Errorf("bridgevm: duplicate chain id %d", cfg.ChainID)
-		}
-		byName[cfg.Name] = client
 		byID[uint32(cfg.ChainID)] = client
 	}
 
@@ -271,7 +258,6 @@ func (vm *VM) EnableBridgeRelease(ctx context.Context, chains []ExternalChainCon
 	vm.mu.Lock()
 	old := vm.releaser
 	oldWatch := vm.watcher
-	vm.chainClients = byName
 	vm.evmByChainID = byID
 	vm.attestClient = ac
 	vm.mu.Unlock()

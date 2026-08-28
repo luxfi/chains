@@ -5,7 +5,6 @@ package bridgevm
 
 import (
 	"context"
-	"math"
 	"math/big"
 	"sync"
 	"time"
@@ -28,11 +27,12 @@ const (
 	// M and broadcast — so this is set for cheap polling rather than speed.
 	watchInterval = 5 * time.Second
 
-	// watchLag is how far behind its head a chain is read. A lock that a reorg
-	// takes back must never become a request, and a request is only ever
-	// created once, so B reads only what the source chain is unlikely to
-	// reconsider.
-	watchLag = 12
+	// minWatchLag is how far behind its head a chain is read at the very
+	// least. A lock that a reorg takes back must never become a request, and a
+	// request is only ever created once, so B reads only what the source chain
+	// is unlikely to reconsider. The chain's own MinConfirmations raises this
+	// when it asks for more.
+	minWatchLag = 12
 
 	// watchSpan bounds one pass. A node that has been down for a week asks for
 	// its backlog a piece at a time rather than in one query no endpoint will
@@ -48,9 +48,8 @@ type lockSource interface {
 	FetchLockEvents(ctx context.Context, from, to *big.Int) ([]lock, error)
 }
 
-// lock is one Locked event: the transfer it authorises, the transaction it was
-// emitted by, and the block it sits in — which is what its depth is measured
-// from.
+// lock is one Locked event: the transfer it authorises, and the transaction it
+// was emitted by.
 type lock struct {
 	Transfer bridgeattest.BridgeTransfer
 	TxID     ids.ID
@@ -60,7 +59,6 @@ type lock struct {
 // watcher turns what the source chains locked into requests a block can carry.
 type watcher struct {
 	vm     *VM
-	names  map[uint32]string // chain id -> the label clients are keyed by
 	cursor map[uint32]uint64 // chain id -> last block read
 	quit   chan struct{}
 	wg     sync.WaitGroup
@@ -68,13 +66,8 @@ type watcher struct {
 }
 
 func newWatcher(vm *VM, chains []ExternalChainConfig) *watcher {
-	names := make(map[uint32]string, len(chains))
-	for _, cfg := range chains {
-		names[uint32(cfg.ChainID)] = cfg.Name
-	}
 	w := &watcher{
 		vm:     vm,
-		names:  names,
 		cursor: make(map[uint32]uint64, len(chains)),
 		quit:   make(chan struct{}),
 	}
@@ -122,10 +115,25 @@ func (w *watcher) pass() {
 			continue
 		}
 		if err := w.read(ctx, id, source); err != nil {
-			w.vm.log.Debug("Bridge watch pass failed",
+			w.vm.log.Debug("bridgevm: watch pass failed",
 				log.Uint32("chain", id), log.String("err", err.Error()))
 		}
 	}
+}
+
+// lag is how far behind a source chain's head this node reads.
+//
+// It is the deeper of the reorg margin and what the chain's own configuration
+// demands, so anything read is by construction buried deep enough to be
+// carried. Reading at a fixed margin and stamping each request with the depth
+// it happened to have at that moment left a transfer observed at depth 12 by a
+// chain requiring 100 permanently ineligible: the depth was never revisited and
+// the cursor had already moved past the lock.
+func (w *watcher) lag() uint64 {
+	if conf := uint64(w.vm.config.MinConfirmations); conf > minWatchLag {
+		return conf
+	}
+	return minWatchLag
 }
 
 func (w *watcher) read(ctx context.Context, chain uint32, source lockSource) error {
@@ -133,10 +141,11 @@ func (w *watcher) read(ctx context.Context, chain uint32, source lockSource) err
 	if err != nil {
 		return err
 	}
-	if head < watchLag {
+	lag := w.lag()
+	if head < lag {
 		return nil
 	}
-	to := head - watchLag
+	to := head - lag
 
 	from, seen := w.cursor[chain]
 	if !seen {
@@ -160,29 +169,38 @@ func (w *watcher) read(ctx context.Context, chain uint32, source lockSource) err
 		return err
 	}
 	for _, l := range locks {
-		w.enqueue(l, head)
+		w.enqueue(l)
 	}
 	w.cursor[chain] = to
 	return nil
 }
 
 // enqueue turns a lock into a request a block can carry. The transfer's digest
-// is its identity: it is what M signs and what the destination gateway keys its
-// replay guard by, so two chains reusing a nonce cannot collide and the same
-// lock read twice is the same request.
-func (w *watcher) enqueue(l lock, head uint64) {
+// is its identity: it is what M signs, what the destination gateway keys its
+// replay guard by, and what this chain names the request, so two chains reusing
+// a nonce cannot collide and the same lock read twice is the same request.
+func (w *watcher) enqueue(l lock) {
 	transfer := l.Transfer
 	id := ids.ID(transfer.Digest())
 
-	// How deep the lock is buried, which is what decides whether a block may
-	// carry it yet. Reading watchLag behind the head means this is never less
-	// than watchLag; the chain's own policy decides whether that is enough.
-	var depth uint64
-	if head > l.Block {
-		depth = head - l.Block
+	req := &BridgeRequest{
+		ID:         id,
+		SrcChainID: transfer.SrcChainID,
+		DstChainID: transfer.DstChainID,
+		Nonce:      transfer.Nonce,
+		Asset:      ids.ID(transfer.Asset),
+		Amount:     transfer.Amount,
+		Recipient:  append([]byte(nil), transfer.Recipient[:]...),
+		SourceTxID: l.TxID,
 	}
-	if depth > math.MaxUint32 {
-		depth = math.MaxUint32
+
+	// A lock this chain can never carry is not held: it would be proposed,
+	// refused, and proposed again for as long as the node runs. What can be
+	// decided without the chain's state is decided here, once.
+	if err := admissible(&w.vm.config, req); err != nil {
+		w.vm.log.Warn("bridgevm: lock not admitted",
+			log.Stringer("requestID", id), log.String("reason", err.Error()))
+		return
 	}
 
 	w.vm.mu.Lock()
@@ -190,24 +208,10 @@ func (w *watcher) enqueue(l lock, head uint64) {
 		w.vm.mu.Unlock()
 		return
 	}
-	w.vm.pendingBridges[id] = &BridgeRequest{
-		ID:            id,
-		SourceChain:   w.names[transfer.SrcChainID],
-		DestChain:     w.names[transfer.DstChainID],
-		SrcChainID:    transfer.SrcChainID,
-		DstChainID:    transfer.DstChainID,
-		Nonce:         transfer.Nonce,
-		Asset:         ids.ID(transfer.Asset),
-		Amount:        transfer.Amount,
-		Recipient:     append([]byte(nil), transfer.Recipient[:]...),
-		SourceTxID:    l.TxID,
-		Confirmations: uint32(depth),
-		Status:        StatusPending,
-		CreatedAt:     time.Now(),
-	}
+	w.vm.pendingBridges[id] = req
 	w.vm.mu.Unlock()
 
-	w.vm.log.Info("Bridge lock observed",
+	w.vm.log.Info("bridgevm: lock observed",
 		log.Stringer("requestID", id),
 		log.Uint32("src", transfer.SrcChainID),
 		log.Uint32("dst", transfer.DstChainID),

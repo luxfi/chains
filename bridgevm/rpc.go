@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gorilla/rpc/v2"
 	"github.com/luxfi/ids"
@@ -571,6 +572,7 @@ type GetBridgeInfoReply struct {
 	SupportedChains []string `json:"supportedChains"`
 	TotalBridged    string   `json:"totalBridged"`
 	TotalFees       string   `json:"totalFees"`
+	Height          uint64   `json:"height"`
 }
 
 // GetBridgeInfo answers bridge_getInfo. Read-only snapshot of node-level
@@ -591,24 +593,30 @@ func (s *Service) GetBridgeInfo(_ *http.Request, _ *GetBridgeInfoArgs, reply *Ge
 		reply.MPCReady = true
 		reply.MPCPublicKey = hexEncode(key)
 	}
-	reply.Threshold = s.vm.config.MPCThreshold
-	reply.TotalParties = s.vm.config.MPCTotalParties
-	reply.SupportedChains = append([]string(nil), s.vm.config.SupportedChains...)
+	// The threshold and the party count come from the signer set, which is
+	// the set that signs. Reporting a configured number beside it gave one
+	// question two answers, and the configured one was never anything but its
+	// default.
+	info := s.vm.GetSignerSetInfo()
+	reply.Threshold = info.Threshold
+	reply.TotalParties = info.TotalSigners
 
-	// Aggregate totals from the registry. Stringified so the daemon's
-	// bigint-safe decode (parseAmount) consumes them directly.
+	// TotalBridged is what has moved TODAY, summed over the destinations this
+	// bridge serves, read from the same durable counter the daily cap is
+	// enforced against. Stringified so the daemon's bigint-safe decode
+	// (parseAmount) consumes them directly.
 	var totalBridged uint64
-	if s.vm.bridgeRegistry != nil {
-		s.vm.bridgeRegistry.mu.RLock()
-		for _, v := range s.vm.bridgeRegistry.Validators {
-			totalBridged += v.TotalBridged
-		}
-		s.vm.bridgeRegistry.mu.RUnlock()
+	now := time.Now().Unix()
+	for _, cfg := range s.vm.config.ExternalChains {
+		reply.SupportedChains = append(reply.SupportedChains, cfg.Name)
+		totalBridged += s.vm.movedToday(now, uint32(cfg.ChainID))
 	}
 	reply.TotalBridged = strconv.FormatUint(totalBridged, 10)
-	// TotalFees is not tracked in registry yet; expose 0 explicitly so
-	// the daemon's JSON decode doesn't surface an "empty result" error.
+	// This chain charges its fee at admission, not out of the transfer, so
+	// nothing is accumulated here. Reported explicitly so the daemon's JSON
+	// decode does not surface an "empty result" error.
 	reply.TotalFees = "0"
+	_, reply.Height = s.vm.chain.Tip()
 	return nil
 }
 
@@ -635,26 +643,34 @@ type ChainConfigReply struct {
 	Enabled        bool              `json:"enabled"`
 }
 
-// GetSupportedChains answers bridge_getSupportedChains. The VM's
-// SupportedChains config drives the result; per-chain RPC endpoints /
-// token contracts are not yet stored chain-side, so we surface the
-// minimal stable shape (ChainID + Enabled) and leave the optional
-// fields empty. The daemon already treats those as informational.
+// GetSupportedChains answers bridge_getSupportedChains from the ONE
+// declaration of which chains this bridge serves — the same ExternalChains the
+// release path routes by. A second list of chain names, declared beside it and
+// used only here, could name a chain the bridge cannot reach or omit one it
+// releases to.
+//
+// The gas-key KMS path is deliberately not reported: it names where a secret
+// lives, and this surface is unauthenticated.
 func (s *Service) GetSupportedChains(_ *http.Request, _ *GetSupportedChainsArgs, reply *GetSupportedChainsReply) error {
 	if s.vm == nil {
 		return errors.New("bridgevm: VM not initialized")
 	}
-	out := make([]ChainConfigReply, 0, len(s.vm.config.SupportedChains))
-	for _, id := range s.vm.config.SupportedChains {
-		out = append(out, ChainConfigReply{
-			ChainID:       id,
-			ChainName:     id,
-			Confirmations: int(s.vm.config.MinConfirmations),
-			Enabled:       true,
-		})
+	out := make([]ChainConfigReply, 0, len(s.vm.config.ExternalChains))
+	for _, cfg := range s.vm.config.ExternalChains {
+		out = append(out, s.chainConfig(cfg))
 	}
 	reply.Chains = out
 	return nil
+}
+
+func (s *Service) chainConfig(cfg ExternalChainConfig) ChainConfigReply {
+	return ChainConfigReply{
+		ChainID:        strconv.FormatUint(cfg.ChainID, 10),
+		ChainName:      cfg.Name,
+		BridgeContract: cfg.Gateway,
+		Confirmations:  int(s.vm.config.MinConfirmations),
+		Enabled:        true,
+	}
 }
 
 // GetChainConfigArgs is the bridge_getChainConfig request body.
@@ -665,9 +681,9 @@ type GetChainConfigArgs struct {
 // GetChainConfigReply is the bridge_getChainConfig response.
 type GetChainConfigReply ChainConfigReply
 
-// GetChainConfig answers bridge_getChainConfig for one chain. Returns
-// an explicit error when the chain isn't in the SupportedChains set so
-// callers can distinguish "unknown chain" from "RPC mis-routed".
+// GetChainConfig answers bridge_getChainConfig for one chain, by its numeric
+// id or by its name. Returns an explicit error when this bridge does not serve
+// the chain, so callers can distinguish "unknown chain" from "RPC mis-routed".
 func (s *Service) GetChainConfig(_ *http.Request, args *GetChainConfigArgs, reply *GetChainConfigReply) error {
 	if s.vm == nil {
 		return errors.New("bridgevm: VM not initialized")
@@ -676,18 +692,13 @@ func (s *Service) GetChainConfig(_ *http.Request, args *GetChainConfigArgs, repl
 	if want == "" {
 		return errors.New("bridgevm: chainId required")
 	}
-	for _, id := range s.vm.config.SupportedChains {
-		if strings.EqualFold(id, want) {
-			*reply = GetChainConfigReply{
-				ChainID:       id,
-				ChainName:     id,
-				Confirmations: int(s.vm.config.MinConfirmations),
-				Enabled:       true,
-			}
+	for _, cfg := range s.vm.config.ExternalChains {
+		if strings.EqualFold(cfg.Name, want) || strconv.FormatUint(cfg.ChainID, 10) == want {
+			*reply = GetChainConfigReply(s.chainConfig(cfg))
 			return nil
 		}
 	}
-	return fmt.Errorf("bridgevm: chain %q not in supportedChains", want)
+	return fmt.Errorf("bridgevm: chain %q is not one this bridge serves", want)
 }
 
 // GetSignatureArgs is the bridge_getSignature request body.

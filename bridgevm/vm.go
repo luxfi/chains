@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/luxfi/chains/internal/bridgeattest"
 	"net/http"
 	"sort"
 	"strconv"
@@ -17,14 +16,15 @@ import (
 	"time"
 
 	"github.com/luxfi/chains/chain"
+	"github.com/luxfi/chains/internal/bridgeattest"
 	"github.com/luxfi/chains/internal/warpmsg"
+	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/version"
 	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/runtime"
 	"github.com/luxfi/threshold/pkg/party"
-	"github.com/luxfi/threshold/pkg/pool"
 	"github.com/luxfi/threshold/protocols/cmp/config"
 	vmcore "github.com/luxfi/vm"
 	vmchain "github.com/luxfi/vm/chain"
@@ -39,59 +39,94 @@ var (
 		Minor: 0,
 		Patch: 0,
 	}
-
-	errNotImplemented = errors.New("not implemented")
 )
 
-// Silence unused variable warning
-var _ = errNotImplemented
+// minValidatorBond is the bond a bridge signer puts at risk. It is slashable,
+// NOT staked, and it is declared here once: a chain that names its own
+// minimum in two places eventually enforces the smaller one.
+const minValidatorBond uint64 = 1_000_000 * 1e9 // 1M LUX
 
 // BridgeConfig contains VM configuration
 type BridgeConfig struct {
-	// MPC configuration for secure cross-chain operations
-	MPCThreshold    int `json:"mpcThreshold"`    // t: Threshold (t+1 parties needed)
-	MPCTotalParties int `json:"mpcTotalParties"` // n: Total number of MPC nodes
+	// MinConfirmations is how deep a lock must be buried on its source chain
+	// before this chain will carry it. It is applied where the lock is read,
+	// so a lock that is not yet deep enough is left for a later pass rather
+	// than admitted and held.
+	MinConfirmations uint32 `json:"minConfirmations"`
+	BridgeFee        uint64 `json:"bridgeFee"` // Fee in LUX for bridge operations
 
-	// Bridge parameters
-	MinConfirmations uint32 `json:"minConfirmations"` // Confirmations required before bridging
-	BridgeFee        uint64 `json:"bridgeFee"`        // Fee in LUX for bridge operations
-
-	// Supported chains
-	SupportedChains []string `json:"supportedChains"` // Chain IDs that can be bridged
-
-	// ExternalChains configures the concrete EVM chains B releases to/from
-	// (Zoo 200201, Lux testnet C 96368). It carries endpoints, gateway + custody
-	// addresses, and KMS paths for the relayer keys — never key material. A
-	// relayer node reads this and calls EnableBridgeRelease with a KMS-backed
-	// KeyProvider and a Warp-backed AttestationClient.
+	// ExternalChains is the ONE declaration of which chains this bridge
+	// serves. It carries endpoints, gateway + custody addresses, and KMS paths
+	// for the relayer keys — never key material. A relayer node reads this and
+	// calls EnableBridgeRelease with a KMS-backed KeyProvider and a Warp-backed
+	// AttestationClient; every other node uses it to name the chains it will
+	// carry transfers between.
 	ExternalChains []ExternalChainConfig `json:"externalChains,omitempty"`
 
-	// Security settings
-	MaxBridgeAmount      uint64 `json:"maxBridgeAmount"`      // Maximum amount per bridge transaction
-	DailyBridgeLimit     uint64 `json:"dailyBridgeLimit"`     // Daily limit for bridge operations
-	RequireValidatorBond uint64 `json:"requireValidatorBond"` // 1M LUX bond required (slashable, NOT staked)
+	// The spend caps. Both are declared, never defaulted: a bridge whose cap
+	// is whatever the code happens to pick is a bridge nobody decided the risk
+	// of.
+	MaxBridgeAmount  uint64 `json:"maxBridgeAmount"`  // Maximum amount per transfer
+	DailyBridgeLimit uint64 `json:"dailyBridgeLimit"` // Maximum per destination per day
 
-	// LP-333: Opt-in Signer Set Management
-	MaxSigners     int     `json:"maxSigners"`     // Maximum signers before set is frozen (default: 100)
-	ThresholdRatio float64 `json:"thresholdRatio"` // Threshold as ratio of signers (default: 0.67 = 2/3)
+	RequireValidatorBond uint64 `json:"requireValidatorBond"` // Bond required of a signer (slashable, NOT staked)
+
+	// MaxSigners is the size the signer set freezes at (LP-333).
+	MaxSigners int `json:"maxSigners"`
+}
+
+// validate refuses a configuration this chain cannot enforce. A bridge with no
+// declared cap does not fail safe by accident: a zero per-transfer cap refuses
+// every transfer silently at every block, which looks exactly like a bridge
+// nobody is using.
+func (c *BridgeConfig) validate() error {
+	switch {
+	case c.MinConfirmations == 0:
+		return errors.New("bridgevm: minConfirmations must be at least 1")
+	case c.MaxBridgeAmount == 0:
+		return errors.New("bridgevm: maxBridgeAmount must be declared")
+	case c.DailyBridgeLimit < c.MaxBridgeAmount:
+		return fmt.Errorf("bridgevm: dailyBridgeLimit %d is below maxBridgeAmount %d",
+			c.DailyBridgeLimit, c.MaxBridgeAmount)
+	case c.RequireValidatorBond < minValidatorBond:
+		return fmt.Errorf("bridgevm: requireValidatorBond %d is below the %d minimum",
+			c.RequireValidatorBond, minValidatorBond)
+	}
+	return nil
 }
 
 // SignerSet tracks the current MPC signer set (LP-333)
-// First 100 validators opt-in without reshare. Reshare ONLY on slot replacement.
+// First MaxSigners validators opt-in without reshare. Reshare ONLY on slot
+// replacement.
 type SignerSet struct {
-	Signers      []*SignerInfo `json:"signers"`      // Active signers (max 100)
+	Signers      []*SignerInfo `json:"signers"`      // Active signers
 	Waitlist     []ids.NodeID  `json:"waitlist"`     // Validators waiting for a slot
 	CurrentEpoch uint64        `json:"currentEpoch"` // Increments ONLY on reshare (slot replacement)
 	SetFrozen    bool          `json:"setFrozen"`    // True when len(Signers) >= MaxSigners
-	ThresholdT   int           `json:"thresholdT"`   // Current t value (T+1 required to sign)
+	ThresholdT   int           `json:"thresholdT"`   // t, where t+1 signers are required
 	PublicKey    []byte        `json:"publicKey"`    // Combined threshold public key
+}
+
+// quorum is how many of n signers must agree, and it is the only definition of
+// that number.
+//
+// ⌈2n/3⌉, in integers. The float it replaced read int(n*0.67), which at n=3
+// asked for all three: a set with no fault tolerance at all, where one signer
+// going away stops the bridge. At n=1 it asked for two of one, which nothing
+// can satisfy. Rounding a security threshold through a configurable float also
+// left the number a matter of taste; it is not.
+func quorum(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	return (2*n + 2) / 3
 }
 
 // SignerInfo contains information about a signer in the set
 type SignerInfo struct {
 	NodeID     ids.NodeID `json:"nodeId"`
 	PartyID    party.ID   `json:"partyId"`
-	BondAmount uint64     `json:"bondAmount"` // 1M LUX bond (slashable, NOT staked)
+	BondAmount uint64     `json:"bondAmount"` // Slashable bond, NOT stake
 	MPCPubKey  []byte     `json:"mpcPubKey"`
 	Active     bool       `json:"active"`
 	JoinedAt   time.Time  `json:"joinedAt"`
@@ -103,7 +138,7 @@ type SignerInfo struct {
 // RegisterValidatorInput is the input for registering as a bridge signer
 type RegisterValidatorInput struct {
 	NodeID     string `json:"nodeId"`
-	BondAmount string `json:"bondAmount,omitempty"` // 1M LUX bond (slashable)
+	BondAmount string `json:"bondAmount,omitempty"`
 	MPCPubKey  string `json:"mpcPubKey,omitempty"`
 }
 
@@ -173,33 +208,33 @@ const (
 	MPCRequestRefresh
 )
 
-// maxRequestsPerBlock caps how many bridge requests one block carries. Applied to
-// the id-sorted candidate list, so the cap is a deterministic prefix.
+// maxRequestsPerBlock caps how many bridge requests one block carries. Applied
+// to the id-sorted candidate list, so the cap is a deterministic prefix.
 const maxRequestsPerBlock = 100
 
 // VM implements the Bridge VM for cross-chain interoperability
 type VM struct {
-	rt       *runtime.Runtime
-	config   BridgeConfig
-	toEngine chan<- vmcore.Message
-	log      log.Logger
+	rt     *runtime.Runtime
+	config BridgeConfig
+	log    log.Logger
+
+	// chainID is the chain this VM is running, hashed into every block id so a
+	// block of one chain is not a block of another.
+	chainID ids.ID
 
 	// Custody threshold signing runs on M-Chain (mpcvm) via dealerless
 	// CGGMP21/FROST DKG — no trusted dealer, secret never assembled by any
 	// validator. B-Chain requests keygen/reshare/sign from M-Chain over
-	// Warp (CrossChainMPCRequest) and VERIFIES the resulting CMP threshold
-	// signatures against this config. B-Chain never holds a custody key.
-	mpcConfig   *config.Config // CMP group config for verification (from M-Chain keygen)
-	mpcPartyID  party.ID       // This party's ID in the MPC group
-	mpcPartyIDs []party.ID     // All party IDs in the MPC group
-	mpcPool     *pool.Pool     // Worker pool for MPC operations
+	// Warp (CrossChainMPCRequest) and VERIFIES the resulting attestations
+	// against this config. B-Chain never holds a custody key.
+	mpcConfig *config.Config
 
 	// LP-333: Signer Set Management (opt-in model)
-	signerSet *SignerSet // Active signer set with opt-in management
+	signerSet *SignerSet
 
-	// Bridge state
+	// pendingBridges holds the transfers waiting for a block, keyed by the
+	// digest that identifies them.
 	pendingBridges map[ids.ID]*BridgeRequest
-	bridgeRegistry *BridgeRegistry
 
 	// Permissionless settlement: authoritative quote engine + swap
 	// state, exposed via bridge_estimateFee / bridge_submitRequest /
@@ -207,11 +242,8 @@ type VM struct {
 	quoteEngine *QuoteEngine
 	swapStore   SwapStore
 
-	// Chain connectivity. chainClients is the name-keyed ChainClient map (the
-	// field the recon flagged as never populated); evmByChainID is the id-keyed
-	// routing index the release path uses. Both are populated by
-	// EnableBridgeRelease and point at the same *evmChainClient objects.
-	chainClients map[string]ChainClient
+	// evmByChainID routes a transfer to the client for its chain. Populated by
+	// EnableBridgeRelease on relayer nodes and empty everywhere else.
 	evmByChainID map[uint32]ChainClient
 
 	// EVM release plumbing (injected via EnableBridgeRelease; nil until a
@@ -238,33 +270,28 @@ type VM struct {
 	// signer set, the chain clients, the release plumbing. That is not the
 	// chain's state and does not share the chain's lock.
 	//
-	// LOCK ORDER, without exception: the chain's lock, then this one, then the
-	// registry's. A block publishes under the chain's lock and completes its
-	// transfers inside it, so any path taking them the other way round would
-	// deadlock.
+	// LOCK ORDER, without exception: the chain's lock, then this one. A block
+	// publishes under the chain's lock and clears its transfers inside it, so
+	// any path taking them the other way round would deadlock.
 	mu sync.RWMutex
 }
 
-// BridgeRequest represents a cross-chain bridge request
+// BridgeRequest is one cross-chain transfer this chain has been asked to
+// settle.
+//
+// ID is the transfer's digest — the same value M signs and the destination
+// gateway keys its replay guard by — so the request's name IS its contents.
+// Every field but SourceTxID is covered by it, and SourceTxID is a source-chain
+// fact every node reads the same.
 type BridgeRequest struct {
-	ID          ids.ID `json:"id"`
-	SourceChain string `json:"sourceChain"`
-	DestChain   string `json:"destChain"`
-	// SrcChainID / DstChainID are the numeric EVM chain ids (200201, 96368) that
-	// the canonical attestation digest binds; SourceChain / DestChain remain the
-	// human labels used to key clients. Nonce is the per-route replay guard
-	// assigned by the source lock and enforced by the destination gateway.
-	SrcChainID    uint32              `json:"srcChainId"`
-	DstChainID    uint32              `json:"dstChainId"`
-	Nonce         uint64              `json:"nonce"`
-	Asset         ids.ID              `json:"asset"`
-	Amount        uint64              `json:"amount"`
-	Recipient     []byte              `json:"recipient"`
-	SourceTxID    ids.ID              `json:"sourceTxId"`
-	Confirmations uint32              `json:"confirmations"`
-	Status        BridgeRequestStatus `json:"status"`
-	MPCSignatures [][]byte            `json:"mpcSignatures"`
-	CreatedAt     time.Time           `json:"createdAt"`
+	ID         ids.ID `json:"id"`
+	SrcChainID uint32 `json:"srcChainId"`
+	DstChainID uint32 `json:"dstChainId"`
+	Nonce      uint64 `json:"nonce"`
+	Asset      ids.ID `json:"asset"`
+	Amount     uint64 `json:"amount"`
+	Recipient  []byte `json:"recipient"`
+	SourceTxID ids.ID `json:"sourceTxId"`
 }
 
 // ChainClient interface for interacting with different chains
@@ -279,116 +306,55 @@ type ChainClient interface {
 	IsProcessed(ctx context.Context, transfer bridgeattest.BridgeTransfer) (bool, error)
 }
 
-// BridgeRegistry tracks bridge operations and validators
-type BridgeRegistry struct {
-	Validators       map[ids.NodeID]*BridgeValidator
-	CompletedBridges map[ids.ID]*CompletedBridge
-	DailyVolume      map[string]uint64 // chainID -> volume
-	mu               sync.RWMutex
-}
-
-// BridgeValidator represents a bridge validator node
-type BridgeValidator struct {
-	NodeID       ids.NodeID
-	StakeAmount  uint64
-	MPCPublicKey []byte
-	Active       bool
-	TotalBridged uint64
-	SuccessRate  float64
-}
-
-// CompletedBridge represents a completed bridge operation
-type CompletedBridge struct {
-	RequestID    ids.ID
-	SourceTxID   ids.ID
-	DestTxID     ids.ID
-	CompletedAt  time.Time
-	MPCSignature []byte
-}
-
 // Initialize implements the chain.ChainVM interface
 func (vm *VM) Initialize(
 	ctx context.Context,
 	vmInit vmcore.Init,
 ) error {
-	// Convert chain runtime to Runtime.
 	vm.rt = vmInit.Runtime
-	vm.toEngine = vmInit.ToEngine
-
-	if logger, ok := vm.rt.Log.(log.Logger); ok {
-		vm.log = logger
-	} else {
-		return errors.New("invalid logger type")
+	if vm.rt == nil {
+		return errors.New("bridgevm: no runtime")
+	}
+	if vmInit.DB == nil {
+		return errors.New("bridgevm: no database")
 	}
 
+	logger, ok := vm.rt.Log.(log.Logger)
+	if !ok {
+		return errors.New("bridgevm: invalid logger type")
+	}
+	vm.log = logger
+	vm.chainID = vm.rt.ChainID
+
 	vm.pendingBridges = make(map[ids.ID]*BridgeRequest)
-	vm.chainClients = make(map[string]ChainClient)
 	vm.evmByChainID = make(map[uint32]ChainClient)
 
 	// B-Chain accepts user-submitted bridge transfers, so it declares the
 	// floor; the node's boot-time Validate refuses a zero-fee user-facing chain.
-	var networkID uint32
-	if vm.rt != nil {
-		networkID = vm.rt.NetworkID
-	}
-	vm.fee = chain.Floor(networkID)
+	vm.fee = chain.Floor(vm.rt.NetworkID)
 	if err := fee.Validate(vm.fee.Policy()); err != nil {
 		return fmt.Errorf("bridgevm: fee policy: %w", err)
 	}
 
-	// Parse configuration (use JSON like other VMs)
 	if len(vmInit.Config) > 0 {
 		if err := json.Unmarshal(vmInit.Config, &vm.config); err != nil {
-			return fmt.Errorf("failed to parse config: %w", err)
+			return fmt.Errorf("bridgevm: parse config: %w", err)
 		}
 	}
-
-	// Set LP-333 defaults for signer set management
 	if vm.config.MaxSigners == 0 {
-		vm.config.MaxSigners = 100 // First 100 validators opt-in, then set freezes
+		vm.config.MaxSigners = 100 // LP-333: the set freezes here
 	}
-	if vm.config.ThresholdRatio == 0 {
-		vm.config.ThresholdRatio = 0.67 // 2/3 threshold for BFT safety
-	}
-	if vm.config.RequireValidatorBond == 0 {
-		vm.config.RequireValidatorBond = 1_000_000 * 1e9 // Default: 1M LUX bond
+	if err := vm.config.validate(); err != nil {
+		return err
 	}
 
-	// Validate configuration - Bridge validators require 1M LUX BOND (slashable, not stake)
-	if vm.config.RequireValidatorBond < 1_000_000*1e9 { // 1M LUX bond
-		return errors.New("B-chain requires 1M LUX bond (slashable)")
-	}
-
-	// Initialize LP-333 signer set (opt-in model)
 	vm.signerSet = &SignerSet{
-		Signers:      make([]*SignerInfo, 0, vm.config.MaxSigners),
-		Waitlist:     make([]ids.NodeID, 0),
-		CurrentEpoch: 0,
-		SetFrozen:    false,
-		ThresholdT:   0,
-	}
-
-	// Initialize MPC components using threshold protocol
-	// Party ID is derived from node ID
-	vm.mpcPartyID = party.ID(vm.rt.NodeID.String())
-
-	// Create worker pool for MPC operations (8 workers)
-	vm.mpcPool = pool.NewPool(8)
-
-	// mpcConfig / mpcPartyIDs are populated from M-Chain's dealerless keygen
-	// when validators join the bridge signer set (CrossChainMPCRequest). No
-	// key material is generated on B-Chain.
-
-	// Initialize bridge registry
-	vm.bridgeRegistry = &BridgeRegistry{
-		Validators:       make(map[ids.NodeID]*BridgeValidator),
-		CompletedBridges: make(map[ids.ID]*CompletedBridge),
-		DailyVolume:      make(map[string]uint64),
+		Signers:  make([]*SignerInfo, 0, vm.config.MaxSigners),
+		Waitlist: make([]ids.NodeID, 0),
 	}
 
 	// Authoritative quote engine + swap store. The price feed default
-	// seeds the assets the bridge handles at genesis; a future PR adds
-	// a quorum-signed oracle feed without changing the RPC surface.
+	// seeds the assets the bridge handles at genesis.
 	vm.quoteEngine = &QuoteEngine{Feed: defaultPriceFeed()}
 	vm.swapStore = newInMemorySwapStore()
 
@@ -396,23 +362,17 @@ func (vm *VM) Initialize(
 	// which needs the KMS-backed KeyProvider and the Warp-backed
 	// AttestationClient — runtime deps not available at consensus boot. Config
 	// carries the chain list; a relayer reads vm.config.ExternalChains and calls
-	// EnableBridgeRelease. Non-relayer nodes leave chainClients empty and never
-	// broadcast.
-	if len(vm.config.ExternalChains) > 0 {
-		vm.log.Info("bridgevm: external chains configured; awaiting EnableBridgeRelease",
-			log.Int("count", len(vm.config.ExternalChains)),
-		)
-	}
+	// EnableBridgeRelease. Non-relayer nodes never broadcast.
 
-	// Parse genesis - use JSON for simple genesis configuration
 	genesis := &Genesis{}
 	if len(vmInit.Genesis) > 0 {
 		if err := json.Unmarshal(vmInit.Genesis, genesis); err != nil {
-			return fmt.Errorf("failed to parse genesis: %w", err)
+			return fmt.Errorf("bridgevm: parse genesis: %w", err)
 		}
 	}
 
-	// Create genesis block
+	vm.chain = chain.New[*Block](vmInit.DB, nil)
+
 	genesisBlock := &Block{
 		BlockHeight:    0,
 		BlockTimestamp: genesis.Timestamp,
@@ -420,12 +380,35 @@ func (vm *VM) Initialize(
 		BridgeRequests: []*BridgeRequest{},
 		vm:             vm,
 	}
-
 	genesisBlock.ID_ = genesisBlock.computeID()
 	vm.genesisBlock = genesisBlock
 
-	_, _, err := vm.chain.Open(genesisBlock, vm.parseBlock)
-	return err
+	_, fresh, err := vm.chain.Open(genesisBlock, vm.parseBlock)
+	if err != nil {
+		return err
+	}
+	// A chain that reports no tip while its own settlement records are on disk
+	// did not find a fresh database — it failed to read one. Starting from
+	// genesis there would commit a new chain over a live one and re-open a
+	// daily cap that has already been spent, durably and without a word.
+	if fresh {
+		settled, err := hasAny(vmInit.DB, settledPrefix)
+		if err != nil {
+			return fmt.Errorf("bridgevm: read settlement records: %w", err)
+		}
+		if settled {
+			return errors.New("bridgevm: no tip recorded, but this database holds settled transfers — refusing to restart the chain over it")
+		}
+	}
+	return nil
+}
+
+// hasAny reports whether the database holds even one key under prefix.
+func hasAny(db database.Database, prefix []byte) (bool, error) {
+	it := db.NewIteratorWithPrefix(prefix)
+	defer it.Release()
+	found := it.Next()
+	return found, it.Error()
 }
 
 // parseBlock decodes a block belonging to this VM. The store reads accepted
@@ -439,66 +422,72 @@ func (vm *VM) parseBlock(raw []byte) (*Block, error) {
 	return blk, nil
 }
 
-// BuildBlock implements the chain.ChainVM interface
+// BuildBlock implements the chain.ChainVM interface.
+//
+// The candidates are ordered by id and admitted by the SAME rule Verify
+// applies, over the state as of the same parent. A builder with its own
+// looser rule proposes a block every node refuses, and since a refused
+// transfer goes straight back into the pending set, it proposes it again:
+// block production stops and does not resume.
 func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
-	built, err := vm.chain.Propose(func(parent *Block) (*Block, error) {
-		// The transfers in flight are the bridge's state, so they are read under
-		// the bridge's lock — taken here, inside the chain's, which is the one
-		// order these are ever taken in.
-		vm.mu.RLock()
-		if len(vm.pendingBridges) == 0 {
-			vm.mu.RUnlock()
-			return nil, errors.New("no pending bridge requests")
-		}
+	return vm.chain.Propose(func(parent *Block) (*Block, error) {
+		state := vm.spendAt(parent)
 
-		// Collect bridge requests that are ready, then order them by request id.
-		// pendingBridges is a map, and Go randomises map iteration: taking the
-		// first maxRequestsPerBlock straight out of the range made both the ORDER
-		// of the block's requests and, once more than that many are ready, WHICH
-		// requests it carries vary run to run. That order is hashed into the block
-		// id (block.go computeID) and written to the wire, so the same pending set
-		// produced a different block every time and a request could be starved at
-		// random. Sorting first makes the block a function of its inputs and the
-		// cap a deterministic prefix.
-		requests := make([]*BridgeRequest, 0, len(vm.pendingBridges))
+		// Chain time only moves forward, so a block is never stamped before
+		// its parent even when this node's clock disagrees.
+		at := time.Now().Unix()
+		if at < parent.BlockTimestamp {
+			at = parent.BlockTimestamp
+		}
+		day := at / dayLength
+
+		// pendingBridges is a map and Go randomises map iteration, so the
+		// candidate list is sorted before anything is chosen from it: the
+		// order is hashed into the block id, and the cap has to be a defined
+		// prefix rather than a random draw that can starve a transfer forever.
+		vm.mu.RLock()
+		candidates := make([]*BridgeRequest, 0, len(vm.pendingBridges))
 		for _, req := range vm.pendingBridges {
-			if req.Confirmations >= vm.config.MinConfirmations {
-				requests = append(requests, req)
-			}
+			candidates = append(candidates, req)
 		}
 		vm.mu.RUnlock()
 
-		sort.Slice(requests, func(i, j int) bool {
-			return bytes.Compare(requests[i].ID[:], requests[j].ID[:]) < 0
+		sort.Slice(candidates, func(i, j int) bool {
+			return bytes.Compare(candidates[i].ID[:], candidates[j].ID[:]) < 0
 		})
-		if len(requests) > maxRequestsPerBlock {
-			requests = requests[:maxRequestsPerBlock]
-		}
 
+		requests := make([]*BridgeRequest, 0, maxRequestsPerBlock)
+		for _, req := range candidates {
+			if len(requests) == maxRequestsPerBlock {
+				break
+			}
+			if err := state.admit(&vm.config, day, req); err != nil {
+				vm.log.Debug("bridgevm: transfer not carried",
+					log.Stringer("requestID", req.ID), log.String("reason", err.Error()))
+				continue
+			}
+			requests = append(requests, req)
+		}
 		if len(requests) == 0 {
-			return nil, errors.New("no ready bridge requests")
+			return nil, errors.New("bridgevm: no transfer is ready to be carried")
 		}
 
-		// Create new block
 		blk := &Block{
 			ParentID_:      parent.ID(),
 			BlockHeight:    parent.Height() + 1,
-			BlockTimestamp: time.Now().Unix(),
+			BlockTimestamp: at,
 			BridgeRequests: requests,
 			vm:             vm,
+			spend:          state,
 		}
 		blk.ID_ = blk.computeID()
 
-		vm.log.Info("built bridge block",
+		vm.log.Info("bridgevm: block built",
 			log.Stringer("blockID", blk.ID()),
-			log.Int("numRequests", len(requests)),
+			log.Int("transfers", len(requests)),
 		)
 		return blk, nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	return built, nil
 }
 
 // GetBlock implements the chain.ChainVM interface
@@ -510,14 +499,8 @@ func (vm *VM) GetBlock(ctx context.Context, id ids.ID) (vmchain.Block, error) {
 }
 
 // ParseBlock implements the chain.ChainVM interface
-func (vm *VM) ParseBlock(ctx context.Context, bytes []byte) (vmchain.Block, error) {
-	blk := &Block{vm: vm}
-	if err := parseBlockBytes(bytes, blk); err != nil {
-		return nil, err
-	}
-
-	blk.ID_ = blk.computeID()
-	return blk, nil
+func (vm *VM) ParseBlock(ctx context.Context, raw []byte) (vmchain.Block, error) {
+	return vm.parseBlock(raw)
 }
 
 // SetPreference implements the chain.ChainVM interface
@@ -604,7 +587,6 @@ func (vm *VM) Disconnected(ctx context.Context, nodeID ids.NodeID) error {
 
 // Request implements the common.VM interface
 func (vm *VM) Request(ctx context.Context, nodeID ids.NodeID, requestID uint32, deadline time.Time, request []byte) error {
-	// Bridge VMs may use this for cross-chain communication
 	return nil
 }
 
@@ -630,7 +612,6 @@ func (vm *VM) Version(ctx context.Context) (string, error) {
 
 // CrossChainRequest implements the common.VM interface
 func (vm *VM) CrossChainRequest(ctx context.Context, chainID ids.ID, requestID uint32, deadline time.Time, request []byte) error {
-	// Bridge VMs handle cross-chain requests
 	return nil
 }
 
@@ -653,8 +634,6 @@ func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, er
 
 // SetState implements the common.VM interface
 func (vm *VM) SetState(ctx context.Context, state uint32) error {
-	// For now, no-op
-	// In production, handle state transitions
 	return nil
 }
 
@@ -682,8 +661,6 @@ func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
 	return vm.work.WaitForEvent(ctx)
 }
 
-// HTTP handler methods
-
 // Genesis represents the genesis state
 type Genesis struct {
 	Timestamp int64 `json:"timestamp"`
@@ -691,23 +668,35 @@ type Genesis struct {
 
 // =============================================================================
 // LP-333: Opt-In Signer Set Management
-// First 100 validators opt-in without reshare. Reshare ONLY on slot replacement.
+// First MaxSigners validators opt-in without reshare. Reshare ONLY on slot
+// replacement.
 // =============================================================================
 
+// renumber makes each signer's slot its position in the set. The slot was
+// stored and left alone through removals, so after the first one it named a
+// position the signer no longer held.
+func (s *SignerSet) renumber() {
+	for i, signer := range s.Signers {
+		signer.SlotIndex = i
+	}
+	s.ThresholdT = quorum(len(s.Signers)) - 1
+	if s.ThresholdT < 0 {
+		s.ThresholdT = 0
+	}
+}
+
 // RegisterValidator registers a new validator as a bridge signer (opt-in model)
-// LP-333: First 100 validators are accepted directly - NO reshare on join.
-// After 100 signers, new validators go to waitlist until a slot opens.
+// LP-333: the first MaxSigners validators are accepted directly - NO reshare on
+// join. After that, new validators go to the waitlist until a slot opens.
 func (vm *VM) RegisterValidator(input *RegisterValidatorInput) (*RegisterValidatorResult, error) {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 
-	// Parse node ID
 	nodeID, err := ids.NodeIDFromString(input.NodeID)
 	if err != nil {
-		return nil, fmt.Errorf("invalid node ID: %w", err)
+		return nil, fmt.Errorf("bridgevm: invalid node ID: %w", err)
 	}
 
-	// Check if already a signer
 	for _, signer := range vm.signerSet.Signers {
 		if signer.NodeID == nodeID {
 			return &RegisterValidatorResult{
@@ -722,7 +711,6 @@ func (vm *VM) RegisterValidator(input *RegisterValidatorInput) (*RegisterValidat
 		}
 	}
 
-	// Check if already on waitlist
 	for _, wl := range vm.signerSet.Waitlist {
 		if wl == nodeID {
 			return &RegisterValidatorResult{
@@ -734,101 +722,92 @@ func (vm *VM) RegisterValidator(input *RegisterValidatorInput) (*RegisterValidat
 		}
 	}
 
-	// Parse bond amount (1M LUX required, slashable)
-	var bondAmount uint64
-	if input.BondAmount != "" {
-		if _, err := fmt.Sscanf(input.BondAmount, "%d", &bondAmount); err != nil {
-			bondAmount = 0
-		}
+	// The bond is the whole of a signer's accountability, and the chain
+	// declares what it must be. Reading the field and admitting whatever it
+	// said left the requirement documented and unapplied.
+	bondAmount, err := strconv.ParseUint(input.BondAmount, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("bridgevm: bond amount %q is not a number", input.BondAmount)
+	}
+	if bondAmount < vm.config.RequireValidatorBond {
+		return nil, fmt.Errorf("bridgevm: bond %d is below the required %d",
+			bondAmount, vm.config.RequireValidatorBond)
 	}
 
-	// If set is NOT frozen (under max signers), add directly - NO RESHARE
 	if !vm.signerSet.SetFrozen && len(vm.signerSet.Signers) < vm.config.MaxSigners {
-		// Create signer info
 		signerInfo := &SignerInfo{
 			NodeID:     nodeID,
 			PartyID:    party.ID(nodeID.String()),
-			BondAmount: bondAmount, // 1M LUX bond (slashable)
+			BondAmount: bondAmount,
 			Active:     true,
 			JoinedAt:   time.Now(),
-			SlotIndex:  len(vm.signerSet.Signers),
-			Slashed:    false,
-			SlashCount: 0,
 		}
-
-		// Parse MPC public key if provided
 		if input.MPCPubKey != "" {
 			signerInfo.MPCPubKey = []byte(input.MPCPubKey)
 		}
 
-		// Add to signer set
 		vm.signerSet.Signers = append(vm.signerSet.Signers, signerInfo)
-
-		// Update threshold: t = floor(n * ratio)
-		vm.signerSet.ThresholdT = int(float64(len(vm.signerSet.Signers)) * vm.config.ThresholdRatio)
-		if vm.signerSet.ThresholdT < 1 {
-			vm.signerSet.ThresholdT = 1
-		}
-
-		// Check if set should freeze (reached max signers)
+		vm.signerSet.renumber()
 		if len(vm.signerSet.Signers) >= vm.config.MaxSigners {
 			vm.signerSet.SetFrozen = true
 		}
 
-		remainingSlots := vm.config.MaxSigners - len(vm.signerSet.Signers)
-
-		if vm.log != nil && !vm.log.IsZero() {
-			vm.log.Info("validator registered as bridge signer (LP-333 opt-in)",
-				log.Stringer("nodeID", nodeID),
-				log.Int("signerIndex", signerInfo.SlotIndex),
-				log.Int("totalSigners", len(vm.signerSet.Signers)),
-				log.Int("threshold", vm.signerSet.ThresholdT),
-				log.Bool("setFrozen", vm.signerSet.SetFrozen),
-			)
-		}
+		vm.logInfo("bridgevm: validator registered as signer",
+			log.Stringer("nodeID", nodeID),
+			log.Int("slot", signerInfo.SlotIndex),
+			log.Int("signers", len(vm.signerSet.Signers)),
+			log.Int("threshold", vm.signerSet.ThresholdT),
+			log.Bool("frozen", vm.signerSet.SetFrozen),
+		)
 
 		return &RegisterValidatorResult{
 			Success:        true,
 			NodeID:         input.NodeID,
 			Registered:     true,
-			Waitlisted:     false,
 			SignerIndex:    signerInfo.SlotIndex,
 			TotalSigners:   len(vm.signerSet.Signers),
 			Threshold:      vm.signerSet.ThresholdT,
-			ReshareNeeded:  false, // LP-333: NO reshare on join
 			CurrentEpoch:   vm.signerSet.CurrentEpoch,
 			SetFrozen:      vm.signerSet.SetFrozen,
-			RemainingSlots: remainingSlots,
+			RemainingSlots: vm.config.MaxSigners - len(vm.signerSet.Signers),
 			Message:        "registered as bridge signer",
 		}, nil
 	}
 
-	// Set is frozen - add to waitlist
 	vm.signerSet.Waitlist = append(vm.signerSet.Waitlist, nodeID)
 	waitlistIndex := len(vm.signerSet.Waitlist) - 1
 
-	if vm.log != nil && !vm.log.IsZero() {
-		vm.log.Info("validator added to waitlist (signer set frozen)",
-			log.Stringer("nodeID", nodeID),
-			log.Int("waitlistIndex", waitlistIndex),
-			log.Int("totalSigners", len(vm.signerSet.Signers)),
-		)
-	}
+	vm.logInfo("bridgevm: validator waitlisted, signer set frozen",
+		log.Stringer("nodeID", nodeID),
+		log.Int("waitlistIndex", waitlistIndex),
+		log.Int("signers", len(vm.signerSet.Signers)),
+	)
 
 	return &RegisterValidatorResult{
-		Success:        true,
-		NodeID:         input.NodeID,
-		Registered:     false,
-		Waitlisted:     true,
-		WaitlistIndex:  waitlistIndex,
-		TotalSigners:   len(vm.signerSet.Signers),
-		Threshold:      vm.signerSet.ThresholdT,
-		ReshareNeeded:  false,
-		CurrentEpoch:   vm.signerSet.CurrentEpoch,
-		SetFrozen:      vm.signerSet.SetFrozen,
-		RemainingSlots: 0,
-		Message:        "added to waitlist (signer set frozen at 100)",
+		Success:       true,
+		NodeID:        input.NodeID,
+		Waitlisted:    true,
+		WaitlistIndex: waitlistIndex,
+		TotalSigners:  len(vm.signerSet.Signers),
+		Threshold:     vm.signerSet.ThresholdT,
+		CurrentEpoch:  vm.signerSet.CurrentEpoch,
+		SetFrozen:     vm.signerSet.SetFrozen,
+		Message:       "added to waitlist (signer set frozen)",
 	}, nil
+}
+
+// logInfo writes a line when this VM has a logger. A VM assembled for a unit
+// test has none, and a log call is not a reason for a chain to panic.
+func (vm *VM) logInfo(msg string, fields ...interface{}) {
+	if vm.log != nil && !vm.log.IsZero() {
+		vm.log.Info(msg, fields...)
+	}
+}
+
+func (vm *VM) logWarn(msg string, fields ...interface{}) {
+	if vm.log != nil && !vm.log.IsZero() {
+		vm.log.Warn(msg, fields...)
+	}
 }
 
 // GetSignerSetInfo returns information about the current signer set
@@ -859,34 +838,27 @@ func (vm *VM) GetSignerSetInfo() *SignerSetInfo {
 	return info
 }
 
-// RemoveSigner removes a failed/stopped signer and triggers replacement
-// LP-333: This is the ONLY operation that triggers a reshare.
-// Epoch increments only when a signer is replaced.
+// RemoveSigner removes a failed/stopped signer and triggers replacement.
+// LP-333: this is the ONLY operation that triggers a reshare, and the epoch
+// increments only here.
 func (vm *VM) RemoveSigner(nodeID ids.NodeID, replacementNodeID *ids.NodeID) (*SignerReplacementResult, error) {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 
-	// Find and remove the signer
-	found := false
-	var removedSigner *SignerInfo
+	slot := -1
 	for i, signer := range vm.signerSet.Signers {
 		if signer.NodeID == nodeID {
-			removedSigner = signer
-			// Remove from slice
-			vm.signerSet.Signers = append(vm.signerSet.Signers[:i], vm.signerSet.Signers[i+1:]...)
-			found = true
+			slot = i
 			break
 		}
 	}
-
-	if !found {
+	if slot < 0 {
 		return &SignerReplacementResult{
 			Success: false,
 			Message: fmt.Sprintf("signer %s not found in active set", nodeID),
 		}, nil
 	}
 
-	// Determine replacement (from parameter or waitlist)
 	var replacement ids.NodeID
 	var replacementSource string
 	if replacementNodeID != nil && *replacementNodeID != ids.EmptyNodeID {
@@ -898,53 +870,42 @@ func (vm *VM) RemoveSigner(nodeID ids.NodeID, replacementNodeID *ids.NodeID) (*S
 		replacementSource = "waitlist"
 	}
 
-	// Add replacement signer if available
-	if replacement != ids.EmptyNodeID {
-		newSigner := &SignerInfo{
-			NodeID:     replacement,
-			PartyID:    party.ID(replacement.String()),
-			BondAmount: 0, // Will be verified during reshare (1M LUX required)
-			Active:     true,
-			JoinedAt:   time.Now(),
-			SlotIndex:  removedSigner.SlotIndex,
-			Slashed:    false,
-			SlashCount: 0,
+	if replacement == ids.EmptyNodeID {
+		vm.signerSet.Signers = append(vm.signerSet.Signers[:slot], vm.signerSet.Signers[slot+1:]...)
+	} else {
+		// The replacement takes the vacated slot. Splicing the old signer out
+		// and appending the new one moved every signer above it, which is a
+		// reshuffle of the set rather than the one-slot replacement LP-333
+		// describes.
+		vm.signerSet.Signers[slot] = &SignerInfo{
+			NodeID:  replacement,
+			PartyID: party.ID(replacement.String()),
+			// The bond is verified during the reshare, not asserted here.
+			Active:   true,
+			JoinedAt: time.Now(),
 		}
-		vm.signerSet.Signers = append(vm.signerSet.Signers, newSigner)
 	}
-
-	// Update threshold
-	vm.signerSet.ThresholdT = int(float64(len(vm.signerSet.Signers)) * vm.config.ThresholdRatio)
-	if vm.signerSet.ThresholdT < 1 && len(vm.signerSet.Signers) > 0 {
-		vm.signerSet.ThresholdT = 1
-	}
-
-	// INCREMENT EPOCH - This is the ONLY reshare trigger (LP-333)
+	vm.signerSet.renumber()
 	vm.signerSet.CurrentEpoch++
 
-	// Generate reshare session ID
 	reshareSession := fmt.Sprintf("reshare-epoch-%d-%s", vm.signerSet.CurrentEpoch, time.Now().Format("20060102150405"))
 
-	if vm.log != nil && !vm.log.IsZero() {
-		vm.log.Info("signer removed and reshare triggered (LP-333)",
-			log.Stringer("removedNodeID", nodeID),
-			log.Stringer("replacementNodeID", replacement),
-			log.String("replacementSource", replacementSource),
-			log.Uint64("newEpoch", vm.signerSet.CurrentEpoch),
-			log.Int("activeSigners", len(vm.signerSet.Signers)),
-			log.String("reshareSession", reshareSession),
-		)
-	}
+	vm.logInfo("bridgevm: signer removed, reshare triggered",
+		log.Stringer("removedNodeID", nodeID),
+		log.Stringer("replacementNodeID", replacement),
+		log.String("replacementSource", replacementSource),
+		log.Uint64("newEpoch", vm.signerSet.CurrentEpoch),
+		log.Int("activeSigners", len(vm.signerSet.Signers)),
+		log.String("reshareSession", reshareSession),
+	)
 
-	// Trigger actual reshare protocol via M-Chain (ThresholdVM-MPC, per LP-134) using warp messaging
+	// Trigger the reshare on M-Chain (LP-134) over warp. A failure here is
+	// retryable and does not undo the removal: the signer is out either way.
 	if err := vm.triggerReshareProtocol(reshareSession, nodeID, replacement); err != nil {
-		if vm.log != nil && !vm.log.IsZero() {
-			vm.log.Warn("failed to trigger reshare protocol",
-				log.String("reshareSession", reshareSession),
-				log.String("error", err.Error()),
-			)
-		}
-		// Continue anyway - reshare can be retried
+		vm.logWarn("bridgevm: reshare protocol not triggered",
+			log.String("reshareSession", reshareSession),
+			log.String("error", err.Error()),
+		)
 	}
 
 	result := &SignerReplacementResult{
@@ -955,13 +916,11 @@ func (vm *VM) RemoveSigner(nodeID ids.NodeID, replacementNodeID *ids.NodeID) (*S
 		Threshold:     vm.signerSet.ThresholdT,
 		Message:       "signer removed, reshare initiated",
 	}
-
 	if replacement != ids.EmptyNodeID {
 		result.ReplacementNodeID = replacement.String()
 		result.ReshareSession = reshareSession
 		result.Message = fmt.Sprintf("signer replaced from %s, reshare initiated", replacementSource)
 	}
-
 	return result, nil
 }
 
@@ -978,41 +937,26 @@ func (vm *VM) HasSigner(nodeID ids.NodeID) bool {
 	return false
 }
 
-// triggerReshareProtocol sends a cross-chain request to ThresholdVM to initiate
-// the MPC key reshare protocol. This is triggered when a signer is replaced.
+// triggerReshareProtocol sends a cross-chain request to M-Chain to initiate the
+// MPC key reshare protocol. Called when a signer is replaced; the caller holds
+// vm.mu.
 func (vm *VM) triggerReshareProtocol(sessionID string, removedNodeID ids.NodeID, newNodeID ids.NodeID) error {
-	// Check if runtime is available (may not be in unit tests)
-	if vm.rt == nil {
-		if vm.log != nil && !vm.log.IsZero() {
-			vm.log.Debug("skipping reshare protocol trigger - runtime not initialized")
-		}
+	if vm.rt == nil || vm.rt.WarpSigner == nil || vm.rt.Sender == nil {
+		// Not a node with warp plumbing (a unit test, or a node that does not
+		// relay). Nothing to send, and nothing wrong.
 		return nil
 	}
 
-	// Check required warp infrastructure
-	if vm.rt.WarpSigner == nil || vm.rt.Sender == nil {
-		if vm.log != nil && !vm.log.IsZero() {
-			vm.log.Debug("skipping reshare protocol trigger - warp infrastructure not available")
-		}
-		return nil
-	}
-
-	// Build the list of old party IDs (current signers excluding the removed one)
 	oldPartyIDs := make([]party.ID, 0, len(vm.signerSet.Signers))
+	newPartyIDs := make([]party.ID, 0, len(vm.signerSet.Signers))
 	for _, signer := range vm.signerSet.Signers {
 		if signer.NodeID != removedNodeID && signer.NodeID != newNodeID {
 			oldPartyIDs = append(oldPartyIDs, signer.PartyID)
 		}
-	}
-
-	// Build the list of new party IDs (current signers after replacement)
-	newPartyIDs := make([]party.ID, 0, len(vm.signerSet.Signers))
-	for _, signer := range vm.signerSet.Signers {
 		newPartyIDs = append(newPartyIDs, signer.PartyID)
 	}
 
-	// Create the cross-chain MPC request
-	mpcRequest := &CrossChainMPCRequest{
+	requestBytes, err := json.Marshal(&CrossChainMPCRequest{
 		Type:          MPCRequestReshare,
 		SessionID:     sessionID,
 		Epoch:         vm.signerSet.CurrentEpoch,
@@ -1021,50 +965,38 @@ func (vm *VM) triggerReshareProtocol(sessionID string, removedNodeID ids.NodeID,
 		Threshold:     vm.signerSet.ThresholdT,
 		SourceChainID: vm.rt.ChainID[:],
 		Timestamp:     time.Now().Unix(),
-	}
-
-	// Serialize the request
-	requestBytes, err := json.Marshal(mpcRequest)
+	})
 	if err != nil {
-		return fmt.Errorf("failed to marshal MPC request: %w", err)
+		return fmt.Errorf("bridgevm: marshal MPC request: %w", err)
 	}
 
 	// Build, sign, and wrap the reshare request as a single-signer Warp
 	// envelope. The node signs with its BLS key over the Beam domain; the
-	// receiving ThresholdVM nodes aggregate and verify the signature against
+	// receiving M-Chain nodes aggregate and verify the signature against
 	// the canonical validator set. warpmsg.BuildSigned is the one place that
 	// performs this build→sign→wrap sequence.
 	env, err := warpmsg.BuildSigned(vm.rt.WarpSigner, vm.rt.NetworkID, vm.rt.ChainID, requestBytes)
 	if err != nil {
-		return fmt.Errorf("failed to build signed warp message: %w", err)
+		return fmt.Errorf("bridgevm: build signed warp message: %w", err)
 	}
-
-	// Broadcast the reshare request to all signers via gossip
-	// The ThresholdVM nodes will receive this and participate in the reshare protocol
 	msgBytes, err := env.Bytes()
 	if err != nil {
-		return fmt.Errorf("failed to encode warp envelope: %w", err)
+		return fmt.Errorf("bridgevm: encode warp envelope: %w", err)
 	}
 
-	config := warp.SendConfig{
-		Validators: len(vm.signerSet.Signers), // Send to all validators in signer set
-		Peers:      0,
+	if err := vm.rt.Sender.SendGossip(context.Background(), warp.SendConfig{
+		Validators: len(vm.signerSet.Signers),
+	}, msgBytes); err != nil {
+		return fmt.Errorf("bridgevm: broadcast reshare request: %w", err)
 	}
 
-	if err := vm.rt.Sender.SendGossip(context.Background(), config, msgBytes); err != nil {
-		return fmt.Errorf("failed to broadcast reshare request: %w", err)
-	}
-
-	if vm.log != nil && !vm.log.IsZero() {
-		vm.log.Info("reshare protocol triggered",
-			log.String("sessionID", sessionID),
-			log.Uint64("epoch", vm.signerSet.CurrentEpoch),
-			log.Int("oldParties", len(oldPartyIDs)),
-			log.Int("newParties", len(newPartyIDs)),
-			log.Int("threshold", vm.signerSet.ThresholdT),
-		)
-	}
-
+	vm.logInfo("bridgevm: reshare protocol triggered",
+		log.String("sessionID", sessionID),
+		log.Uint64("epoch", vm.signerSet.CurrentEpoch),
+		log.Int("oldParties", len(oldPartyIDs)),
+		log.Int("newParties", len(newPartyIDs)),
+		log.Int("threshold", vm.signerSet.ThresholdT),
+	)
 	return nil
 }
 
@@ -1087,28 +1019,24 @@ type SlashSignerResult struct {
 	Message         string `json:"message"`
 }
 
-// SlashSigner slashes a misbehaving bridge signer's bond
-// The bond is NOT stake - it's a slashable deposit that can be partially or fully seized
+// SlashSigner slashes a misbehaving bridge signer's bond. The bond is NOT
+// stake — it is a slashable deposit that can be partially or fully seized.
 func (vm *VM) SlashSigner(input *SlashSignerInput) (*SlashSignerResult, error) {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 
-	// Validate slash percentage
 	if input.SlashPercent < 1 || input.SlashPercent > 100 {
-		return nil, errors.New("slash percent must be between 1 and 100")
+		return nil, errors.New("bridgevm: slash percent must be between 1 and 100")
 	}
 
-	// Find the signer
 	var signer *SignerInfo
-	var signerIndex int
+	signerIndex := -1
 	for i, s := range vm.signerSet.Signers {
 		if s.NodeID == input.NodeID {
-			signer = s
-			signerIndex = i
+			signer, signerIndex = s, i
 			break
 		}
 	}
-
 	if signer == nil {
 		return &SlashSignerResult{
 			Success: false,
@@ -1117,25 +1045,21 @@ func (vm *VM) SlashSigner(input *SlashSignerInput) (*SlashSignerResult, error) {
 		}, nil
 	}
 
-	// Calculate slash amount
 	slashAmount := (signer.BondAmount * uint64(input.SlashPercent)) / 100
 	remainingBond := signer.BondAmount - slashAmount
 
-	// Update signer state
 	signer.BondAmount = remainingBond
 	signer.Slashed = true
 	signer.SlashCount++
 
-	if vm.log != nil && !vm.log.IsZero() {
-		vm.log.Warn("bridge signer slashed",
-			log.Stringer("nodeID", input.NodeID),
-			log.String("reason", input.Reason),
-			log.Int("slashPercent", input.SlashPercent),
-			log.Uint64("slashedAmount", slashAmount),
-			log.Uint64("remainingBond", remainingBond),
-			log.Int("slashCount", signer.SlashCount),
-		)
-	}
+	vm.logWarn("bridgevm: signer slashed",
+		log.Stringer("nodeID", input.NodeID),
+		log.String("reason", input.Reason),
+		log.Int("slashPercent", input.SlashPercent),
+		log.Uint64("slashedAmount", slashAmount),
+		log.Uint64("remainingBond", remainingBond),
+		log.Int("slashCount", signer.SlashCount),
+	)
 
 	result := &SlashSignerResult{
 		Success:         true,
@@ -1143,35 +1067,25 @@ func (vm *VM) SlashSigner(input *SlashSignerInput) (*SlashSignerResult, error) {
 		SlashedAmount:   slashAmount,
 		RemainingBond:   remainingBond,
 		TotalSlashCount: signer.SlashCount,
-		RemovedFromSet:  false,
-		Message:         fmt.Sprintf("slashed %d%% of bond (%d LUX)", input.SlashPercent, slashAmount/1e9),
+		Message:         fmt.Sprintf("slashed %d%% of bond (%d)", input.SlashPercent, slashAmount),
 	}
 
-	// If bond drops below minimum (1M LUX), remove from signer set
-	minBond := uint64(1_000_000 * 1e9) // 1M LUX
-	if remainingBond < minBond {
-		// Remove signer
+	// A signer whose bond no longer meets what the chain requires is not a
+	// signer. The requirement is read from the same declaration registration
+	// applies, so the two cannot drift apart.
+	if remainingBond < vm.config.RequireValidatorBond {
 		vm.signerSet.Signers = append(vm.signerSet.Signers[:signerIndex], vm.signerSet.Signers[signerIndex+1:]...)
-
-		// Update threshold
-		vm.signerSet.ThresholdT = int(float64(len(vm.signerSet.Signers)) * vm.config.ThresholdRatio)
-		if vm.signerSet.ThresholdT < 1 && len(vm.signerSet.Signers) > 0 {
-			vm.signerSet.ThresholdT = 1
-		}
-
-		// Increment epoch (removal triggers reshare)
+		vm.signerSet.renumber()
 		vm.signerSet.CurrentEpoch++
 
 		result.RemovedFromSet = true
-		result.Message = fmt.Sprintf("slashed %d%% of bond, signer removed (bond below 1M LUX minimum)", input.SlashPercent)
+		result.Message = fmt.Sprintf("slashed %d%% of bond, signer removed (bond below the required minimum)", input.SlashPercent)
 
-		if vm.log != nil && !vm.log.IsZero() {
-			vm.log.Warn("bridge signer removed due to insufficient bond after slashing",
-				log.Stringer("nodeID", input.NodeID),
-				log.Uint64("remainingBond", remainingBond),
-				log.Uint64("newEpoch", vm.signerSet.CurrentEpoch),
-			)
-		}
+		vm.logWarn("bridgevm: signer removed, bond below the required minimum",
+			log.Stringer("nodeID", input.NodeID),
+			log.Uint64("remainingBond", remainingBond),
+			log.Uint64("newEpoch", vm.signerSet.CurrentEpoch),
+		)
 	}
 
 	return result, nil
