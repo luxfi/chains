@@ -104,14 +104,35 @@ func (v *AIVertex) ConflictsVertex(other vertex.Vertex) bool {
 	return v.Conflicts(ov)
 }
 
+// computeID is the vertex's identity, so everything that distinguishes one
+// vertex from another has to reach the hash, and no two distinct vertices may
+// reach the same one.
+//
+// Both halves of that were false. The transaction ids were left out entirely,
+// so the payload was unauthenticated: two vertices carrying different work
+// under the same job names shared an id, and either could be served for the
+// other. And the job names were concatenated without separation, so ["ab","c"]
+// and ["a","bc"] hashed the same bytes — a second vertex that a peer must treat
+// as the first. Each variable-length part is now written with its length ahead
+// of it, which is what makes the encoding injective.
 func (v *AIVertex) computeID() ids.ID {
 	h := sha256.New()
 	binary.Write(h, binary.BigEndian, v.height)
 	binary.Write(h, binary.BigEndian, v.epoch)
+
+	binary.Write(h, binary.BigEndian, uint32(len(v.parents)))
 	for _, p := range v.parents {
-		h.Write(p[:])
+		h.Write(p[:]) // fixed width, self-delimiting
 	}
+
+	binary.Write(h, binary.BigEndian, uint32(len(v.txIDs)))
+	for _, t := range v.txIDs {
+		h.Write(t[:]) // fixed width
+	}
+
+	binary.Write(h, binary.BigEndian, uint32(len(v.jobIDs)))
 	for _, j := range v.jobIDs {
+		binary.Write(h, binary.BigEndian, uint32(len(j)))
 		h.Write([]byte(j))
 	}
 	return ids.ID(h.Sum(nil))
