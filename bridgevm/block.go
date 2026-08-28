@@ -248,19 +248,12 @@ func (b *Block) Timestamp() time.Time {
 	return time.Unix(b.BlockTimestamp, 0)
 }
 
-// Bytes returns the block bytes
+// Bytes returns the block's encoding, computed once.
 func (b *Block) Bytes() []byte {
-	if b.bytes != nil {
-		return b.bytes
+	if b.bytes == nil {
+		b.bytes = b.Marshal()
 	}
-
-	bytes, err := b.Marshal()
-	if err != nil {
-		return nil
-	}
-
-	b.bytes = bytes
-	return bytes
+	return b.bytes
 }
 
 var _ chain.Block = (*Block)(nil)

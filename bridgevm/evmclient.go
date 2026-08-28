@@ -52,13 +52,13 @@ const defaultReleaseGasLimit uint64 = 300_000
 // resolved by the VM's KeyProvider at Initialize; the private key never lives in
 // genesis, config JSON, or logs.
 type ExternalChainConfig struct {
-	Name          string   `json:"name"`          // logical key, e.g. "zoo-testnet", "lux-testnet-c"
-	ChainID       uint64   `json:"chainId"`       // EVM chain id (200201, 96368)
-	RPCEndpoints  []string `json:"rpcEndpoints"`  // 1..N validator RPCs; release broadcast to ALL
-	Gateway       string   `json:"gateway"`       // BridgeGateway contract address (0x..)
-	CustodySigner string   `json:"custodySigner"` // MPC custody signer EVM address baked into the gateway
-	MinGasPrice   string   `json:"minGasPrice,omitempty"` // wei floor; release uses max(suggested, floor)
-	GasLimit      uint64   `json:"gasLimit,omitempty"`    // release call gas limit (default 300000)
+	Name          string   `json:"name"`                    // logical key, e.g. "zoo-testnet", "lux-testnet-c"
+	ChainID       uint64   `json:"chainId"`                 // EVM chain id (200201, 96368)
+	RPCEndpoints  []string `json:"rpcEndpoints"`            // 1..N validator RPCs; release broadcast to ALL
+	Gateway       string   `json:"gateway"`                 // BridgeGateway contract address (0x..)
+	CustodySigner string   `json:"custodySigner"`           // MPC custody signer EVM address baked into the gateway
+	MinGasPrice   string   `json:"minGasPrice,omitempty"`   // wei floor; release uses max(suggested, floor)
+	GasLimit      uint64   `json:"gasLimit,omitempty"`      // release call gas limit (default 300000)
 	GasKeyKMSPath string   `json:"gasKeyKmsPath,omitempty"` // KMS path for the relayer key — NEVER inline
 }
 
@@ -105,18 +105,18 @@ var parsedGatewayABI = func() abi.ABI {
 
 // evmChainClient is the concrete ChainClient for one external EVM chain.
 type evmChainClient struct {
-	name        string
-	chainID     *big.Int
-	gateway     common.Address
-	custody     common.Address
-	gasKey      *ecdsa.PrivateKey
-	gasAddr     common.Address
-	gasLimit    uint64
-	minGasPrice *big.Int
-	signer      types.Signer
-	endpoints   []*ethclient.Client
+	name         string
+	chainID      *big.Int
+	gateway      common.Address
+	custody      common.Address
+	gasKey       *ecdsa.PrivateKey
+	gasAddr      common.Address
+	gasLimit     uint64
+	minGasPrice  *big.Int
+	signer       types.Signer
+	endpoints    []*ethclient.Client
 	rawEndpoints []string
-	log         log.Logger
+	log          log.Logger
 
 	mu sync.Mutex // serialises nonce acquisition + broadcast for this gas key
 }

@@ -49,30 +49,11 @@ func movedKey(day int64, dst uint32) []byte {
 	return append(k, buf[:4]...)
 }
 
-// settlement is what the chain records about a transfer it has settled: the
-// block that carried it. Presence is the replay guard; the contents answer
-// when.
-type settlement struct {
-	Height uint64
-	Time   int64
-}
-
-func (s settlement) bytes() []byte {
-	var out [16]byte
-	binary.BigEndian.PutUint64(out[:8], s.Height)
-	binary.BigEndian.PutUint64(out[8:], uint64(s.Time))
-	return out[:]
-}
-
-func readSettlement(raw []byte) (settlement, error) {
-	if len(raw) != 16 {
-		return settlement{}, fmt.Errorf("bridgevm: settlement record is %d bytes, want 16", len(raw))
-	}
-	return settlement{
-		Height: binary.BigEndian.Uint64(raw[:8]),
-		Time:   int64(binary.BigEndian.Uint64(raw[8:])),
-	}, nil
-}
+// settled is what a settlement record holds. The record IS the fact — this
+// transfer has been settled by this chain — and the block that settled it is
+// already named by the chain itself, so a copy of it here would be a second
+// record of the same thing, able to disagree.
+var settled = []byte{1}
 
 // spend is the bridge's state as of one block: committed state, plus whatever
 // the blocks between it and the accepted tip have already decided.
@@ -206,11 +187,11 @@ func (s *spend) admit(cfg *BridgeConfig, day int64, req *BridgeRequest) error {
 	if err := admissible(cfg, req); err != nil {
 		return err
 	}
-	settled, err := s.isSettled(req.ID)
+	already, err := s.isSettled(req.ID)
 	if err != nil {
 		return err
 	}
-	if settled {
+	if already {
 		return fmt.Errorf("%w: %s", errReplay, req.ID)
 	}
 	was, err := s.movedOn(day, req.DstChainID)
@@ -234,7 +215,7 @@ func (s *spend) admit(cfg *BridgeConfig, day int64, req *BridgeRequest) error {
 func (b *Block) write(db database.Database) error {
 	day := b.BlockTimestamp / dayLength
 	for _, req := range b.BridgeRequests {
-		if err := db.Put(settledKey(req.ID), settlement{Height: b.BlockHeight, Time: b.BlockTimestamp}.bytes()); err != nil {
+		if err := db.Put(settledKey(req.ID), settled); err != nil {
 			return err
 		}
 		key := movedKey(day, req.DstChainID)
@@ -274,12 +255,8 @@ func (vm *VM) spendAt(parent *Block) *spend {
 }
 
 // movedToday reports what has moved to dst on the day the given time falls
-// in, from committed state. It is the diagnostic view of the same counter the
-// cap is enforced against.
-func (vm *VM) movedToday(at int64, dst uint32) uint64 {
-	v, err := newSpend(vm.chain.Base()).movedOn(at/dayLength, dst)
-	if err != nil {
-		return 0
-	}
-	return v
+// in, from committed state — the same counter the cap is enforced against,
+// read rather than kept a second time.
+func (vm *VM) movedToday(at int64, dst uint32) (uint64, error) {
+	return newSpend(vm.chain.Base()).movedOn(at/dayLength, dst)
 }

@@ -17,14 +17,20 @@ func (vm *VM) gateUserBridgeFee(paid uint64) error { return vm.fee.Admit(paid) }
 func (vm *VM) FeePolicy() fee.Policy { return vm.fee.Policy() }
 
 // mpcGroupPublicKey returns the serialized CGGMP21 custody group public key
-// (established by M-Chain's dealerless keygen), or nil if keygen has not
-// completed. B-Chain never holds a custody secret — only this public point.
+// (established by M-Chain's dealerless keygen), or nil if there is not one.
+// B-Chain never holds a custody secret — only this public point.
+//
+// A group with no shares in it sums to the identity, which marshals to a
+// perfectly well-formed 33 bytes. Handing that back as a key made an empty
+// config look like a finished keygen: the node reported itself ready to
+// attest, and bridge_getInfo said the same, on a chain that could verify
+// nothing. The identity is not a key.
 func (vm *VM) mpcGroupPublicKey() []byte {
 	if vm.mpcConfig == nil {
 		return nil
 	}
 	pt := vm.mpcConfig.PublicPoint()
-	if pt == nil {
+	if pt == nil || pt.IsIdentity() {
 		return nil
 	}
 	b, err := pt.MarshalBinary()

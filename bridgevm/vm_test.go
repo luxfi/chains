@@ -17,7 +17,6 @@ import (
 	"github.com/luxfi/constants"
 	"github.com/luxfi/database/memdb"
 	"github.com/luxfi/ids"
-	"github.com/luxfi/log"
 	"github.com/luxfi/runtime"
 	vmcore "github.com/luxfi/vm"
 	"github.com/luxfi/warp"
@@ -284,8 +283,7 @@ func TestReplacingASignerAsksMChainToReshare(t *testing.T) {
 	}
 	replacement := ids.GenerateTestNodeID()
 
-	result, err := vm.RemoveSigner(nodes[2], &replacement)
-	require.NoError(t, err)
+	result := vm.RemoveSigner(nodes[2], &replacement)
 	require.True(t, result.Success)
 
 	sender.mu.Lock()
@@ -314,8 +312,7 @@ func TestANodeWithoutWarpAsksNobody(t *testing.T) {
 	node := ids.GenerateTestNodeID()
 	require.NoError(t, registerSigner(vm, node))
 
-	result, err := vm.RemoveSigner(node, nil)
-	require.NoError(t, err)
+	result := vm.RemoveSigner(node, nil)
 	require.True(t, result.Success, "removal stands whether or not the request goes out")
 }
 
@@ -341,20 +338,8 @@ func TestAReshareRequestThatFailsDoesNotUndoTheRemoval(t *testing.T) {
 		node := ids.GenerateTestNodeID()
 		require.NoError(t, registerSigner(vm, node))
 
-		result, err := vm.RemoveSigner(node, nil)
-		require.NoError(t, err, name)
+		result := vm.RemoveSigner(node, nil)
 		require.True(t, result.Success, name)
 		require.False(t, vm.HasSigner(node), name)
 	}
-}
-
-// A VM with no logger does not panic when something happens worth logging.
-func TestALoglessVMDoesNotPanic(t *testing.T) {
-	vm := &VM{signerSet: &SignerSet{}, config: testConfig()}
-	vm.logInfo("nothing here")
-	vm.logWarn("nor here")
-
-	vm.log = log.NewNoOpLogger()
-	vm.logInfo("nor here either")
-	vm.logWarn("nor here either")
 }

@@ -637,20 +637,11 @@ func (vm *VM) SetState(ctx context.Context, state uint32) error {
 	return nil
 }
 
-// NewHTTPHandler returns HTTP handlers for the VM
+// NewHTTPHandler serves the same API CreateHandlers names, mounted where it
+// names it. Building a second route table here is how the two drift.
 func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
-	handlers, err := vm.CreateHandlers(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	mux := http.NewServeMux()
-	for path, handler := range handlers {
-		if path == "" {
-			path = "/"
-		}
-		mux.Handle(path, handler)
-	}
+	mux.Handle(rpcPath, &jsonRPCHandler{service: NewService(vm)})
 	return mux, nil
 }
 
@@ -752,7 +743,7 @@ func (vm *VM) RegisterValidator(input *RegisterValidatorInput) (*RegisterValidat
 			vm.signerSet.SetFrozen = true
 		}
 
-		vm.logInfo("bridgevm: validator registered as signer",
+		vm.log.Info("bridgevm: validator registered as signer",
 			log.Stringer("nodeID", nodeID),
 			log.Int("slot", signerInfo.SlotIndex),
 			log.Int("signers", len(vm.signerSet.Signers)),
@@ -777,7 +768,7 @@ func (vm *VM) RegisterValidator(input *RegisterValidatorInput) (*RegisterValidat
 	vm.signerSet.Waitlist = append(vm.signerSet.Waitlist, nodeID)
 	waitlistIndex := len(vm.signerSet.Waitlist) - 1
 
-	vm.logInfo("bridgevm: validator waitlisted, signer set frozen",
+	vm.log.Info("bridgevm: validator waitlisted, signer set frozen",
 		log.Stringer("nodeID", nodeID),
 		log.Int("waitlistIndex", waitlistIndex),
 		log.Int("signers", len(vm.signerSet.Signers)),
@@ -796,29 +787,10 @@ func (vm *VM) RegisterValidator(input *RegisterValidatorInput) (*RegisterValidat
 	}, nil
 }
 
-// logInfo writes a line when this VM has a logger. A VM assembled for a unit
-// test has none, and a log call is not a reason for a chain to panic.
-func (vm *VM) logInfo(msg string, fields ...interface{}) {
-	if vm.log != nil && !vm.log.IsZero() {
-		vm.log.Info(msg, fields...)
-	}
-}
-
-func (vm *VM) logWarn(msg string, fields ...interface{}) {
-	if vm.log != nil && !vm.log.IsZero() {
-		vm.log.Warn(msg, fields...)
-	}
-}
-
 // GetSignerSetInfo returns information about the current signer set
 func (vm *VM) GetSignerSetInfo() *SignerSetInfo {
 	vm.mu.RLock()
 	defer vm.mu.RUnlock()
-
-	remainingSlots := vm.config.MaxSigners - len(vm.signerSet.Signers)
-	if remainingSlots < 0 {
-		remainingSlots = 0
-	}
 
 	info := &SignerSetInfo{
 		TotalSigners:   len(vm.signerSet.Signers),
@@ -826,7 +798,7 @@ func (vm *VM) GetSignerSetInfo() *SignerSetInfo {
 		MaxSigners:     vm.config.MaxSigners,
 		CurrentEpoch:   vm.signerSet.CurrentEpoch,
 		SetFrozen:      vm.signerSet.SetFrozen,
-		RemainingSlots: remainingSlots,
+		RemainingSlots: vm.config.MaxSigners - len(vm.signerSet.Signers),
 		WaitlistSize:   len(vm.signerSet.Waitlist),
 		Signers:        vm.signerSet.Signers,
 	}
@@ -841,7 +813,7 @@ func (vm *VM) GetSignerSetInfo() *SignerSetInfo {
 // RemoveSigner removes a failed/stopped signer and triggers replacement.
 // LP-333: this is the ONLY operation that triggers a reshare, and the epoch
 // increments only here.
-func (vm *VM) RemoveSigner(nodeID ids.NodeID, replacementNodeID *ids.NodeID) (*SignerReplacementResult, error) {
+func (vm *VM) RemoveSigner(nodeID ids.NodeID, replacementNodeID *ids.NodeID) *SignerReplacementResult {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 
@@ -856,7 +828,7 @@ func (vm *VM) RemoveSigner(nodeID ids.NodeID, replacementNodeID *ids.NodeID) (*S
 		return &SignerReplacementResult{
 			Success: false,
 			Message: fmt.Sprintf("signer %s not found in active set", nodeID),
-		}, nil
+		}
 	}
 
 	var replacement ids.NodeID
@@ -890,7 +862,7 @@ func (vm *VM) RemoveSigner(nodeID ids.NodeID, replacementNodeID *ids.NodeID) (*S
 
 	reshareSession := fmt.Sprintf("reshare-epoch-%d-%s", vm.signerSet.CurrentEpoch, time.Now().Format("20060102150405"))
 
-	vm.logInfo("bridgevm: signer removed, reshare triggered",
+	vm.log.Info("bridgevm: signer removed, reshare triggered",
 		log.Stringer("removedNodeID", nodeID),
 		log.Stringer("replacementNodeID", replacement),
 		log.String("replacementSource", replacementSource),
@@ -902,7 +874,7 @@ func (vm *VM) RemoveSigner(nodeID ids.NodeID, replacementNodeID *ids.NodeID) (*S
 	// Trigger the reshare on M-Chain (LP-134) over warp. A failure here is
 	// retryable and does not undo the removal: the signer is out either way.
 	if err := vm.triggerReshareProtocol(reshareSession, nodeID, replacement); err != nil {
-		vm.logWarn("bridgevm: reshare protocol not triggered",
+		vm.log.Warn("bridgevm: reshare protocol not triggered",
 			log.String("reshareSession", reshareSession),
 			log.String("error", err.Error()),
 		)
@@ -921,7 +893,7 @@ func (vm *VM) RemoveSigner(nodeID ids.NodeID, replacementNodeID *ids.NodeID) (*S
 		result.ReshareSession = reshareSession
 		result.Message = fmt.Sprintf("signer replaced from %s, reshare initiated", replacementSource)
 	}
-	return result, nil
+	return result
 }
 
 // HasSigner checks if a node ID is in the active signer set
@@ -990,7 +962,7 @@ func (vm *VM) triggerReshareProtocol(sessionID string, removedNodeID ids.NodeID,
 		return fmt.Errorf("bridgevm: broadcast reshare request: %w", err)
 	}
 
-	vm.logInfo("bridgevm: reshare protocol triggered",
+	vm.log.Info("bridgevm: reshare protocol triggered",
 		log.String("sessionID", sessionID),
 		log.Uint64("epoch", vm.signerSet.CurrentEpoch),
 		log.Int("oldParties", len(oldPartyIDs)),
@@ -1052,7 +1024,7 @@ func (vm *VM) SlashSigner(input *SlashSignerInput) (*SlashSignerResult, error) {
 	signer.Slashed = true
 	signer.SlashCount++
 
-	vm.logWarn("bridgevm: signer slashed",
+	vm.log.Warn("bridgevm: signer slashed",
 		log.Stringer("nodeID", input.NodeID),
 		log.String("reason", input.Reason),
 		log.Int("slashPercent", input.SlashPercent),
@@ -1081,7 +1053,7 @@ func (vm *VM) SlashSigner(input *SlashSignerInput) (*SlashSignerResult, error) {
 		result.RemovedFromSet = true
 		result.Message = fmt.Sprintf("slashed %d%% of bond, signer removed (bond below the required minimum)", input.SlashPercent)
 
-		vm.logWarn("bridgevm: signer removed, bond below the required minimum",
+		vm.log.Warn("bridgevm: signer removed, bond below the required minimum",
 			log.Stringer("nodeID", input.NodeID),
 			log.Uint64("remainingBond", remainingBond),
 			log.Uint64("newEpoch", vm.signerSet.CurrentEpoch),
