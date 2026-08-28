@@ -611,5 +611,3 @@ func (vm *VM) CrossChainRequestFailed(ctx context.Context, chainID ids.ID, reque
 func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
 	return vm.chain.IDAtHeight(height)
 }
-
-var lastAcceptedKey = []byte("last_accepted")
