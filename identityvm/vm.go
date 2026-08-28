@@ -143,7 +143,7 @@ type VM struct {
 	// chain is the durable state, the blocks in flight and the tip — and the
 	// one lock over all of it, which the record caches below share. Take it
 	// with chain.Lock or chain.RLock.
-	chain *chain.Store
+	chain *chain.Store[*Block]
 
 	// Record caches, under the chain's lock.
 	identities  map[ids.ID]*Identity
@@ -180,7 +180,7 @@ func (vm *VM) Initialize(
 	// The caches are rebuilt only here: a block publishes its records after its
 	// writes have committed, so a block that fails leaves them untouched and
 	// there is nothing to roll back.
-	vm.chain = chain.New(vmInit.DB, nil)
+	vm.chain = chain.New[*Block](vmInit.DB, nil)
 	vm.identities = make(map[ids.ID]*Identity)
 	vm.credentials = make(map[ids.ID]*Credential)
 	vm.issuers = make(map[ids.ID]*Issuer)
@@ -263,7 +263,7 @@ func (vm *VM) Initialize(
 // parseBlock decodes a block belonging to this VM. The store uses it to read
 // back the tip and any accepted block, so there is one decoder rather than one
 // per call site.
-func (vm *VM) parseBlock(raw []byte) (chain.Block, error) {
+func (vm *VM) parseBlock(raw []byte) (*Block, error) {
 	var block Block
 	if err := parseBlock(raw, &block); err != nil {
 		return nil, err
@@ -350,7 +350,7 @@ func (vm *VM) Disconnected(ctx context.Context, nodeID ids.NodeID) error {
 // block on it happen in one step, so nothing can be accepted in between and
 // leave the proposal hanging off a parent that is no longer the tip.
 func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
-	built, err := vm.chain.Propose(func(parent ids.ID, height uint64) (chain.Block, error) {
+	built, err := vm.chain.Propose(func(parent ids.ID, height uint64) (*Block, error) {
 		// A block with nothing in it says nothing and still has to be voted on.
 		creds := vm.pending.Take(0)
 		if len(creds) == 0 {

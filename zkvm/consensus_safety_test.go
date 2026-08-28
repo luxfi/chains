@@ -144,7 +144,7 @@ func TestBlockVerifyRejectsDuplicateNullifier(t *testing.T) {
 	acceptProofs(vmImpl, first, second)
 
 	blk := &Block{
-		ParentID_:      vmImpl.lastAcceptedID,
+		ParentID_:      tipOf(vmImpl),
 		BlockHeight:    1,
 		BlockTimestamp: 1607144400,
 		Txs:            []*Transaction{first, second},
@@ -155,7 +155,7 @@ func TestBlockVerifyRejectsDuplicateNullifier(t *testing.T) {
 	// Sanity: each tx on its own is a block this VM accepts, so the rejection
 	// below is caused by the pair sharing a nullifier and nothing else.
 	solo := &Block{
-		ParentID_:      vmImpl.lastAcceptedID,
+		ParentID_:      tipOf(vmImpl),
 		BlockHeight:    1,
 		BlockTimestamp: 1607144400,
 		Txs:            []*Transaction{first},
@@ -181,7 +181,7 @@ func TestBlockVerifyRejectsNullifierRepeatedInOneTx(t *testing.T) {
 	acceptProofs(vmImpl, tx)
 
 	blk := &Block{
-		ParentID_:      vmImpl.lastAcceptedID,
+		ParentID_:      tipOf(vmImpl),
 		BlockHeight:    1,
 		BlockTimestamp: 1607144400,
 		Txs:            []*Transaction{tx},
@@ -206,12 +206,12 @@ func TestVertexVerifyRejectsDuplicateNullifier(t *testing.T) {
 	second.ID = second.ComputeID()
 	acceptProofs(vmImpl, first, second)
 
-	solo := &Vertex{height: 1, parents: []ids.ID{vmImpl.lastAcceptedID}, txs: []*Transaction{first}, vm: vmImpl}
+	solo := &Vertex{height: 1, parents: []ids.ID{tipOf(vmImpl)}, txs: []*Transaction{first}, vm: vmImpl}
 	require.NoError(solo.Verify(context.Background()))
 
 	v := &Vertex{
 		height:  1,
-		parents: []ids.ID{vmImpl.lastAcceptedID},
+		parents: []ids.ID{tipOf(vmImpl)},
 		txs:     []*Transaction{first, second},
 		vm:      vmImpl,
 	}
@@ -269,4 +269,10 @@ func TestDeserializeVertexBoundsTxCount(t *testing.T) {
 	require.True(errors.Is(err, errInvalidBlock))
 	require.Less(after.TotalAlloc-before.TotalAlloc, uint64(4<<20),
 		"rejecting the header must not allocate the claimed txs")
+}
+
+// tipOf is the accepted block a test builds its next block on.
+func tipOf(vm *VM) ids.ID {
+	id, _ := vm.chain.Tip()
+	return id
 }

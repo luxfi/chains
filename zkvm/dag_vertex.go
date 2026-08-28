@@ -11,6 +11,7 @@ import (
 
 	"github.com/luxfi/consensus/core/choices"
 	"github.com/luxfi/consensus/engine/dag/vertex"
+	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 )
 
@@ -64,12 +65,16 @@ func (v *Vertex) Verify(ctx context.Context) error {
 	return nil
 }
 
+// Accept applies the vertex through the same store a block goes through: its
+// spends and outputs are staged and committed in one batch with the vertex and
+// the tip. A vertex is not a block — it has several parents and no timestamp —
+// but it changes state the same way, and this is that way.
 func (v *Vertex) Accept(ctx context.Context) error {
-	v.status = choices.Accepted
+	return v.vm.chain.Accept(v)
+}
 
-	v.vm.mu.Lock()
-	defer v.vm.mu.Unlock()
-
+// Write records the vertex's spends and its outputs.
+func (v *Vertex) Write(database.Database) error {
 	for _, tx := range v.txs {
 		for _, nullifier := range tx.Nullifiers {
 			if err := v.vm.nullifierDB.MarkNullifierSpent(nullifier, v.height); err != nil {
@@ -77,30 +82,28 @@ func (v *Vertex) Accept(ctx context.Context) error {
 			}
 		}
 		for i, output := range tx.Outputs {
-			utxo := &UTXO{
+			if err := v.vm.utxoDB.AddUTXO(&UTXO{
 				TxID:        tx.ID,
 				OutputIndex: uint32(i),
 				Commitment:  output.Commitment,
 				Ciphertext:  output.EncryptedNote,
 				EphemeralPK: output.EphemeralPubKey,
 				Height:      v.height,
-			}
-			if err := v.vm.utxoDB.AddUTXO(utxo); err != nil {
+			}); err != nil {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// Publish marks the vertex accepted and releases the transactions it carried,
+// once those spends are durable.
+func (v *Vertex) Publish() {
+	v.status = choices.Accepted
+	for _, tx := range v.txs {
 		v.vm.mempool.RemoveTransaction(tx.ID)
 	}
-
-	id := v.ID()
-	if err := v.vm.db.Put(lastAcceptedKey, id[:]); err != nil {
-		return err
-	}
-	if err := v.vm.db.Put(id[:], v.bytes); err != nil {
-		return err
-	}
-	v.vm.lastAcceptedID = id
-	return nil
 }
 
 func (v *Vertex) Reject(ctx context.Context) error {
@@ -163,8 +166,7 @@ func (v *Vertex) computeID() ids.ID {
 
 // BuildVertex drains the mempool, batches non-conflicting txs, and returns a vertex.
 func (vm *VM) BuildVertex(ctx context.Context) (vertex.Vertex, error) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
+	parent, height := vm.chain.Tip()
 
 	candidates := vm.mempool.GetPendingTransactions(int(vm.config.MaxUTXOsPerBlock))
 	if len(candidates) == 0 {
@@ -206,9 +208,9 @@ func (vm *VM) BuildVertex(ctx context.Context) (vertex.Vertex, error) {
 	}
 
 	v := &Vertex{
-		height:  vm.lastAccepted.Height() + 1,
+		height:  height + 1,
 		epoch:   0,
-		parents: []ids.ID{vm.lastAcceptedID},
+		parents: []ids.ID{parent},
 		txIDs:   txIDs,
 		txs:     batch,
 		status:  choices.Processing,

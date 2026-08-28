@@ -14,12 +14,13 @@ import (
 
 	"github.com/luxfi/log"
 
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/consensus/core/choices"
-	"github.com/luxfi/consensus/engine/chain/block"
+	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 )
 
-var _ block.Block = (*Block)(nil)
+var _ chain.Block = (*Block)(nil)
 
 // Block represents a block in the ZK UTXO chain
 type Block struct {
@@ -175,87 +176,65 @@ func (b *Block) Verify(ctx context.Context) error {
 	return nil
 }
 
-// Accept accepts the block
+// Accept applies the block. Everything below is staged and committed in one
+// batch with the block and the tip, so a spend that cannot be recorded takes
+// the whole block with it.
+//
+// This used to mark the block accepted and move lastAccepted before writing
+// anything, then issue a Put per nullifier and per output, each returning
+// early. A failure partway left some notes spent and some outputs created,
+// under a tip the chain had already advanced — a shielded pool half applied,
+// with no way back and no way to apply the block again.
 func (b *Block) Accept(ctx context.Context) error {
-	b.status = choices.Accepted
+	return b.vm.chain.Accept(b)
+}
 
-	// Update VM state
-	b.vm.mu.Lock()
-	defer b.vm.mu.Unlock()
-
-	b.vm.lastAccepted = b
-	b.vm.lastAcceptedID = b.ID()
-
-	// Save to database
-	id := b.ID()
-	if err := b.vm.db.Put(lastAcceptedKey, id[:]); err != nil {
-		return err
-	}
-
-	// Save block
-	blockBytes := b.Bytes()
-	if blockBytes == nil {
-		return errors.New("failed to serialize block")
-	}
-
-	if err := b.vm.db.Put(id[:], blockBytes); err != nil {
-		return err
-	}
-
-	// Apply transactions to state
+// Write records the block's spends and its outputs, and advances the committed
+// state root. The three stores were built over this same view at Initialize,
+// so what they write here commits with the block or not at all.
+func (b *Block) Write(database.Database) error {
 	for _, tx := range b.Txs {
-		// Add nullifiers to spent set
 		for _, nullifier := range tx.Nullifiers {
 			if err := b.vm.nullifierDB.MarkNullifierSpent(nullifier, b.BlockHeight); err != nil {
 				return err
 			}
 		}
-
-		// Add outputs to UTXO set
 		for i, output := range tx.Outputs {
-			utxo := &UTXO{
+			if err := b.vm.utxoDB.AddUTXO(&UTXO{
 				TxID:        tx.ID,
 				OutputIndex: uint32(i),
 				Commitment:  output.Commitment,
 				Ciphertext:  output.EncryptedNote,
 				EphemeralPK: output.EphemeralPubKey,
 				Height:      b.BlockHeight,
-			}
-
-			if err := b.vm.utxoDB.AddUTXO(utxo); err != nil {
+			}); err != nil {
 				return err
 			}
 		}
+	}
+	return b.vm.stateTree.Finalize(b.StateRoot)
+}
 
-		// Remove from mempool
+// Publish marks the block accepted and releases the transactions it carried.
+// It runs after the commit, so a transaction is only dropped from the mempool
+// once the block that spends it is durable.
+func (b *Block) Publish() {
+	b.status = choices.Accepted
+	for _, tx := range b.Txs {
 		b.vm.mempool.RemoveTransaction(tx.ID)
 	}
-
-	// Update state tree
-	if err := b.vm.stateTree.Finalize(b.StateRoot); err != nil {
-		return err
-	}
-
-	// Remove from pending
-	delete(b.vm.pendingBlocks, b.ID())
 
 	b.vm.log.Info("Block accepted",
 		log.Uint64("height", b.BlockHeight),
 		log.String("id", b.ID().String()),
 		log.Int("txCount", len(b.Txs)),
 	)
-
-	return nil
 }
 
 // Reject rejects the block
 func (b *Block) Reject(ctx context.Context) error {
 	b.status = choices.Rejected
-
-	// Remove from pending
-	b.vm.mu.Lock()
-	delete(b.vm.pendingBlocks, b.ID())
-	b.vm.mu.Unlock()
+	b.vm.chain.Drop(b.ID())
 
 	// Return transactions to mempool
 	for _, tx := range b.Txs {

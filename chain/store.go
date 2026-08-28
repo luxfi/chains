@@ -21,19 +21,24 @@ import (
 	"github.com/luxfi/database"
 	"github.com/luxfi/database/versiondb"
 	"github.com/luxfi/ids"
-	vmchain "github.com/luxfi/vm/chain"
 )
 
-// Block is a block a Store can accept: the engine's own block, plus the two
-// halves of applying one.
+// Block is a unit of state change a Store can accept: an identity, a place in
+// the sequence, an encoding, and the two halves of applying it.
 //
-// Splitting them is what makes a half-applied block unwritable. Write can fail
-// and is discarded whole; Publish cannot fail and runs only once the writes
-// are durable. A chain that writes and publishes in one pass has no such
-// boundary, and the first failed write leaves the chain believing something
-// that is not on disk.
+// Splitting Write from Publish is what makes a half-applied block unwritable.
+// Write can fail and is discarded whole; Publish cannot fail and runs only
+// once the writes are durable. A chain that writes and publishes in one pass
+// has no such boundary, and its first failed write leaves the chain believing
+// something that is not on disk.
+//
+// This is deliberately NOT the engine's block interface. A linear chain's
+// blocks satisfy that as well; a DAG's vertices have several parents and no
+// timestamp and do not. Both change state the same way, and this is that way.
 type Block interface {
-	vmchain.Block
+	ID() ids.ID
+	Height() uint64
+	Bytes() []byte
 
 	// Write stages every durable change the block makes, through the view it
 	// is given and nothing else. Writing anywhere else escapes the rollback.
@@ -52,7 +57,7 @@ type Block interface {
 // take it with Lock or RLock. A second mutex over any part of this gives one
 // map two owners, which in Go is a fatal throw rather than a bug you get to
 // debug.
-type Store struct {
+type Store[B Block] struct {
 	sync.RWMutex
 
 	base database.Database   // committed state
@@ -60,7 +65,7 @@ type Store struct {
 
 	reload func() error
 
-	flight map[ids.ID]Block
+	flight map[ids.ID]B
 	tip    ids.ID
 	height uint64
 }
@@ -83,24 +88,24 @@ var ErrNoBlock = errors.New("chain: no such block")
 // is called after a failed apply, so the caches say what the database says
 // rather than what the abandoned block said. A chain that mutates nothing in
 // memory before the commit has nothing to rebuild and passes nil.
-func New(db database.Database, reload func() error) *Store {
-	return &Store{
+func New[B Block](db database.Database, reload func() error) *Store[B] {
+	return &Store[B]{
 		base:   db,
 		view:   versiondb.New(db),
 		reload: reload,
-		flight: make(map[ids.ID]Block),
+		flight: make(map[ids.ID]B),
 	}
 }
 
 // View is what a block writes through, and what every read sees: committed
 // state plus whatever the block in progress has staged.
-func (s *Store) View() database.Database { return s.view }
+func (s *Store[B]) View() database.Database { return s.view }
 
 // Base is committed state, for the writes a chain makes outside any block. A
 // write here is durable at once and belongs to no block, so no rollback takes
 // it back — which is right for a record no block claims and wrong for one a
 // block does.
-func (s *Store) Base() database.Database { return s.base }
+func (s *Store[B]) Base() database.Database { return s.base }
 
 // Accept applies b and commits it.
 //
@@ -112,7 +117,7 @@ func (s *Store) Base() database.Database { return s.base }
 //
 // The block's own effects become visible last, after the commit, so there is
 // no window in which the chain has advanced past state that is not on disk.
-func (s *Store) Accept(b Block) error {
+func (s *Store[B]) Accept(b Block) error {
 	s.Lock()
 	defer s.Unlock()
 
@@ -148,7 +153,7 @@ func (s *Store) Accept(b Block) error {
 // committed state says. The caller gets the block's own error; a reload that
 // also fails is joined to it, because a chain that cannot re-read its own
 // state has a second problem and reporting only the first hides it.
-func (s *Store) undo(cause error) error {
+func (s *Store[B]) undo(cause error) error {
 	s.view.Abort()
 	if s.reload != nil {
 		if err := s.reload(); err != nil {
@@ -158,20 +163,41 @@ func (s *Store) undo(cause error) error {
 	return cause
 }
 
+// Seed applies the one mutation a chain makes outside consensus: what its
+// genesis allocates, written through the view and committed at once, before
+// any block exists. Everything after this happens in a block.
+//
+// It commits for the same reason Accept does. Left staged, a genesis
+// allocation would ride on whichever block committed first and vanish with a
+// chain that never accepted one.
+func (s *Store[B]) Seed(write func(database.Database) error) error {
+	s.Lock()
+	defer s.Unlock()
+
+	if err := write(s.view); err != nil {
+		return s.undo(err)
+	}
+	if err := s.view.Commit(); err != nil {
+		return s.undo(fmt.Errorf("chain: commit genesis: %w", err))
+	}
+	return nil
+}
+
 // Propose hands the caller the tip to build on and tracks whatever it builds,
 // in one step. Reading the tip and registering the child as two steps leaves a
 // window in which a block is accepted between them, and the proposal is then
 // built on a parent that is no longer the tip.
 //
-// A build that has nothing to propose returns a nil block, which is not an
-// error and is not tracked.
-func (s *Store) Propose(build func(parent ids.ID, height uint64) (Block, error)) (Block, error) {
+// A build with nothing to propose says so with an error, and nothing is
+// tracked.
+func (s *Store[B]) Propose(build func(parent ids.ID, height uint64) (B, error)) (B, error) {
 	s.Lock()
 	defer s.Unlock()
 
 	b, err := build(s.tip, s.height)
-	if err != nil || b == nil {
-		return nil, err
+	if err != nil {
+		var nothing B
+		return nothing, err
 	}
 	s.track(b)
 	return b, nil
@@ -181,13 +207,13 @@ func (s *Store) Propose(build func(parent ids.ID, height uint64) (Block, error))
 // resolve it as a parent — whether this node built the block or parsed it from
 // a peer. Tracking only what a node builds leaves a follower able to verify
 // the first block of a run and unable to verify the second.
-func (s *Store) Track(b Block) {
+func (s *Store[B]) Track(b B) {
 	s.Lock()
 	defer s.Unlock()
 	s.track(b)
 }
 
-func (s *Store) track(b Block) {
+func (s *Store[B]) track(b B) {
 	if b.Height() <= s.height {
 		return
 	}
@@ -200,7 +226,7 @@ func (s *Store) track(b Block) {
 // rejecting it, so a set that only grew would leak. Anything at or below the
 // tip is already decided or orphaned, which bounds this to the blocks actually
 // in flight above it. Caller holds the lock.
-func (s *Store) prune() {
+func (s *Store[B]) prune() {
 	for id, b := range s.flight {
 		if b.Height() <= s.height {
 			delete(s.flight, id)
@@ -210,14 +236,14 @@ func (s *Store) prune() {
 
 // Drop forgets a block in flight. A rejected block is one the chain will not
 // build on, and it never wrote anything, so there is nothing else to undo.
-func (s *Store) Drop(id ids.ID) {
+func (s *Store[B]) Drop(id ids.ID) {
 	s.Lock()
 	defer s.Unlock()
 	delete(s.flight, id)
 }
 
 // Tip is the accepted block's id and height.
-func (s *Store) Tip() (ids.ID, uint64) {
+func (s *Store[B]) Tip() (ids.ID, uint64) {
 	s.RLock()
 	defer s.RUnlock()
 	return s.tip, s.height
@@ -225,7 +251,7 @@ func (s *Store) Tip() (ids.ID, uint64) {
 
 // Accepted reports whether id is the accepted tip or a block committed beneath
 // it. A block in flight is neither.
-func (s *Store) Accepted(id ids.ID) bool {
+func (s *Store[B]) Accepted(id ids.ID) bool {
 	s.RLock()
 	defer s.RUnlock()
 	if id == s.tip {
@@ -237,7 +263,7 @@ func (s *Store) Accepted(id ids.ID) bool {
 
 // Block returns a block by id: one in flight, or one read back from committed
 // state and decoded by parse.
-func (s *Store) Block(id ids.ID, parse func([]byte) (Block, error)) (Block, error) {
+func (s *Store[B]) Block(id ids.ID, parse func([]byte) (B, error)) (B, error) {
 	s.RLock()
 	defer s.RUnlock()
 
@@ -246,7 +272,8 @@ func (s *Store) Block(id ids.ID, parse func([]byte) (Block, error)) (Block, erro
 	}
 	raw, err := s.view.Get(blockKey(id))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrNoBlock, id)
+		var nothing B
+		return nothing, fmt.Errorf("%w: %s", ErrNoBlock, id)
 	}
 	return parse(raw)
 }
@@ -254,7 +281,7 @@ func (s *Store) Block(id ids.ID, parse func([]byte) (Block, error)) (Block, erro
 // IDAtHeight names the block accepted at height, from the index written in the
 // same commit as the block itself — so the index can never name a block the
 // chain did not accept.
-func (s *Store) IDAtHeight(height uint64) (ids.ID, error) {
+func (s *Store[B]) IDAtHeight(height uint64) (ids.ID, error) {
 	s.RLock()
 	defer s.RUnlock()
 
@@ -268,9 +295,11 @@ func (s *Store) IDAtHeight(height uint64) (ids.ID, error) {
 // Open sets the chain's starting point: the tip recorded in committed state,
 // or genesis if nothing is recorded. It reports which, so a chain that seeds
 // state on its first run can tell its first run from every later one.
-func (s *Store) Open(genesis Block, parse func([]byte) (Block, error)) (Block, bool, error) {
+func (s *Store[B]) Open(genesis B, parse func([]byte) (B, error)) (B, bool, error) {
 	s.Lock()
 	defer s.Unlock()
+
+	var nothing B
 
 	raw, err := s.view.Get(tipKey)
 	if err != nil || len(raw) != ids.IDLen {
@@ -280,7 +309,7 @@ func (s *Store) Open(genesis Block, parse func([]byte) (Block, error)) (Block, b
 
 	id, err := ids.ToID(raw)
 	if err != nil {
-		return nil, false, err
+		return nothing, false, err
 	}
 	if id == genesis.ID() {
 		s.tip, s.height = id, genesis.Height()
@@ -289,11 +318,11 @@ func (s *Store) Open(genesis Block, parse func([]byte) (Block, error)) (Block, b
 
 	block, err := s.view.Get(blockKey(id))
 	if err != nil {
-		return nil, false, fmt.Errorf("%w: tip %s", ErrNoBlock, id)
+		return nothing, false, fmt.Errorf("%w: tip %s", ErrNoBlock, id)
 	}
 	b, err := parse(block)
 	if err != nil {
-		return nil, false, err
+		return nothing, false, err
 	}
 	s.tip, s.height = id, b.Height()
 	return b, false, nil
@@ -301,7 +330,7 @@ func (s *Store) Open(genesis Block, parse func([]byte) (Block, error)) (Block, b
 
 // Close releases the store. The view is closed rather than committed: anything
 // still staged belongs to a block that was never accepted.
-func (s *Store) Close() error {
+func (s *Store[B]) Close() error {
 	s.Lock()
 	defer s.Unlock()
 	return s.view.Close()

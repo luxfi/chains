@@ -178,11 +178,14 @@ func handleGetBlock(vm *VM) http.HandlerFunc {
 
 func handleGetLatestBlock(vm *VM) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		vm.mu.RLock()
-		block := vm.lastAccepted
-		vm.mu.RUnlock()
+		id, _ := vm.chain.Tip()
+		block, err := vm.GetBlock(r.Context(), id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
 
-		resp := block.ToSummary()
+		resp := block.(*Block).ToSummary()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)

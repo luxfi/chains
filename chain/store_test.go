@@ -4,10 +4,8 @@
 package chain
 
 import (
-	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -47,17 +45,9 @@ func newBlock(id byte, parent ids.ID, height uint64, records ...string) *testBlo
 
 var errWriteRefused = errors.New("write refused")
 
-func (b *testBlock) ID() ids.ID           { return b.id }
-func (b *testBlock) Parent() ids.ID       { return b.parent }
-func (b *testBlock) ParentID() ids.ID     { return b.parent }
-func (b *testBlock) Height() uint64       { return b.height }
-func (b *testBlock) Timestamp() time.Time { return time.Unix(int64(b.height), 0) }
-func (b *testBlock) Status() uint8        { return 0 }
-func (b *testBlock) Bytes() []byte        { return b.raw }
-
-func (b *testBlock) Verify(context.Context) error { return nil }
-func (b *testBlock) Accept(context.Context) error { return nil }
-func (b *testBlock) Reject(context.Context) error { return nil }
+func (b *testBlock) ID() ids.ID     { return b.id }
+func (b *testBlock) Height() uint64 { return b.height }
+func (b *testBlock) Bytes() []byte  { return b.raw }
 
 func (b *testBlock) Write(db database.Database) error {
 	for i, r := range b.records {
@@ -105,7 +95,7 @@ func (b *refusingBatch) Write() error {
 
 type fixture struct {
 	base    *refusingDB
-	store   *Store
+	store   *Store[*testBlock]
 	reloads int
 	genesis *testBlock
 }
@@ -113,7 +103,7 @@ type fixture struct {
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	f := &fixture{base: &refusingDB{Database: memdb.New()}}
-	f.store = New(f.base, func() error { f.reloads++; return nil })
+	f.store = New[*testBlock](f.base, func() error { f.reloads++; return nil })
 	f.genesis = newBlock(0, ids.Empty, 0)
 	_, fresh, err := f.store.Open(f.genesis, f.parse)
 	require.NoError(t, err)
@@ -121,7 +111,7 @@ func newFixture(t *testing.T) *fixture {
 	return f
 }
 
-func (f *fixture) parse(raw []byte) (Block, error) {
+func (f *fixture) parse(raw []byte) (*testBlock, error) {
 	if len(raw) != 2 {
 		return nil, errors.New("bad block")
 	}
@@ -239,9 +229,9 @@ func TestABlockWithNoEncodingIsRefusedWhole(t *testing.T) {
 func TestAReloadFailureIsReportedBesideItsCause(t *testing.T) {
 	base := &refusingDB{Database: memdb.New()}
 	broken := errors.New("caches unreadable")
-	store := New(base, func() error { return broken })
+	store := New[*testBlock](base, func() error { return broken })
 	genesis := newBlock(0, ids.Empty, 0)
-	_, _, err := store.Open(genesis, func([]byte) (Block, error) { return nil, nil })
+	_, _, err := store.Open(genesis, func([]byte) (*testBlock, error) { return nil, nil })
 	require.NoError(t, err)
 
 	b := newBlock(1, genesis.ID(), 1, "alpha")
@@ -266,6 +256,37 @@ func TestTheChainStillWorksAfterAFailedBlock(t *testing.T) {
 	require.Equal(t, good.ID(), tip)
 	require.Equal(t, uint64(1), height)
 	require.True(t, f.committed(t, []byte("beta")))
+}
+
+func TestSeedIsDurableBeforeAnyBlock(t *testing.T) {
+	f := newFixture(t)
+
+	require.NoError(t, f.store.Seed(func(db database.Database) error {
+		return db.Put([]byte("allocation"), []byte{1})
+	}))
+
+	// Committed, not merely staged: a chain that never accepts a block must
+	// still have what its genesis allocated.
+	require.True(t, f.committed(t, []byte("allocation")))
+}
+
+func TestASeedThatFailsLeavesNothing(t *testing.T) {
+	f := newFixture(t)
+	refused := errors.New("allocation refused")
+
+	err := f.store.Seed(func(db database.Database) error {
+		if err := db.Put([]byte("partial"), []byte{1}); err != nil {
+			return err
+		}
+		return refused
+	})
+	require.ErrorIs(t, err, refused)
+	require.False(t, f.committed(t, []byte("partial")))
+	require.Equal(t, 1, f.reloads)
+
+	// And what it staged does not ride along on the first block.
+	require.NoError(t, f.store.Accept(newBlock(1, f.genesis.ID(), 1, "alpha")))
+	require.False(t, f.committed(t, []byte("partial")))
 }
 
 // ---- blocks in flight ----
@@ -339,7 +360,7 @@ func TestProposeBuildsOnTheTipAndTracksWhatItBuilt(t *testing.T) {
 
 	var sawParent ids.ID
 	var sawHeight uint64
-	built, err := f.store.Propose(func(parent ids.ID, height uint64) (Block, error) {
+	built, err := f.store.Propose(func(parent ids.ID, height uint64) (*testBlock, error) {
 		sawParent, sawHeight = parent, height
 		return newBlock(2, parent, height+1), nil
 	})
@@ -352,10 +373,12 @@ func TestProposeBuildsOnTheTipAndTracksWhatItBuilt(t *testing.T) {
 	require.Equal(t, built.ID(), got.ID())
 }
 
-func TestProposingNothingIsNotAnErrorAndTracksNothing(t *testing.T) {
+func TestAProposalThatRefusesTracksNothing(t *testing.T) {
 	f := newFixture(t)
-	built, err := f.store.Propose(func(ids.ID, uint64) (Block, error) { return nil, nil })
-	require.NoError(t, err)
+	nothing := errors.New("nothing to propose")
+
+	built, err := f.store.Propose(func(ids.ID, uint64) (*testBlock, error) { return nil, nothing })
+	require.ErrorIs(t, err, nothing)
 	require.Nil(t, built)
 
 	f.store.RLock()
@@ -403,7 +426,7 @@ func TestOpenResumesFromTheRecordedTip(t *testing.T) {
 	require.NoError(t, f.store.Accept(one))
 
 	// A second store over the same database is a restart.
-	restarted := New(f.base, nil)
+	restarted := New[*testBlock](f.base, nil)
 	at, fresh, err := restarted.Open(f.genesis, f.parse)
 	require.NoError(t, err)
 	require.False(t, fresh, "this chain has run before")
@@ -415,9 +438,9 @@ func TestOpenResumesFromTheRecordedTip(t *testing.T) {
 }
 
 func TestOpenOnAnEmptyStoreStartsAtGenesisAndSaysSo(t *testing.T) {
-	store := New(memdb.New(), nil)
+	store := New[*testBlock](memdb.New(), nil)
 	genesis := newBlock(0, ids.Empty, 0)
-	at, fresh, err := store.Open(genesis, func([]byte) (Block, error) { return nil, errors.New("unreachable") })
+	at, fresh, err := store.Open(genesis, func([]byte) (*testBlock, error) { return nil, errors.New("unreachable") })
 	require.NoError(t, err)
 	require.True(t, fresh)
 	require.Equal(t, genesis.ID(), at.ID())

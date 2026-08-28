@@ -95,17 +95,32 @@ func (st *StateTree) Finalize(newRoot []byte) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	st.currentRoot = newRoot
-
-	// Save root to database
+	// The record first: a root held in memory that is not in the database is a
+	// root this node alone believes.
 	if err := st.db.Put([]byte("state_root"), newRoot); err != nil {
 		return err
 	}
+	st.currentRoot = newRoot
 
 	st.log.Debug("State tree finalized",
 		log.String("root", fmt.Sprintf("%x", newRoot[:8])),
 	)
 
+	return nil
+}
+
+// reload puts the committed root back, discarding an advance that belonged to
+// a block whose writes were discarded.
+func (st *StateTree) reload() error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	root, err := st.db.Get([]byte("state_root"))
+	if err != nil {
+		st.currentRoot = make([]byte, 32)
+		return nil
+	}
+	st.currentRoot = root
 	return nil
 }
 

@@ -9,9 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sync"
 	"time"
 
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/chains/zkvm/precompiles"
 	"github.com/luxfi/consensus/engine/dag/vertex"
 	"github.com/luxfi/database"
@@ -19,7 +19,7 @@ import (
 	"github.com/luxfi/log"
 	"github.com/luxfi/runtime"
 	vmcore "github.com/luxfi/vm"
-	"github.com/luxfi/vm/chain"
+	vmchain "github.com/luxfi/vm/chain"
 	"github.com/luxfi/warp"
 
 	"github.com/luxfi/node/version"
@@ -27,7 +27,7 @@ import (
 )
 
 var (
-	_ chain.ChainVM = (*VM)(nil)
+	_ vmchain.ChainVM = (*VM)(nil)
 	_ vertex.DAGVM  = (*VM)(nil)
 
 	Version = &version.Semantic{
@@ -85,8 +85,11 @@ type VM struct {
 	rt     *runtime.Runtime
 	config ZConfig
 
-	// State management
-	db          database.Database
+	// chain is the durable state, the blocks in flight and the tip — and the
+	// one lock over all of it. The three stores below write through its view,
+	// so their records commit with the block that made them and are discarded
+	// with a block that fails.
+	chain       *chain.Store[*Block]
 	utxoDB      *UTXODB
 	nullifierDB *NullifierDB
 	stateTree   *StateTree
@@ -106,10 +109,7 @@ type VM struct {
 	zkPrecompiles *precompiles.MapRegistry
 
 	// Block management
-	genesisBlock   *Block
-	lastAcceptedID ids.ID
-	lastAccepted   *Block
-	pendingBlocks  map[ids.ID]*Block
+	genesisBlock *Block
 
 	// Transaction mempool
 	mempool *Mempool
@@ -120,13 +120,10 @@ type VM struct {
 	// Logging
 	log log.Logger
 
-	// Fee policy gating user-submitted tx admission. user-tx-accepting
-	// (HTTP /sendTransaction -> Mempool.AddTransaction) so attach a
-	// FlatPolicy at MinTxFeeFloor; consensus-internal paths bypass.
-	feePolicy fee.Policy
-	networkID uint32
-
-	mu sync.RWMutex
+	// fee is what this chain charges to admit a shielded transaction at the
+	// HTTP entry, before it reaches the mempool. Consensus-internal paths
+	// bypass it.
+	fee chain.Fee
 }
 
 // Initialize initializes the VM
@@ -135,14 +132,13 @@ func (vm *VM) Initialize(
 	init vmcore.Init,
 ) error {
 	vm.rt = init.Runtime
-	vm.db = init.DB
 	vm.toEngine = init.ToEngine
 	vm.log = init.Log
 
 	if vm.rt == nil {
 		return errors.New("runtime is nil")
 	}
-	if vm.db == nil {
+	if init.DB == nil {
 		return errors.New("database is nil")
 	}
 	if vm.log == nil {
@@ -153,7 +149,7 @@ func (vm *VM) Initialize(
 			return errors.New("invalid logger type")
 		}
 	}
-	vm.pendingBlocks = make(map[ids.ID]*Block)
+	vm.chain = chain.New[*Block](init.DB, vm.reload)
 
 	// Parse configuration or use defaults
 	if len(init.Config) > 0 {
@@ -186,21 +182,21 @@ func (vm *VM) Initialize(
 	}
 
 	// Initialize UTXO database
-	utxoDB, err := NewUTXODB(vm.db, vm.log)
+	utxoDB, err := NewUTXODB(vm.chain.View(), vm.log)
 	if err != nil {
 		return fmt.Errorf("failed to initialize UTXO DB: %w", err)
 	}
 	vm.utxoDB = utxoDB
 
 	// Initialize nullifier database
-	nullifierDB, err := NewNullifierDB(vm.db, vm.log)
+	nullifierDB, err := NewNullifierDB(vm.chain.View(), vm.log)
 	if err != nil {
 		return fmt.Errorf("failed to initialize nullifier DB: %w", err)
 	}
 	vm.nullifierDB = nullifierDB
 
 	// Initialize state tree
-	stateTree, err := NewStateTree(vm.db, vm.log)
+	stateTree, err := NewStateTree(vm.chain.View(), vm.log)
 	if err != nil {
 		return fmt.Errorf("failed to initialize state tree: %w", err)
 	}
@@ -237,7 +233,7 @@ func (vm *VM) Initialize(
 	}
 
 	// Initialize address manager
-	addressManager, err := NewAddressManager(vm.db, vm.config.EnablePrivateAddresses, vm.log)
+	addressManager, err := NewAddressManager(vm.chain.Base(), vm.config.EnablePrivateAddresses, vm.log)
 	if err != nil {
 		return fmt.Errorf("failed to initialize address manager: %w", err)
 	}
@@ -246,15 +242,14 @@ func (vm *VM) Initialize(
 	// Initialize mempool
 	vm.mempool = NewMempool(1000, vm.log) // Max 1000 pending txs
 
-	// Pin fee policy from runtime networkID. Z-Chain accepts user-
-	// submitted shielded txs so attach the canonical FlatPolicy at
-	// MinTxFeeFloor; fee.Validate refuses zero-fee user-facing chains
-	// at boot, before any block is accepted.
+	// Z-Chain accepts user-submitted shielded txs, so it declares the floor;
+	// the node's boot-time Validate refuses a zero-fee user-facing chain.
+	var networkID uint32
 	if init.Runtime != nil {
-		vm.networkID = init.Runtime.NetworkID
+		networkID = init.Runtime.NetworkID
 	}
-	vm.feePolicy = newFeePolicy(vm.networkID)
-	if err := fee.Validate(vm.feePolicy); err != nil {
+	vm.fee = chain.Floor(networkID)
+	if err := fee.Validate(vm.fee.Policy()); err != nil {
 		return fmt.Errorf("zkvm: fee policy: %w", err)
 	}
 
@@ -272,26 +267,19 @@ func (vm *VM) Initialize(
 	}
 	vm.genesisBlock.ID_ = vm.genesisBlock.computeID()
 
-	// Load last accepted block
-	lastAcceptedBytes, err := vm.db.Get(lastAcceptedKey)
-	if err == database.ErrNotFound {
-		// First time initialization
-		vm.lastAccepted = vm.genesisBlock
-		vm.lastAcceptedID = vm.genesisBlock.ID()
-
-		if err := vm.db.Put(lastAcceptedKey, vm.lastAcceptedID[:]); err != nil {
-			return err
-		}
-
-		// Process genesis transactions
-		if err := vm.processGenesisTransactions(genesis); err != nil {
-			return err
-		}
-	} else if err != nil {
+	_, fresh, err := vm.chain.Open(vm.genesisBlock, vm.parseBlock)
+	if err != nil {
 		return err
-	} else {
-		vm.lastAcceptedID, _ = ids.ToID(lastAcceptedBytes)
-		// Load the block (implementation depends on block storage)
+	}
+	if fresh {
+		// The genesis allocation is the one mutation outside a block, and it is
+		// committed on its own: staged, it would ride on whichever block landed
+		// first and vanish from a chain that never accepted one.
+		if err := vm.chain.Seed(func(database.Database) error {
+			return vm.processGenesisTransactions(genesis)
+		}); err != nil {
+			return err
+		}
 	}
 
 	vm.log.Info("ZK UTXO VM initialized",
@@ -315,95 +303,92 @@ func (vm *VM) ZKPrecompiles() *precompiles.MapRegistry { return vm.zkPrecompiles
 // proof verifier and the classical-precompile registration.
 func (vm *VM) StrictPQ() bool { return vm.config.StrictPQ }
 
-// BuildBlock builds a new block
-func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	// Get transactions from mempool
-	txs := vm.mempool.GetPendingTransactions(int(vm.config.MaxUTXOsPerBlock))
-	if len(txs) == 0 {
-		return nil, errors.New("no transactions to include in block")
-	}
-
-	// Verify all transactions
-	validTxs := make([]*Transaction, 0, len(txs))
-	for _, tx := range txs {
-		if err := vm.verifyTransaction(tx); err != nil {
-			vm.log.Debug("Transaction verification failed",
-				log.String("txID", tx.ID.String()),
-				log.Reflect("error", err),
-			)
-			continue
+// BuildBlock builds a new block. Reading the tip and registering the block on
+// it happen in one step, so nothing can be accepted in between and leave the
+// proposal hanging off a parent that is no longer the tip.
+func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
+	built, err := vm.chain.Propose(func(parent ids.ID, height uint64) (*Block, error) {
+		// Get transactions from mempool
+		txs := vm.mempool.GetPendingTransactions(int(vm.config.MaxUTXOsPerBlock))
+		if len(txs) == 0 {
+			return nil, errors.New("no transactions to include in block")
 		}
-		validTxs = append(validTxs, tx)
+
+		// Verify all transactions
+		validTxs := make([]*Transaction, 0, len(txs))
+		for _, tx := range txs {
+			if err := vm.verifyTransaction(tx); err != nil {
+				vm.log.Debug("Transaction verification failed",
+					log.String("txID", tx.ID.String()),
+					log.Reflect("error", err),
+				)
+				continue
+			}
+			validTxs = append(validTxs, tx)
+		}
+
+		if len(validTxs) == 0 {
+			return nil, errors.New("no valid transactions to include in block")
+		}
+
+		block := &Block{
+			ParentID_:      parent,
+			BlockHeight:    height + 1,
+			BlockTimestamp: time.Now().Unix(),
+			Txs:            validTxs,
+			vm:             vm,
+		}
+		block.StateRoot = vm.computeStateRoot(validTxs)
+		block.ID_ = block.computeID()
+
+		vm.log.Debug("Built new block",
+			log.String("blockID", block.ID().String()),
+			log.Uint64("height", block.BlockHeight),
+			log.Int("txCount", len(validTxs)),
+		)
+		return block, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	if len(validTxs) == 0 {
-		return nil, errors.New("no valid transactions to include in block")
-	}
-
-	// Create new block
-	block := &Block{
-		ParentID_:      vm.lastAcceptedID,
-		BlockHeight:    vm.lastAccepted.Height() + 1,
-		BlockTimestamp: time.Now().Unix(),
-		Txs:            validTxs,
-		vm:             vm,
-	}
-
-	block.StateRoot = vm.computeStateRoot(validTxs)
-
-	// Compute block ID
-	block.ID_ = block.computeID()
-
-	// Store pending block
-	vm.pendingBlocks[block.ID()] = block
-
-	vm.log.Debug("Built new block",
-		log.String("blockID", block.ID().String()),
-		log.Uint64("height", block.BlockHeight),
-		log.Int("txCount", len(validTxs)),
-	)
-
-	return block, nil
+	return built, nil
 }
 
 // ParseBlock parses a block from bytes
-func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (chain.Block, error) {
+func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (vmchain.Block, error) {
+	return vm.parseBlock(blockBytes)
+}
+
+// parseBlock decodes a block belonging to this VM. The store reads accepted
+// blocks back through it, so there is one decoder rather than one per caller.
+func (vm *VM) parseBlock(raw []byte) (*Block, error) {
 	block := &Block{vm: vm}
-	if err := parseBlockBytes(blockBytes, block); err != nil {
+	if err := parseBlockBytes(raw, block); err != nil {
 		return nil, err
 	}
-
 	block.ID_ = block.computeID()
 	return block, nil
 }
 
 // GetBlock retrieves a block by ID
-func (vm *VM) GetBlock(ctx context.Context, blkID ids.ID) (chain.Block, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-
-	// Check pending blocks (nil-safe for early calls before initialization)
-	if vm.pendingBlocks != nil {
-		if block, exists := vm.pendingBlocks[blkID]; exists {
-			return block, nil
-		}
-	}
-
-	// Check if it's genesis
+func (vm *VM) GetBlock(ctx context.Context, blkID ids.ID) (vmchain.Block, error) {
 	if blkID == vm.genesisBlock.ID() {
 		return vm.genesisBlock, nil
 	}
+	return vm.chain.Block(blkID, vm.parseBlock)
+}
 
-	// Load from database
-	blockBytes, err := vm.db.Get(blkID[:])
-	if err != nil {
-		return nil, err
+// reload rebuilds the caches the three stores keep beside the database. It runs
+// after a block's writes have been discarded, so a cache that had already
+// recorded that block's spends, outputs or root stops claiming them.
+func (vm *VM) reload() error {
+	if err := vm.nullifierDB.reload(); err != nil {
+		return err
 	}
-
-	return vm.ParseBlock(ctx, blockBytes)
+	if err := vm.utxoDB.reload(); err != nil {
+		return err
+	}
+	return vm.stateTree.reload()
 }
 
 // SetState sets the VM state
@@ -433,10 +418,10 @@ func (vm *VM) Shutdown(ctx context.Context) error {
 		vm.addressManager.Close()
 	}
 
-	if vm.db != nil {
-		return vm.db.Close()
+	if err := vm.chain.Close(); err != nil {
+		return err
 	}
-	return nil
+	return vm.chain.Base().Close()
 }
 
 // Version returns the VM version
@@ -445,14 +430,14 @@ func (vm *VM) Version(ctx context.Context) (string, error) {
 }
 
 // HealthCheck performs a health check
-func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
-	return chain.HealthResult{
+func (vm *VM) HealthCheck(ctx context.Context) (vmchain.HealthResult, error) {
+	_, height := vm.chain.Tip()
+	return vmchain.HealthResult{
 		Healthy: true,
 		Details: map[string]string{
 			"utxoCount":         fmt.Sprintf("%d", vm.utxoDB.GetUTXOCount()),
 			"nullifierCount":    fmt.Sprintf("%d", vm.nullifierDB.GetNullifierCount()),
-			"lastBlockHeight":   fmt.Sprintf("%d", vm.lastAccepted.Height()),
-			"pendingBlockCount": fmt.Sprintf("%d", len(vm.pendingBlocks)),
+			"lastBlockHeight":   fmt.Sprintf("%d", height),
 			"mempoolSize":       fmt.Sprintf("%d", vm.mempool.Size()),
 			"proofCacheSize":    fmt.Sprintf("%d", vm.proofVerifier.GetCacheSize()),
 		},
@@ -553,12 +538,11 @@ func (vm *VM) SetPreference(ctx context.Context, blkID ids.ID) error {
 }
 
 func (vm *VM) LastAccepted(ctx context.Context) (ids.ID, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-	return vm.lastAcceptedID, nil
+	id, _ := vm.chain.Tip()
+	return id, nil
 }
 
-func (vm *VM) Connected(ctx context.Context, nodeID ids.NodeID, nodeVersion *chain.VersionInfo) error {
+func (vm *VM) Connected(ctx context.Context, nodeID ids.NodeID, nodeVersion *vmchain.VersionInfo) error {
 	return nil
 }
 
