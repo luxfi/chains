@@ -41,6 +41,16 @@ func BuildSigned(signer warp.Signer, networkID uint32, sourceChainID ids.ID, pay
 		return nil, fmt.Errorf("sign warp message: %w", err)
 	}
 
+	// Signer is an interface, so the width of what it returns is not a
+	// compile-time fact. Copying it into a fixed array without checking pads a
+	// short signature with zeros and silently truncates a long one, and either
+	// way the envelope is well-formed and unverifiable — a cross-chain message
+	// the sender believes it sent and no receiver can accept. Refuse instead.
+	if len(sigBytes) != warp.SignatureLen {
+		return nil, fmt.Errorf("sign warp message: signature is %d bytes, want %d",
+			len(sigBytes), warp.SignatureLen)
+	}
+
 	var sig [warp.SignatureLen]byte
 	copy(sig[:], sigBytes)
 
