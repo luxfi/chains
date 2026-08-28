@@ -6,15 +6,18 @@ package graphvm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/luxfi/database"
 )
 
-// DEX-specific data types matching Uniswap v2/v3 subgraph schema
+// DEX data types matching the Uniswap v2/v3 subgraph schema. The field names are
+// the wire contract clients query by, so they are kept verbatim.
 
 // DexFactory represents DEX factory stats (Uniswap-compatible)
 type DexFactory struct {
@@ -281,987 +284,345 @@ type PairDayData struct {
 	DailyTxns         int64  `json:"dailyTxns"`
 }
 
-// Database key prefixes for DEX data
+// Database key prefixes for DEX data. A record lives at "<prefix><id>"; the
+// pool->token index lives at PrefixPoolByToken+<token>.
 const (
-	PrefixFactory   = "dex:factory:"
-	PrefixBundle    = "dex:bundle:"
-	PrefixToken     = "dex:token:"
-	PrefixPool      = "dex:pool:"
-	PrefixPair      = "dex:pair:"
-	PrefixTick      = "dex:tick:"
-	PrefixSwap      = "dex:swap:"
-	PrefixMint      = "dex:mint:"
-	PrefixBurn      = "dex:burn:"
-	PrefixTokenDay  = "dex:tokenday:"
-	PrefixTokenHour = "dex:tokenhour:"
-	PrefixPoolDay   = "dex:poolday:"
-	PrefixPoolHour  = "dex:poolhour:"
-	PrefixPairDay   = "dex:pairday:"
-	// Index prefixes for efficient queries
+	PrefixFactory     = "dex:factory:"
+	PrefixBundle      = "dex:bundle:"
+	PrefixToken       = "dex:token:"
+	PrefixPool        = "dex:pool:"
+	PrefixPair        = "dex:pair:"
+	PrefixTick        = "dex:tick:"
+	PrefixSwap        = "dex:swap:"
+	PrefixMint        = "dex:mint:"
+	PrefixBurn        = "dex:burn:"
+	PrefixTokenDay    = "dex:tokenday:"
+	PrefixTokenHour   = "dex:tokenhour:"
+	PrefixPoolDay     = "dex:poolday:"
+	PrefixPoolHour    = "dex:poolhour:"
+	PrefixPairDay     = "dex:pairday:"
+	PrefixDayData     = "dex:daydata:"
 	PrefixPoolByToken = "idx:pool:token:"
-	PrefixPairByToken = "idx:pair:token:"
-	PrefixSwapByPool  = "idx:swap:pool:"
-	PrefixSwapByToken = "idx:swap:token:"
 )
 
-// registerDexResolvers adds DEX-specific GraphQL resolvers
-func (e *QueryExecutor) registerDexResolvers() {
-	// Factory/Protocol stats
-	e.resolvers["factory"] = e.resolveFactory
-	e.resolvers["factories"] = e.resolveFactories
-	e.resolvers["uniswapFactory"] = e.resolveFactory // v2 compat
+// The subgraph surface has exactly two read shapes — one record by id, and a
+// window of records under a prefix — so it is written twice, here, and every
+// entity is a line in registerDexResolvers. Bounds, cancellation and ordering
+// are therefore properties of the shape rather than of each of forty copies:
+// before this, `mints` and `burns` had no upper bound at all, and any of them
+// answered `first: "-1"` with `makeslice: cap out of range`, which is a remote
+// panic reachable from an unauthenticated query.
 
-	// Price bundle (critical for quotes)
-	e.resolvers["bundle"] = e.resolveBundle
-	e.resolvers["bundles"] = e.resolveBundles
-
-	// Token queries
-	e.resolvers["token"] = e.resolveToken
-	e.resolvers["tokens"] = e.resolveTokens
-
-	// Pool queries (v3)
-	e.resolvers["pool"] = e.resolvePool
-	e.resolvers["pools"] = e.resolvePools
-
-	// Pair queries (v2)
-	e.resolvers["pair"] = e.resolvePair
-	e.resolvers["pairs"] = e.resolvePairs
-
-	// Tick queries (v3)
-	e.resolvers["tick"] = e.resolveTick
-	e.resolvers["ticks"] = e.resolveTicks
-
-	// Swap queries
-	e.resolvers["swap"] = e.resolveSwap
-	e.resolvers["swaps"] = e.resolveSwaps
-
-	// Mint queries
-	e.resolvers["mint"] = e.resolveMint
-	e.resolvers["mints"] = e.resolveMints
-
-	// Burn queries
-	e.resolvers["burn"] = e.resolveBurn
-	e.resolvers["burns"] = e.resolveBurns
-
-	// Time series data
-	e.resolvers["tokenDayData"] = e.resolveTokenDayData
-	e.resolvers["tokenDayDatas"] = e.resolveTokenDayDatas
-	e.resolvers["tokenHourData"] = e.resolveTokenHourData
-	e.resolvers["tokenHourDatas"] = e.resolveTokenHourDatas
-	e.resolvers["poolDayData"] = e.resolvePoolDayData
-	e.resolvers["poolDayDatas"] = e.resolvePoolDayDatas
-	e.resolvers["poolHourData"] = e.resolvePoolHourData
-	e.resolvers["poolHourDatas"] = e.resolvePoolHourDatas
-	e.resolvers["pairDayData"] = e.resolvePairDayData
-	e.resolvers["pairDayDatas"] = e.resolvePairDayDatas
-
-	// Aggregation queries for analytics
-	e.resolvers["uniswapDayData"] = e.resolveUniswapDayData
-	e.resolvers["uniswapDayDatas"] = e.resolveUniswapDayDatas
-}
-
-// Factory resolver
-func (e *QueryExecutor) resolveFactory(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id := "1" // Default factory ID
-	if idArg, ok := args["id"].(string); ok {
-		id = idArg
-	}
-
-	key := []byte(PrefixFactory + id)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			// Return empty factory
-			return &DexFactory{
-				ID:                  id,
-				PoolCount:           0,
-				PairCount:           0,
-				TxCount:             0,
-				TotalVolumeUSD:      "0",
-				TotalVolumeETH:      "0",
-				TotalFeesUSD:        "0",
-				TotalValueLockedUSD: "0",
-				TotalLiquidityUSD:   "0",
-				TotalValueLockedETH: "0",
-			}, nil
+// bound reads the caller's paging argument and clamps it into [1, max]. Absent,
+// unparsable, negative and oversized all land in range: the caller never picks
+// the allocation size.
+func bound(args map[string]interface{}, key string, def, max int) int {
+	n := def
+	switch v := args[key].(type) {
+	case string:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			n = parsed
 		}
-		return nil, err
+	case float64: // JSON variables arrive as float64
+		n = int(v)
 	}
-
-	var factory DexFactory
-	if err := json.Unmarshal(data, &factory); err != nil {
-		return nil, err
+	if n < 1 {
+		return 1
 	}
-	return &factory, nil
+	if n > max {
+		return max
+	}
+	return n
 }
 
-func (e *QueryExecutor) resolveFactories(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	iter := db.NewIteratorWithPrefix([]byte(PrefixFactory))
-	defer iter.Release()
-
-	factories := make([]*DexFactory, 0)
-	for iter.Next() {
-		var factory DexFactory
-		if err := json.Unmarshal(iter.Value(), &factory); err != nil {
-			continue
-		}
-		factories = append(factories, &factory)
-	}
-
-	return factories, iter.Error()
+// narrow describes how a `where:` argument turns into a key-prefix. The first
+// key present wins, and sep is what the indexer wrote between the value and the
+// rest of the record id.
+type narrow struct {
+	keys []string
+	sep  string
 }
 
-// Bundle resolver (ETH/LUX price)
-func (e *QueryExecutor) resolveBundle(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id := "1"
-	if idArg, ok := args["id"].(string); ok {
-		id = idArg
+// prefix returns the scan prefix for these args: the base, plus the narrowing
+// component when the caller supplied one.
+func (n *narrow) prefix(base string, args map[string]interface{}) string {
+	if n == nil {
+		return base
 	}
-
-	key := []byte(PrefixBundle + id)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			// Return default bundle with placeholder price
-			return &Bundle{
-				ID:          id,
-				EthPriceUSD: "0",
-				EthPrice:    "0",
-				LuxPriceUSD: "0",
-			}, nil
-		}
-		return nil, err
-	}
-
-	var bundle Bundle
-	if err := json.Unmarshal(data, &bundle); err != nil {
-		return nil, err
-	}
-	return &bundle, nil
-}
-
-func (e *QueryExecutor) resolveBundles(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	iter := db.NewIteratorWithPrefix([]byte(PrefixBundle))
-	defer iter.Release()
-
-	bundles := make([]*Bundle, 0)
-	for iter.Next() {
-		var bundle Bundle
-		if err := json.Unmarshal(iter.Value(), &bundle); err != nil {
-			continue
-		}
-		bundles = append(bundles, &bundle)
-	}
-
-	return bundles, iter.Error()
-}
-
-// Token resolver
-func (e *QueryExecutor) resolveToken(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id, ok := args["id"].(string)
+	where, ok := args["where"].(map[string]interface{})
 	if !ok {
-		return nil, fmt.Errorf("token: requires 'id' argument")
+		return base
 	}
+	for _, k := range n.keys {
+		if v, ok := where[k].(string); ok && v != "" {
+			return base + strings.ToLower(v) + n.sep
+		}
+	}
+	return base
+}
 
-	id = strings.ToLower(id) // Normalize address
-	key := []byte(PrefixToken + id)
-	data, err := db.Get(key)
+// readOne loads one JSON record. A genuine miss is (nil, nil) — GraphQL null.
+// A read that FAILED is an error, never an empty answer.
+func readOne[T any](db database.Database, key string) (*T, error) {
+	raw, err := db.Get([]byte(key))
 	if err != nil {
-		if err == database.ErrNotFound {
+		if errors.Is(err, database.ErrNotFound) {
 			return nil, nil
 		}
 		return nil, err
 	}
-
-	var token Token
-	if err := json.Unmarshal(data, &token); err != nil {
+	var v T
+	if err := json.Unmarshal(raw, &v); err != nil {
 		return nil, err
 	}
-	return &token, nil
+	return &v, nil
 }
 
-func (e *QueryExecutor) resolveTokens(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	limit := 100
-	if l, ok := args["first"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
+// object reads one free-form JSON record. A miss is untyped nil, so the
+// response carries null rather than a pointer to nothing.
+func object(db database.Database, key string) (interface{}, error) {
+	v, err := readOne[map[string]interface{}](db, key)
+	if v == nil || err != nil {
+		return nil, err
 	}
-	if limit > 1000 {
-		limit = 1000
-	}
+	return *v, nil
+}
 
-	orderBy := "volumeUSD"
-	if ob, ok := args["orderBy"].(string); ok {
-		orderBy = ob
-	}
-
-	orderDirection := "desc"
-	if od, ok := args["orderDirection"].(string); ok {
-		orderDirection = od
-	}
-
-	iter := db.NewIteratorWithPrefix([]byte(PrefixToken))
-	defer iter.Release()
-
-	tokens := make([]*Token, 0, limit)
-	for iter.Next() && len(tokens) < limit*2 { // Over-fetch for sorting
-		var token Token
-		if err := json.Unmarshal(iter.Value(), &token); err != nil {
-			continue
+// byID resolves "<entity>(id: ...)". miss supplies the answer for a record that
+// is not there; nil means null. The two singletons — factory and bundle — carry
+// a default id and answer a zero record instead, because a client reading
+// protocol totals wants zeroes, not a null it has to special-case.
+func byID[T any](name, prefix, defaultID string, fold bool, miss func(id string) interface{}) ResolverFunc {
+	return func(_ context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
+		id, ok := args["id"].(string)
+		if !ok {
+			if defaultID == "" {
+				return nil, fmt.Errorf("%s: requires 'id' argument", name)
+			}
+			id = defaultID
 		}
-		tokens = append(tokens, &token)
-	}
-
-	// Sort by specified field
-	sortTokens(tokens, orderBy, orderDirection)
-
-	// Apply limit after sort
-	if len(tokens) > limit {
-		tokens = tokens[:limit]
-	}
-
-	return tokens, iter.Error()
-}
-
-// Pool resolver (v3)
-func (e *QueryExecutor) resolvePool(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id, ok := args["id"].(string)
-	if !ok {
-		return nil, fmt.Errorf("pool: requires 'id' argument")
-	}
-
-	id = strings.ToLower(id)
-	key := []byte(PrefixPool + id)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
+		if fold {
+			id = strings.ToLower(id) // addresses are case-folded on write
+		}
+		v, err := readOne[T](db, prefix+id)
+		if err != nil {
+			return nil, err
+		}
+		if v == nil {
+			if miss != nil {
+				return miss(id), nil
+			}
 			return nil, nil
 		}
-		return nil, err
+		return v, nil
 	}
-
-	var pool Pool
-	if err := json.Unmarshal(data, &pool); err != nil {
-		return nil, err
-	}
-	return &pool, nil
 }
 
-func (e *QueryExecutor) resolvePools(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	limit := 100
-	if l, ok := args["first"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
+// list resolves "<entity>s(first: n, where: {...})". It scans one window under
+// the prefix, orders that window, and stops the moment the query's deadline
+// passes — which is what makes QueryTimeoutMs mean something.
+func list[T any](prefix string, def, max int, n *narrow, order func(args map[string]interface{}, xs []*T)) ResolverFunc {
+	return func(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
+		limit := bound(args, "first", def, max)
 
-	// Check for token filter
-	var tokenFilter string
-	if where, ok := args["where"].(map[string]interface{}); ok {
-		if t0, ok := where["token0"].(string); ok {
-			tokenFilter = strings.ToLower(t0)
-		} else if t1, ok := where["token1"].(string); ok {
-			tokenFilter = strings.ToLower(t1)
-		}
-	}
-
-	var pools []*Pool
-	var iterErr error
-
-	if tokenFilter != "" {
-		// Use index for token filter
-		pools, iterErr = e.getPoolsByToken(db, tokenFilter, limit)
-	} else {
-		iter := db.NewIteratorWithPrefix([]byte(PrefixPool))
+		iter := db.NewIteratorWithPrefix([]byte(n.prefix(prefix, args)))
 		defer iter.Release()
 
-		pools = make([]*Pool, 0, limit)
-		for iter.Next() && len(pools) < limit {
-			var pool Pool
-			if err := json.Unmarshal(iter.Value(), &pool); err != nil {
+		out := make([]*T, 0, limit)
+		for iter.Next() && len(out) < limit {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			var v T
+			if err := json.Unmarshal(iter.Value(), &v); err != nil {
 				continue
 			}
-			pools = append(pools, &pool)
+			out = append(out, &v)
 		}
-		iterErr = iter.Error()
+		if err := iter.Error(); err != nil {
+			return nil, err
+		}
+		if order != nil {
+			order(args, out)
+		}
+		return out, nil
 	}
-
-	return pools, iterErr
 }
 
-// Pair resolver (v2)
-func (e *QueryExecutor) resolvePair(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id, ok := args["id"].(string)
-	if !ok {
-		return nil, fmt.Errorf("pair: requires 'id' argument")
+// desc orders newest-first on an int64 field. SliceStable over a prefix scan is
+// total: ties keep key order, so two nodes answer identically.
+func desc[T any](get func(*T) int64) func(map[string]interface{}, []*T) {
+	return func(_ map[string]interface{}, xs []*T) {
+		sort.SliceStable(xs, func(i, j int) bool { return get(xs[i]) > get(xs[j]) })
 	}
-
-	id = strings.ToLower(id)
-	key := []byte(PrefixPair + id)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var pair Pair
-	if err := json.Unmarshal(data, &pair); err != nil {
-		return nil, err
-	}
-	return &pair, nil
 }
 
-func (e *QueryExecutor) resolvePairs(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	limit := 100
-	if l, ok := args["first"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
-
-	iter := db.NewIteratorWithPrefix([]byte(PrefixPair))
-	defer iter.Release()
-
-	pairs := make([]*Pair, 0, limit)
-	for iter.Next() && len(pairs) < limit {
-		var pair Pair
-		if err := json.Unmarshal(iter.Value(), &pair); err != nil {
-			continue
+// registerDexResolvers adds the v2/v3 subgraph surface. The names are the wire
+// contract — clients query by them — so they stay verbatim.
+func (e *QueryExecutor) registerDexResolvers() {
+	// Factory/protocol stats and the price bundle answer zeroes when absent.
+	factory := byID[DexFactory]("factory", PrefixFactory, "1", false, func(id string) interface{} {
+		return &DexFactory{
+			ID: id, TotalVolumeUSD: "0", TotalVolumeETH: "0", TotalFeesUSD: "0",
+			TotalValueLockedUSD: "0", TotalLiquidityUSD: "0", TotalValueLockedETH: "0",
 		}
-		pairs = append(pairs, &pair)
-	}
-
-	return pairs, iter.Error()
-}
-
-// Tick resolver (v3)
-func (e *QueryExecutor) resolveTick(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id, ok := args["id"].(string)
-	if !ok {
-		return nil, fmt.Errorf("tick: requires 'id' argument")
-	}
-
-	key := []byte(PrefixTick + id)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var tick Tick
-	if err := json.Unmarshal(data, &tick); err != nil {
-		return nil, err
-	}
-	return &tick, nil
-}
-
-func (e *QueryExecutor) resolveTicks(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	limit := 100
-	if l, ok := args["first"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
-
-	// Filter by pool
-	poolFilter := ""
-	if where, ok := args["where"].(map[string]interface{}); ok {
-		if p, ok := where["pool"].(string); ok {
-			poolFilter = strings.ToLower(p)
-		} else if p, ok := where["poolAddress"].(string); ok {
-			poolFilter = strings.ToLower(p)
-		}
-	}
-
-	prefix := []byte(PrefixTick)
-	if poolFilter != "" {
-		prefix = []byte(PrefixTick + poolFilter + "#")
-	}
-
-	iter := db.NewIteratorWithPrefix(prefix)
-	defer iter.Release()
-
-	ticks := make([]*Tick, 0, limit)
-	for iter.Next() && len(ticks) < limit {
-		var tick Tick
-		if err := json.Unmarshal(iter.Value(), &tick); err != nil {
-			continue
-		}
-		ticks = append(ticks, &tick)
-	}
-
-	return ticks, iter.Error()
-}
-
-// Swap resolver
-func (e *QueryExecutor) resolveSwap(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id, ok := args["id"].(string)
-	if !ok {
-		return nil, fmt.Errorf("swap: requires 'id' argument")
-	}
-
-	key := []byte(PrefixSwap + id)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var swap Swap
-	if err := json.Unmarshal(data, &swap); err != nil {
-		return nil, err
-	}
-	return &swap, nil
-}
-
-func (e *QueryExecutor) resolveSwaps(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	limit := 100
-	if l, ok := args["first"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
-
-	iter := db.NewIteratorWithPrefix([]byte(PrefixSwap))
-	defer iter.Release()
-
-	swaps := make([]*Swap, 0, limit)
-	for iter.Next() && len(swaps) < limit {
-		var swap Swap
-		if err := json.Unmarshal(iter.Value(), &swap); err != nil {
-			continue
-		}
-		swaps = append(swaps, &swap)
-	}
-
-	// Sort by timestamp descending (newest first)
-	sort.Slice(swaps, func(i, j int) bool {
-		return swaps[i].Timestamp > swaps[j].Timestamp
 	})
+	e.resolvers["factory"] = factory
+	e.resolvers["uniswapFactory"] = factory // v2 compat
+	e.resolvers["factories"] = list[DexFactory](PrefixFactory, 100, 1000, nil, nil)
 
-	return swaps, iter.Error()
-}
-
-// Mint resolver
-func (e *QueryExecutor) resolveMint(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id, ok := args["id"].(string)
-	if !ok {
-		return nil, fmt.Errorf("mint: requires 'id' argument")
-	}
-
-	key := []byte(PrefixMint + id)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var mint Mint
-	if err := json.Unmarshal(data, &mint); err != nil {
-		return nil, err
-	}
-	return &mint, nil
-}
-
-func (e *QueryExecutor) resolveMints(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	limit := 100
-	if l, ok := args["first"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-
-	iter := db.NewIteratorWithPrefix([]byte(PrefixMint))
-	defer iter.Release()
-
-	mints := make([]*Mint, 0, limit)
-	for iter.Next() && len(mints) < limit {
-		var mint Mint
-		if err := json.Unmarshal(iter.Value(), &mint); err != nil {
-			continue
-		}
-		mints = append(mints, &mint)
-	}
-
-	return mints, iter.Error()
-}
-
-// Burn resolver
-func (e *QueryExecutor) resolveBurn(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id, ok := args["id"].(string)
-	if !ok {
-		return nil, fmt.Errorf("burn: requires 'id' argument")
-	}
-
-	key := []byte(PrefixBurn + id)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var burn Burn
-	if err := json.Unmarshal(data, &burn); err != nil {
-		return nil, err
-	}
-	return &burn, nil
-}
-
-func (e *QueryExecutor) resolveBurns(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	limit := 100
-	if l, ok := args["first"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-
-	iter := db.NewIteratorWithPrefix([]byte(PrefixBurn))
-	defer iter.Release()
-
-	burns := make([]*Burn, 0, limit)
-	for iter.Next() && len(burns) < limit {
-		var burn Burn
-		if err := json.Unmarshal(iter.Value(), &burn); err != nil {
-			continue
-		}
-		burns = append(burns, &burn)
-	}
-
-	return burns, iter.Error()
-}
-
-// Token time series resolvers
-func (e *QueryExecutor) resolveTokenDayData(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id, ok := args["id"].(string)
-	if !ok {
-		return nil, fmt.Errorf("tokenDayData: requires 'id' argument")
-	}
-
-	key := []byte(PrefixTokenDay + id)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var tdd TokenDayData
-	if err := json.Unmarshal(data, &tdd); err != nil {
-		return nil, err
-	}
-	return &tdd, nil
-}
-
-func (e *QueryExecutor) resolveTokenDayDatas(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	limit := 30 // Default to 30 days
-	if l, ok := args["first"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-	if limit > 365 {
-		limit = 365
-	}
-
-	// Filter by token
-	tokenFilter := ""
-	if where, ok := args["where"].(map[string]interface{}); ok {
-		if t, ok := where["token"].(string); ok {
-			tokenFilter = strings.ToLower(t)
-		}
-	}
-
-	prefix := []byte(PrefixTokenDay)
-	if tokenFilter != "" {
-		prefix = []byte(PrefixTokenDay + tokenFilter + "-")
-	}
-
-	iter := db.NewIteratorWithPrefix(prefix)
-	defer iter.Release()
-
-	datas := make([]*TokenDayData, 0, limit)
-	for iter.Next() && len(datas) < limit {
-		var tdd TokenDayData
-		if err := json.Unmarshal(iter.Value(), &tdd); err != nil {
-			continue
-		}
-		datas = append(datas, &tdd)
-	}
-
-	// Sort by date descending
-	sort.Slice(datas, func(i, j int) bool {
-		return datas[i].Date > datas[j].Date
+	e.resolvers["bundle"] = byID[Bundle]("bundle", PrefixBundle, "1", false, func(id string) interface{} {
+		return &Bundle{ID: id, EthPriceUSD: "0", EthPrice: "0", LuxPriceUSD: "0"}
 	})
+	e.resolvers["bundles"] = list[Bundle](PrefixBundle, 100, 1000, nil, nil)
 
-	return datas, iter.Error()
-}
+	e.resolvers["token"] = byID[Token]("token", PrefixToken, "", true, nil)
+	e.resolvers["tokens"] = list[Token](PrefixToken, 100, 1000, nil, orderTokens)
 
-func (e *QueryExecutor) resolveTokenHourData(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id, ok := args["id"].(string)
-	if !ok {
-		return nil, fmt.Errorf("tokenHourData: requires 'id' argument")
-	}
+	e.resolvers["pool"] = byID[Pool]("pool", PrefixPool, "", true, nil)
+	e.resolvers["pools"] = e.resolvePools
 
-	key := []byte(PrefixTokenHour + id)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return nil, nil
+	e.resolvers["pair"] = byID[Pair]("pair", PrefixPair, "", true, nil)
+	e.resolvers["pairs"] = list[Pair](PrefixPair, 100, 1000, nil, nil)
+
+	e.resolvers["tick"] = byID[Tick]("tick", PrefixTick, "", false, nil)
+	e.resolvers["ticks"] = list[Tick](PrefixTick, 100, 1000,
+		&narrow{keys: []string{"pool", "poolAddress"}, sep: "#"}, nil)
+
+	e.resolvers["swap"] = byID[Swap]("swap", PrefixSwap, "", false, nil)
+	e.resolvers["swaps"] = list[Swap](PrefixSwap, 100, 1000, nil,
+		desc(func(s *Swap) int64 { return s.Timestamp }))
+
+	e.resolvers["mint"] = byID[Mint]("mint", PrefixMint, "", false, nil)
+	e.resolvers["mints"] = list[Mint](PrefixMint, 100, 1000, nil,
+		desc(func(m *Mint) int64 { return m.Timestamp }))
+
+	e.resolvers["burn"] = byID[Burn]("burn", PrefixBurn, "", false, nil)
+	e.resolvers["burns"] = list[Burn](PrefixBurn, 100, 1000, nil,
+		desc(func(b *Burn) int64 { return b.Timestamp }))
+
+	byToken := &narrow{keys: []string{"token"}, sep: "-"}
+	byPool := &narrow{keys: []string{"pool"}, sep: "-"}
+
+	e.resolvers["tokenDayData"] = byID[TokenDayData]("tokenDayData", PrefixTokenDay, "", false, nil)
+	e.resolvers["tokenDayDatas"] = list[TokenDayData](PrefixTokenDay, 30, 365, byToken,
+		desc(func(d *TokenDayData) int64 { return d.Date }))
+
+	e.resolvers["tokenHourData"] = byID[TokenHourData]("tokenHourData", PrefixTokenHour, "", false, nil)
+	e.resolvers["tokenHourDatas"] = list[TokenHourData](PrefixTokenHour, 24, 168, byToken,
+		desc(func(d *TokenHourData) int64 { return d.PeriodStartUnix }))
+
+	e.resolvers["poolDayData"] = byID[PoolDayData]("poolDayData", PrefixPoolDay, "", false, nil)
+	e.resolvers["poolDayDatas"] = list[PoolDayData](PrefixPoolDay, 30, 365, byPool,
+		desc(func(d *PoolDayData) int64 { return d.Date }))
+
+	e.resolvers["poolHourData"] = byID[PoolHourData]("poolHourData", PrefixPoolHour, "", false, nil)
+	e.resolvers["poolHourDatas"] = list[PoolHourData](PrefixPoolHour, 24, 168, byPool,
+		desc(func(d *PoolHourData) int64 { return d.PeriodStartUnix }))
+
+	e.resolvers["pairDayData"] = byID[PairDayData]("pairDayData", PrefixPairDay, "", false, nil)
+	e.resolvers["pairDayDatas"] = list[PairDayData](PrefixPairDay, 30, 365,
+		&narrow{keys: []string{"pairAddress"}, sep: "-"},
+		desc(func(d *PairDayData) int64 { return d.Date }))
+
+	// Protocol-level daily totals are free-form: whatever the indexer wrote.
+	e.resolvers["uniswapDayData"] = func(_ context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
+		id, ok := args["id"].(string)
+		if !ok {
+			return nil, fmt.Errorf("uniswapDayData: requires 'id' argument")
 		}
-		return nil, err
+		return object(db, PrefixDayData+id)
 	}
-
-	var thd TokenHourData
-	if err := json.Unmarshal(data, &thd); err != nil {
-		return nil, err
+	e.resolvers["uniswapDayDatas"] = func(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
+		return scan[map[string]interface{}](ctx, db, PrefixDayData, bound(args, "first", 30, 365))
 	}
-	return &thd, nil
 }
 
-func (e *QueryExecutor) resolveTokenHourDatas(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	limit := 24 // Default to 24 hours
-	if l, ok := args["first"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-	if limit > 168 { // Max 7 days
-		limit = 168
-	}
-
-	tokenFilter := ""
+// resolvePools is the one list that is not a prefix scan: a token filter reads
+// the pool-by-token index instead, so it stays written out.
+func (e *QueryExecutor) resolvePools(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
+	token := ""
 	if where, ok := args["where"].(map[string]interface{}); ok {
-		if t, ok := where["token"].(string); ok {
-			tokenFilter = strings.ToLower(t)
+		for _, k := range []string{"token0", "token1"} {
+			if v, ok := where[k].(string); ok && v != "" {
+				token = strings.ToLower(v)
+				break
+			}
 		}
 	}
-
-	prefix := []byte(PrefixTokenHour)
-	if tokenFilter != "" {
-		prefix = []byte(PrefixTokenHour + tokenFilter + "-")
+	if token == "" {
+		return list[Pool](PrefixPool, 100, 1000, nil, nil)(ctx, db, args)
 	}
 
-	iter := db.NewIteratorWithPrefix(prefix)
-	defer iter.Release()
-
-	datas := make([]*TokenHourData, 0, limit)
-	for iter.Next() && len(datas) < limit {
-		var thd TokenHourData
-		if err := json.Unmarshal(iter.Value(), &thd); err != nil {
-			continue
-		}
-		datas = append(datas, &thd)
+	limit := bound(args, "first", 100, 1000)
+	index, err := readOne[[]string](db, PrefixPoolByToken+token)
+	if err != nil || index == nil {
+		return []*Pool{}, err
 	}
 
-	sort.Slice(datas, func(i, j int) bool {
-		return datas[i].PeriodStartUnix > datas[j].PeriodStartUnix
-	})
-
-	return datas, iter.Error()
-}
-
-// Pool time series resolvers
-func (e *QueryExecutor) resolvePoolDayData(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id, ok := args["id"].(string)
-	if !ok {
-		return nil, fmt.Errorf("poolDayData: requires 'id' argument")
-	}
-
-	key := []byte(PrefixPoolDay + id)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var pdd PoolDayData
-	if err := json.Unmarshal(data, &pdd); err != nil {
-		return nil, err
-	}
-	return &pdd, nil
-}
-
-func (e *QueryExecutor) resolvePoolDayDatas(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	limit := 30
-	if l, ok := args["first"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-
-	poolFilter := ""
-	if where, ok := args["where"].(map[string]interface{}); ok {
-		if p, ok := where["pool"].(string); ok {
-			poolFilter = strings.ToLower(p)
-		}
-	}
-
-	prefix := []byte(PrefixPoolDay)
-	if poolFilter != "" {
-		prefix = []byte(PrefixPoolDay + poolFilter + "-")
-	}
-
-	iter := db.NewIteratorWithPrefix(prefix)
-	defer iter.Release()
-
-	datas := make([]*PoolDayData, 0, limit)
-	for iter.Next() && len(datas) < limit {
-		var pdd PoolDayData
-		if err := json.Unmarshal(iter.Value(), &pdd); err != nil {
-			continue
-		}
-		datas = append(datas, &pdd)
-	}
-
-	sort.Slice(datas, func(i, j int) bool {
-		return datas[i].Date > datas[j].Date
-	})
-
-	return datas, iter.Error()
-}
-
-func (e *QueryExecutor) resolvePoolHourData(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id, ok := args["id"].(string)
-	if !ok {
-		return nil, fmt.Errorf("poolHourData: requires 'id' argument")
-	}
-
-	key := []byte(PrefixPoolHour + id)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var phd PoolHourData
-	if err := json.Unmarshal(data, &phd); err != nil {
-		return nil, err
-	}
-	return &phd, nil
-}
-
-func (e *QueryExecutor) resolvePoolHourDatas(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	limit := 24
-	if l, ok := args["first"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-
-	poolFilter := ""
-	if where, ok := args["where"].(map[string]interface{}); ok {
-		if p, ok := where["pool"].(string); ok {
-			poolFilter = strings.ToLower(p)
-		}
-	}
-
-	prefix := []byte(PrefixPoolHour)
-	if poolFilter != "" {
-		prefix = []byte(PrefixPoolHour + poolFilter + "-")
-	}
-
-	iter := db.NewIteratorWithPrefix(prefix)
-	defer iter.Release()
-
-	datas := make([]*PoolHourData, 0, limit)
-	for iter.Next() && len(datas) < limit {
-		var phd PoolHourData
-		if err := json.Unmarshal(iter.Value(), &phd); err != nil {
-			continue
-		}
-		datas = append(datas, &phd)
-	}
-
-	sort.Slice(datas, func(i, j int) bool {
-		return datas[i].PeriodStartUnix > datas[j].PeriodStartUnix
-	})
-
-	return datas, iter.Error()
-}
-
-// Pair time series resolvers (v2)
-func (e *QueryExecutor) resolvePairDayData(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id, ok := args["id"].(string)
-	if !ok {
-		return nil, fmt.Errorf("pairDayData: requires 'id' argument")
-	}
-
-	key := []byte(PrefixPairDay + id)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var pdd PairDayData
-	if err := json.Unmarshal(data, &pdd); err != nil {
-		return nil, err
-	}
-	return &pdd, nil
-}
-
-func (e *QueryExecutor) resolvePairDayDatas(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	limit := 30
-	if l, ok := args["first"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-
-	pairFilter := ""
-	if where, ok := args["where"].(map[string]interface{}); ok {
-		if p, ok := where["pairAddress"].(string); ok {
-			pairFilter = strings.ToLower(p)
-		}
-	}
-
-	prefix := []byte(PrefixPairDay)
-	if pairFilter != "" {
-		prefix = []byte(PrefixPairDay + pairFilter + "-")
-	}
-
-	iter := db.NewIteratorWithPrefix(prefix)
-	defer iter.Release()
-
-	datas := make([]*PairDayData, 0, limit)
-	for iter.Next() && len(datas) < limit {
-		var pdd PairDayData
-		if err := json.Unmarshal(iter.Value(), &pdd); err != nil {
-			continue
-		}
-		datas = append(datas, &pdd)
-	}
-
-	sort.Slice(datas, func(i, j int) bool {
-		return datas[i].Date > datas[j].Date
-	})
-
-	return datas, iter.Error()
-}
-
-// Protocol-level daily data
-func (e *QueryExecutor) resolveUniswapDayData(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	id, ok := args["id"].(string)
-	if !ok {
-		return nil, fmt.Errorf("uniswapDayData: requires 'id' argument")
-	}
-
-	key := []byte("dex:daydata:" + id)
-	data, err := db.Get(key)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var dayData map[string]interface{}
-	if err := json.Unmarshal(data, &dayData); err != nil {
-		return nil, err
-	}
-	return dayData, nil
-}
-
-func (e *QueryExecutor) resolveUniswapDayDatas(ctx context.Context, db database.Database, args map[string]interface{}) (interface{}, error) {
-	limit := 30
-	if l, ok := args["first"].(string); ok {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-
-	iter := db.NewIteratorWithPrefix([]byte("dex:daydata:"))
-	defer iter.Release()
-
-	datas := make([]map[string]interface{}, 0, limit)
-	for iter.Next() && len(datas) < limit {
-		var dayData map[string]interface{}
-		if err := json.Unmarshal(iter.Value(), &dayData); err != nil {
-			continue
-		}
-		datas = append(datas, dayData)
-	}
-
-	return datas, iter.Error()
-}
-
-// Helper functions
-
-func (e *QueryExecutor) getPoolsByToken(db database.Database, token string, limit int) ([]*Pool, error) {
-	// Use token->pool index
-	indexKey := []byte(PrefixPoolByToken + token)
-	indexData, err := db.Get(indexKey)
-	if err != nil {
-		if err == database.ErrNotFound {
-			return []*Pool{}, nil
-		}
-		return nil, err
-	}
-
-	var poolAddrs []string
-	if err := json.Unmarshal(indexData, &poolAddrs); err != nil {
-		return nil, err
-	}
-
-	pools := make([]*Pool, 0, len(poolAddrs))
-	for _, addr := range poolAddrs {
+	pools := make([]*Pool, 0, min(limit, len(*index)))
+	for _, addr := range *index {
 		if len(pools) >= limit {
 			break
 		}
-
-		poolKey := []byte(PrefixPool + addr)
-		poolData, err := db.Get(poolKey)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		pool, err := readOne[Pool](db, PrefixPool+addr)
 		if err != nil {
-			continue
+			return nil, err
 		}
-
-		var pool Pool
-		if err := json.Unmarshal(poolData, &pool); err != nil {
-			continue
+		if pool != nil {
+			pools = append(pools, pool)
 		}
-		pools = append(pools, &pool)
 	}
-
 	return pools, nil
 }
 
-func sortTokens(tokens []*Token, orderBy, orderDirection string) {
-	sort.Slice(tokens, func(i, j int) bool {
-		var cmp bool
-		switch orderBy {
-		case "volumeUSD":
-			vi, _ := new(big.Float).SetString(tokens[i].VolumeUSD)
-			vj, _ := new(big.Float).SetString(tokens[j].VolumeUSD)
-			if vi == nil {
-				vi = big.NewFloat(0)
-			}
-			if vj == nil {
-				vj = big.NewFloat(0)
-			}
-			cmp = vi.Cmp(vj) > 0
-		case "totalValueLockedUSD":
-			vi, _ := new(big.Float).SetString(tokens[i].TotalValueLockedUSD)
-			vj, _ := new(big.Float).SetString(tokens[j].TotalValueLockedUSD)
-			if vi == nil {
-				vi = big.NewFloat(0)
-			}
-			if vj == nil {
-				vj = big.NewFloat(0)
-			}
-			cmp = vi.Cmp(vj) > 0
+// orderTokens applies the caller's orderBy/orderDirection. cmp is three-way so
+// that reversing it stays a strict ordering: the old code returned !cmp, which
+// reported i<j AND j<i for every tie and left sort.Slice free to permute equal
+// rows differently on identical data.
+func orderTokens(args map[string]interface{}, xs []*Token) {
+	by, _ := args["orderBy"].(string)
+	cmp := func(a, b *Token) int {
+		switch by {
 		case "txCount":
-			cmp = tokens[i].TxCount > tokens[j].TxCount
+			return int64cmp(a.TxCount, b.TxCount)
+		case "totalValueLockedUSD":
+			return decimalcmp(a.TotalValueLockedUSD, b.TotalValueLockedUSD)
+		case "volumeUSD", "":
+			return decimalcmp(a.VolumeUSD, b.VolumeUSD)
 		default:
-			cmp = tokens[i].ID < tokens[j].ID
+			return strings.Compare(b.ID, a.ID) // unknown key: id ascending
 		}
+	}
+	if dir, _ := args["orderDirection"].(string); dir == "asc" {
+		sort.SliceStable(xs, func(i, j int) bool { return cmp(xs[i], xs[j]) < 0 })
+		return
+	}
+	sort.SliceStable(xs, func(i, j int) bool { return cmp(xs[i], xs[j]) > 0 })
+}
 
-		if orderDirection == "asc" {
-			return !cmp
-		}
-		return cmp
-	})
+func int64cmp(a, b int64) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+	return 0
+}
+
+// decimalcmp compares two decimal strings; anything unparsable is zero.
+func decimalcmp(a, b string) int {
+	return decimal(a).Cmp(decimal(b))
+}
+
+func decimal(s string) *big.Float {
+	v, ok := new(big.Float).SetString(s)
+	if !ok {
+		return new(big.Float)
+	}
+	return v
 }

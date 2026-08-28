@@ -1,9 +1,9 @@
 // Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
-// Package gvm implements the Graph VM (G-Chain) — a shared GraphQL database
+// Package graphvm implements the Graph VM (G-Chain) — a shared GraphQL database
 // across all Lux chains. Any chain's state is queryable through a unified
-// GraphQL endpoint with auto-indexing and cross-chain query resolution.
+// GraphQL endpoint.
 package graphvm
 
 import (
@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/luxfi/database"
@@ -38,34 +37,33 @@ var (
 		Patch: 0,
 	}
 
-	errNotImplemented = errors.New("not implemented")
+	errNoAppProtocol = errors.New("graphvm: this chain has no app protocol")
 
-	// errReadOnlyChain is what BuildBlock answers. G-Chain indexes what other
-	// chains have already agreed, so it holds no state of its own to agree on
-	// and never advances past genesis. That is the design, not a gap: a block
-	// here would commit a query result, which is derived from state a peer can
-	// recompute, or a schema, which is local configuration. Neither is
-	// something the network has to vote on.
+	// errEmptyAPIKey refuses a configuration that would admit an empty token.
+	// subtle.ConstantTimeCompare reports equal for two zero-length slices, so a
+	// configured "" matches the token in `Authorization: Bearer ` — auth on,
+	// everyone in. A chain refuses to boot rather than serve that.
+	errEmptyAPIKey = errors.New("graphvm: requireAuth with an empty api key")
+
+	// errReadOnlyChain is the ONE predicate. G-Chain indexes what other chains
+	// have already agreed, so it holds no state of its own to agree on and never
+	// advances past genesis. BuildBlock declines by it, ParseBlock refuses any
+	// bytes but genesis by it, and Verify/Accept refuse any block but genesis by
+	// it — because a chain that admits what it cannot build has a gap between
+	// admission and consensus, and that gap is where a peer parks a block whose
+	// parent no one can resolve.
 	errReadOnlyChain = errors.New("graphvm: this chain indexes other chains and builds no blocks")
 )
 
-// GConfig contains VM configuration
+// GConfig contains VM configuration. Every field here is read; a knob that
+// changes nothing is worse than no knob, because it reads as a control.
 type GConfig struct {
-	// DGraph configuration
-	DgraphEndpoint   string `json:"dgraphEndpoint"`
-	SchemaVersion    string `json:"schemaVersion"`
-	EnableFederation bool   `json:"enableFederation"`
-
-	// Query configuration
+	// Query bounds
 	MaxQueryDepth  int `json:"maxQueryDepth"`
 	QueryTimeoutMs int `json:"queryTimeoutMs"`
 	MaxResultSize  int `json:"maxResultSize"`
 
-	// Index configuration
-	AutoIndex      bool `json:"autoIndex"`
-	IndexBatchSize int  `json:"indexBatchSize"`
-
-	// Authentication configuration
+	// Authentication
 	RequireAuth bool     `json:"requireAuth"`
 	APIKeys     []string `json:"apiKeys"`
 }
@@ -78,114 +76,41 @@ type VM struct {
 	toEngine  chan<- vmcore.Message
 	appSender warp.Sender
 
-	// State. The G-Chain is read-only and never advances past genesis, so
-	// genesisBlock is permanently the last-accepted block. lastAcceptedID is
-	// what LastAccepted() returns and what the engine resolves via GetBlock at
-	// initialization; preferredID tracks SetPreference separately.
-	genesisBlock   *Block
-	lastAcceptedID ids.ID
-	preferredID    ids.ID
+	// genesis is the whole of this chain's consensus state: it is the first
+	// block, the last-accepted block and the preferred block, permanently. One
+	// value, so the three can never disagree.
+	genesis *Block
 
-	// Graph-specific fields
-	schemas       map[string]*GraphSchema
-	queries       map[ids.ID]*Query
-	subscriptions map[ids.ID]*Subscription
-	dataIndexes   map[string]*DataIndex
-	chainSources  map[ids.ID]*ChainDataSource
-
-	// Synchronization
-	schemaMu sync.RWMutex
-	queryMu  sync.RWMutex
+	// queries answers /graphql against the chain database.
+	queries *QueryExecutor
 
 	// G-Chain is read-only; the policy refuses all user-tx at the boundary.
 	// See feegate.go.
 	feePolicy fee.Policy
 }
 
-// GraphSchema represents a GraphQL schema definition
-type GraphSchema struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	Version    string   `json:"version"`
-	Schema     string   `json:"schema"`
-	Types      []string `json:"types"`
-	Directives []string `json:"directives"`
-	CreatedAt  int64    `json:"createdAt"`
-	UpdatedAt  int64    `json:"updatedAt"`
-}
-
-// Query represents a GraphQL query
-type Query struct {
-	ID          ids.ID      `json:"id"`
-	QueryText   string      `json:"queryText"`
-	Variables   []byte      `json:"variables"`
-	ChainScope  []ids.ID    `json:"chainScope"`
-	Result      []byte      `json:"result,omitempty"`
-	Status      QueryStatus `json:"status"`
-	SubmittedAt int64       `json:"submittedAt"`
-	CompletedAt int64       `json:"completedAt,omitempty"`
-}
-
-// Subscription represents a GraphQL subscription
-type Subscription struct {
-	ID         ids.ID   `json:"id"`
-	QueryText  string   `json:"queryText"`
-	ChainScope []ids.ID `json:"chainScope"`
-	Active     bool     `json:"active"`
-	CreatedAt  int64    `json:"createdAt"`
-}
-
-// DataIndex represents an index for optimized queries
-type DataIndex struct {
-	ID        string   `json:"id"`
-	ChainID   ids.ID   `json:"chainId"`
-	IndexType string   `json:"indexType"`
-	Fields    []string `json:"fields"`
-	Status    string   `json:"status"`
-}
-
-// ChainDataSource represents a connected chain data source
-type ChainDataSource struct {
-	ChainID     ids.ID `json:"chainId"`
-	ChainName   string `json:"chainName"`
-	Connected   bool   `json:"connected"`
-	LastSync    int64  `json:"lastSync"`
-	BlockHeight uint64 `json:"blockHeight"`
-}
-
-// QueryStatus represents the status of a query
-type QueryStatus uint8
-
-const (
-	QueryPending QueryStatus = iota
-	QueryProcessing
-	QueryCompleted
-	QueryFailed
-)
-
 // Initialize implements the common.VM interface
-func (vm *VM) Initialize(
-	ctx context.Context,
-	vmInit vmcore.Init,
-) error {
+func (vm *VM) Initialize(ctx context.Context, vmInit vmcore.Init) error {
 	vm.rt = vmInit.Runtime
 	vm.db = vmInit.DB
 	vm.toEngine = vmInit.ToEngine
 	vm.appSender = vmInit.Sender
 
-	// Parse config
 	if len(vmInit.Config) > 0 {
 		if err := json.Unmarshal(vmInit.Config, &vm.config); err != nil {
 			return fmt.Errorf("failed to parse config: %w", err)
 		}
 	}
-
-	// Initialize state management
-	vm.schemas = make(map[string]*GraphSchema)
-	vm.queries = make(map[ids.ID]*Query)
-	vm.subscriptions = make(map[ids.ID]*Subscription)
-	vm.dataIndexes = make(map[string]*DataIndex)
-	vm.chainSources = make(map[ids.ID]*ChainDataSource)
+	if vm.config.RequireAuth {
+		if len(vm.config.APIKeys) == 0 {
+			return errEmptyAPIKey
+		}
+		for _, k := range vm.config.APIKeys {
+			if k == "" {
+				return errEmptyAPIKey
+			}
+		}
+	}
 
 	// Fee gate: read-only chain → NoUserTxPolicy (refuses all user-tx).
 	vm.feePolicy = newFeePolicy()
@@ -193,32 +118,18 @@ func (vm *VM) Initialize(
 		return fmt.Errorf("feepolicy: %w", err)
 	}
 
-	// Parse genesis if needed
-	if len(vmInit.Genesis) > 0 {
-		if err := vm.parseGenesis(vmInit.Genesis); err != nil {
-			return fmt.Errorf("failed to parse genesis: %w", err)
-		}
-	}
+	vm.queries = NewQueryExecutor(vm.db, &vm.config)
 
-	// Build the deterministic genesis block and pin it as the last-accepted
-	// block. The G-Chain is a read-only query/index VM that never advances
-	// past genesis, but the consensus engine still REQUIRES a resolvable
-	// last-accepted block at boot: the ZAP VM server calls LastAccepted() then
-	// GetBlock(lastAccepted) inside Initialize, and a miss there is the
-	// "get last accepted block: not implemented" failure that fails the node's
-	// G-Chain health check on lux-mainnet.
-	genesisBlock, err := newGenesisBlock(vm, vmInit.Genesis)
-	if err != nil {
-		return fmt.Errorf("failed to build genesis block: %w", err)
-	}
-	vm.genesisBlock = genesisBlock
-	vm.lastAcceptedID = genesisBlock.ID()
-	vm.preferredID = genesisBlock.ID()
+	// The consensus engine REQUIRES a resolvable last-accepted block at boot:
+	// the ZAP VM server calls LastAccepted() then GetBlock(lastAccepted) inside
+	// Initialize, and a miss there is the "get last accepted block: not
+	// implemented" failure that fails the node's G-Chain health check.
+	vm.genesis = newBlock(vm, vmInit.Genesis)
 
 	if logger, ok := vm.rt.Log.(log.Logger); ok {
 		logger.Info("initialized Graph VM",
 			log.Reflect("version", Version),
-			log.String("genesisBlockID", vm.lastAcceptedID.String()),
+			log.String("genesisBlockID", vm.genesis.ID().String()),
 		)
 	}
 
@@ -250,58 +161,33 @@ func (vm *VM) Version(context.Context) (string, error) {
 // handler that dispatches on r.URL.Path therefore never recognizes anything.
 // The key IS the route; one handler per key.
 func (vm *VM) CreateHandlers(context.Context) (map[string]http.Handler, error) {
-	h := &apiHandler{vm: vm}
-	guard := func(next http.Handler) http.Handler {
-		if vm.config.RequireAuth {
-			return authMiddleware(next, vm.config.APIKeys)
-		}
-		return next
-	}
-
-	return map[string]http.Handler{
-		"/graphql": guard(http.HandlerFunc(h.handleGraphQL)),
-		"/schema":  http.HandlerFunc(h.handleSchema), // Schema can be public
-		"/query":   guard(http.HandlerFunc(h.handleQuery)),
-		"/index":   http.HandlerFunc(h.handleIndex), // Index metadata can be public
-	}, nil
+	return map[string]http.Handler{"/graphql": vm.graphql()}, nil
 }
 
-// NewHTTPHandler returns HTTP handlers for the VM
+// NewHTTPHandler returns the same one route, mounted by path.
 func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
-	return &apiHandler{vm: vm}, nil
+	mux := http.NewServeMux()
+	mux.Handle("/graphql", vm.graphql())
+	return mux, nil
 }
 
-// WaitForEvent waits out the context and reports nothing, because this chain
-// has nothing to report: it never builds a block, so there is never news of one
-// to send. A latch here would wake a builder that declines, which is why this
-// is not the frozen WaitForEvent the other chains had — those had work and no
-// way to say so. See errReadOnlyChain.
-func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
-	<-ctx.Done()
-	return vmcore.Message{}, ctx.Err()
+// graphql builds the query endpoint. Authentication is decided here, once, so
+// there is no second door onto the executor.
+func (vm *VM) graphql() http.Handler {
+	var h http.Handler = &queryHandler{vm: vm}
+	if vm.config.RequireAuth {
+		h = authenticated(h, vm.config.APIKeys)
+	}
+	return h
 }
 
 // HealthCheck implements the health.Checker interface
 func (vm *VM) HealthCheck(context.Context) (chain.HealthResult, error) {
-	vm.schemaMu.RLock()
-	schemaCount := len(vm.schemas)
-	vm.schemaMu.RUnlock()
-
-	vm.queryMu.RLock()
-	queryCount := len(vm.queries)
-	subCount := len(vm.subscriptions)
-	vm.queryMu.RUnlock()
-
 	return chain.HealthResult{
 		Healthy: true,
 		Details: map[string]string{
-			"version":       Version.String(),
-			"schemas":       fmt.Sprintf("%d", schemaCount),
-			"queries":       fmt.Sprintf("%d", queryCount),
-			"subscriptions": fmt.Sprintf("%d", subCount),
-			"indexes":       fmt.Sprintf("%d", len(vm.dataIndexes)),
-			"chainSources":  fmt.Sprintf("%d", len(vm.chainSources)),
-			"state":         "active",
+			"version": Version.String(),
+			"state":   "active",
 		},
 	}, nil
 }
@@ -318,7 +204,7 @@ func (vm *VM) Disconnected(ctx context.Context, nodeID ids.NodeID) error {
 
 // Request implements the common.AppHandler interface
 func (vm *VM) Request(ctx context.Context, nodeID ids.NodeID, requestID uint32, deadline time.Time, request []byte) error {
-	return errNotImplemented
+	return errNoAppProtocol
 }
 
 // RequestFailed implements the common.AppHandler interface
@@ -351,355 +237,116 @@ func (vm *VM) CrossChainResponse(ctx context.Context, chainID ids.ID, requestID 
 	return nil
 }
 
+// WaitForEvent waits out the context and reports nothing, because this chain
+// has nothing to report: it never builds a block, so there is never news of one
+// to send. A latch here would wake a builder that declines, which is why this
+// is not the frozen WaitForEvent the other chains had — those had work and no
+// way to say so. See errReadOnlyChain.
+func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
+	<-ctx.Done()
+	return vmcore.Message{}, ctx.Err()
+}
+
 // BuildBlock implements the chain.ChainVM interface, by declining. See
 // errReadOnlyChain.
 func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	return nil, errReadOnlyChain
 }
 
-// ParseBlock implements the chain.ChainVM interface. It decodes the canonical
-// block encoding produced by Block.Bytes(), recomputing the content-addressed
-// ID so a re-parsed block is byte- and ID-identical to the original.
+// ParseBlock implements the chain.ChainVM interface. The only block this chain
+// has is genesis, so those are the only bytes that name a block of it: anything
+// else is refused here rather than admitted, verified, accepted, and then found
+// unresolvable by the next node that boots.
 func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (chain.Block, error) {
-	blk, err := parseBlock(vm, blockBytes)
-	if err != nil {
-		return nil, err
-	}
-	return blk, nil
+	return parseBlock(vm, blockBytes)
 }
 
 // GetBlock implements the chain.ChainVM interface. The G-Chain has exactly one
 // block — genesis — which is permanently the accepted frontier; any other ID is
-// unknown. Returning database.ErrNotFound (not errNotImplemented) lets the ZAP
+// unknown. Returning database.ErrNotFound (not a "not implemented") lets the ZAP
 // VM server map a genuine miss to the wire NotFound code.
 func (vm *VM) GetBlock(ctx context.Context, blkID ids.ID) (chain.Block, error) {
-	if vm.genesisBlock != nil && blkID == vm.genesisBlock.ID() {
-		return vm.genesisBlock, nil
+	if blkID != vm.genesis.ID() {
+		return nil, database.ErrNotFound
 	}
-	return nil, database.ErrNotFound
+	return vm.genesis, nil
 }
 
-// SetPreference implements the chain.ChainVM interface
+// SetPreference implements the chain.ChainVM interface. Preferring a block this
+// chain does not have is a caller error, not a value to store.
 func (vm *VM) SetPreference(ctx context.Context, blkID ids.ID) error {
-	vm.preferredID = blkID
+	if blkID != vm.genesis.ID() {
+		return errReadOnlyChain
+	}
 	return nil
 }
 
 // LastAccepted implements the chain.ChainVM interface.
 func (vm *VM) LastAccepted(context.Context) (ids.ID, error) {
-	return vm.lastAcceptedID, nil
+	return vm.genesis.ID(), nil
 }
 
 // GetBlockIDAtHeight implements the chain.ChainVM interface. Genesis (height 0)
 // is the only block; every other height is absent.
 func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
-	if height == 0 && vm.genesisBlock != nil {
-		return vm.genesisBlock.ID(), nil
+	if height != 0 {
+		return ids.Empty, database.ErrNotFound
 	}
-	return ids.Empty, database.ErrNotFound
+	return vm.genesis.ID(), nil
 }
 
-// parseGenesis parses the genesis data
-func (vm *VM) parseGenesis(genesisBytes []byte) error {
-	type Genesis struct {
-		DefaultSchema  string   `json:"defaultSchema"`
-		ChainSources   []string `json:"chainSources"`
-		DgraphEndpoint string   `json:"dgraphEndpoint"`
-		SchemaVersion  string   `json:"schemaVersion"`
-	}
+// maxRequestBytes bounds what a caller may POST. parseQuery's length check runs
+// after decoding, which is too late to stop a body that never ends.
+const maxRequestBytes = maxQueryLength + 1<<16
 
-	var genesis Genesis
-	if err := json.Unmarshal(genesisBytes, &genesis); err != nil {
-		return err
-	}
-
-	// Initialize default schema
-	if genesis.DefaultSchema != "" {
-		vm.schemas["default"] = &GraphSchema{
-			ID:        "default",
-			Name:      "Default Schema",
-			Version:   genesis.SchemaVersion,
-			Schema:    genesis.DefaultSchema,
-			CreatedAt: time.Now().Unix(),
-		}
-	}
-
-	return nil
-}
-
-// ExecuteQuery executes a GraphQL query against registered schemas and data sources
-func (vm *VM) ExecuteQuery(query *Query) error {
-	vm.queryMu.Lock()
-	defer vm.queryMu.Unlock()
-
-	query.Status = QueryProcessing
-	query.SubmittedAt = time.Now().Unix()
-
-	vm.queries[query.ID] = query
-
-	// Parse and execute the GraphQL query
-	result, err := vm.executeGraphQLQuery(query.QueryText, query.Variables, query.ChainScope)
-	if err != nil {
-		query.Status = QueryFailed
-		query.Result = []byte(fmt.Sprintf(`{"errors":[{"message":%q}]}`, err.Error()))
-		return err
-	}
-
-	query.Status = QueryCompleted
-	query.CompletedAt = time.Now().Unix()
-	query.Result = result
-
-	return nil
-}
-
-// executeGraphQLQuery is the core GraphQL execution engine
-func (vm *VM) executeGraphQLQuery(queryText string, variables []byte, chainScope []ids.ID) ([]byte, error) {
-	// Parse query to extract operation type and fields
-	op, fields, err := parseGraphQLQuery(queryText)
-	if err != nil {
-		return nil, fmt.Errorf("query parse error: %w", err)
-	}
-
-	// Only queries are supported for now (no mutations/subscriptions)
-	if op != "query" && op != "" {
-		return nil, fmt.Errorf("unsupported operation type: %s", op)
-	}
-
-	// Build response data by resolving each top-level field
-	data := make(map[string]interface{})
-	for _, field := range fields {
-		value, err := vm.resolveField(field, chainScope)
-		if err != nil {
-			// GraphQL returns partial results with errors
-			data[field] = nil
-			continue
-		}
-		data[field] = value
-	}
-
-	// Encode response as JSON
-	response := map[string]interface{}{
-		"data": data,
-	}
-	return json.Marshal(response)
-}
-
-// parseGraphQLQuery is a minimal GraphQL query parser
-// Supports basic queries like: query { field1 field2 }
-func parseGraphQLQuery(queryText string) (operation string, fields []string, err error) {
-	// Trim whitespace and normalize
-	queryText = strings.TrimSpace(queryText)
-	if queryText == "" {
-		return "", nil, errors.New("empty query")
-	}
-
-	// Check for operation type prefix
-	operation = "query" // default
-	if strings.HasPrefix(queryText, "query") {
-		queryText = strings.TrimPrefix(queryText, "query")
-		queryText = strings.TrimSpace(queryText)
-	} else if strings.HasPrefix(queryText, "mutation") {
-		return "mutation", nil, errors.New("mutations not supported")
-	} else if strings.HasPrefix(queryText, "subscription") {
-		return "subscription", nil, errors.New("subscriptions not supported")
-	}
-
-	// Skip optional operation name
-	if idx := strings.Index(queryText, "{"); idx > 0 {
-		queryText = queryText[idx:]
-	}
-
-	// Extract fields from within braces
-	if !strings.HasPrefix(queryText, "{") || !strings.HasSuffix(queryText, "}") {
-		return "", nil, errors.New("invalid query format: expected { fields }")
-	}
-
-	// Remove braces and extract field names
-	fieldStr := strings.TrimPrefix(queryText, "{")
-	fieldStr = strings.TrimSuffix(fieldStr, "}")
-	fieldStr = strings.TrimSpace(fieldStr)
-
-	// Split by whitespace or newlines to get field names
-	// Note: This is simplified and doesn't handle nested fields
-	fieldNames := strings.Fields(fieldStr)
-	for _, f := range fieldNames {
-		// Clean up field names (remove any sub-selections for now)
-		if idx := strings.Index(f, "{"); idx > 0 {
-			f = f[:idx]
-		}
-		if f != "" && f != "{" && f != "}" {
-			fields = append(fields, f)
-		}
-	}
-
-	return operation, fields, nil
-}
-
-// resolveField resolves a single GraphQL field against the available data sources
-func (vm *VM) resolveField(fieldName string, chainScope []ids.ID) (interface{}, error) {
-	vm.schemaMu.RLock()
-	defer vm.schemaMu.RUnlock()
-
-	// Built-in introspection fields
-	switch fieldName {
-	case "__schema":
-		return vm.introspectSchema(), nil
-	case "__typename":
-		return "Query", nil
-	case "schemas":
-		// Return all registered schemas
-		schemas := make([]map[string]string, 0, len(vm.schemas))
-		for _, s := range vm.schemas {
-			schemas = append(schemas, map[string]string{
-				"id":      s.ID,
-				"name":    s.Name,
-				"version": s.Version,
-			})
-		}
-		return schemas, nil
-	case "chainSources":
-		// Return connected chain sources
-		sources := make([]map[string]interface{}, 0, len(vm.chainSources))
-		for _, cs := range vm.chainSources {
-			sources = append(sources, map[string]interface{}{
-				"chainId":     cs.ChainID.String(),
-				"chainName":   cs.ChainName,
-				"connected":   cs.Connected,
-				"blockHeight": cs.BlockHeight,
-			})
-		}
-		return sources, nil
-	case "indexes":
-		// Return data indexes
-		indexes := make([]map[string]interface{}, 0, len(vm.dataIndexes))
-		for _, idx := range vm.dataIndexes {
-			indexes = append(indexes, map[string]interface{}{
-				"id":        idx.ID,
-				"indexType": idx.IndexType,
-				"status":    idx.Status,
-				"fields":    idx.Fields,
-			})
-		}
-		return indexes, nil
-	}
-
-	return nil, fmt.Errorf("unknown field: %s", fieldName)
-}
-
-// introspectSchema returns GraphQL schema introspection data
-func (vm *VM) introspectSchema() map[string]interface{} {
-	return map[string]interface{}{
-		"queryType": map[string]string{
-			"name": "Query",
-		},
-		"types": []map[string]string{
-			{"name": "Query"},
-			{"name": "Schema"},
-			{"name": "ChainSource"},
-			{"name": "Index"},
-		},
-	}
-}
-
-// RegisterSchema registers a new GraphQL schema
-func (vm *VM) RegisterSchema(schema *GraphSchema) error {
-	vm.schemaMu.Lock()
-	defer vm.schemaMu.Unlock()
-
-	schema.CreatedAt = time.Now().Unix()
-	schema.UpdatedAt = schema.CreatedAt
-	vm.schemas[schema.ID] = schema
-
-	return nil
-}
-
-// ConnectChainSource connects a chain as a data source
-func (vm *VM) ConnectChainSource(chainID ids.ID, chainName string) error {
-	vm.chainSources[chainID] = &ChainDataSource{
-		ChainID:   chainID,
-		ChainName: chainName,
-		Connected: true,
-		LastSync:  time.Now().Unix(),
-	}
-	return nil
-}
-
-// API handler for Graph-specific endpoints
-type apiHandler struct {
+// queryHandler answers GraphQL over HTTP. POST with a JSON body is the one way
+// in; a query in a URL is a second way to say the same thing.
+type queryHandler struct {
 	vm *VM
 }
 
-func (h *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	switch r.URL.Path {
-	case "/graphql":
-		h.handleGraphQL(w, r)
-	case "/schema":
-		h.handleSchema(w, r)
-	case "/query":
-		h.handleQuery(w, r)
-	case "/index":
-		h.handleIndex(w, r)
-	default:
-		http.Error(w, "not found", http.StatusNotFound)
+func (h *queryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeErr(w, "graphql: POST a JSON body")
+		return
 	}
+
+	var req GraphQLRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes)).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		writeErr(w, err.Error())
+		return
+	}
+
+	// A GraphQL error is a 200 with an errors array; the request was understood.
+	json.NewEncoder(w).Encode(h.vm.queries.Execute(r.Context(), &req))
 }
 
-func (h *apiHandler) handleGraphQL(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"data":   nil,
-		"errors": []string{"GraphQL endpoint ready"},
-	})
+func writeErr(w http.ResponseWriter, msg string) {
+	json.NewEncoder(w).Encode(&GraphQLResponse{Errors: []GraphQLError{{Message: msg}}})
 }
 
-func (h *apiHandler) handleSchema(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	h.vm.schemaMu.RLock()
-	defer h.vm.schemaMu.RUnlock()
-	json.NewEncoder(w).Encode(h.vm.schemas)
-}
-
-func (h *apiHandler) handleQuery(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status": "query endpoint ready",
-	})
-}
-
-func (h *apiHandler) handleIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(h.vm.dataIndexes)
-}
-
-// authMiddleware validates API key from Authorization header
-func authMiddleware(next http.Handler, validKeys []string) http.Handler {
+// authenticated admits a request carrying one of the configured API keys.
+// Initialize has already refused an empty key, so an empty token matches
+// nothing here.
+func authenticated(next http.Handler, keys []string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Extract token from Authorization header
-		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			http.Error(w, "Unauthorized: missing Authorization header", http.StatusUnauthorized)
-			return
-		}
+		token := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 
-		// Support both "Bearer <token>" and just "<token>"
-		token := strings.TrimPrefix(authHeader, "Bearer ")
-		token = strings.TrimSpace(token)
-
-		// Validate token against configured API keys (constant-time comparison)
-		var valid bool
-		for _, validKey := range validKeys {
-			if subtle.ConstantTimeCompare([]byte(token), []byte(validKey)) == 1 {
-				valid = true
-				break
+		var ok bool
+		for _, key := range keys {
+			if subtle.ConstantTimeCompare([]byte(token), []byte(key)) == 1 {
+				ok = true
 			}
 		}
-
-		if !valid {
-			http.Error(w, "Unauthorized: invalid API key", http.StatusUnauthorized)
+		if !ok {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
-		// Token is valid, proceed
 		next.ServeHTTP(w, r)
 	})
 }
