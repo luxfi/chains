@@ -255,14 +255,6 @@ func TestBlockVerifyRefusals(t *testing.T) {
 		require.ErrorIs(t, b.Verify(ctx), errExpired)
 	})
 
-	t.Run("a block proof that does not verify", func(t *testing.T) {
-		b := valid()
-		b.BlockProof = &ZKProof{ProofType: "nonsense", ProofData: []byte("x")}
-		b.StateRoot = vm.computeStateRoot(b.Txs)
-		vm.proofVerifier.proofCache.Purge()
-		require.Error(t, b.Verify(ctx))
-	})
-
 	t.Run("a parent nothing can resolve", func(t *testing.T) {
 		b := valid()
 		b.ParentID_ = ids.GenerateTestID()
@@ -318,7 +310,6 @@ func TestBlockAccessorsAndSummary(t *testing.T) {
 		BlockTimestamp: 1_700_000_000,
 		Txs:            []*Transaction{tx},
 		StateRoot:      []byte("root"),
-		BlockProof:     &ZKProof{ProofType: "plonk", ProofData: []byte("bp")},
 		vm:             vm,
 	}
 
@@ -330,12 +321,12 @@ func TestBlockAccessorsAndSummary(t *testing.T) {
 	require.NotEmpty(t, b.Bytes())
 	require.Equal(t, b.Bytes(), b.Bytes(), "the encoding is computed once")
 
-	// The block proof is part of the identity: changing it changes the block.
+	// Every field the block carries is part of its identity.
 	before := b.ID()
 	require.Equal(t, before, b.ID(), "the id is computed once")
 	other := *b
-	other.ID_ = ids.Empty
-	other.BlockProof = &ZKProof{ProofType: "plonk", ProofData: []byte("different")}
+	other.ID_, other.bytes = ids.Empty, nil
+	other.StateRoot = []byte("different")
 	require.NotEqual(t, before, other.ID())
 
 	s := b.ToSummary()

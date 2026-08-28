@@ -148,7 +148,6 @@ func TestWireRoundTrip_Block(t *testing.T) {
 		BlockTimestamp: 1_700_000_000,
 		Txs:            []*Transaction{tx},
 		StateRoot:      []byte("root"),
-		BlockProof:     &ZKProof{ProofType: "plonk", ProofData: []byte("bp")},
 	}
 	b := blk.Marshal()
 	var got Block
@@ -159,5 +158,4 @@ func TestWireRoundTrip_Block(t *testing.T) {
 	require.Equal(blk.StateRoot, got.StateRoot)
 	require.Len(got.Txs, 1)
 	require.Equal(tx.ComputeID(), got.Txs[0].ID, "a nested transaction's id is derived from its content too")
-	require.Equal(blk.BlockProof, got.BlockProof)
 }

@@ -44,7 +44,6 @@ func blockAround(txBlob []byte) []byte {
 	ob.SetList(48, txOff, 1)
 	ob.SetBytes(56, txBlob)
 	ob.SetBytes(64, []byte("root"))
-	ob.SetBytes(72, nil)
 	ob.FinishAsRoot()
 	return bld.Finish()
 }
@@ -84,7 +83,6 @@ func TestBlockReencodesToTheBytesItParsed(t *testing.T) {
 		BlockTimestamp: 1_600_000_000,
 		Txs:            []*Transaction{blockTx(1), blockTx(2)},
 		StateRoot:      []byte("state-root"),
-		BlockProof:     &ZKProof{ProofType: "plonk", ProofData: []byte("agg")},
 	}
 	raw := blk.Marshal()
 

@@ -31,8 +31,11 @@ type Block struct {
 	Txs            []*Transaction `json:"transactions"`
 	StateRoot      []byte         `json:"stateRoot"` // Merkle tree root of UTXO set
 
-	// Aggregated proof for the block (optional)
-	BlockProof *ZKProof `json:"blockProof,omitempty"`
+	// There is no aggregate block proof. What stood here was carried on the
+	// wire, hashed into the id, and "verified" by re-verifying the very
+	// transactions Verify had already verified one line above — a second
+	// implementation of a check, standing where a reader would take an
+	// aggregate guarantee to be.
 
 	// Cached values
 	ID_    ids.ID
@@ -74,12 +77,6 @@ func (b *Block) computeID() ids.ID {
 
 	// Include state root
 	h.Write(b.StateRoot)
-
-	// Include block proof if present
-	if b.BlockProof != nil {
-		h.Write([]byte(b.BlockProof.ProofType))
-		h.Write(b.BlockProof.ProofData)
-	}
 
 	return ids.ID(h.Sum(nil))
 }
@@ -150,23 +147,11 @@ func (b *Block) Verify(ctx context.Context) error {
 		}
 	}
 
-	// Verify block proof if present
-	if b.BlockProof != nil {
-		if err := b.vm.proofVerifier.VerifyBlockProof(b); err != nil {
-			return err
-		}
-	}
-
 	// Verify against parent
 	if b.BlockHeight > 0 {
-		parent, err := b.vm.GetBlock(ctx, b.ParentID_)
+		parentBlock, err := b.vm.block(b.ParentID_)
 		if err != nil {
 			return err
-		}
-
-		parentBlock, ok := parent.(*Block)
-		if !ok {
-			return errors.New("invalid parent block type")
 		}
 
 		// The parent must be one this chain can still build on: the accepted

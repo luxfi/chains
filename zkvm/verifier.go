@@ -148,7 +148,7 @@ func (pv *ProofVerifier) VerifyTransactionProof(tx *Transaction) error {
 	case "groth16":
 		err = pv.verifyGroth16Proof(tx)
 	case "plonk":
-		err = pv.verifyPLONKProof(tx)
+		err = errPLONKIncomplete
 	case "bulletproofs":
 		err = errors.New("zkvm: Bulletproof verification not yet implemented, use groth16 or plonk")
 	default:
@@ -228,27 +228,6 @@ func (pv *ProofVerifier) verifySTARKProof(tx *Transaction) error {
 	return nil
 }
 
-// VerifyBlockProof verifies an aggregated block proof.
-//
-// There is ONE verification path. It used to take a batch path when
-// accel.Available() and more than one transaction — a second, inline copy of
-// the Groth16 checks that consulted neither the proof cache nor the dummy-key
-// refusal — so whether a node accepted a block turned on whether that node had
-// an accelerator, and validators with and without one rejected each other.
-func (pv *ProofVerifier) VerifyBlockProof(block *Block) error {
-	if block.BlockProof == nil {
-		return nil // Block proof is optional
-	}
-
-	for _, tx := range block.Txs {
-		if err := pv.VerifyTransactionProof(tx); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 // verifyGroth16Proof verifies a Groth16 proof using gnark
 func (pv *ProofVerifier) verifyGroth16Proof(tx *Transaction) error {
 	// Get verifying key for circuit type
@@ -275,37 +254,6 @@ func (pv *ProofVerifier) verifyGroth16Proof(tx *Transaction) error {
 	}
 
 	pv.log.Debug("Groth16 proof verified",
-		log.String("txID", tx.ID.String()),
-		log.Int("vkLen", len(vkBytes)),
-	)
-
-	return nil
-}
-
-// verifyPLONKProof verifies a PLONK proof using gnark-crypto BN254 pairings
-func (pv *ProofVerifier) verifyPLONKProof(tx *Transaction) error {
-	// Get verifying key for circuit type
-	vkBytes, exists := pv.verifyingKeys[string(tx.Type)]
-	if !exists {
-		return fmt.Errorf("zkvm: no verifying key for circuit %q", tx.Type)
-	}
-
-	// Verify public inputs
-	if err := pv.verifyPublicInputs(tx); err != nil {
-		return err
-	}
-
-	// PLONK proof structure: 7 G1 commitments + 3 scalars = 7*64 + 3*32 = 544 bytes
-	if len(tx.Proof.ProofData) < 544 {
-		return errors.New("invalid PLONK proof data length: expected 544+ bytes")
-	}
-
-	// Perform actual PLONK verification
-	if err := pv.verifyPLONKWithGnark(tx.Proof, vkBytes); err != nil {
-		return fmt.Errorf("PLONK verification failed: %w", err)
-	}
-
-	pv.log.Debug("PLONK proof verified",
 		log.String("txID", tx.ID.String()),
 		log.Int("vkLen", len(vkBytes)),
 	)
@@ -683,254 +631,21 @@ func deserializeVerifyingKey(data []byte) (*Groth16VerifyingKey, error) {
 	return vk, nil
 }
 
-// ============================================================================
-// PLONK Verification Implementation
-// ============================================================================
-
-// PLONKProof represents a PLONK proof structure
-type PLONKProof struct {
-	// Commitments (7 G1 points)
-	LCommit bn254.G1Affine // Wire L commitment
-	RCommit bn254.G1Affine // Wire R commitment
-	OCommit bn254.G1Affine // Wire O commitment
-	ZCommit bn254.G1Affine // Permutation polynomial commitment
-	TLow    bn254.G1Affine // Quotient polynomial low
-	TMid    bn254.G1Affine // Quotient polynomial mid
-	THigh   bn254.G1Affine // Quotient polynomial high
-
-	// Opening proof components
-	WzOpening  bn254.G1Affine // Opening at z
-	WzwOpening bn254.G1Affine // Opening at z*omega
-
-	// Evaluation proofs (scalars)
-	AEval     fr.Element // a(z) evaluation
-	BEval     fr.Element // b(z) evaluation
-	CEval     fr.Element // c(z) evaluation
-	SigmaEval fr.Element // sigma permutation evaluation
-	ZEval     fr.Element // z(z*omega) evaluation
-}
-
-// PLONKVerifyingKey represents a PLONK verifying key
-type PLONKVerifyingKey struct {
-	// SRS elements
-	G1      bn254.G1Affine // Generator in G1
-	G2      bn254.G2Affine // Generator in G2
-	G2Alpha bn254.G2Affine // [alpha]_2
-
-	// Selector commitments
-	QLCommit bn254.G1Affine // Left selector
-	QRCommit bn254.G1Affine // Right selector
-	QMCommit bn254.G1Affine // Multiplication selector
-	QOCommit bn254.G1Affine // Output selector
-	QCCommit bn254.G1Affine // Constant selector
-
-	// Permutation commitments
-	S1Commit bn254.G1Affine // Sigma_1 permutation
-	S2Commit bn254.G1Affine // Sigma_2 permutation
-	S3Commit bn254.G1Affine // Sigma_3 permutation
-
-	// Domain parameters
-	N      uint64     // Circuit size (power of 2)
-	K1, K2 fr.Element // Coset generators
-	Omega  fr.Element // Root of unity
-}
-
-// verifyPLONKWithGnark performs actual PLONK verification
-func (pv *ProofVerifier) verifyPLONKWithGnark(proof *ZKProof, vkBytes []byte) error {
-	// Deserialize verifying key
-	vk, err := deserializePLONKVerifyingKey(vkBytes)
-	if err != nil {
-		return fmt.Errorf("failed to deserialize PLONK verifying key: %w", err)
-	}
-
-	// Deserialize proof
-	plonkProof, err := deserializePLONKProof(proof.ProofData)
-	if err != nil {
-		return fmt.Errorf("failed to deserialize PLONK proof: %w", err)
-	}
-
-	// Deserialize public inputs
-	publicInputs := make([]fr.Element, 0, len(proof.PublicInputs))
-	for _, inputBytes := range proof.PublicInputs {
-		var elem fr.Element
-		elem.SetBytes(inputBytes)
-		publicInputs = append(publicInputs, elem)
-	}
-
-	// Perform PLONK verification
-	if err := verifyPLONKPairing(plonkProof, vk, publicInputs); err != nil {
-		return fmt.Errorf("PLONK pairing verification failed: %w", err)
-	}
-
-	return nil
-}
-
 // errPLONKIncomplete says why a PLONK proof is never accepted here.
 //
-// What stood in this place checked e(Wz + u·Wzw, [α]₂) = e(z·Wz + u·zω·Wzw, [1]₂)
-// and nothing else. It computed the public-input polynomial at the challenge
-// point and threw the value away, and it never read the selector, permutation,
-// quotient or evaluation commitments — so it related the two opening proofs to
-// each other and said nothing about the statement being proved. A proof bound to
-// no statement is a proof of anything.
+// What stood in this place decoded the proof and the key — exact sizes,
+// subgroup checks, points at infinity, some 200 lines of it — and then handed
+// the result to a pairing that refused every proof unconditionally, because the
+// verification equation
 //
-// The precompile at 0x81 reached the same conclusion about its own copy and
-// fails closed for it. This is the same rule at the second door: refusing costs
-// nothing that works today, because an honest prover's proof does not satisfy
-// that equation either.
+//	e(Wz + u·Wzw, [α]₂) = e(z·Wz + u·zω·Wzw, [1]₂)
+//
+// was never written. Decoding a proof carefully in order to refuse it is not a
+// verifier; it is a shape that reads like one. The refusal is the whole of what
+// this path does, so it is the whole of what this path says.
+//
+// A strict-PQ chain — the default here — refuses classical systems before
+// reaching this at all. On a permissive chain, PLONK is refused here.
 var errPLONKIncomplete = errors.New(
 	"plonk: the verification equation is not implemented — failing closed rather than " +
-		"binding a proof to nothing; use the STARK/FRI verifier on strict-PQ chains")
-
-// verifyPLONKPairing refuses every proof. The decoding above it still runs, so a
-// caller can tell a malformed proof from one this will not judge, and there is
-// no path through here that returns nil.
-func verifyPLONKPairing(_ *PLONKProof, _ *PLONKVerifyingKey, _ []fr.Element) error {
-	return errPLONKIncomplete
-}
-
-// plonkProofSize is 9 G1 commitments and the 5 evaluations that go with them.
-const plonkProofSize = 9*64 + 5*32
-
-// deserializePLONKProof reads a PLONK proof, which is exactly plonkProofSize
-// bytes: every evaluation is part of the proof, so a frame that is short of one
-// is not a proof rather than a proof with a zero in it. Trailing bytes are
-// refused for the reason they are refused elsewhere here — bytes the format
-// does not describe are bytes two proofs can differ in while decoding alike.
-func deserializePLONKProof(data []byte) (*PLONKProof, error) {
-	if len(data) != plonkProofSize {
-		return nil, fmt.Errorf("PLONK proof is %d bytes, want %d", len(data), plonkProofSize)
-	}
-
-	proof := &PLONKProof{}
-	offset := 0
-
-	// Unmarshal 9 G1 points
-	points := []*bn254.G1Affine{
-		&proof.LCommit, &proof.RCommit, &proof.OCommit,
-		&proof.ZCommit, &proof.TLow, &proof.TMid, &proof.THigh,
-		&proof.WzOpening, &proof.WzwOpening,
-	}
-
-	for i, pt := range points {
-		if err := pt.Unmarshal(data[offset : offset+64]); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal G1 point %d: %w", i, err)
-		}
-		if err := checkG1(pt); err != nil {
-			return nil, fmt.Errorf("PLONK proof G1 point %d: %w", i, err)
-		}
-		offset += 64
-	}
-
-	for _, sc := range []*fr.Element{
-		&proof.AEval, &proof.BEval, &proof.CEval, &proof.SigmaEval, &proof.ZEval,
-	} {
-		sc.SetBytes(data[offset : offset+32])
-		offset += 32
-	}
-
-	return proof, nil
-}
-
-// deserializePLONKVerifyingKey deserializes a PLONK verifying key from bytes
-func deserializePLONKVerifyingKey(data []byte) (*PLONKVerifyingKey, error) {
-	if len(data) < 1024 {
-		return nil, errors.New("PLONK verifying key data too short")
-	}
-
-	vk := &PLONKVerifyingKey{}
-	offset := 0
-
-	// G1 (64 bytes)
-	if err := vk.G1.Unmarshal(data[offset : offset+64]); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal G1: %w", err)
-	}
-	if err := checkG1(&vk.G1); err != nil {
-		return nil, fmt.Errorf("PLONK VK G1 generator: %w", err)
-	}
-	offset += 64
-
-	// G2 (128 bytes)
-	if err := vk.G2.Unmarshal(data[offset : offset+128]); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal G2: %w", err)
-	}
-	if err := checkG2(&vk.G2); err != nil {
-		return nil, fmt.Errorf("PLONK VK G2 generator: %w", err)
-	}
-	offset += 128
-
-	// G2Alpha (128 bytes)
-	if err := vk.G2Alpha.Unmarshal(data[offset : offset+128]); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal G2Alpha: %w", err)
-	}
-	if err := checkG2(&vk.G2Alpha); err != nil {
-		return nil, fmt.Errorf("PLONK VK G2Alpha: %w", err)
-	}
-	offset += 128
-
-	// Selector commitments (5 G1 points)
-	selectorPoints := []*bn254.G1Affine{
-		&vk.QLCommit, &vk.QRCommit, &vk.QMCommit, &vk.QOCommit, &vk.QCCommit,
-	}
-	for i, pt := range selectorPoints {
-		if offset+64 > len(data) {
-			return nil, fmt.Errorf("insufficient data for selector %d", i)
-		}
-		if err := pt.Unmarshal(data[offset : offset+64]); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal selector %d: %w", i, err)
-		}
-		if err := checkG1(pt); err != nil {
-			return nil, fmt.Errorf("PLONK VK selector %d: %w", i, err)
-		}
-		offset += 64
-	}
-
-	// Permutation commitments (3 G1 points)
-	permPoints := []*bn254.G1Affine{&vk.S1Commit, &vk.S2Commit, &vk.S3Commit}
-	for i, pt := range permPoints {
-		if offset+64 > len(data) {
-			return nil, fmt.Errorf("insufficient data for permutation %d", i)
-		}
-		if err := pt.Unmarshal(data[offset : offset+64]); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal permutation %d: %w", i, err)
-		}
-		if err := checkG1(pt); err != nil {
-			return nil, fmt.Errorf("PLONK VK permutation %d: %w", i, err)
-		}
-		offset += 64
-	}
-
-	// Domain parameters
-	if offset+8 <= len(data) {
-		vk.N = binary.BigEndian.Uint64(data[offset : offset+8])
-		offset += 8
-	}
-
-	// K1, K2 (32 bytes each)
-	if offset+32 <= len(data) {
-		vk.K1.SetBytes(data[offset : offset+32])
-		offset += 32
-	}
-	if offset+32 <= len(data) {
-		vk.K2.SetBytes(data[offset : offset+32])
-		offset += 32
-	}
-
-	// Omega (32 bytes)
-	if offset+32 <= len(data) {
-		vk.Omega.SetBytes(data[offset : offset+32])
-	}
-
-	return vk, nil
-}
-
-// STARK verification is disabled. The previous implementation only performed
-// structural checks (commitment lengths, FRI layer presence) without actually
-// verifying the FRI protocol or constraint composition. Accepting structurally-
-// valid but mathematically-invalid proofs is worse than rejecting all proofs.
-// Use groth16 or plonk proof types.
-
-// Bulletproof verification is disabled. The previous implementation only checked
-// that L/R vectors were present and a0/b0 were non-zero, without verifying the
-// inner product argument. This is structurally checking, not mathematical
-// verification. Use groth16 or plonk proof types.
+		"accepting a proof on its shape")
