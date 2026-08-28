@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/luxfi/chains/chain"
@@ -18,15 +19,38 @@ import (
 
 var _ chain.Block = (*Block)(nil)
 
-// Block represents a block in the IdentityVM chain
+// maxClockSkew bounds how far ahead of this node's clock a block may be
+// stamped.
+const maxClockSkew = 60 // seconds
+
+var (
+	errInvalidBlock = errors.New("identityvm: invalid block")
+
+	// ErrNotOnTip refuses a block that does not extend the chain: one whose
+	// parent is neither the accepted tip nor a block verified above it.
+	ErrNotOnTip = errors.New("identityvm: block does not extend the accepted tip")
+)
+
+// Block carries every state change this chain makes.
+//
+// It used to carry Identities and Revocations that Verify never looked at and
+// Publish applied anyway — so a peer's block naming {victim's id, attacker's
+// key} took over the victim's DID, and one naming any credential revoked it.
+// Nothing else produced those two lists, and Write persisted neither, so the
+// takeover was invisible on disk and survived until restart.
+//
+// Now every list is produced by this chain, verified here, written here and
+// published here — and identity, issuer and revocation state reaches consensus
+// at all, which it did not when the RPC wrote it straight to the base database
+// on whichever node received the call.
 type Block struct {
-	ParentID_      ids.ID             `json:"parentId"`
-	BlockHeight    uint64             `json:"height"`
-	BlockTimestamp int64              `json:"timestamp"`
-	Credentials    []*Credential      `json:"credentials"`
-	Revocations    []*RevocationEntry `json:"revocations,omitempty"`
-	Identities     []*Identity        `json:"identities,omitempty"`
-	StateRoot      []byte             `json:"stateRoot"`
+	ParentID_      ids.ID        `json:"parentId"`
+	BlockHeight    uint64        `json:"height"`
+	BlockTimestamp int64         `json:"timestamp"`
+	Identities     []*Identity   `json:"identities,omitempty"`
+	Issuers        []*Issuer     `json:"issuers,omitempty"`
+	Credentials    []*Credential `json:"credentials,omitempty"`
+	Revocations    []*Revocation `json:"revocations,omitempty"`
 
 	// Cached values
 	ID_    ids.ID
@@ -43,169 +67,190 @@ func (b *Block) ID() ids.ID {
 	return b.ID_
 }
 
-// computeID computes the block ID as the hash of the canonical ZAP wire.
-// The wire commits to every block field, so identical logical blocks yield
-// identical IDs and any field change moves the ID.
+// computeID is the hash of the chain's binding and the block's canonical wire.
+// The binding — sha256(ChainID ‖ NetworkID) — is NOT on the wire, so the same
+// bytes name a different block on a different chain: two chains with an
+// identical genesis config would otherwise derive the same genesis id, and one
+// chain's blocks would chain onto the other's verbatim.
 func (b *Block) computeID() ids.ID {
-	return ids.ID(sha256.Sum256(b.Bytes()))
+	h := sha256.New()
+	h.Write(b.vm.bind[:])
+	h.Write(b.Bytes())
+	return ids.ID(h.Sum(nil))
 }
 
 // ParentID returns the parent block ID
-func (b *Block) ParentID() ids.ID {
-	return b.ParentID_
-}
+func (b *Block) ParentID() ids.ID { return b.ParentID_ }
 
 // Parent is an alias for ParentID for compatibility
-func (b *Block) Parent() ids.ID {
-	return b.ParentID_
-}
+func (b *Block) Parent() ids.ID { return b.ParentID_ }
 
 // Height returns the block height
-func (b *Block) Height() uint64 {
-	return b.BlockHeight
-}
+func (b *Block) Height() uint64 { return b.BlockHeight }
 
 // Timestamp returns the block timestamp
-func (b *Block) Timestamp() time.Time {
-	return time.Unix(b.BlockTimestamp, 0)
-}
+func (b *Block) Timestamp() time.Time { return time.Unix(b.BlockTimestamp, 0) }
 
 // Status returns the block status
-func (b *Block) Status() uint8 {
-	return uint8(b.status)
+func (b *Block) Status() uint8 { return uint8(b.status) }
+
+// Bytes returns the block's canonical encoding, computed once.
+func (b *Block) Bytes() []byte {
+	if b.bytes == nil {
+		b.bytes = b.Marshal()
+	}
+	return b.bytes
 }
 
-// Verify verifies the block
+// records is how many state changes the block carries.
+func (b *Block) records() int {
+	return len(b.Identities) + len(b.Issuers) + len(b.Credentials) + len(b.Revocations)
+}
+
+// Verify checks the block and every record in it.
+//
+// Records are checked against the state the chain holds PLUS what this block
+// introduces before them, so a credential may name an identity the same block
+// creates, and a second record claiming the same id is refused whichever half
+// of the pair it is.
 func (b *Block) Verify(ctx context.Context) error {
-	// Verify height
 	if b.BlockHeight == 0 && b.ParentID_ != ids.Empty {
-		return errors.New("invalid genesis block")
+		return fmt.Errorf("%w: genesis has no parent", errInvalidBlock)
+	}
+	if n := b.records(); n == 0 || n > b.vm.config.MaxRecordsPerBlock {
+		return fmt.Errorf("%w: %d records, the bound is 1..%d",
+			errInvalidBlock, n, b.vm.config.MaxRecordsPerBlock)
+	}
+	if b.BlockTimestamp > time.Now().Unix()+maxClockSkew {
+		return fmt.Errorf("%w: timestamp %d is beyond the skew allowance", errInvalidBlock, b.BlockTimestamp)
 	}
 
-	// Verify timestamp is not too far in future
-	if b.BlockTimestamp > time.Now().Unix()+60 {
-		return errors.New("block timestamp too far in future")
-	}
-
-	// Verify parent exists and heights are consecutive
 	if b.BlockHeight > 0 {
-		parent, err := b.vm.GetBlock(ctx, b.ParentID_)
+		parent, err := b.vm.chain.Block(b.ParentID_, b.vm.parseBlock)
 		if err != nil {
-			return err
+			return fmt.Errorf("identityvm: parent %s: %w", b.ParentID_, err)
 		}
 
-		if b.BlockHeight != parent.Height()+1 {
-			return errors.New("non-consecutive block heights")
+		// The parent must be one this chain can still build on: the accepted
+		// tip, or a block verified above it. Height alone is not that check —
+		// a block whose parent is an OLD accepted block satisfies
+		// height == parent+1 perfectly well, and accepting it rewinds the tip
+		// and leaves the height index naming an orphan as the block at that
+		// height to every peer that bootstraps from it.
+		tip, tipHeight := b.vm.chain.Tip()
+		if parent.ID() != tip && parent.BlockHeight <= tipHeight {
+			return fmt.Errorf("%w: parent %s at height %d is beneath the tip at %d",
+				ErrNotOnTip, parent.ID(), parent.BlockHeight, tipHeight)
 		}
-
-		if b.BlockTimestamp < parent.Timestamp().Unix() {
-			return errors.New("block timestamp before parent")
+		if b.BlockHeight != parent.BlockHeight+1 {
+			return fmt.Errorf("%w: height %d does not follow parent %d",
+				errInvalidBlock, b.BlockHeight, parent.BlockHeight)
+		}
+		// Chain time only moves forward: it is what credential expiry is
+		// judged against, so a proposer free to rewind it reopens a credential
+		// the chain has already let lapse.
+		if b.BlockTimestamp < parent.BlockTimestamp {
+			return fmt.Errorf("%w: timestamp %d precedes parent %d",
+				errInvalidBlock, b.BlockTimestamp, parent.BlockTimestamp)
 		}
 	}
 
-	// Verify all credentials
-	for _, cred := range b.Credentials {
-		if err := b.verifyCredential(cred); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (b *Block) verifyCredential(cred *Credential) error {
-	// Verify issuer exists
-	_, err := b.vm.GetIssuer(cred.Issuer)
-	if err != nil && !b.vm.config.AllowSelfIssue {
-		return err
-	}
-
-	// Verify claims count
-	if len(cred.Claims) > b.vm.config.MaxClaims {
-		return errors.New("too many claims")
-	}
-
-	// The credential must be unexpired AS OF THIS BLOCK. Comparing against the
-	// wall clock would make the verdict depend on when a node happens to verify:
-	// the same block is valid before the expiry and invalid after it, and a node
-	// replaying history during bootstrap rejects every block whose credentials
-	// have since expired. The block timestamp is the only clock every node agrees
-	// on, and Verify has already bounded it against the parent and local time.
-	if time.Unix(b.BlockTimestamp, 0).After(cred.ExpirationDate) {
-		return errors.New("credential already expired")
-	}
-
-	return nil
+	return b.vm.check(b)
 }
 
 // Accept applies the block. The store commits everything below in one batch,
-// so a credential that cannot be written takes the whole block with it rather
-// than leaving the chain holding half of one.
+// so a record that cannot be written takes the whole block with it rather than
+// leaving the chain holding half of one.
 func (b *Block) Accept(ctx context.Context) error {
+	// A block extends the tip or it is not accepted. Verify reached the same
+	// verdict earlier, against the tip AT THAT TIME; the tip moves between the
+	// two, and a block whose parent has since been buried would otherwise
+	// write the height index and the tip pointer for an abandoned branch.
+	tip, _ := b.vm.chain.Tip()
+	if b.BlockHeight > 0 && b.ParentID_ != tip {
+		return fmt.Errorf("%w: %s extends %s, which is not the tip %s",
+			ErrNotOnTip, b.ID(), b.ParentID_, tip)
+	}
 	return b.vm.chain.Accept(b)
 }
 
-// Write records every credential the block carries. The error a Put returns
-// used to be dropped here, which meant a credential silently missing from the
-// database while the chain went on believing the block had been applied.
+// Write records every change the block makes. All four kinds land here: the
+// identities and revocations used to be applied in memory only, so a restart
+// lost them and the node came back disagreeing with the block it had accepted.
 func (b *Block) Write(db database.Database) error {
+	for _, identity := range b.Identities {
+		if err := db.Put(identityKey(identity.ID), marshalIdentity(identity)); err != nil {
+			return err
+		}
+	}
+	for _, issuer := range b.Issuers {
+		if err := db.Put(issuerKey(issuer.ID), marshalIssuer(issuer)); err != nil {
+			return err
+		}
+	}
 	for _, cred := range b.Credentials {
 		if err := db.Put(credentialKey(cred.ID), marshalCredential(cred)); err != nil {
 			return err
 		}
 	}
+	for _, rev := range b.Revocations {
+		if err := db.Put(revocationKey(rev.CredentialID), marshalRevocation(rev)); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-// Publish makes the block's effects visible: the credentials it carries, the
-// revocations it applies, the identities it introduces, and the block's own
-// status. It runs after the commit, so nothing here can be believed and then
-// lost — which is what setting them first did.
+// Publish makes the block's effects visible in memory. It runs after the
+// commit, so nothing here can be believed and then lost.
 func (b *Block) Publish() {
 	vm := b.vm
 
+	for _, identity := range b.Identities {
+		vm.identities[identity.ID] = identity
+	}
+	for _, issuer := range b.Issuers {
+		vm.issuers[issuer.ID] = issuer
+	}
 	for _, cred := range b.Credentials {
 		vm.credentials[cred.ID] = cred
 	}
 	for _, rev := range b.Revocations {
 		vm.revocations[rev.CredentialID] = rev
-		if cred, ok := vm.credentials[rev.CredentialID]; ok {
-			cred.Status = CredentialRevoked
-		}
-	}
-	for _, identity := range b.Identities {
-		vm.identities[identity.ID] = identity
 	}
 
-	vm.pending.Drop(b.Credentials)
+	vm.pending.Drop(b.changes())
 	b.status = choices.Accepted
 
 	vm.log.Info("Block accepted",
 		log.Uint64("height", b.BlockHeight),
 		log.String("id", b.ID().String()),
-		log.Int("credentials", len(b.Credentials)),
+		log.Int("records", b.records()),
 	)
 }
 
 // Reject discards the block. It wrote nothing, so there is nothing to undo;
-// its credentials stay queued for a later block.
+// what it carried stays queued for a later block.
 func (b *Block) Reject(ctx context.Context) error {
 	b.status = choices.Rejected
 	b.vm.chain.Drop(b.ID())
 	return nil
 }
 
-// Bytes returns the block bytes
-func (b *Block) Bytes() []byte {
-	if b.bytes != nil {
-		return b.bytes
+// changes is the block's records back in the shape the pool holds them.
+func (b *Block) changes() []*Change {
+	out := make([]*Change, 0, b.records())
+	for _, v := range b.Identities {
+		out = append(out, &Change{Identity: v})
 	}
-
-	bytes, err := b.Marshal()
-	if err != nil {
-		return nil
+	for _, v := range b.Issuers {
+		out = append(out, &Change{Issuer: v})
 	}
-
-	b.bytes = bytes
-	return bytes
+	for _, v := range b.Credentials {
+		out = append(out, &Change{Credential: v})
+	}
+	for _, v := range b.Revocations {
+		out = append(out, &Change{Revocation: v})
+	}
+	return out
 }
