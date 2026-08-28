@@ -363,7 +363,9 @@ func TestAbortRollsBackTheWholeBlock(t *testing.T) {
 	require.Zero(t, burned)
 	bal, _ := vm.Balance(k.addr)
 	require.Equal(t, testFund, bal)
-	require.Zero(t, vm.nonceOf(k.addr))
+	nonce, err := vm.nonceOf(k.addr)
+	require.NoError(t, err)
+	require.Zero(t, nonce)
 
 	// And the chain still works.
 	acceptOne(t, vm, good)

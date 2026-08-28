@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/luxfi/chains/fee"
 	"github.com/luxfi/chains/mpcvm/fhe"
 )
 
@@ -298,4 +299,46 @@ func TestHTTPHandlerServesRPC(t *testing.T) {
 	require.Nil(t, static, "F serves nothing that does not depend on chain state")
 
 	var _ http.Handler = h
+}
+
+// TestServiceReportsWhatItCannotAnswer covers the RPC surface's refusals: an
+// address or identifier it cannot decode, and a ledger it cannot read. A read
+// endpoint that answered zero on a failed read would be worse than one that
+// refuses — a caller cannot tell the difference from the outside.
+func TestServiceReportsWhatItCannotAnswer(t *testing.T) {
+	k := newTestKey(t)
+	committee, _ := newCommittee(t, 1)
+	vm := newTestVM(t, fundAll(k), committee, 1)
+	svc := &Service{vm: vm}
+	acceptOne(t, vm, registerTx(t, k, testScheme, digestOf("listed"), 1))
+
+	// A filter whose address does not decode is an error, not an empty listing:
+	// an empty listing reads as "this owner has nothing".
+	require.Error(t, svc.ListCiphertexts(nil,
+		&ListCiphertextsArgs{Owner: "not-an-address"}, &ListCiphertextsReply{}))
+	require.Error(t, svc.Balance(nil, &BalanceArgs{Address: "zz"}, &BalanceReply{}))
+
+	// The control: the same calls with sound arguments answer.
+	var listed ListCiphertextsReply
+	require.NoError(t, svc.ListCiphertexts(nil, &ListCiphertextsArgs{Owner: k.hexAddr()}, &listed))
+	require.Equal(t, 1, listed.Total)
+
+	var bal BalanceReply
+	require.NoError(t, svc.Balance(nil, &BalanceArgs{Address: k.hexAddr()}, &bal))
+	require.Less(t, bal.BalanceNLUX, testFund, "the fee was burned")
+	require.Positive(t, bal.BurnedNLUX)
+
+	// A ledger that cannot be read is reported, on both the balance it names and
+	// the supply it reports beside it.
+	sound := vm.state
+	vm.state = &faults{Database: sound, readFails: []byte("fee/")}
+	vm.ledger = fee.NewLedger(vm.state)
+	require.ErrorIs(t, svc.Balance(nil, &BalanceArgs{Address: k.hexAddr()}, &BalanceReply{}), errDisk)
+	require.ErrorIs(t, svc.Health(nil, &HealthArgs{}, &HealthReply{}), errDisk)
+	vm.state, vm.ledger = sound, fee.NewLedger(sound)
+
+	// And with it sound again, health answers.
+	var h HealthReply
+	require.NoError(t, svc.Health(nil, &HealthArgs{}, &h))
+	require.True(t, h.Healthy)
 }

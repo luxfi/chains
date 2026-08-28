@@ -98,3 +98,22 @@ func TestGas_EveryOperationIsPriced(t *testing.T) {
 	}
 	require.Len(t, opBaseGas, len(opNames), "every priced operation must have exactly one name")
 }
+
+// TestFeeForRefusesWhatItCannotPrice proves the fee surface fails closed on the
+// same inputs the gas schedule does. A fee that defaulted to zero on an unknown
+// operation would be an operation that settles nothing.
+func TestFeeForRefusesWhatItCannotPrice(t *testing.T) {
+	if _, err := FeeFor(&Transaction{Type: 99}); err == nil {
+		t.Fatal("FeeFor priced an operation the schedule does not name")
+	}
+	if _, err := FeeFor(&Transaction{Type: TxRegisterCiphertext, Scheme: "rot13-n1"}); err == nil {
+		t.Fatal("FeeFor priced a scheme the schedule does not name")
+	}
+	f, err := FeeFor(&Transaction{Type: TxRegisterCiphertext, Scheme: testScheme})
+	if err != nil {
+		t.Fatalf("the control failed: %v", err)
+	}
+	if f == 0 {
+		t.Fatal("a priced operation settles nothing")
+	}
+}

@@ -347,10 +347,15 @@ func decode[T any](payload []byte, op string) (T, error) {
 	return v, nil
 }
 
-// authenticate verifies the payer authorized this transaction. PUBLIC ONLY:
-// parse the payer's ML-DSA-65 public key, require it hashes to Payer, and
-// verify the signature over SigningBytes. No secret material is touched.
-func (tx *Transaction) authenticate() error {
+// authenticate verifies the payer authorized this transaction ON THIS CHAIN.
+// PUBLIC ONLY: parse the payer's ML-DSA-65 public key, require it hashes to
+// Payer, and verify the signature over SigningBytes(chain). No secret material
+// is touched.
+//
+// chain is the verifying node's own chain id, never one the transaction
+// carries, so a transaction signed for another F-Chain fails here rather than
+// spending a balance the payer holds on every chain at the same address.
+func (tx *Transaction) authenticate(chain ids.ID) error {
 	if len(tx.Auth) == 0 || len(tx.Sig) == 0 {
 		return ErrUnsignedTx
 	}
@@ -361,7 +366,7 @@ func (tx *Transaction) authenticate() error {
 	if err != nil {
 		return fmt.Errorf("fhevm: payer public key: %w", err)
 	}
-	if !pub.VerifySignature(tx.SigningBytes(), tx.Sig) {
+	if !pub.VerifySignature(tx.SigningBytes(chain), tx.Sig) {
 		return ErrBadSignature
 	}
 	return nil

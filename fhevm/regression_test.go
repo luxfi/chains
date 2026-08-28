@@ -6,6 +6,7 @@ package fhevm
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"reflect"
 	"sort"
@@ -281,13 +282,28 @@ func TestH3_BytesArePricedAndBounded(t *testing.T) {
 	})
 	require.ErrorIs(t, trailing.SyntacticVerify(), ErrInvalidPayload)
 
-	// Bulk is bounded outright, whatever shape it claims.
+	// Bulk is bounded outright, whatever shape it claims. The payload here is
+	// VALID and decodes to exactly the schema — whitespace is not content — so
+	// the only thing that can refuse it is the length bound itself. Filling it
+	// with bytes that are not JSON would prove nothing: the decoder would refuse
+	// those with or without a bound, and the test would pass over a chain that
+	// had none.
+	padded := append(mustJSON(t, RegisterPayload{Digest: digest, Type: 4, Level: 3, Size: 4096}),
+		bytes.Repeat([]byte(" "), MaxPayload)...)
+	require.Greater(t, len(padded), MaxPayload)
 	huge := k.sign(t, &Transaction{
 		Type: TxRegisterCiphertext, Scheme: testScheme, Payer: k.addr,
-		Subject: handle, GasLimit: testGas, Nonce: 1,
-		Payload: bytes.Repeat([]byte("A"), MaxPayload+1),
+		Subject: handle, GasLimit: testGas, Nonce: 1, Payload: padded,
 	})
 	require.ErrorIs(t, huge.SyntacticVerify(), ErrInvalidPayload)
+
+	// The control: the same value, unpadded, is accepted — so what was refused
+	// was the size and nothing else.
+	require.NoError(t, k.sign(t, &Transaction{
+		Type: TxRegisterCiphertext, Scheme: testScheme, Payer: k.addr,
+		Subject: handle, GasLimit: testGas, Nonce: 1,
+		Payload: mustJSON(t, RegisterPayload{Digest: digest, Type: 4, Level: 3, Size: 4096}),
+	}).SyntacticVerify())
 
 	// And Scheme is not a second unpriced channel on the operations that ignore
 	// it: it is bounded on every operation.
@@ -774,4 +790,368 @@ func TestM3_TheInFlightSetIsBounded(t *testing.T) {
 		require.Greater(t, blk.height, vm.height,
 			"block %s at height %d is at or below the accepted height %d", id, blk.height, vm.height)
 	}
+}
+
+// C2: Verify required only that a block's height was its parent's plus one, and
+// never that the parent was the TIP. A block at height 2 whose parent is the
+// long-since-accepted block at height 1 satisfies that perfectly, so a chain at
+// height 3 verified it, accepted it, and rewound: the last-accepted pointer, the
+// in-memory height and the height index all moved back to the orphan, while the
+// index still named the abandoned block at height 3. Every peer bootstrapping
+// from that index was served an incoherent chain.
+func TestC2_AnOrphanCannotRewindTheChain(t *testing.T) {
+	k := newTestKey(t)
+	committee, _ := newCommittee(t, 1)
+	vm := newTestVM(t, fundAll(k), committee, 1)
+
+	acceptOne(t, vm, registerTx(t, k, testScheme, digestOf("one"), 1))
+	forkPoint, forkTime := vm.lastAccepted, vm.lastBlock.timestamp
+	acceptOne(t, vm, registerTx(t, k, testScheme, digestOf("two"), 2))
+	acceptOne(t, vm, registerTx(t, k, testScheme, digestOf("three"), 3))
+	tip, height := vm.lastAccepted, vm.height
+	require.Equal(t, uint64(3), height)
+
+	// Everything else about this block is impeccable: the height follows its
+	// parent, the time follows its parent and is inside the skew allowance, and
+	// its transaction carries the payer's next nonce against committed state.
+	orphan := &Block{
+		parentID:     forkPoint,
+		height:       2,
+		timestamp:    forkTime.Add(time.Second),
+		transactions: []*Transaction{registerTx(t, k, testScheme, digestOf("rewind"), 4)},
+		vm:           vm,
+	}
+	orphan.id = orphan.computeID()
+
+	require.ErrorIs(t, orphan.Verify(context.Background()), ErrNotOnTip)
+	require.ErrorIs(t, orphan.Accept(context.Background()), ErrNotOnTip,
+		"Accept decides this too: Verify judged an earlier tip")
+
+	require.Equal(t, height, vm.height, "the chain did not rewind")
+	require.Equal(t, tip, vm.lastAccepted)
+	at2, err := vm.GetBlockIDAtHeight(context.Background(), 2)
+	require.NoError(t, err)
+	require.NotEqual(t, orphan.id, at2, "the height index still names the accepted chain")
+	_, ok := vm.Ciphertext(orphan.transactions[0].Subject)
+	require.False(t, ok, "and applied nothing")
+
+	// The control: the same transaction in a block that DOES extend the tip is
+	// accepted. What was refused is the parent, not the contents.
+	acceptOne(t, vm, registerTx(t, k, testScheme, digestOf("rewind"), 4))
+	require.Equal(t, uint64(4), vm.height)
+}
+
+// C2: Accept re-decides it because the tip moves between the two calls. The
+// engine may verify a block, accept a sibling, and only then accept the first —
+// at which point it no longer extends anything.
+func TestC2_ATipThatMovesAfterVerifyIsCaughtByAccept(t *testing.T) {
+	first, second := newTestKey(t), newTestKey(t)
+	committee, _ := newCommittee(t, 1)
+	vm := newTestVM(t, fundAll(first, second), committee, 1)
+
+	a := forceBlock(vm, registerTx(t, first, testScheme, digestOf("a"), 1))
+	b := forceBlock(vm, registerTx(t, second, testScheme, digestOf("b"), 1))
+	require.NotEqual(t, a.id, b.id, "two distinct siblings on one parent")
+
+	require.NoError(t, a.Verify(context.Background()))
+	require.NoError(t, b.Verify(context.Background()), "both verify against the same tip")
+
+	require.NoError(t, a.Accept(context.Background()))
+	require.ErrorIs(t, b.Accept(context.Background()), ErrNotOnTip,
+		"the sibling no longer extends the tip, whatever Verify said earlier")
+	require.Equal(t, uint64(1), vm.height)
+}
+
+// H7: MaxBlockTxs was applied by Verify, and Verify runs after the parse — so
+// nothing bounded what a peer could make this node parse, hash and allocate
+// before a single check had run. An 8 MB message carrying 1,524 transactions
+// parsed to completion. Both bounds belong at the first byte, and neither
+// implies the other: the byte bound limits what is read, the count bound limits
+// what is verified, and a small message can still declare a great many tiny
+// transactions.
+func TestH7_ABlockIsBoundedInBytesAndInCount(t *testing.T) {
+	k := newTestKey(t)
+	committee, _ := newCommittee(t, 1)
+	vm := newTestVM(t, fundAll(k), committee, 1)
+
+	// Bytes: a block over the size bound is refused before it is decoded.
+	fat := registerTx(t, k, testScheme, digestOf("fat"), 1)
+	fat.Payload = bytes.Repeat([]byte("A"), MaxPayload)
+	k.sign(t, fat)
+	bulk := make([]*Transaction, 0, 32)
+	for len(bulk) < 32 {
+		bulk = append(bulk, fat)
+	}
+	huge := &Block{parentID: vm.lastAccepted, height: 1, timestamp: vm.clock.Time(), transactions: bulk, vm: vm}
+	raw := huge.Bytes()
+	require.Greater(t, len(raw), MaxBlockSize)
+	_, err := vm.ParseBlock(context.Background(), raw)
+	require.ErrorIs(t, err, ErrInvalidPayload, "an oversize block is refused at the first byte")
+
+	// Count: a block UNDER the size bound may still declare more transactions
+	// than may ever be verified, so the count is bounded at the parse too.
+	tiny := &Transaction{Type: TxRevokePermit, Nonce: 1, Payload: mustJSON(t, RevokePayload{})}
+	many := make([]*Transaction, 0, MaxBlockTxs+1)
+	for len(many) < MaxBlockTxs+1 {
+		many = append(many, tiny)
+	}
+	crowd := &Block{parentID: vm.lastAccepted, height: 1, timestamp: vm.clock.Time(), transactions: many, vm: vm}
+	crowded := crowd.Bytes()
+	require.LessOrEqual(t, len(crowded), MaxBlockSize, "this one is small; only the count is out of bounds")
+	_, err = vm.ParseBlock(context.Background(), crowded)
+	require.ErrorIs(t, err, ErrInvalidPayload)
+
+	// A block this node builds is held to the byte bound too, so a proposer
+	// cannot produce one its peers refuse to parse.
+	require.ErrorIs(t, huge.Verify(context.Background()), ErrInvalidBlock)
+
+	// The control: one transaction under both bounds round-trips.
+	acceptOne(t, vm, registerTx(t, k, testScheme, digestOf("ordinary"), 1))
+	_, err = vm.ParseBlock(context.Background(), vm.lastBlock.Bytes())
+	require.NoError(t, err)
+}
+
+// H7: selection stops at the byte bound as well as the count, so the proposer
+// and the parser agree. Stopping only on the count let 1024 ordinary
+// transactions — each carrying an ML-DSA-65 public key and signature — build a
+// 5 MB block this node's own parser refuses.
+func TestH7_SelectionStopsAtTheByteBound(t *testing.T) {
+	k := newTestKey(t)
+	committee, _ := newCommittee(t, 1)
+	vm := newTestVM(t, map[string]uint64{k.hexAddr(): 1 << 50}, committee, 1)
+
+	// Ordinary register transactions — nothing oversized about any of them. What
+	// makes them heavy is the fixed part: an ML-DSA-65 public key and signature,
+	// about 5 KB a transaction, which no payload bound touches.
+	const queued = 450
+	for nonce := uint64(1); nonce <= queued; nonce++ {
+		_, err := vm.SubmitTx(registerTx(t, k, testScheme, digestOf(strconv.FormatUint(nonce, 10)), nonce))
+		require.NoError(t, err)
+	}
+	require.Len(t, vm.mempool, queued)
+
+	blkIntf, err := vm.BuildBlock(context.Background())
+	require.NoError(t, err)
+	blk := blkIntf.(*Block)
+
+	require.LessOrEqual(t, len(blk.Bytes()), MaxBlockSize,
+		"the proposer stopped at the size its own parser enforces")
+	require.Less(t, len(blk.transactions), queued, "so it could not take them all")
+	require.Less(t, len(blk.transactions), MaxBlockTxs,
+		"and the BYTE bound is what stopped it, well before the count bound")
+
+	require.NoError(t, blk.Verify(context.Background()))
+	_, err = vm.ParseBlock(context.Background(), blk.Bytes())
+	require.NoError(t, err, "what it built, it can parse")
+
+	// The rest is still queued and goes out in the next block.
+	require.NoError(t, blk.Accept(context.Background()))
+	require.Len(t, vm.mempool, queued-len(blk.transactions))
+	next := acceptQueued(t, vm)
+	require.NotEmpty(t, next.transactions)
+}
+
+// H8: nothing bound a transaction or a block to the chain it was meant for. An
+// address is the hash of a public key, so the same payer exists on every
+// F-Chain; a transaction lifted from one authenticated verbatim on the others
+// and burned a balance there for an operation nobody asked for. Blocks were
+// worse: every chain whose genesis carried the same timestamp had the SAME
+// genesis id, so one chain's block resolved its parent on all of them.
+func TestH8_ASignatureAndABlockNameOneChain(t *testing.T) {
+	k := newTestKey(t)
+	committee, _ := newCommittee(t, 1)
+	other := ids.ID{'a', 'n', 'o', 't', 'h', 'e', 'r'}
+
+	home := newTestVM(t, fundAll(k), committee, 1)
+	away := newVMOnChain(t, other, fundAll(k), committee, 1)
+
+	// Same genesis bytes, same timestamp, different chains: different ids.
+	require.NotEqual(t, home.lastAccepted, away.lastAccepted,
+		"two chains must not share a genesis block")
+
+	// A transaction signed for home does not authenticate away.
+	tx := registerTx(t, k, testScheme, digestOf("mine"), 1)
+	require.NoError(t, tx.authenticate(home.chainID))
+	require.ErrorIs(t, tx.authenticate(away.chainID), ErrBadSignature)
+	_, err := away.SubmitTx(tx)
+	require.ErrorIs(t, err, ErrBadSignature, "the replay is refused at admission")
+
+	// Nor inside a block: a peer forcing it in gets a refusal, not an effect.
+	forced := &Block{
+		parentID: away.lastAccepted, height: 1, timestamp: away.clock.Time(),
+		transactions: []*Transaction{tx}, vm: away,
+	}
+	forced.id = forced.computeID()
+	require.ErrorIs(t, forced.Verify(context.Background()), ErrBadSignature)
+
+	// And home's whole block does not land away: its parent is a genesis away
+	// has never heard of.
+	acceptOne(t, home, tx)
+	parsed, err := away.ParseBlock(context.Background(), home.lastBlock.Bytes())
+	require.NoError(t, err, "the bytes are well formed; it is the chain that differs")
+	require.Error(t, parsed.Verify(context.Background()))
+	require.Zero(t, away.height, "nothing from another chain moved this one")
+
+	// The control: signed for away, it works away.
+	native := k.signFor(t, other, registerTx(t, k, testScheme, digestOf("theirs"), 1))
+	_, err = away.SubmitTx(native)
+	require.NoError(t, err)
+}
+
+// newVMOnChain seats a chain with an explicitly named id. Only a test that is
+// about more than one chain needs it; every other one uses testChainID, because
+// production runs one chain with one id.
+func newVMOnChain(t *testing.T, chain ids.ID, alloc map[string]uint64, committee []fhe.CommitteeMember, threshold int) *VM {
+	t.Helper()
+	logger := log.NewNoOpLogger()
+	gb, err := json.Marshal(Genesis{
+		Version: 1, Timestamp: testGenesisTime, Alloc: alloc,
+		Committee: committee, Threshold: threshold, PublicKey: []byte("network-fhe-public-key"),
+	})
+	require.NoError(t, err)
+	vm := &VM{}
+	require.NoError(t, vm.Initialize(context.Background(), vmcore.Init{
+		Runtime:  &runtime.Runtime{ChainID: chain, NetworkID: 96369, Log: logger},
+		DB:       memdb.New(),
+		ToEngine: make(chan vmcore.Message, 8),
+		Log:      logger,
+		Genesis:  gb,
+	}))
+	t.Cleanup(func() { _ = vm.Shutdown(context.Background()) })
+	return vm
+}
+
+// L3: what an UNAUTHENTICATED transaction can make this node do before its
+// signature is checked. The answer must be bounded by its own declared size,
+// and it is: bytes and count are bounded at the parse, the payload and scheme
+// are bounded before either is decoded, and the one expensive decode — parsing
+// a committee's ML-DSA-65 public keys — is bounded by MaxCommittee.
+func TestL3_UnauthenticatedWorkIsBoundedBySize(t *testing.T) {
+	k := newTestKey(t)
+
+	// The costly branch: an epoch proposal makes SyntacticVerify parse a public
+	// key per member, and that runs before authenticate. MaxCommittee bounds it.
+	over, _ := newCommittee(t, MaxCommittee+1)
+	huge := &Transaction{
+		Type: TxAdvanceEpoch, Nonce: 1,
+		Subject: committeeDigest(1, 2, []byte("pk"), over),
+		Payload: mustJSON(t, AdvancePayload{Epoch: 1, Committee: over, Threshold: 2, PublicKey: []byte("pk")}),
+	}
+	require.ErrorIs(t, huge.SyntacticVerify(), ErrInvalidCommittee,
+		"the committee is refused by COUNT, before any of its keys is parsed")
+
+	// Every other byte channel is bounded before it is decoded at all.
+	for name, tx := range map[string]*Transaction{
+		"payload": {Type: TxRevokePermit, Nonce: 1, Payload: bytes.Repeat([]byte("A"), MaxPayload+1)},
+		"scheme":  {Type: TxRevokePermit, Nonce: 1, Scheme: string(bytes.Repeat([]byte("A"), MaxScheme+1)), Payload: mustJSON(t, RevokePayload{})},
+		"auth":    {Type: TxRevokePermit, Nonce: 1, Payload: mustJSON(t, RevokePayload{}), Auth: bytes.Repeat([]byte("A"), 9)},
+		"sig":     {Type: TxRevokePermit, Nonce: 1, Payload: mustJSON(t, RevokePayload{}), Sig: bytes.Repeat([]byte("A"), 9)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.ErrorIs(t, tx.SyntacticVerify(), ErrInvalidPayload)
+		})
+	}
+
+	// And the order holds where it matters: a transaction whose signature is
+	// wrong is refused, so nothing beyond the bounded checks above is ever done
+	// on an unauthenticated one.
+	forged := registerTx(t, k, testScheme, digestOf("forged"), 1)
+	forged.Sig[0] ^= 0xff
+	require.ErrorIs(t, forged.authenticate(testChainID), ErrBadSignature)
+}
+
+// The receive path must decide exactly what the build path decides. A sibling
+// VM's parser discarded the transaction set, so a signature check gated on the
+// set being non-empty ran only on blocks that node had built itself: the same
+// block was refused in memory and accepted off the wire. Here the same block is
+// fed in BOTH ways and the two verdicts are required to agree — for a sound
+// block and for each way one can be unsound.
+func TestTheWireVerdictIsTheMemoryVerdict(t *testing.T) {
+	k := newTestKey(t)
+	committee, _ := newCommittee(t, 1)
+	vm := newTestVM(t, fundAll(k), committee, 1)
+
+	bothWays := func(t *testing.T, blk *Block) (inMemory, offWire error) {
+		t.Helper()
+		inMemory = blk.Verify(context.Background())
+		parsed, err := vm.ParseBlock(context.Background(), blk.Bytes())
+		if err != nil {
+			return inMemory, err
+		}
+		return inMemory, parsed.Verify(context.Background())
+	}
+
+	build := func(txs ...*Transaction) *Block {
+		b := &Block{
+			parentID: vm.lastAccepted, height: vm.height + 1,
+			timestamp: vm.clock.Time(), transactions: txs, vm: vm,
+		}
+		b.id = b.computeID()
+		return b
+	}
+
+	// Sound: both accept.
+	sound := build(registerTx(t, k, testScheme, digestOf("sound"), 1))
+	mem, wire := bothWays(t, sound)
+	require.NoError(t, mem)
+	require.NoError(t, wire)
+
+	// Forged signature: both refuse, and for the same reason.
+	forged := registerTx(t, k, testScheme, digestOf("forged"), 1)
+	forged.Sig = append([]byte(nil), forged.Sig...)
+	forged.Sig[0] ^= 0xff
+	forged.id = ids.Empty
+	mem, wire = bothWays(t, build(forged))
+	require.ErrorIs(t, mem, ErrBadSignature)
+	require.ErrorIs(t, wire, ErrBadSignature)
+
+	// Unsigned: a transaction carrying no authorization at all must not become
+	// authorized by travelling.
+	unsigned := registerTx(t, k, testScheme, digestOf("unsigned"), 1)
+	unsigned.Auth, unsigned.Sig, unsigned.id = nil, nil, ids.Empty
+	mem, wire = bothWays(t, build(unsigned))
+	require.ErrorIs(t, mem, ErrUnsignedTx)
+	require.ErrorIs(t, wire, ErrUnsignedTx)
+
+	// A nonce out of order: refused both ways.
+	mem, wire = bothWays(t, build(registerTx(t, k, testScheme, digestOf("gap"), 9)))
+	require.ErrorIs(t, mem, ErrBadNonce)
+	require.ErrorIs(t, wire, ErrBadNonce)
+
+	// And an empty block does not become non-empty by being parsed.
+	mem, _ = bothWays(t, build())
+	require.ErrorIs(t, mem, ErrInvalidBlock)
+}
+
+// A fixed-width field read past the end of its message copies NOTHING, leaving
+// the destination zeroed — the shape that silently turned a short signature
+// into a well-formed unverifiable envelope in a sibling package. Here it cannot
+// pass: a zeroed field re-serializes to bytes that are not the bytes that
+// arrived, and the canonical rule refuses the difference.
+func TestATruncatedFixedFieldIsRefusedNotZeroFilled(t *testing.T) {
+	sound := sampleTx().Bytes()
+	n, err := zapLen(sound)
+	require.NoError(t, err)
+
+	// Shrink the leading message's declared size so Payer and Subject fall
+	// outside it. zapLen still passes — it reads only the size — and zap.Parse
+	// still passes, because the header is intact.
+	for _, cut := range []int{txPayer + 4, txSubject + 4, txSubject + 20} {
+		truncated := append([]byte(nil), sound...)
+		size := zap.HeaderSize + cut
+		require.Less(t, size, n, "the cut must actually fall inside the message")
+		binary.LittleEndian.PutUint32(truncated[12:16], uint32(size))
+
+		if _, err := zapLen(truncated); err != nil {
+			t.Fatalf("cut %d: the length field is sound, zapLen must pass: %v", cut, err)
+		}
+		_, err := ParseTransaction(truncated)
+		require.Errorf(t, err, "cut %d: a field read past the end must refuse, not zero-fill", cut)
+	}
+
+	// The control: uncut, it parses and its fixed fields survive intact.
+	parsed, err := ParseTransaction(sound)
+	require.NoError(t, err)
+	require.Equal(t, sampleTx().Payer, parsed.Payer)
+	require.Equal(t, sampleTx().Subject, parsed.Subject)
 }
