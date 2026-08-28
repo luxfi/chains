@@ -4,6 +4,7 @@
 package fhevm
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"github.com/luxfi/chains/mpcvm/fhe"
 	"github.com/luxfi/crypto/mldsa"
 	"github.com/luxfi/ids"
+	"github.com/luxfi/log"
 )
 
 // Transaction types. Each is a MUTATING operation that may only take effect
@@ -118,6 +120,27 @@ type AdvancePayload struct {
 	PublicKey []byte                `json:"publicKey"`
 }
 
+// Size bounds. Every one of these is a byte channel onto a chain that keeps
+// what it is given, so each is bounded before anything is decoded and priced
+// once it is.
+const (
+	// MaxPayload bounds an operation's encoding. It is set by the largest
+	// legitimate payload — a MaxCommittee-member epoch proposal, whose members
+	// each carry an ML-DSA-65 public key — with room to spare.
+	MaxPayload = 128 * 1024
+	// MaxScheme bounds the scheme name. Scheme names are short labels
+	// ("ckks-n14"); anything longer is a channel, not a name.
+	MaxScheme = 32
+	// MaxCommittee bounds a threshold committee. It bounds the epoch payload,
+	// and with it the public-key parsing an UNAUTHENTICATED transaction can
+	// demand before its own signature is checked.
+	MaxCommittee = 32
+	// MaxCiphertextSize bounds the off-chain body a registration may describe.
+	// The body is not stored here, but a size nobody could ever serve describes
+	// nothing.
+	MaxCiphertextSize = 1 << 30
+)
+
 // DefaultRequestWindow is how long a decryption request stays answerable when
 // the requester names no expiry. A request that no committee can still answer
 // is dead weight in state, and an unbounded one would be answerable by a future
@@ -154,6 +177,22 @@ func (tx *Transaction) SyntacticVerify() error {
 	default:
 		return ErrInvalidTxType
 	}
+	// Bounds FIRST, before anything is decoded or parsed, so the work an
+	// unauthenticated transaction can demand is bounded by its own size.
+	if len(tx.Payload) > MaxPayload {
+		return fmt.Errorf("fhevm: %w: payload %d exceeds %d bytes", ErrInvalidPayload, len(tx.Payload), MaxPayload)
+	}
+	if len(tx.Scheme) > MaxScheme {
+		return fmt.Errorf("fhevm: %w: scheme %d exceeds %d bytes", ErrInvalidPayload, len(tx.Scheme), MaxScheme)
+	}
+	// Auth and Sig are fixed-width by algorithm. Pinning them here keeps them
+	// from becoming a third byte channel that the base cost would carry for free.
+	if len(tx.Auth) != 0 && len(tx.Auth) != mldsa.GetPublicKeySize(payerAuthMode) {
+		return fmt.Errorf("fhevm: %w: auth is %d bytes, not %d", ErrInvalidPayload, len(tx.Auth), mldsa.GetPublicKeySize(payerAuthMode))
+	}
+	if len(tx.Sig) != 0 && len(tx.Sig) != mldsa.GetSignatureSize(payerAuthMode) {
+		return fmt.Errorf("fhevm: %w: signature is %d bytes, not %d", ErrInvalidPayload, len(tx.Sig), mldsa.GetSignatureSize(payerAuthMode))
+	}
 	// Pricing also validates scheme membership for scheme-bearing ops.
 	if _, err := GasFor(tx); err != nil {
 		return err
@@ -171,8 +210,8 @@ func (tx *Transaction) SyntacticVerify() error {
 		if p.Digest == ([32]byte{}) {
 			return fmt.Errorf("fhevm: %w: register: empty ciphertext digest", ErrInvalidPayload)
 		}
-		if p.Size == 0 {
-			return fmt.Errorf("fhevm: %w: register: zero-length ciphertext", ErrInvalidPayload)
+		if p.Size == 0 || p.Size > MaxCiphertextSize {
+			return fmt.Errorf("fhevm: %w: register: ciphertext size %d", ErrInvalidPayload, p.Size)
 		}
 		if p.Level < 0 {
 			return fmt.Errorf("fhevm: %w: register: negative level", ErrInvalidPayload)
@@ -251,6 +290,9 @@ func ValidateCommittee(c []fhe.CommitteeMember, threshold int, publicKey []byte)
 	if len(c) == 0 {
 		return fmt.Errorf("fhevm: %w: empty committee", ErrInvalidCommittee)
 	}
+	if len(c) > MaxCommittee {
+		return fmt.Errorf("fhevm: %w: %d members exceeds %d", ErrInvalidCommittee, len(c), MaxCommittee)
+	}
 	if threshold <= 0 || threshold > len(c) {
 		return fmt.Errorf("fhevm: %w: threshold %d of %d", ErrInvalidThreshold, threshold, len(c))
 	}
@@ -260,6 +302,13 @@ func ValidateCommittee(c []fhe.CommitteeMember, threshold int, publicKey []byte)
 	if !committeeOrder(c) {
 		return fmt.Errorf("fhevm: %w: members not in canonical node-ID order", ErrInvalidCommittee)
 	}
+	// A seat is only a vote if a distinct account can cast it. Membership is
+	// tested by addressOf(PublicKey) — the same derivation that authenticates a
+	// payer — so that is what must be unique. Deduplicating NodeID instead let n
+	// seats share one key: the committee passed every check, reported itself
+	// fully seated, and could never reach its own threshold, for a decryption or
+	// for rotating itself out.
+	voters := make(map[fee.Account]struct{}, len(c))
 	for i, m := range c {
 		if i > 0 && c[i-1].NodeID == m.NodeID {
 			return fmt.Errorf("fhevm: %w: duplicate member %s", ErrInvalidCommittee, m.NodeID)
@@ -267,15 +316,33 @@ func ValidateCommittee(c []fhe.CommitteeMember, threshold int, publicKey []byte)
 		if _, err := mldsa.PublicKeyFromBytes(m.PublicKey, payerAuthMode); err != nil {
 			return fmt.Errorf("fhevm: %w: member %s key: %v", ErrInvalidCommittee, m.NodeID, err)
 		}
+		acct := addressOf(m.PublicKey)
+		if _, dup := voters[acct]; dup {
+			return fmt.Errorf("fhevm: %w: member %s shares a voting identity with another seat",
+				ErrInvalidCommittee, m.NodeID)
+		}
+		voters[acct] = struct{}{}
 	}
 	return nil
 }
 
-// decode unmarshals an op payload, naming the operation in the error.
+// decode unmarshals an op payload, naming the operation in the error. It
+// accepts EXACTLY the schema: a member the schema does not describe, or bytes
+// after the value, is refused rather than ignored.
+//
+// encoding/json ignores what it does not recognise, which on a chain that
+// persists the transaction verbatim is a byte channel — a ciphertext body in a
+// "body" member decoded fine, cost nothing extra, and came back out of the
+// block store. There is one encoding of each payload and this is it.
 func decode[T any](payload []byte, op string) (T, error) {
 	var v T
-	if err := json.Unmarshal(payload, &v); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&v); err != nil {
 		return v, fmt.Errorf("fhevm: %w: %s: %v", ErrInvalidPayload, op, err)
+	}
+	if dec.More() {
+		return v, fmt.Errorf("fhevm: %w: %s: trailing content", ErrInvalidPayload, op)
 	}
 	return v, nil
 }
@@ -307,26 +374,37 @@ func (tx *Transaction) authenticate() error {
 // withdrawn, or the member already counted, and abort the block that carried
 // them both.
 //
-// Nonces do not catch that on their own. A payer's nonces n and n+1 are both
+// Nonces do not catch that on their own: a payer's nonces n and n+1 are both
 // valid, so one payer can build two transactions that individually pass every
-// check and together wedge a block — and since a rejected block requeues its
-// contents, the same doomed pair would be rebuilt indefinitely. Naming the
+// check and together spend a block on work only one of them can do. Naming the
 // effect lets admission refuse the second before it is ever queued (vm.go
 // SubmitTx) and lets consensus refuse a peer's block that contains both
-// (block.go Verify). One function, both layers, no drift.
+// (batch.admit). One function, both layers, no drift.
 func (tx *Transaction) effect() [32]byte {
 	h := sha256.New()
 	h.Write([]byte{tx.Type})
-	h.Write(tx.Subject[:])
 	switch tx.Type {
+	case TxAdvanceEpoch:
+		// The DECISION, not the proposal. Exactly one epoch is ever open —
+		// checkAuth refuses any target but the sitting epoch's successor — so a
+		// member's vote is named by the member alone. Naming it by Subject
+		// instead made two votes for two different committees two different
+		// effects: both passed admission, both passed Verify against committed
+		// state, and Accept applied the first and refused the second. A block
+		// every validator certifies and no validator can apply halts the chain
+		// at that height, which is the whole thing this function exists to stop.
+		h.Write(tx.Payer[:])
+
 	case TxRegisterCiphertext, TxRevokePermit:
 		// The entry is named by Subject alone: one registration per handle, one
 		// withdrawal per permit, whoever asks for it.
+		h.Write(tx.Subject[:])
 
-	case TxFulfillDecrypt, TxAdvanceEpoch:
-		// A threshold decision takes one write per member, so the effect is the
-		// member's VOTE rather than the value voted for. That is what stops a
-		// member spending twice on one decision, or hedging across two values.
+	case TxFulfillDecrypt:
+		// One write per member per request. The voted value lives in the
+		// payload, so the effect is the member's vote on THIS request rather
+		// than the result it names.
+		h.Write(tx.Subject[:])
 		h.Write(tx.Payer[:])
 
 	default:
@@ -334,6 +412,7 @@ func (tx *Transaction) effect() [32]byte {
 		// payer and its nonce, so no two of them collide — the same owner may
 		// grant twice over one handle, to different grantees, in one block.
 		// Qualifying by the same two fields keeps that true here.
+		h.Write(tx.Subject[:])
 		h.Write(tx.Payer[:])
 		var u8 [8]byte
 		binary.BigEndian.PutUint64(u8[:], tx.Nonce)
@@ -426,6 +505,22 @@ func (tx *Transaction) checkAuth(vm *VM, now int64) error {
 		if req.Expiry != 0 && now > req.Expiry {
 			return ErrRequestExpired
 		}
+		// The permit that authorized the ask must still authorize it. Revocation
+		// is a withdrawal of consent and reaches a request already in flight —
+		// otherwise an owner who revoked would watch the committee answer anyway
+		// and deliver the plaintext to the callback.
+		//
+		// Expiry is deliberately NOT re-checked. It bounds when the grantee may
+		// ASK; the grantee asked in time, and the committee answering afterwards
+		// is not the grantee acting. Re-checking it would make any permit
+		// shorter than a decryption round useless.
+		pm, ok := vm.getPermit(req.PermitID)
+		if !ok {
+			return ErrPermitNotFound
+		}
+		if pm.Status != StatusActive {
+			return ErrPermitRevoked
+		}
 		// Only the committee of the epoch the request was made in may answer it:
 		// a later committee holds different shares and never saw the permit.
 		ep, ok := vm.getEpoch(req.Epoch)
@@ -434,9 +529,6 @@ func (tx *Transaction) checkAuth(vm *VM, now int64) error {
 		}
 		if !ep.memberOf(tx.Payer) {
 			return ErrNotCommittee
-		}
-		if attested(req.Attestations, tx.Payer) {
-			return ErrAlreadyAttested
 		}
 		return nil
 
@@ -453,9 +545,6 @@ func (tx *Transaction) checkAuth(vm *VM, now int64) error {
 		if !cur.memberOf(tx.Payer) {
 			return ErrNotCommittee
 		}
-		if attested(cur.Attestations, tx.Payer) {
-			return ErrAlreadyAttested
-		}
 		return nil
 
 	default:
@@ -463,31 +552,50 @@ func (tx *Transaction) checkAuth(vm *VM, now int64) error {
 	}
 }
 
-// Apply mutates VM state for an already-verified, already-paid transaction. It
-// runs inside block.Accept, writing through the VM's versiondb so the effect
-// commits atomically with the fee burn. now is the accepting block's unix time
-// — every timestamp F stores comes from here, never from a validator's clock.
-// It re-runs checkAuth (defense in depth) before mutating.
-func (tx *Transaction) Apply(vm *VM, now int64) error {
+// Apply is where authorization is DECIDED and where state changes. It runs
+// inside block.Accept, writing through the VM's versiondb so an effect commits
+// atomically with the fee burn. now is the accepting block's unix time — every
+// timestamp F stores comes from here, never from a validator's clock.
+//
+// It reports whether the transaction took effect. A transaction that fails
+// checkAuth REVERTS: applied is false, err is nil, state is untouched, and the
+// caller still burns the fee and consumes the nonce. This is the only place the
+// verdict is reached, so every validator reaches it from the same committed
+// state in the same order. Deciding it earlier, in Verify, would let a block
+// pass consensus on state that an earlier transaction in the same block then
+// changes — and a block every validator certifies and no validator can apply
+// halts the chain.
+//
+// A non-nil err means the write itself failed, which no validator can proceed
+// past; block.Accept rolls the whole block back.
+func (tx *Transaction) Apply(vm *VM, now int64) (bool, error) {
 	if err := tx.checkAuth(vm, now); err != nil {
-		return err
+		vm.log.Info("F-Chain transaction reverted",
+			log.String("txID", tx.ID().String()),
+			log.String("reason", err.Error()),
+		)
+		return false, nil
 	}
+	var err error
 	switch tx.Type {
 	case TxRegisterCiphertext:
-		return tx.applyRegister(vm, now)
+		err = tx.applyRegister(vm, now)
 	case TxGrantPermit:
-		return tx.applyGrant(vm, now)
+		err = tx.applyGrant(vm, now)
 	case TxRevokePermit:
-		return tx.applyRevoke(vm)
+		err = tx.applyRevoke(vm)
 	case TxRequestDecrypt:
-		return tx.applyRequest(vm, now)
+		err = tx.applyRequest(vm, now)
 	case TxFulfillDecrypt:
-		return tx.applyFulfill(vm, now)
+		err = tx.applyFulfill(vm, now)
 	case TxAdvanceEpoch:
-		return tx.applyAdvance(vm, now)
+		err = tx.applyAdvance(vm, now)
 	default:
-		return ErrInvalidTxType
+		// Unreachable: SyntacticVerify refuses an unknown type before a
+		// transaction can reach a block. Treated as a refusal, not a halt.
+		return false, nil
 	}
+	return err == nil, err
 }
 
 func (tx *Transaction) applyRegister(vm *VM, now int64) error {
@@ -583,7 +691,7 @@ func (tx *Transaction) applyFulfill(vm *VM, now int64) error {
 	if !ok {
 		return ErrEpochNotFound
 	}
-	req.Attestations = append(req.Attestations, Attestation{Member: tx.Payer, Value: p.Result})
+	req.Attestations = vote(req.Attestations, tx.Payer, p.Result)
 	// The request completes the moment a threshold of DISTINCT members have
 	// named the same handle. A member that names a different one is counted
 	// against that value alone, so it delays nothing and pays for the privilege.
@@ -601,7 +709,7 @@ func (tx *Transaction) applyAdvance(vm *VM, now int64) error {
 		return err
 	}
 	cur := vm.currentEpoch()
-	cur.Attestations = append(cur.Attestations, Attestation{Member: tx.Payer, Value: tx.Subject})
+	cur.Attestations = vote(cur.Attestations, tx.Payer, tx.Subject)
 	if tally(cur.Attestations, tx.Subject) < cur.Threshold {
 		// Not yet decided: record the vote against the sitting epoch and stop.
 		return vm.putEpoch(cur)

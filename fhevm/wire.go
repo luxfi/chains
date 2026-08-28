@@ -17,7 +17,9 @@ import (
 // Native-ZAP struct-is-wire for F-Chain (fhevm). No hand-rolled big-endian, no
 // cursor codec — the Transaction and the Block each own their marshal/parse
 // over zap objects at FIXED field offsets. The on-wire format is exactly these
-// offsets (canonical: parse rejects trailing bytes).
+// offsets, and BOTH parsers are canonical: each re-serializes what it decoded
+// and refuses input that is not already byte-identical to it. Exactly one
+// byte-string decodes to each transaction and each block.
 //
 // SECURITY — the signing/authentication architecture:
 //
@@ -219,7 +221,21 @@ func parseBlock(vm *VM, data []byte) (*Block, error) {
 		b.transactions = append(b.transactions, tx)
 		pos += int(l)
 	}
+	// The lengths must account for the whole blob. Without this, bytes no length
+	// covers ride along unread: the fields decode identically, the id is
+	// computed from the transactions rather than the bytes, and a block has as
+	// many encodings as an attacker cares to make.
+	if pos != len(blob) {
+		return nil, fmt.Errorf("fhevm: %w: %d unread bytes in the tx blob",
+			ErrInvalidPayload, len(blob)-pos)
+	}
+	// And the whole encoding must be the one this block serializes to, the same
+	// rule ParseTransaction applies — so the claim in this file's header holds
+	// for a block as well as for a transaction.
 	b.id = b.computeID()
+	if !bytes.Equal(data, b.Bytes()) {
+		return nil, fmt.Errorf("fhevm: %w: non-canonical block encoding", ErrInvalidPayload)
+	}
 	return b, nil
 }
 

@@ -30,11 +30,14 @@ func TestFeeSettledThroughConsensus(t *testing.T) {
 
 	tx := registerTx(t, k, testScheme, digestOf("treasury"), 1)
 
-	// The fee is computed from the per-scheme gas schedule, NOT supplied by the
-	// caller: register + ckks-n14 = (21000 + 60000) gas * 1000 nLUX/gas.
+	// The fee is computed from the schedule, NOT supplied by the caller:
+	// register + ckks-n14 = (21000 + 60000) gas, plus 16 gas for every byte the
+	// transaction puts on the chain, all at 1000 nLUX/gas.
 	expectedFee, err := FeeFor(tx)
 	require.NoError(t, err)
-	require.Equal(t, uint64(81_000_000), expectedFee)
+	stored := fee.Gas(len(tx.Payload) + len(tx.Scheme))
+	require.Equal(t, uint64((21_000+60_000+stored*GasPerByte)*GasPrice), expectedFee)
+	require.Greater(t, expectedFee, uint64(81_000_000), "stored bytes are not free")
 
 	txID, err := vm.SubmitTx(tx)
 	require.NoError(t, err)
@@ -106,31 +109,38 @@ func TestUnfundedPayerCannotSettle(t *testing.T) {
 
 // TestCumulativeFeesWithinBlock proves affordability is checked against the
 // payer's RUNNING debit inside the block, not its opening balance: two
-// operations that each fit alone but do not fit together are refused.
+// operations that each fit alone but do not fit together never share a block,
+// and a peer proposing both is refused.
 func TestCumulativeFeesWithinBlock(t *testing.T) {
 	k := newTestKey(t)
 	committee, _ := newCommittee(t, 1)
 
-	one, err := FeeFor(&Transaction{Type: TxRegisterCiphertext, Scheme: testScheme})
+	a := registerTx(t, k, testScheme, digestOf("a"), 1)
+	b := registerTx(t, k, testScheme, digestOf("b"), 2)
+	one, err := FeeFor(a)
 	require.NoError(t, err)
 	// Enough for one operation and one nLUX, never for two.
 	vm := newTestVM(t, map[string]uint64{k.hexAddr(): one + 1}, committee, 1)
-
-	a := registerTx(t, k, testScheme, digestOf("a"), 1)
-	b := registerTx(t, k, testScheme, digestOf("b"), 2)
 	_, err = vm.SubmitTx(a)
 	require.NoError(t, err)
 	_, err = vm.SubmitTx(b)
 	require.NoError(t, err, "each is affordable on its own at admission")
 
+	// The proposer takes what fits and leaves the rest queued, rather than
+	// proposing a block its own Verify would reject.
 	blk, err := vm.BuildBlock(context.Background())
 	require.NoError(t, err)
-	require.ErrorIs(t, blk.(*Block).Verify(context.Background()), fee.ErrInsufficientFunds)
+	require.Len(t, blk.(*Block).transactions, 1, "only the affordable one is taken")
+	require.NoError(t, blk.(*Block).Verify(context.Background()))
+	require.Len(t, vm.mempool, 2, "selection does not drain the queue")
+
+	// A peer proposing both is refused.
+	require.ErrorIs(t, forceBlock(vm, a, b).Verify(context.Background()), fee.ErrInsufficientFunds)
 }
 
 // TestGasLimitEnforced proves the payer's declared ceiling is real: an
-// operation costing more gas than the payer allowed is refused rather than
-// silently charged.
+// operation costing more gas than the payer allowed is never included and never
+// charged.
 func TestGasLimitEnforced(t *testing.T) {
 	k := newTestKey(t)
 	committee, _ := newCommittee(t, 1)
@@ -143,12 +153,15 @@ func TestGasLimitEnforced(t *testing.T) {
 	_, err := vm.SubmitTx(tx)
 	require.NoError(t, err, "admission prices the operation but does not meter it")
 
-	blk, err := vm.BuildBlock(context.Background())
-	require.NoError(t, err)
-	require.ErrorIs(t, blk.(*Block).Verify(context.Background()), fee.ErrOutOfGas)
+	// Nothing else is queued, so the proposer has nothing it can build.
+	_, err = vm.BuildBlock(context.Background())
+	require.ErrorIs(t, err, errNoPendingTxs)
+
+	// And a peer proposing it is refused.
+	require.ErrorIs(t, forceBlock(vm, tx).Verify(context.Background()), fee.ErrOutOfGas)
 
 	burned, _ := vm.Burned()
-	require.Zero(t, burned, "a refused block burns nothing")
+	require.Zero(t, burned, "an unmetered operation is never charged")
 }
 
 // TestTamperedOrUnsignedTxRejected proves authorization integrity at the VM
@@ -202,22 +215,36 @@ func TestReplayRejected(t *testing.T) {
 	require.Equal(t, balAfter, bal2, "replay must not burn the payer again")
 }
 
-// TestNonceMustBeSequential proves a payer's transactions are ordered: a gap is
-// refused, so a signed transaction cannot be held back and injected later out
-// of order.
+// TestNonceMustBeSequential proves admission enforces the SAME nonce rule
+// consensus does, counted over what is already queued. It used to accept any
+// nonce above the committed one, so a payer could queue a gap that made every
+// block containing it unverifiable — and a Verify-failed block is discarded
+// without Reject, so the queue behind it went too.
 func TestNonceMustBeSequential(t *testing.T) {
 	k := newTestKey(t)
 	committee, _ := newCommittee(t, 1)
 	vm := newTestVM(t, map[string]uint64{k.hexAddr(): testFund}, committee, 1)
 
-	// Nonce 2 without 1: admission accepts it (it is greater than the last
-	// used), but consensus requires exactly the next one.
-	skipped := registerTx(t, k, testScheme, digestOf("skip"), 2)
-	_, err := vm.SubmitTx(skipped)
+	// A gap is refused outright.
+	_, err := vm.SubmitTx(registerTx(t, k, testScheme, digestOf("skip"), 2))
+	require.ErrorIs(t, err, ErrBadNonce)
+	require.Empty(t, vm.mempool)
+
+	// Consecutive nonces queue, including ahead of the committed one.
+	_, err = vm.SubmitTx(registerTx(t, k, testScheme, digestOf("one"), 1))
 	require.NoError(t, err)
-	blk, err := vm.BuildBlock(context.Background())
+	_, err = vm.SubmitTx(registerTx(t, k, testScheme, digestOf("two"), 2))
+	require.NoError(t, err, "the second follows the first that is already queued")
+	_, err = vm.SubmitTx(registerTx(t, k, testScheme, digestOf("four"), 4))
+	require.ErrorIs(t, err, ErrBadNonce, "and a gap after them is still a gap")
+
+	blk := acceptQueued(t, vm)
+	require.Len(t, blk.transactions, 2)
+	require.Empty(t, vm.mempool, "acceptance is what clears the queue")
+
+	// After acceptance the payer continues from the committed nonce.
+	_, err = vm.SubmitTx(registerTx(t, k, testScheme, digestOf("three"), 3))
 	require.NoError(t, err)
-	require.ErrorIs(t, blk.(*Block).Verify(context.Background()), ErrBadNonce)
 }
 
 // TestDuplicateEffectRefused proves one payer cannot queue two transactions
@@ -252,11 +279,14 @@ func TestDuplicateEffectRefused(t *testing.T) {
 	require.ErrorIs(t, err, ErrCiphertextExists)
 }
 
-// TestAcceptIsAtomic proves a block that fails partway through applies NOTHING
-// and burns NOTHING. The pair here passes Verify honestly — at that moment the
-// permit is still active — and only collides once the revocation lands, which
-// is exactly the case a per-transaction check cannot see coming.
-func TestAcceptIsAtomic(t *testing.T) {
+// TestUnauthorizedTransactionReverts proves an authorization failure costs the
+// payer its fee and nothing else. The pair here passes Verify honestly — at
+// that moment the permit is still active — and only conflicts once the
+// revocation lands, which is exactly the case no per-transaction check can see
+// coming. Aborting the block there would mean one every validator certified and
+// none could apply, which halts the chain; reverting the one transaction does
+// not.
+func TestUnauthorizedTransactionReverts(t *testing.T) {
 	owner := newTestKey(t)
 	grantee := newTestKey(t)
 	committee, _ := newCommittee(t, 1)
@@ -268,39 +298,77 @@ func TestAcceptIsAtomic(t *testing.T) {
 	handle, permitID := seedPermit(t, vm, owner, grantee, fhe.PermitOpDecrypt, 0)
 
 	burnedBefore, _ := vm.Burned()
-	ownerBefore, _ := vm.Balance(owner.addr)
 	granteeBefore, _ := vm.Balance(grantee.addr)
 
-	// Revocation first, then a request that the revocation invalidates. The
-	// owner has already spent nonces 1 and 2 seeding the permit.
+	// Revocation first, then a request the revocation invalidates. The owner has
+	// already spent nonces 1 and 2 seeding the permit.
 	revoke := revokeTx(t, owner, permitID, 3)
 	request := requestTx(t, grantee, testScheme, handle, permitID, 0, 1)
 
 	blk := forceBlock(vm, revoke, request)
 	require.NoError(t, blk.Verify(context.Background()),
-		"both are valid against committed state — the conflict is created by the block itself")
+		"both are well-formed, ordered and paid for — authorization is not Verify's question")
+	require.NoError(t, blk.Accept(context.Background()),
+		"the block applies; only the transaction that lost its authority reverts")
 
-	require.ErrorIs(t, blk.Accept(context.Background()), ErrPermitRevoked)
-
-	// Nothing applied: the permit is still active, no request exists.
+	// The revocation took effect.
 	pm, ok := vm.Permit(permitID)
 	require.True(t, ok)
-	require.Equal(t, StatusActive, pm.Status, "the revocation must be rolled back with the block")
-	_, ok = vm.Decrypt(deriveRequestID(handle, grantee.addr, 1))
-	require.False(t, ok)
-
-	// Nothing burned, no balance moved.
-	burnedAfter, _ := vm.Burned()
-	require.Equal(t, burnedBefore, burnedAfter, "an aborted block burns nothing")
-	ownerAfter, _ := vm.Balance(owner.addr)
-	granteeAfter, _ := vm.Balance(grantee.addr)
-	require.Equal(t, ownerBefore, ownerAfter)
-	require.Equal(t, granteeBefore, granteeAfter)
-
-	// The chain is still usable: the revocation alone succeeds.
-	acceptOne(t, vm, revokeTx(t, owner, permitID, 3))
-	pm, _ = vm.Permit(permitID)
 	require.Equal(t, StatusRevoked, pm.Status)
+
+	// The request did not.
+	_, ok = vm.Decrypt(deriveRequestID(handle, grantee.addr, 1))
+	require.False(t, ok, "a reverted transaction leaves no record")
+
+	// But it paid: the fee is burned and the nonce consumed, so a revert is not
+	// free block space.
+	requestFee, err := FeeFor(request)
+	require.NoError(t, err)
+	revokeFee, err := FeeFor(revoke)
+	require.NoError(t, err)
+	burnedAfter, _ := vm.Burned()
+	require.Equal(t, burnedBefore+requestFee+revokeFee, burnedAfter)
+	granteeAfter, _ := vm.Balance(grantee.addr)
+	require.Equal(t, granteeBefore-requestFee, granteeAfter)
+
+	// The nonce advanced, so the reverted transaction cannot be retried as-is.
+	_, err = vm.SubmitTx(request)
+	require.ErrorIs(t, err, ErrBadNonce)
+}
+
+// TestAbortRollsBackTheWholeBlock proves the commit boundary: when settlement
+// cannot proceed at all — here a nonce Verify would have caught, reached by
+// calling Accept directly — the versiondb is rolled back and the caches are
+// reloaded, so no part of the block survives.
+func TestAbortRollsBackTheWholeBlock(t *testing.T) {
+	k := newTestKey(t)
+	committee, _ := newCommittee(t, 1)
+	vm := newTestVM(t, map[string]uint64{k.hexAddr(): testFund}, committee, 1)
+
+	good := registerTx(t, k, testScheme, digestOf("good"), 1)
+	gapped := registerTx(t, k, testScheme, digestOf("gapped"), 3) // 2 is missing
+
+	blk := forceBlock(vm, good, gapped)
+	require.ErrorIs(t, blk.Verify(context.Background()), ErrBadNonce,
+		"consensus would never accept this block")
+	require.ErrorIs(t, blk.Accept(context.Background()), ErrBadNonce)
+
+	// The first transaction had already been applied and burned in memory when
+	// the second failed. Neither survives.
+	_, ok := vm.Ciphertext(good.Subject)
+	require.False(t, ok)
+	_, ok = vm.Ciphertext(gapped.Subject)
+	require.False(t, ok)
+	burned, _ := vm.Burned()
+	require.Zero(t, burned)
+	bal, _ := vm.Balance(k.addr)
+	require.Equal(t, testFund, bal)
+	require.Zero(t, vm.nonceOf(k.addr))
+
+	// And the chain still works.
+	acceptOne(t, vm, good)
+	_, ok = vm.Ciphertext(good.Subject)
+	require.True(t, ok)
 }
 
 // forceBlock builds a block directly from the given transactions, bypassing the

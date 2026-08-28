@@ -68,10 +68,47 @@ result delays nothing and pays for the attempt.
 F **wraps** `mpcvm/fhe/` rather than restating it: its records embed that
 package's types and its public parameters come from `DefaultThresholdConfig()`.
 It does **not** use that package's `Registry`, which stamps records with
-`time.Now()` — right for the off-chain daemon it was written for, wrong for a
-state root, because two validators replaying one block would write different
-bytes. F owns its persistence and every timestamp it writes comes from the
-accepting block.
+`time.Now()` — right for the off-chain daemon it was written for, wrong here,
+because two validators replaying one block would store different bytes and
+return different answers to the same query. F owns its persistence and every
+timestamp it writes comes from the accepting block.
+
+**A transaction that fails authorization REVERTS**: it burns its fee, consumes
+its nonce, and changes nothing. Authorization is decided once, in `Accept`,
+because an earlier transaction in the same block can change the state a later
+one is judged against — so a verdict reached in `Verify` can differ from the one
+reached at application, and a block every validator certifies and no validator
+can apply halts the chain at that height. `Verify` therefore asks only that a
+block is well-formed, authentic, correctly ordered and paid for; `batch.admit`
+is that rule, and `BuildBlock` runs the same rule and simply leaves out what
+does not fit, so a proposer cannot build a block its own `Verify` would reject.
+
+### Two things F does not have, and the one change that gives both
+
+F **commits no state root**, and it **cannot verify a child of a block it has
+not yet accepted** (the second is shared with `keyvm/`). Both come from the same
+gap: there is one state layer, so `Verify` reads committed state and a proposer
+cannot know its post-state until `Accept`.
+
+- A root checked only at `Accept` would be *worse* than none — a wrong root in a
+  proposed block would pass `Verify` everywhere and fail `Accept` everywhere,
+  which is a halt an adversary triggers at will.
+- Verifying `b2` on top of an unaccepted `b1` needs `b1`'s post-state, which is
+  the same missing layer.
+
+The fix for both is a state layer per in-flight block (`versiondb` chains, with
+the record caches moving under it). Until then, determinism is enforced from
+outside consensus by `replay_test.go`, which replays a chain onto independently
+built nodes running different clocks and requires their databases to be
+byte-identical.
+
+Chain time is monotone and bounded ahead of the verifier's clock by
+`MaxFutureSkew`; within `[parent timestamp, clock + skew]` the proposer still
+chooses, so a permit that lapsed during a gap in block production can authorize
+one request in the block that closes the gap. `TestH2_ProposerFreedomIsExactly‑
+TheGapSinceTheLastBlock` measures exactly that. Removing it means counting
+lifetimes in block heights, which no proposer can rewind — a change to the grant
+API, not a patch.
 
 T-Chain is gone entirely — LP-134 dissolves it with zero remainder (threshold
 signing → M, FHE → F, cross-chain messaging/teleport → B). There is no

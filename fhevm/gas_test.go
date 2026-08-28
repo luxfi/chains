@@ -69,15 +69,20 @@ func TestGas_UnknownOperationRejected(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestGas_RecordOpsAreSchemeIndependent proves the fixed-size record writes
-// ignore the scheme field entirely.
-func TestGas_RecordOpsAreSchemeIndependent(t *testing.T) {
+// TestGas_RecordOpsIgnoreWhichScheme proves the fixed-size record writes do not
+// care WHICH scheme is named — only how many bytes it takes to name it, which
+// every operation pays for because every operation stores it.
+func TestGas_RecordOpsIgnoreWhichScheme(t *testing.T) {
 	for _, op := range []uint8{TxGrantPermit, TxRevokePermit, TxFulfillDecrypt, TxAdvanceEpoch} {
 		a, err := FeeFor(&Transaction{Type: op, Scheme: "ckks-n15"})
 		require.NoError(t, err)
-		b, err := FeeFor(&Transaction{Type: op})
+		b, err := FeeFor(&Transaction{Type: op, Scheme: "tfhe-n10"})
 		require.NoError(t, err)
-		require.Equalf(t, a, b, "op %d must be scheme-independent", op)
+		require.Equalf(t, a, b, "op %d must not care which scheme is named", op)
+
+		none, err := FeeFor(&Transaction{Type: op})
+		require.NoError(t, err)
+		require.Greaterf(t, a, none, "op %d must still pay for the bytes it stores", op)
 	}
 }
 

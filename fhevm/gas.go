@@ -16,6 +16,15 @@ import (
 // the two fee surfaces can never silently drift apart.
 const GasPrice = fee.Gas(1_000)
 
+// GasPerByte prices the bytes a transaction puts on the chain FOREVER: its
+// payload and its scheme, the two fields whose length the payer chooses. It
+// follows Ethereum's non-zero calldata rate for the same reason — storage is
+// the cost a base fee cannot express — and it is what stops a ciphertext body
+// riding onto F for the price of the handle that was supposed to replace it.
+// The fixed part of a transaction (header, public key, signature) is bounded by
+// construction and is covered by the operation's base cost.
+const GasPerByte = fee.Gas(16)
+
 // opBaseGas prices the STRUCTURAL cost of an operation — signature
 // authentication, state writes, indexing — independent of any FHE scheme.
 var opBaseGas = map[uint8]fee.Gas{
@@ -79,7 +88,7 @@ func GasFor(tx *Transaction) (fee.Gas, error) {
 		}
 		total += sg
 	}
-	return total, nil
+	return total + fee.Gas(len(tx.Payload)+len(tx.Scheme))*GasPerByte, nil
 }
 
 // FeeFor returns the nLUX fee a transaction settles: GasFor(tx) * GasPrice.
