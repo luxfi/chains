@@ -33,7 +33,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"net/http"
 	"sync"
 	"time"
 
@@ -132,6 +131,11 @@ type BlockResult struct {
 	// recomputes it on every validator and rejects a block whose claimed root
 	// does not match — the multi-validator safety gate M0 omitted.
 	StateRoot ids.ID
+
+	// Applied are the transactions that took effect, in order. A proposer puts
+	// exactly these in the block it builds, so a block a node builds is a block
+	// that node verifies.
+	Applied [][]byte
 }
 
 // VM is the inner functional storage VM. It holds the dual-DB layering and the
@@ -181,14 +185,16 @@ func (vm *VM) Initialize(ctx context.Context, vmInit vmcore.Init) error {
 		vm.chainID = vm.consensusRuntime.ChainID
 	}
 
-	// Logger from runtime, falling back to a no-op.
-	if vm.consensusRuntime != nil && vm.consensusRuntime.Log != nil {
+	// Logger: the consensus runtime's if it has a usable one, otherwise whatever
+	// the factory installed, otherwise a no-op. Resolved in ONE place, because
+	// the old fallback asked an UNSET logger whether it was zero — a nil
+	// interface, and a panic at boot for any VM the manager hands no runtime.
+	if vm.consensusRuntime != nil {
 		if logger, ok := vm.consensusRuntime.Log.(log.Logger); ok && !logger.IsZero() {
 			vm.log = logger
-		} else {
-			vm.log = log.Noop()
 		}
-	} else if vm.log.IsZero() {
+	}
+	if vm.log == nil || vm.log.IsZero() {
 		vm.log = log.Noop()
 	}
 
@@ -218,11 +224,43 @@ func (vm *VM) Initialize(ctx context.Context, vmInit vmcore.Init) error {
 // manifest writes land in vm.db's in-memory layer and become durable only when
 // acceptBlock commits the batch.
 func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime time.Time, blockTxs [][]byte, blockCtx BlockContext) (*BlockResult, error) {
+	result, refused, err := vm.run(blockHeight, blockTime, blockTxs, blockCtx)
+	if err != nil {
+		return nil, err
+	}
+	// A verifier is judging somebody else's block: a safety-gate violation
+	// anywhere in it fails the WHOLE block. Admitting it as a skipped transaction
+	// would silently accept a block a proposer built to write a range it does not
+	// own — the exact double-write the pinned writer forbids.
+	if refused != nil {
+		vm.abort()
+		return nil, refused
+	}
+	return result, nil
+}
+
+// Select is the proposer's half of the same discipline: it applies candidates
+// and returns the block result for the ones that TOOK EFFECT, leaving the rest
+// out. A proposer is choosing its own contents, so an unusable candidate is
+// simply not included — where a verifier must reject the block, a builder must
+// not build one it would then refuse, and must not let one bad candidate cost
+// every other transaction in the mempool its place.
+func (vm *VM) Select(blockHeight uint64, blockTime time.Time, candidates [][]byte, blockCtx BlockContext) (*BlockResult, error) {
+	result, _, err := vm.run(blockHeight, blockTime, candidates, blockCtx)
+	return result, err
+}
+
+// run applies txs to the version layer and computes the block's state root over
+// the result. It returns the transactions that took effect, plus the first
+// safety-gate violation it saw — it never stops early, so one refused
+// transaction does not cost the ones behind it their place. The two callers
+// differ only in what they do with `refused`.
+func (vm *VM) run(blockHeight uint64, blockTime time.Time, blockTxs [][]byte, blockCtx BlockContext) (*BlockResult, error, error) {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
 
 	if vm.shutdown {
-		return nil, errShutdown
+		return nil, nil, errShutdown
 	}
 
 	// Apply over COMMITTED state, not accumulated staging. A block is processed
@@ -247,32 +285,30 @@ func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime ti
 		blockHash:   blockHash,
 	}
 
+	var refused error
 	for i, txBytes := range blockTxs {
-		if err := vm.processTx(txBytes, blockCtx); err != nil {
-			// Two failure classes, two dispositions:
-			//
-			//   - A SAFETY-GATE violation (a non-owner AllocateTx, or an allocate
-			//     with no validator set to prove ownership) FAILS THE WHOLE BLOCK.
-			//     Letting it through as a skipped tx would silently admit a block a
-			//     malicious proposer built to write a range it does not own — the
-			//     exact double-write the pinned writer forbids. The block must be
-			//     rejected so no validator accepts it.
-			//   - Any OTHER per-tx failure (a malformed/invalid manifest) does not
-			//     fail the block: it simply stages no write, mirroring dexvm's
-			//     per-tx-failure-continues discipline (dexvm/vm.go:562).
-			if isAllocateGateError(err) {
-				return nil, err
-			}
-			if !vm.log.IsZero() {
-				vm.log.Warn("S-Chain transaction failed", "index", i, "error", err)
-			}
+		err := vm.processTx(txBytes, blockCtx)
+		if err == nil {
+			result.Applied = append(result.Applied, txBytes)
+			continue
+		}
+		// A transaction that fails stages nothing and the rest continue, mirroring
+		// dexvm's per-tx-failure discipline. A SAFETY-GATE violation (a non-owner
+		// AllocateTx, an allocate with no validator set to prove ownership, a
+		// replayed one) is recorded so the verifier can fail the whole block.
+		if isAllocateGateError(err) && refused == nil {
+			refused = err
+		}
+		if !vm.log.IsZero() {
+			vm.log.Warn("S-Chain transaction failed", "index", i, "error", err)
 		}
 	}
 
 	vm.currentBlockHeight = blockHeight
 	vm.lastBlockTime = blockTime
 	if err := vm.state.SetLastBlock(blockHash, blockHeight); err != nil {
-		return nil, fmt.Errorf("failed to persist last block: %w", err)
+		vm.db.Abort()
+		return nil, nil, fmt.Errorf("failed to persist last block: %w", err)
 	}
 
 	// Commit the post-apply manifest state into the block's StateRoot. The writes
@@ -283,14 +319,26 @@ func (vm *VM) ProcessBlock(ctx context.Context, blockHeight uint64, blockTime ti
 	// root and rejects a mismatch.
 	root, err := vm.computeStateRoot(blockHash)
 	if err != nil {
-		return nil, err
+		vm.db.Abort()
+		return nil, nil, err
 	}
 	result.StateRoot = root
 
 	if !vm.log.IsZero() {
 		vm.log.Debug("S-Chain block processed", "height", blockHeight, "txs", len(blockTxs), "root", root)
 	}
-	return result, nil
+	return result, refused, nil
+}
+
+// abort drops the version layer's staged writes. It is the counterpart of the
+// Abort every apply starts with: a run that does not end in a commit must leave
+// nothing behind for the next one to pick up.
+func (vm *VM) abort() {
+	vm.lock.Lock()
+	defer vm.lock.Unlock()
+	if vm.db != nil {
+		vm.db.Abort()
+	}
 }
 
 // computeStateRoot folds the block's consensus binding (blockHash + height) with
@@ -381,13 +429,11 @@ func (vm *VM) processTx(txBytes []byte, blockCtx BlockContext) error {
 // across blocks AND across owner re-pin (the counter is committed VM state, not
 // owner-local memory — DESIGN §6.5).
 func (vm *VM) applyAllocate(tx *txs.AllocateTx, blockCtx BlockContext) error {
-	// (1) Fail closed when the set is empty: with no validators nobody can be proven
-	// the owner (pinning.Owner returns false on an empty set).
-	if len(blockCtx.Members) == 0 {
-		return errNoValidatorSet
-	}
-	rangeKey := []byte(tx.Range)
-	owner, ok := pinning.Owner(rangeKey, blockCtx.Members)
+	// (1) Fail closed when no member can be proven the owner — an empty set, or
+	// one whose members all carry zero stake. pinning.Owner answers that in one
+	// place; asking whether the set is empty first was a second guard for the
+	// same question, and only the narrower half of it.
+	owner, ok := pinning.Owner([]byte(tx.Range), blockCtx.Members)
 	if !ok {
 		return errNoValidatorSet
 	}
@@ -418,22 +464,34 @@ func (vm *VM) applyAllocate(tx *txs.AllocateTx, blockCtx BlockContext) error {
 		return err
 	}
 
-	base, err := vm.state.GetAlloc(tx.Range)
+	cur, err := vm.state.GetAlloc(tx.Range)
 	if err != nil {
-		return fmt.Errorf("allocate: read counter for range %q: %w", tx.Range, err)
+		return fmt.Errorf("allocate: read allocator state for range %q: %w", tx.Range, err)
 	}
-	next := base + uint64(tx.Count)
-	if next < base {
+
+	// (6) Single use. The signature covers the nonce but nothing compared it to
+	// state, so an owner's allocate could be REPLAYED by anyone who saw it: the
+	// signature still verifies, the epoch is still current, the fingerprint still
+	// matches, and the range's id space is consumed again for free. A range's
+	// allocations are ordered by a strictly increasing nonce, so a replay is a
+	// nonce the range has already spent.
+	if tx.Nonce <= cur.Nonce {
+		return fmt.Errorf("%w: range %q nonce %d already spent (at %d)",
+			errAllocateReplay, tx.Range, tx.Nonce, cur.Nonce)
+	}
+
+	next := cur.Next + uint64(tx.Count)
+	if next < cur.Next {
 		// uint64 wraparound — the range has exhausted its 2^64 id space. Refuse
 		// rather than reissue ids from 0 (which would violate uniqueness). In
 		// practice unreachable, but a silent wrap would be a correctness hole.
 		return fmt.Errorf("allocate: range %q counter overflow", tx.Range)
 	}
-	if err := vm.state.SetAlloc(tx.Range, next); err != nil {
-		return fmt.Errorf("allocate: stage counter for range %q: %w", tx.Range, err)
+	if err := vm.state.SetAlloc(tx.Range, state.Alloc{Next: next, Nonce: tx.Nonce}); err != nil {
+		return fmt.Errorf("allocate: stage allocator state for range %q: %w", tx.Range, err)
 	}
 	if !vm.log.IsZero() {
-		vm.log.Debug("S-Chain allocate", "range", tx.Range, "base", base, "count", tx.Count, "next", next)
+		vm.log.Debug("S-Chain allocate", "range", tx.Range, "base", cur.Next, "count", tx.Count, "next", next)
 	}
 	return nil
 }
@@ -444,16 +502,13 @@ func (vm *VM) applyAllocate(tx *txs.AllocateTx, blockCtx BlockContext) error {
 // the storage-VM analog of dexvm/vm.go:1194 with the cross-chain leg removed —
 // a storage block has no shared-memory operations, so the commit is exactly
 // CommitBatch + batch.Write.
-func (vm *VM) acceptBlock(ctx context.Context, result *BlockResult) error {
+func (vm *VM) commit() error {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
 
 	if vm.db == nil {
 		return nil
 	}
-	_ = result
-	_ = ctx
-
 	// Abort clears the versiondb's in-memory layer after the batch is written
 	// (the platformvm defer-Abort pattern dexvm follows at vm.go:1231).
 	defer vm.db.Abort()
@@ -511,12 +566,6 @@ func (vm *VM) Shutdown(ctx context.Context) error {
 
 // Version returns the VM version string.
 func (vm *VM) Version(ctx context.Context) (string, error) { return "schain/0.1.0", nil }
-
-// CreateHandlers returns the VM's HTTP handlers. M0 exposes none (the VM
-// contract + commit discipline is the deliverable; the S3 API surface is M1+).
-func (vm *VM) CreateHandlers(ctx context.Context) (map[string]http.Handler, error) {
-	return map[string]http.Handler{}, nil
-}
 
 // HealthCheck reports the VM healthy once initialized.
 func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {

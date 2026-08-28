@@ -173,36 +173,52 @@ func allocKey(rng string) []byte {
 	return k
 }
 
-// GetAlloc returns the current allocator counter for range — the next id that
-// will be handed out. An absent range reads as 0 (its first allocation starts at
-// id 0). Reads through the version layer, so it observes a counter staged in this
-// block before commit and the durable value after commit.
-func (s *State) GetAlloc(rng string) (uint64, error) {
+// Alloc is a range's allocator state: the next id it will hand out, and the
+// nonce of the last allocation that moved it. Both live under ONE key, so a
+// read-modify-write cannot leave the cursor and the nonce disagreeing — an
+// advanced cursor with a stale nonce is a replayable allocation.
+type Alloc struct {
+	Next  uint64
+	Nonce uint64
+}
+
+// allocSize is the canonical stored width of an Alloc: Next‖Nonce, big-endian.
+const allocSize = 16
+
+// GetAlloc returns a range's allocator state. An absent range reads as the zero
+// Alloc — its first allocation starts at id 0 and accepts any nonce above 0.
+// Reads through the version layer, so it observes state staged in this block
+// before commit and the durable value after commit.
+func (s *State) GetAlloc(rng string) (Alloc, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	data, err := s.db.Get(allocKey(rng))
 	if err != nil {
 		if errors.Is(err, database.ErrNotFound) {
-			return 0, nil
+			return Alloc{}, nil
 		}
-		return 0, err
+		return Alloc{}, err
 	}
-	if len(data) != 8 {
-		return 0, ErrStateCorrupted
+	if len(data) != allocSize {
+		return Alloc{}, ErrStateCorrupted
 	}
-	return binary.BigEndian.Uint64(data), nil
+	return Alloc{
+		Next:  binary.BigEndian.Uint64(data[:8]),
+		Nonce: binary.BigEndian.Uint64(data[8:]),
+	}, nil
 }
 
-// SetAlloc stages the allocator counter for range into the version layer. It
-// becomes durable only when the VM commits the block's batch at Accept — the
-// same versiondb/CommitBatch discipline as PutManifest. The value is a fixed
-// 8-byte big-endian uint64 so the stored bytes are canonical (GetAlloc rejects
-// any other width as corruption).
-func (s *State) SetAlloc(rng string, n uint64) error {
+// SetAlloc stages a range's allocator state into the version layer. It becomes
+// durable only when the VM commits the block's batch at Accept — the same
+// versiondb/CommitBatch discipline as PutManifest. The value is a fixed-width
+// big-endian pair so the stored bytes are canonical (GetAlloc rejects any other
+// width as corruption).
+func (s *State) SetAlloc(rng string, a Alloc) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], n)
+	var buf [allocSize]byte
+	binary.BigEndian.PutUint64(buf[:8], a.Next)
+	binary.BigEndian.PutUint64(buf[8:], a.Nonce)
 	return s.db.Put(allocKey(rng), buf[:])
 }
 
@@ -270,9 +286,11 @@ func (s *State) Root() (ids.ID, error) {
 }
 
 // stateRootDomain is the SP 800-185 customization string binding the state root
-// to this construction and version. Bumping it invalidates every prior root. V2
-// folds the allocator keyspace (alloc/<range>) in alongside manifests.
-const stateRootDomain = "SCHAIN_STATE_ROOT_V2"
+// to this construction and version. Bumping it invalidates every prior root. V3
+// widens an allocator entry from a bare cursor to the cursor plus the nonce of
+// the allocation that last moved it, so the root commits to which allocations
+// have been spent.
+const stateRootDomain = "SCHAIN_STATE_ROOT_V3"
 
 // leftEncode is SP 800-185 left_encode: a length-self-describing prefix so the
 // concatenation of framed fields is unambiguous (no two field boundaries can be

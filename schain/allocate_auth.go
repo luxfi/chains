@@ -58,6 +58,11 @@ var (
 	// ownership the signer attested to was resolved against a different set.
 	errEpochMismatch = errors.New("allocate: signed epoch does not match block epoch")
 
+	// errAllocateReplay — the allocate's nonce is one the range has already spent.
+	// A signature stays valid forever, so without this an owner's allocate could
+	// be resubmitted by anyone to consume the range's id space again.
+	errAllocateReplay = errors.New("allocate: nonce already spent for this range")
+
 	// errEpochFingerprintMismatch — the signed validator-set fingerprint does not
 	// match the fingerprint recomputed from the verifier's local epoch snapshot.
 	// This is the DESIGN §6.4 local-determinism guard: the proposer pinned against
@@ -74,6 +79,7 @@ func isAllocateGateError(err error) bool {
 	switch {
 	case errors.Is(err, errNonOwnerAllocate),
 		errors.Is(err, errNoValidatorSet),
+		errors.Is(err, errAllocateReplay),
 		errors.Is(err, errUnsignedAllocate),
 		errors.Is(err, errUnknownSignerScheme),
 		errors.Is(err, errSignerKeyMismatch),

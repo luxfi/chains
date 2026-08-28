@@ -29,8 +29,26 @@ var (
 	errBlockNotFound    = errors.New("block not found")
 	errVMNotInitialized = errors.New("VM not initialized")
 
+	// errBadHeight rejects a block that does not sit exactly one above its parent.
+	errBadHeight = errors.New("schain: block height is not parent height + 1")
+
+	// errTimeRewound rejects a block stamped before its parent. Block time is
+	// carried in the bytes the block id commits to and is the chain's only clock;
+	// a proposer that could rewind it could rewrite the order of the chain's
+	// history for anything that reads it.
+	errTimeRewound = errors.New("schain: block timestamp is before its parent's")
+
+	// errTimeAhead rejects a block stamped further ahead of the verifying node
+	// than the clock-sync allowance. Block time only ever moves forward, so a
+	// block accepted far in the future would hold the chain's clock there.
+	errTimeAhead = errors.New("schain: block timestamp is too far in the future")
+
 	genesisBlockID = ids.ID{}
 )
+
+// maxFutureSkew is how far ahead of the verifying node's clock a proposer may
+// stamp a block — the node's usual clock-sync tolerance.
+const maxFutureSkew = 10 * time.Second
 
 // ChainVM wraps the functional storage VM to implement chain.ChainVM — the
 // interface the chains manager drives. It owns the in-memory block index,
@@ -43,8 +61,12 @@ type ChainVM struct {
 	log  log.Logger
 	lock sync.RWMutex
 
-	// In-memory block index.
-	blocks map[ids.ID]*Block
+	// In-memory block index, and the accepted block at each height. blocks holds
+	// the accepted chain plus whatever is still processing; prune releases the
+	// processing blocks the engine abandoned, which are otherwise retained one
+	// per build, forever.
+	blocks  map[ids.ID]*Block
+	heights map[uint64]ids.ID
 
 	lastAcceptedID     ids.ID
 	lastAcceptedHeight uint64
@@ -103,9 +125,55 @@ func (cvm *ChainVM) SetAllocateSigner(s *AllocateSigner) {
 // NewChainVM constructs a ChainVM wrapping a fresh inner storage VM.
 func NewChainVM(logger log.Logger) *ChainVM {
 	return &ChainVM{
-		inner:  &VM{},
-		log:    logger,
-		blocks: make(map[ids.ID]*Block),
+		inner:   &VM{},
+		log:     logger,
+		blocks:  make(map[ids.ID]*Block),
+		heights: make(map[uint64]ids.ID),
+	}
+}
+
+// checkPosition validates a block's place in the chain before any of its
+// contents are applied: the parent must be a block this node holds, the height
+// must be exactly one above it, and the timestamp must not rewind or run past
+// the clock-sync allowance. None of that was checked, so a block could name any
+// parent, claim any height and carry any time — and the height it claimed became
+// the chain's height and part of every state root the chain then computed.
+func (cvm *ChainVM) checkPosition(b *Block) error {
+	cvm.lock.RLock()
+	parent, ok := cvm.blocks[b.parentID]
+	cvm.lock.RUnlock()
+	if !ok {
+		return fmt.Errorf("%w: parent %s", errBlockNotFound, b.parentID)
+	}
+	if b.height != parent.height+1 {
+		return fmt.Errorf("%w: %d after parent %d", errBadHeight, b.height, parent.height)
+	}
+	if b.timestamp.Before(parent.timestamp) {
+		return errTimeRewound
+	}
+	// The ceiling is the local clock plus the allowance, but never below the
+	// parent: the chain already accepted that time, so reusing it stays legal on
+	// a node whose own clock has slipped behind the tip.
+	ceiling := cvm.inner.clock.Time().Add(maxFutureSkew)
+	if parent.timestamp.After(ceiling) {
+		ceiling = parent.timestamp
+	}
+	if b.timestamp.After(ceiling) {
+		return errTimeAhead
+	}
+	return nil
+}
+
+// prune releases every processing block at or below the accepted height. The
+// engine issues a block per build and is under no obligation to accept or reject
+// each one; a block only ever released on those two paths accumulates without
+// limit. Nothing at or below the accepted height can still be accepted, so
+// nothing reachable is lost. The caller holds cvm.lock.
+func (cvm *ChainVM) prune(acceptedHeight uint64) {
+	for id, blk := range cvm.blocks {
+		if blk.status != StatusAccepted && blk.height <= acceptedHeight {
+			delete(cvm.blocks, id)
+		}
 	}
 }
 
@@ -116,9 +184,6 @@ func (cvm *ChainVM) Initialize(ctx context.Context, vmInit vmcore.Init) error {
 
 	cvm.toEngine = vmInit.ToEngine
 
-	if cvm.inner == nil {
-		cvm.inner = &VM{}
-	}
 	cvm.inner.log = cvm.log
 	if err := cvm.inner.Initialize(ctx, vmInit); err != nil {
 		return err
@@ -133,6 +198,7 @@ func (cvm *ChainVM) Initialize(ctx context.Context, vmInit vmcore.Init) error {
 		status:    StatusAccepted,
 	}
 	cvm.blocks[genesisBlockID] = genesisBlock
+	cvm.heights[0] = genesisBlockID
 	cvm.lastAcceptedID = genesisBlockID
 	cvm.lastAcceptedHeight = 0
 	cvm.preferredID = genesisBlockID
@@ -220,20 +286,16 @@ func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	// Proposer build: apply the drained txs to the version layer to obtain the
 	// post-apply STATE ROOT, then carry that root in the block header so every
 	// validator can recompute and check it (mirror of dexvm BuildBlock ->
-	// BuildBlockResult, chainvm.go:258). The staged writes remain in the version
-	// layer; the proposer's own Block.Verify re-applies the identical txs (same
-	// keys/values — idempotent over the versiondb) and a Rejected block's Abort
-	// drops them. The SAME timestamp + block context are fed to every validator's
-	// ProcessBlock, so the root and the owner verdict are reproducible network-wide.
-	result, err := cvm.inner.ProcessBlock(ctx, newHeight, newTimestamp, blockTxs, blockCtx)
+	// BuildBlockResult, chainvm.go:258). Select puts in the block exactly the
+	// transactions that TOOK EFFECT, so a block this node builds is one it
+	// verifies — including when a candidate violates the pinned-writer gate,
+	// which used to fail the whole build and take every other queued transaction
+	// down with it. The SAME timestamp + block context are fed to every
+	// validator's ProcessBlock, so the root and the owner verdict are
+	// reproducible network-wide.
+	cvm.pendingTxs = nil
+	result, err := cvm.inner.Select(newHeight, newTimestamp, blockTxs, blockCtx)
 	if err != nil {
-		// A block-level reject (a non-owner AllocateTx, or one with no validator
-		// set) means this proposer must NOT build this block. Drain the mempool so
-		// the offending tx is dropped rather than retried into the next block — a
-		// non-owner can never validly emit it, so retaining it would wedge block
-		// production. (Per-tx soft failures never reach here; ProcessBlock swallows
-		// those and builds anyway.)
-		cvm.pendingTxs = nil
 		return nil, fmt.Errorf("schain: build block result: %w", err)
 	}
 
@@ -243,15 +305,12 @@ func (cvm *ChainVM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		height:    newHeight,
 		timestamp: newTimestamp,
 		stateRoot: result.StateRoot,
-		txs:       blockTxs,
+		txs:       result.Applied,
 		blockCtx:  blockCtx,
-		result:    result,
 		status:    StatusProcessing,
 	}
 	hash := sha256.Sum256(block.Bytes())
 	copy(block.id[:], hash[:])
-
-	cvm.pendingTxs = nil
 	cvm.blocks[block.id] = block
 
 	if !cvm.log.IsZero() {
@@ -361,16 +420,17 @@ func (cvm *ChainVM) LastAccepted(ctx context.Context) (ids.ID, error) {
 	return cvm.lastAcceptedID, nil
 }
 
-// GetBlockIDAtHeight returns the accepted block id at a height.
+// GetBlockIDAtHeight returns the accepted block id at a height. It reads an
+// index written when the block was accepted, rather than scanning the block map
+// and returning whichever matching entry Go's map iteration reached first.
 func (cvm *ChainVM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
 	cvm.lock.RLock()
 	defer cvm.lock.RUnlock()
-	for id, block := range cvm.blocks {
-		if block.height == height && block.status == StatusAccepted {
-			return id, nil
-		}
+	id, ok := cvm.heights[height]
+	if !ok {
+		return ids.Empty, errBlockNotFound
 	}
-	return ids.Empty, errBlockNotFound
+	return id, nil
 }
 
 // SetState delegates to the inner VM.
@@ -384,20 +444,11 @@ func (cvm *ChainVM) Shutdown(ctx context.Context) error { return cvm.inner.Shutd
 // Version delegates to the inner VM.
 func (cvm *ChainVM) Version(ctx context.Context) (string, error) { return cvm.inner.Version(ctx) }
 
-// NewHTTPHandler assembles the inner VM's handlers behind one mux.
+// NewHTTPHandler returns the chain's HTTP surface. M0 publishes no routes — the
+// VM contract and the commit discipline are the deliverable; the S3 API is M1+ —
+// so this is an empty mux rather than a nil handler the node would dereference.
 func (cvm *ChainVM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
-	handlers, err := cvm.inner.CreateHandlers(ctx)
-	if err != nil {
-		return nil, err
-	}
-	mux := http.NewServeMux()
-	for path, handler := range handlers {
-		if path == "" {
-			path = "/"
-		}
-		mux.Handle(path, handler)
-	}
-	return mux, nil
+	return http.NewServeMux(), nil
 }
 
 // HealthCheck delegates to the inner VM.
