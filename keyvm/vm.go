@@ -27,8 +27,6 @@ import (
 	grjson "github.com/gorilla/rpc/v2/json"
 
 	"github.com/luxfi/chains/fee"
-	"github.com/luxfi/chains/keyvm/config"
-	"github.com/luxfi/database"
 	"github.com/luxfi/database/versiondb"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
@@ -49,7 +47,18 @@ const (
 	KeyPrefix      = "key:"
 	CeremonyPrefix = "ceremony:"
 	BlockPrefix    = "block:"
+	// HeightPrefix indexes accepted blocks by height: HeightPrefix||u64 -> blockID.
+	// Written in the same commit as the block it names, so the index can never
+	// point at a block the chain did not accept.
+	HeightPrefix = "height:"
 )
+
+// maxFutureSkew bounds how far ahead of the verifying node's clock a proposer may
+// stamp a block. Block time is not decoration here: it is the `now` every
+// authorization decision is made against (AuthPolicy.ExpiresAt), so an unbounded
+// timestamp lets a proposer expire a policy early. Ten seconds is the node's
+// existing clock-sync tolerance.
+const maxFutureSkew = 10 * time.Second
 
 var (
 	lastAcceptedKey = []byte("keyvm/last-accepted")
@@ -85,6 +94,19 @@ var (
 	// what stops a captured signed transaction from being resubmitted to drain
 	// the payer's balance through repeated fee burns.
 	ErrBadNonce = errors.New("keyvm: bad or replayed nonce")
+
+	// ErrBadHeight rejects a block that does not sit exactly one above its parent.
+	ErrBadHeight = errors.New("keyvm: block height is not parent height + 1")
+
+	// ErrTimeRewound rejects a block stamped before its parent. Block time is the
+	// clock every authorization decision is made against, so a proposer that could
+	// rewind it could revive an expired policy.
+	ErrTimeRewound = errors.New("keyvm: block timestamp is before its parent's")
+
+	// ErrTimeAhead rejects a block stamped more than maxFutureSkew ahead of the
+	// verifying node — the other half of the same guard, which stops a proposer
+	// expiring a policy early.
+	ErrTimeAhead = errors.New("keyvm: block timestamp is too far in the future")
 )
 
 var noncePrefix = []byte("nonce:")
@@ -97,20 +119,27 @@ var noncePrefix = []byte("nonce:")
 // previous design's *mlkem.PrivateKey cache, KeyShare store, and accel session
 // are gone. authonly_test.go proves no reachable field can hold a secret.
 type VM struct {
-	config.Config
-
-	cancel   context.CancelFunc
-	log      log.Logger
-	db       database.Database
+	cancel context.CancelFunc
+	log    log.Logger
+	// versdb buffers every write of a block; Commit is the chain's one durability
+	// point. It is the only handle to state — there is deliberately no second
+	// name for it, so no write can miss the block's commit by going elsewhere.
 	versdb   *versiondb.Database
-	state    database.Database // == versdb; buffered writes commit per block
 	toEngine chan<- vmcore.Message
 	work     vmcore.Latch
 
+	// networkID is the network this chain belongs to. It is ONE field, not a
+	// factory copy shadowed by a config copy: the factory's value is the
+	// fallback, the consensus runtime overrides it, and the node's chain config
+	// blob overrides that. Most specific wins, resolved once in Initialize.
 	networkID uint32
 	clock     mockable.Clock
 
-	// PUBLIC state caches (authoritative copy lives in the DB).
+	// stateLock guards ALL chain state: the PUBLIC record caches below, the block
+	// index, and the last-accepted pointer. One mutex over one body of state — the
+	// pending-block map used to be guarded by shutdownLock in some paths and by
+	// stateLock in others, which is a Go fatal throw waiting for a concurrent
+	// build-and-abort.
 	stateLock  sync.RWMutex
 	keys       map[ids.ID]*KeyRecord
 	keysByName map[string]ids.ID
@@ -125,16 +154,20 @@ type VM struct {
 	// through `ledger`. Kept so the chain still satisfies the zero-fee refusal.
 	feePolicy nodefee.Policy
 
-	// Consensus mempool + block bookkeeping.
-	mempoolLock   sync.Mutex
-	mempool       []*Transaction
+	// Block bookkeeping, under stateLock.
 	pendingBlocks map[ids.ID]*Block
 	lastAccepted  ids.ID
 	lastBlock     *Block
 	height        uint64
 
+	// The mempool, under its own lock. Lock order is always stateLock then
+	// mempoolLock; nothing takes them the other way round.
+	mempoolLock sync.Mutex
+	mempool     []*Transaction
+
 	rpcServer *rpc.Server
 
+	// shutdownLock guards the shutdown flag and nothing else.
 	shutdownLock sync.RWMutex
 	shuttingDown bool
 }
@@ -153,9 +186,7 @@ type Genesis struct {
 // and the JSON-RPC service.
 func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	_, vm.cancel = context.WithCancel(ctx)
-	vm.db = init.DB
 	vm.versdb = versiondb.New(init.DB)
-	vm.state = vm.versdb
 	vm.toEngine = init.ToEngine
 
 	if init.Runtime != nil {
@@ -171,13 +202,9 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 		}
 	}
 
-	cfg, err := config.ParseConfig(init.Config)
+	cfg, err := ParseConfig(init.Config)
 	if err != nil {
 		return fmt.Errorf("keyvm: parse config: %w", err)
-	}
-	vm.Config = cfg
-	if err := vm.Config.Validate(); err != nil {
-		return fmt.Errorf("keyvm: invalid config: %w", err)
 	}
 
 	vm.stateLock.Lock()
@@ -187,11 +214,11 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	vm.stateLock.Unlock()
 	vm.pendingBlocks = make(map[ids.ID]*Block)
 
-	if init.Runtime != nil {
+	if init.Runtime != nil && init.Runtime.NetworkID != 0 {
 		vm.networkID = init.Runtime.NetworkID
 	}
-	if vm.Config.NetworkID != 0 {
-		vm.networkID = vm.Config.NetworkID
+	if cfg.NetworkID != 0 {
+		vm.networkID = cfg.NetworkID
 	}
 
 	vm.ledger = fee.NewLedger(vm.versdb)
@@ -219,7 +246,7 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	vm.lastAccepted = genesisBlock.id
 	vm.lastBlock = genesisBlock
 
-	if err := vm.seedGenesis(genesis); err != nil {
+	if err := vm.seedGenesis(genesis, genesisBlock); err != nil {
 		return fmt.Errorf("keyvm: seed genesis: %w", err)
 	}
 	if err := vm.loadState(); err != nil {
@@ -237,9 +264,12 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	return nil
 }
 
-// seedGenesis credits the funding allocation once (idempotent via a marker key).
-// It is the only trusted state mutation; all later mutations go through blocks.
-func (vm *VM) seedGenesis(g *Genesis) error {
+// seedGenesis credits the funding allocation and persists the genesis block once
+// (idempotent via a marker key). It is the only trusted state mutation; all later
+// mutations go through blocks. Persisting genesis is what lets the block at
+// height 1 find a parent to verify against — every accepted block, genesis
+// included, is retrievable by id and by height.
+func (vm *VM) seedGenesis(g *Genesis, genesisBlock *Block) error {
 	applied, err := vm.versdb.Has(genesisMarker)
 	if err != nil {
 		return err
@@ -256,10 +286,35 @@ func (vm *VM) seedGenesis(g *Genesis) error {
 			return fmt.Errorf("alloc %q: %w", addrHex, err)
 		}
 	}
+	if err := vm.recordAccepted(genesisBlock); err != nil {
+		return err
+	}
 	if err := vm.versdb.Put(genesisMarker, []byte{1}); err != nil {
 		return err
 	}
 	return vm.versdb.Commit()
+}
+
+// recordAccepted writes a block, its height index entry, and the last-accepted
+// pointer into the versiondb. It does not commit — the caller's commit is what
+// makes all three durable together, so the index can never name a block the
+// chain did not accept.
+func (vm *VM) recordAccepted(b *Block) error {
+	if err := vm.versdb.Put(append([]byte(BlockPrefix), b.id[:]...), b.Bytes()); err != nil {
+		return err
+	}
+	if err := vm.versdb.Put(heightKey(b.height), b.id[:]); err != nil {
+		return err
+	}
+	return vm.versdb.Put(lastAcceptedKey, b.id[:])
+}
+
+func heightKey(h uint64) []byte {
+	k := make([]byte, 0, len(HeightPrefix)+8)
+	k = append(k, HeightPrefix...)
+	var u8 [8]byte
+	binary.BigEndian.PutUint64(u8[:], h)
+	return append(k, u8[:]...)
 }
 
 // loadState rebuilds the PUBLIC caches and lastAccepted pointer from the DB.
@@ -277,7 +332,7 @@ func (vm *VM) loadStateLocked() error {
 	vm.keysByName = make(map[string]ids.ID)
 	vm.ceremonies = make(map[ids.ID]*CeremonyRecord)
 
-	kit := vm.state.NewIteratorWithPrefix([]byte(KeyPrefix))
+	kit := vm.versdb.NewIteratorWithPrefix([]byte(KeyPrefix))
 	defer kit.Release()
 	for kit.Next() {
 		var rec KeyRecord
@@ -293,7 +348,7 @@ func (vm *VM) loadStateLocked() error {
 		return err
 	}
 
-	cit := vm.state.NewIteratorWithPrefix([]byte(CeremonyPrefix))
+	cit := vm.versdb.NewIteratorWithPrefix([]byte(CeremonyPrefix))
 	defer cit.Release()
 	for cit.Next() {
 		var c CeremonyRecord
@@ -308,7 +363,7 @@ func (vm *VM) loadStateLocked() error {
 		return err
 	}
 
-	if b, err := vm.state.Get(lastAcceptedKey); err == nil && len(b) == 32 {
+	if b, err := vm.versdb.Get(lastAcceptedKey); err == nil && len(b) == 32 {
 		copy(vm.lastAccepted[:], b)
 		if blk, err := vm.getBlockLocked(vm.lastAccepted); err == nil {
 			vm.lastBlock = blk
@@ -325,12 +380,20 @@ func (vm *VM) getKey(id ids.ID) (*KeyRecord, bool) {
 	return r, ok
 }
 
-func (vm *VM) putKey(rec *KeyRecord) error {
+// putRecord writes a PUBLIC record as JSON under prefix||id, then the caller
+// indexes it in the matching cache. Encoding cannot fail — every field of both
+// record types is a string, a byte slice, a fixed-width id or an integer — so
+// the only error a caller sees is the store's.
+func (vm *VM) putRecord(prefix string, id ids.ID, rec any) error {
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
-	if err := vm.state.Put([]byte(KeyPrefix+rec.ID.String()), data); err != nil {
+	return vm.versdb.Put([]byte(prefix+id.String()), data)
+}
+
+func (vm *VM) putKey(rec *KeyRecord) error {
+	if err := vm.putRecord(KeyPrefix, rec.ID, rec); err != nil {
 		return err
 	}
 	vm.keys[rec.ID] = rec
@@ -339,11 +402,7 @@ func (vm *VM) putKey(rec *KeyRecord) error {
 }
 
 func (vm *VM) putCeremony(c *CeremonyRecord) error {
-	data, err := json.Marshal(c)
-	if err != nil {
-		return err
-	}
-	if err := vm.state.Put([]byte(CeremonyPrefix+c.ID.String()), data); err != nil {
+	if err := vm.putRecord(CeremonyPrefix, c.ID, c); err != nil {
 		return err
 	}
 	vm.ceremonies[c.ID] = c
@@ -354,7 +413,7 @@ func (vm *VM) putCeremony(c *CeremonyRecord) error {
 // transacted). The next valid nonce is nonceOf(payer)+1. Caller holds a lock.
 func (vm *VM) nonceOf(payer fee.Account) uint64 {
 	key := append(append([]byte{}, noncePrefix...), payer[:]...)
-	b, err := vm.state.Get(key)
+	b, err := vm.versdb.Get(key)
 	if err != nil || len(b) != 8 {
 		return 0
 	}
@@ -367,7 +426,7 @@ func (vm *VM) setNonce(payer fee.Account, n uint64) error {
 	key := append(append([]byte{}, noncePrefix...), payer[:]...)
 	var u [8]byte
 	binary.BigEndian.PutUint64(u[:], n)
-	return vm.state.Put(key, u[:])
+	return vm.versdb.Put(key, u[:])
 }
 
 // ---- Read-only public queries (RPC) ----
@@ -436,39 +495,112 @@ func (vm *VM) Burned() (uint64, error) {
 
 // ---- Mempool / consensus driver ----
 
-// SubmitTx validates, authenticates, and admission-checks a transaction, then
-// enqueues it and signals the engine to build a block. The fee is SETTLED later,
-// in block Accept — never here. Returns the transaction ID.
-func (vm *VM) SubmitTx(tx *Transaction) (ids.ID, error) {
+// running is the per-payer effect of the transactions already accepted into a
+// view: how much each payer has committed to spend, and which nonce each must
+// use next. Admission carries it over the mempool, block assembly and Verify
+// carry it over a block, so a payer's second transaction is always judged
+// against its first.
+type running struct {
+	spent     map[fee.Account]uint64
+	nextNonce map[fee.Account]uint64
+}
+
+func newRunning() *running {
+	return &running{
+		spent:     make(map[fee.Account]uint64),
+		nextNonce: make(map[fee.Account]uint64),
+	}
+}
+
+// checkTx is the ONE admissibility predicate for a transaction. Admission
+// (SubmitTx), block assembly (BuildBlock) and consensus (Block.Verify) all
+// decide through it, so a transaction one of them accepts is never one another
+// refuses. That split was not cosmetic: admission used to accept ANY nonce above
+// the committed one while Verify demanded exactly committed+1, so one gapped
+// transaction from any funded account entered the mempool, was drained into
+// every subsequent block, failed Verify, was requeued by Reject, and wedged
+// block production for free and forever.
+//
+// On success it advances r, so the caller can walk a sequence. now is the time
+// authorization is judged at — the block's timestamp inside consensus, the
+// node's clock at admission. The caller holds stateLock.
+func (vm *VM) checkTx(tx *Transaction, now int64, r *running) error {
 	if err := tx.SyntacticVerify(); err != nil {
-		return ids.Empty, err
+		return err
 	}
 	if err := tx.authenticate(); err != nil {
-		return ids.Empty, err
+		return err
 	}
-	feeAmt, err := FeeFor(tx)
+	return vm.admit(tx, now, r)
+}
+
+// admit is checkTx's stateful half: nonce order, authorization, price and
+// affordability against the view r has advanced to. It is split out because a
+// transaction's signature is worth verifying exactly once — admission does it,
+// and folding the mempool's already-authenticated backlog into a running view
+// must not re-verify ML-DSA on every submission.
+func (vm *VM) admit(tx *Transaction, now int64, r *running) error {
+	// Replay/order guard runs BEFORE authorization so a replayed transaction is
+	// rejected as such regardless of the operation's other preconditions.
+	want, seen := r.nextNonce[tx.Payer]
+	if !seen {
+		want = vm.nonceOf(tx.Payer) + 1
+	}
+	if tx.Nonce != want {
+		return ErrBadNonce
+	}
+	if _, err := tx.checkAuth(vm, now); err != nil {
+		return err
+	}
+	feeAmt, err := meter(tx)
 	if err != nil {
-		return ids.Empty, err
+		return err
 	}
+	bal, err := vm.ledger.Balance(tx.Payer)
+	if err != nil {
+		return err
+	}
+	// Each fee is at least MinScheduledFee and a payer's cumulative spend is
+	// checked against a real uint64 balance, so this sum cannot wrap: reaching
+	// 2^64 nLUX would take ~6e12 transactions in one block. Even if it did, the
+	// per-transaction fee.Charge in Accept is the authoritative debit and fails
+	// closed against the real balance.
+	next := r.spent[tx.Payer] + feeAmt
+	if bal < next {
+		return fee.ErrInsufficientFunds
+	}
+	r.spent[tx.Payer] = next
+	r.nextNonce[tx.Payer] = want + 1
+	return nil
+}
+
+// SubmitTx admits a transaction to the mempool and signals the engine to build a
+// block. It judges the transaction against committed state PLUS everything
+// already queued from the same payer, which is exactly what BuildBlock and
+// Verify will judge it against. The fee is SETTLED later, in block Accept —
+// never here. Returns the transaction ID.
+func (vm *VM) SubmitTx(tx *Transaction) (ids.ID, error) {
+	vm.mempoolLock.Lock()
+	defer vm.mempoolLock.Unlock()
+
+	now := vm.clock.Time().Unix()
 	vm.stateLock.RLock()
-	if tx.Nonce <= vm.nonceOf(tx.Payer) {
-		vm.stateLock.RUnlock()
-		return ids.Empty, ErrBadNonce
+	r := newRunning()
+	// Fold in the backlog BuildBlock will place ahead of this transaction, so a
+	// payer can pipeline nonces 1..n without waiting for a block. A queued
+	// transaction that has since become unadmissible (its key was revoked by a
+	// block accepted meanwhile) does not advance r — BuildBlock will drop it for
+	// the same reason, so the newcomer must be judged as if it is not there.
+	for _, queued := range vm.mempool {
+		_ = vm.admit(queued, now, r)
 	}
-	if err := tx.checkAuth(vm, vm.clock.Time().Unix()); err != nil {
-		vm.stateLock.RUnlock()
-		return ids.Empty, err
-	}
-	err = fee.CanPay(vm.ledger, tx.Payer, feeAmt)
+	err := vm.checkTx(tx, now, r)
 	vm.stateLock.RUnlock()
 	if err != nil {
 		return ids.Empty, err
 	}
 
-	vm.mempoolLock.Lock()
 	vm.mempool = append(vm.mempool, tx)
-	vm.mempoolLock.Unlock()
-
 	vm.work.Signal()
 	return tx.ID(), nil
 }
@@ -479,8 +611,12 @@ func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
 }
 
 // BuildBlock drains the mempool into a new block extending the last accepted
-// block. The block is not yet verified or accepted — settlement happens in
-// Verify/Accept.
+// block. It assembles the block through the SAME predicate Verify will judge it
+// by, dropping any transaction that does not pass, so a block this node builds
+// always verifies. A transaction that is dropped is gone: keeping it would put
+// it back in the very next block, where it would fail again.
+//
+// The block is not yet verified or accepted — settlement happens in Verify/Accept.
 func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	vm.shutdownLock.RLock()
 	down := vm.shuttingDown
@@ -490,34 +626,54 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	}
 
 	vm.mempoolLock.Lock()
-	txs := vm.mempool
+	candidates := vm.mempool
 	vm.mempool = nil
 	vm.mempoolLock.Unlock()
-	if len(txs) == 0 {
+	if len(candidates) == 0 {
 		return nil, errNoPendingTxs
 	}
 
-	vm.stateLock.RLock()
+	vm.stateLock.Lock()
+	defer vm.stateLock.Unlock()
+
 	parent := vm.lastBlock
-	parentID := vm.lastAccepted
-	vm.stateLock.RUnlock()
 	if parent == nil {
-		vm.requeue(txs)
+		vm.requeue(candidates)
 		return nil, errNoParentBlock
 	}
 
+	// Block time never moves backwards: it is the clock every authorization
+	// decision is made against, and Verify refuses a block stamped before its
+	// parent.
+	ts := vm.clock.Time()
+	if ts.Before(parent.timestamp) {
+		ts = parent.timestamp
+	}
+
+	r := newRunning()
+	kept := candidates[:0]
+	for _, tx := range candidates {
+		if err := vm.checkTx(tx, ts.Unix(), r); err != nil {
+			vm.log.Debug("keyvm: dropping unbuildable transaction",
+				log.String("txID", tx.ID().String()),
+				log.String("error", err.Error()))
+			continue
+		}
+		kept = append(kept, tx)
+	}
+	if len(kept) == 0 {
+		return nil, errNoPendingTxs
+	}
+
 	blk := &Block{
-		parentID:     parentID,
+		parentID:     vm.lastAccepted,
 		height:       parent.height + 1,
-		timestamp:    vm.clock.Time(),
-		transactions: txs,
+		timestamp:    ts,
+		transactions: kept,
 		vm:           vm,
 	}
 	blk.id = blk.computeID()
-
-	vm.shutdownLock.Lock()
 	vm.pendingBlocks[blk.id] = blk
-	vm.shutdownLock.Unlock()
 	return blk, nil
 }
 
@@ -561,25 +717,37 @@ func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (chain.Block, e
 
 // GetBlock returns a block by ID.
 func (vm *VM) GetBlock(ctx context.Context, blockID ids.ID) (chain.Block, error) {
-	vm.shutdownLock.RLock()
-	defer vm.shutdownLock.RUnlock()
+	vm.stateLock.RLock()
+	defer vm.stateLock.RUnlock()
 	return vm.getBlockLocked(blockID)
 }
 
+// getBlockLocked is GetBlock's body; the caller holds stateLock.
 func (vm *VM) getBlockLocked(blockID ids.ID) (*Block, error) {
-	if vm.pendingBlocks != nil {
-		if blk, ok := vm.pendingBlocks[blockID]; ok {
-			return blk, nil
-		}
+	if blk, ok := vm.pendingBlocks[blockID]; ok {
+		return blk, nil
 	}
 	if vm.lastBlock != nil && vm.lastBlock.id == blockID {
 		return vm.lastBlock, nil
 	}
-	b, err := vm.state.Get(append([]byte(BlockPrefix), blockID[:]...))
+	b, err := vm.versdb.Get(append([]byte(BlockPrefix), blockID[:]...))
 	if err != nil {
 		return nil, fmt.Errorf("keyvm: block %s: %w", blockID, err)
 	}
 	return parseBlock(vm, b)
+}
+
+// prunePending drops every processing block at or below the accepted height. A
+// block the engine abandons without accepting or rejecting it is otherwise
+// retained forever, and one of those is issued per build. Nothing at or below
+// the accepted height can still be accepted, so nothing reachable is lost. The
+// caller holds stateLock.
+func (vm *VM) prunePending(acceptedHeight uint64) {
+	for id, blk := range vm.pendingBlocks {
+		if blk.height <= acceptedHeight {
+			delete(vm.pendingBlocks, id)
+		}
+	}
 }
 
 // ---- ChainVM lifecycle / misc ----
@@ -594,8 +762,20 @@ func (vm *VM) LastAccepted(ctx context.Context) (ids.ID, error) {
 	return vm.lastAccepted, nil
 }
 
+// GetBlockIDAtHeight returns the accepted block id at height. The index is
+// written in the same commit as the block it names, so it never resolves to a
+// block the chain did not accept.
 func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
-	return ids.Empty, errors.New("keyvm: height index not implemented")
+	vm.stateLock.RLock()
+	defer vm.stateLock.RUnlock()
+	b, err := vm.versdb.Get(heightKey(height))
+	if err != nil {
+		return ids.Empty, fmt.Errorf("keyvm: height %d: %w", height, err)
+	}
+	if len(b) != ids.IDLen {
+		return ids.Empty, fmt.Errorf("keyvm: height %d: corrupt index entry", height)
+	}
+	return ids.ID(b), nil
 }
 
 func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
@@ -605,9 +785,6 @@ func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
 	}
 	mux := http.NewServeMux()
 	for path, h := range handlers {
-		if path == "" {
-			path = "/"
-		}
 		mux.Handle(path, h)
 	}
 	return mux, nil

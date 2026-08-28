@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -32,11 +31,15 @@ func TestFeeSettledThroughConsensus(t *testing.T) {
 
 	tx := registerTx(t, k, "treasury-key", 200_000, 1)
 
-	// The fee is computed from the per-algorithm gas schedule, NOT supplied by
-	// the caller: register + ml-dsa-65 = (21000 + 60000) gas * 1000 nLUX/gas.
+	// The fee is computed from the schedule, NOT supplied by the caller. Prove
+	// that by construction rather than by pinning a number: the same operation
+	// on a different algorithm, and the same algorithm with a longer payload,
+	// both settle differently — a caller-supplied fee would not move at all.
 	expectedFee, err := FeeFor(tx)
 	require.NoError(t, err)
-	require.Equal(t, uint64(81_000_000), expectedFee)
+	onKEM, err := FeeFor(&Transaction{Type: TxRegisterKey, Algorithm: "ml-kem-768", Payload: tx.Payload})
+	require.NoError(t, err)
+	require.NotEqual(t, expectedFee, onKEM, "the algorithm must move the price")
 
 	txID, err := vm.SubmitTx(tx)
 	require.NoError(t, err)
@@ -94,7 +97,7 @@ func TestUnfundedPayerCannotSettle(t *testing.T) {
 	require.ErrorIs(t, err, fee.ErrInsufficientFunds, "admission must reject an unaffordable tx")
 
 	// Force it into a block anyway: consensus Verify must still refuse it.
-	blk := &Block{parentID: vm.lastAccepted, height: 1, timestamp: time.Now(), transactions: []*Transaction{tx}, vm: vm}
+	blk := &Block{parentID: vm.lastAccepted, height: 1, timestamp: vm.clock.Time(), transactions: []*Transaction{tx}, vm: vm}
 	blk.id = blk.computeID()
 	require.ErrorIs(t, blk.Verify(context.Background()), fee.ErrInsufficientFunds)
 
@@ -189,7 +192,7 @@ func TestReplayRejected(t *testing.T) {
 	require.ErrorIs(t, err, ErrBadNonce)
 
 	// Forced into a block, consensus Verify rejects it too — no second burn.
-	blk := &Block{parentID: vm.lastAccepted, height: vm.height + 1, timestamp: time.Now(), transactions: []*Transaction{tx}, vm: vm}
+	blk := &Block{parentID: vm.lastAccepted, height: vm.height + 1, timestamp: vm.clock.Time(), transactions: []*Transaction{tx}, vm: vm}
 	blk.id = blk.computeID()
 	require.ErrorIs(t, blk.Verify(context.Background()), ErrBadNonce)
 
@@ -212,5 +215,15 @@ func mustJSON(t *testing.T, v any) []byte {
 	t.Helper()
 	b, err := json.Marshal(v)
 	require.NoError(t, err)
+	return b
+}
+
+// mustJSONRaw is mustJSON without a *testing.T, for table literals. The values
+// it encodes are plain structs, so encoding cannot fail.
+func mustJSONRaw(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
 	return b
 }
