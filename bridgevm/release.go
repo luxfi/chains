@@ -38,10 +38,14 @@ var (
 	errAlreadyReleased           = errors.New("bridgevm: transfer already released on destination")
 )
 
-// releaseMaxRetries bounds how hard the worker retries a single transfer before
-// logging and dropping it. Dropping is safe: the transfer can be re-observed and
-// re-enqueued, and other relayer validators broadcast independently.
-const releaseMaxRetries = 5
+// How hard the worker retries a single transfer before logging and dropping
+// it, and how long it waits between attempts (doubling each time). Dropping is
+// safe: the transfer can be re-observed and re-enqueued, and other relayer
+// validators broadcast independently.
+const (
+	releaseMaxRetries = 5
+	releaseBackoff    = 250 * time.Millisecond
+)
 
 // transfer maps a consensus bridge request to the canonical, domain-bound value
 // M signs and the gateway verifies. ids.ID is a [32]byte, so Asset maps directly.
@@ -64,20 +68,26 @@ func (r *BridgeRequest) transfer() (bridgeattest.BridgeTransfer, error) {
 	}, nil
 }
 
-// releaser drives releases off the consensus path.
+// releaser drives releases off the consensus path. The retry policy is data on
+// the worker rather than literals inside its loop, so what it will do is one
+// thing to read.
 type releaser struct {
-	vm    *VM
-	queue chan *BridgeRequest
-	quit  chan struct{}
-	wg    sync.WaitGroup
-	once  sync.Once
+	vm      *VM
+	queue   chan *BridgeRequest
+	quit    chan struct{}
+	retries int
+	backoff time.Duration
+	wg      sync.WaitGroup
+	once    sync.Once
 }
 
 func newReleaser(vm *VM) *releaser {
 	r := &releaser{
-		vm:    vm,
-		queue: make(chan *BridgeRequest, 1024),
-		quit:  make(chan struct{}),
+		vm:      vm,
+		queue:   make(chan *BridgeRequest, 1024),
+		quit:    make(chan struct{}),
+		retries: releaseMaxRetries,
+		backoff: releaseBackoff,
 	}
 	r.wg.Add(1)
 	go r.run()
@@ -122,8 +132,8 @@ func (r *releaser) handle(req *BridgeRequest) {
 		return
 	}
 
-	backoff := 250 * time.Millisecond
-	for attempt := 0; attempt < releaseMaxRetries; attempt++ {
+	backoff := r.backoff
+	for attempt := 0; attempt < r.retries; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err := r.releaseOnce(ctx, req, transfer)
 		cancel()
