@@ -1,201 +1,175 @@
 // Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 //
-// Quasar: Quantum-Safe Finality Engine
+// Quasar: the Q-Chain finality bridge.
 //
-// Like stellar fusion combining hydrogen into helium, Quasar unifies
-// classical BLS signatures with post-quantum Corona signatures.
-// Both burn in parallel - classical for speed, quantum for eternity.
-//
-// No block escapes the event horizon without quantum finality.
+// A block is final when a quorum of the committee has SIGNED it and the
+// aggregate of those signatures verifies against the committee's keys. Every
+// word of that is load-bearing here: signed, not claimed; verified, not counted;
+// aggregate, not a tally of names a sender chose for itself.
 
 package quantumvm
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
 
+	"github.com/luxfi/chains/quantumvm/config"
 	"github.com/luxfi/consensus/protocol/quasar"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 )
 
-// BlockSigs contains both BLS and Corona signatures for a block.
-// Both are produced in parallel during signing.
-type BlockSigs struct {
-	BLS    *quasar.BLSSignature
-	Corona *quasar.CoronaSignature
-}
+var (
+	// errDuplicateSigner — a validator that already contributed a signature for
+	// this block sent another. The quorum is counted over signers, so admitting
+	// a second signature from one validator would let a single peer reach the
+	// threshold alone by resending.
+	errDuplicateSigner = errors.New("quantumvm: validator already signed this block")
 
-// Quasar is the core Post-Quantum BFT consensus engine for Q-Chain.
-// Like a supermassive black hole, it pulls all blocks to quantum finality
-// using dual BLS+Corona threshold signatures:
-// - BLS threshold signatures (classical security, fast path)
-// - Corona threshold signatures (post-quantum, Ring-LWE based)
+	// errUnverifiedSigner — the signature does not check out against the
+	// registered key of the validator it names, over the block it names.
+	errUnverifiedSigner = errors.New("quantumvm: signature does not verify for the validator it claims")
+
+	errUnknownBlock      = errors.New("quantumvm: no block awaiting signatures")
+	errNoValidatorID     = errors.New("quantumvm: a signer with no identity cannot be a member of a quorum")
+	errAggregateRefused  = errors.New("quantumvm: the aggregate of the collected signatures does not verify")
+	errAlreadyRegistered = errors.New("quantumvm: validator is already in the committee")
+	errCommitteeFull     = errors.New("quantumvm: the committee is full")
+)
+
+// Quasar collects validator signatures for Q-Chain blocks and finalizes a block
+// once the quorum's aggregate signature verifies.
 //
-// Blocks are NOT considered produced without BOTH thresholds being met.
+// The core underneath signs with the validator's BLS key and, in the same call,
+// attests the same message with that validator's ML-DSA-65 identity key
+// (FIPS 204) — so the post-quantum half rides inside every signature this
+// collects, and VerifyQuasarSig checks both halves or rejects.
 type Quasar struct {
 	mu sync.RWMutex
 
-	// Core Quasar engine - provides both BLS and Corona signing directly
-	quasar *quasar.Quasar
+	// core is the consensus signing engine: it holds the committee's keys and
+	// is the only thing that can say whether a signature is real.
+	core *quasar.Quasar
 
-	// Validator configuration
 	validatorID string
 	threshold   int
-	totalNodes  int
+	committee   int
 
-	// Logging
 	log log.Logger
 
-	// Block finality tracking
+	// validators is the committee roster this bridge registered. The core
+	// holds their keys; this holds the membership, which is what makes the
+	// committee a set of a declared size rather than whatever accumulated.
+	validators map[string]struct{}
+
 	finalizedBlocks map[ids.ID]bool
 	pendingBlocks   map[ids.ID]*PendingBlock
 }
 
-// PendingBlock tracks a block awaiting dual signature finality.
-// Both BLS AND Corona must reach threshold for quantum finality.
-// Signatures are collected in parallel - either can complete first.
+// PendingBlock tracks a block gathering signatures. Every signature in the slice
+// has been verified against BlockHash and against the registered key of the
+// validator it names, and no two name the same validator.
 type PendingBlock struct {
-	BlockID          ids.ID
-	BlockHash        []byte
-	Height           uint64
-	BLSSignatures    []*quasar.BLSSignature    // Classical threshold signatures (parallel)
-	CoronaSignatures []*quasar.CoronaSignature // Post-quantum threshold signatures (parallel)
-	BLSFinalized     bool                      // BLS threshold reached
-	CoronaFinalized  bool                      // Corona threshold reached
-	Finalized        bool                      // BOTH complete = quantum finality
+	BlockID    ids.ID
+	BlockHash  []byte
+	Height     uint64
+	Signatures []*quasar.QuasarSig
+	Finalized  bool
 }
 
-// QuasarConfig configures the Quasar PQ-BFT consensus
+// by returns this block's signature from one validator, or nil.
+func (p *PendingBlock) by(validatorID string) *quasar.QuasarSig {
+	for _, sig := range p.Signatures {
+		if sig.ValidatorID == validatorID {
+			return sig
+		}
+	}
+	return nil
+}
+
+// QuasarConfig configures the finality bridge. The committee size is the only
+// quorum input: the threshold follows from it, so the two cannot be set to
+// disagree.
 type QuasarConfig struct {
 	ValidatorID string
-	Threshold   int
-	TotalNodes  int
+	Committee   int
 	Logger      log.Logger
 }
 
-// NewQuasar creates a new Quasar PQ-BFT consensus engine.
+// NewQuasar creates the finality bridge and registers this node with the
+// consensus core as its own validator.
 //
-// The committee size is settled BEFORE the threshold is derived from it.
-// Deriving first read TotalNodes while it was still zero, so a config that left
-// it unset got (0*2/3)+1 = 1 — a one-of-three quorum on the three-node network
-// the very next line then assumed. Any single validator would have finalized
-// alone.
+// Registration is not optional and not deferred, because a bridge that cannot
+// sign for its own identity does nothing at all: SignMessage answers "validator
+// not found", so no signature is ever recorded, so no peer signature ever finds
+// a block to attach to, so the quorum is never reached and finality is
+// unreachable — silently, one warning line per block.
+//
+// The committee must be able to survive a fault. Below config.CommitteeMin the
+// quorum ⌊2n/3⌋+1 is the entire committee, which the consensus core refuses
+// outright and which would in any case make one absent validator a halt and one
+// dishonest validator the decision.
 func NewQuasar(cfg QuasarConfig) (*Quasar, error) {
-	if cfg.TotalNodes < 1 {
-		cfg.TotalNodes = 3 // Default 3-node network
+	if cfg.ValidatorID == "" {
+		return nil, errNoValidatorID
 	}
-	if cfg.Threshold < 1 {
-		cfg.Threshold = (cfg.TotalNodes * 2 / 3) + 1 // 2/3+1 BFT threshold
+	if cfg.Committee == 0 {
+		cfg.Committee = config.CommitteeMin
+	}
+	if cfg.Committee < config.CommitteeMin {
+		return nil, fmt.Errorf("quantumvm: a committee of %d tolerates no fault; %d is the smallest that does",
+			cfg.Committee, config.CommitteeMin)
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = log.NewNoOpLogger()
 	}
 
-	// Initialize Quasar core with BLS + Corona
-	qcore, err := quasar.NewQuasar(cfg.Threshold)
+	threshold := config.Quorum(cfg.Committee)
+	core, err := quasar.NewQuasar(threshold)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Quasar core: %w", err)
 	}
 
 	q := &Quasar{
-		quasar:          qcore,
+		core:            core,
 		validatorID:     cfg.ValidatorID,
-		threshold:       cfg.Threshold,
-		totalNodes:      cfg.TotalNodes,
+		threshold:       threshold,
+		committee:       cfg.Committee,
 		log:             cfg.Logger,
+		validators:      make(map[string]struct{}, cfg.Committee),
 		finalizedBlocks: make(map[ids.ID]bool),
 		pendingBlocks:   make(map[ids.ID]*PendingBlock),
+	}
+
+	if err := q.AddValidator(cfg.ValidatorID, 1); err != nil {
+		return nil, fmt.Errorf("failed to register this node with its own consensus core: %w", err)
 	}
 
 	return q, nil
 }
 
-// NOTE: there is intentionally no per-epoch dual-threshold key generation here.
-// A prior helper (InitializeDualThreshold) called consensus quasar.GenerateDualKeys,
-// a TRUSTED-DEALER keygen in which one process mints and holds every validator's
-// BLS+Corona secret share — defeating threshold security. Consensus fenced that
-// helper test-only (corona-genesis hardening), and this VM never invoked it: the
-// Quasar bridge below signs through the consensus core with per-validator keys, and
-// validators join via AddValidator. If a genuine per-epoch group key is ever needed,
-// it MUST come from a dealerless DKG (corona dkg2 / pulsar v0.3 distributed), never a
-// trusted dealer.
-
-// SignBlock creates both BLS and Corona signatures for a block in parallel.
-// Returns both signatures; both must reach threshold for quantum finality.
-func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte, height uint64) (*BlockSigs, error) {
+// SignBlock signs a block with this node's validator key and records the
+// signature. Signing the same block again returns the signature already
+// recorded: one validator makes one statement about one block.
+func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte, height uint64) (*quasar.QuasarSig, error) {
 	q.mu.Lock()
 	pending, tracked := q.pendingBlocks[blockID]
 	if !tracked {
-		pending = &PendingBlock{
-			BlockID:          blockID,
-			BlockHash:        blockHash,
-			Height:           height,
-			BLSSignatures:    make([]*quasar.BLSSignature, 0),
-			CoronaSignatures: make([]*quasar.CoronaSignature, 0),
-		}
+		pending = &PendingBlock{BlockID: blockID, BlockHash: blockHash, Height: height}
 		q.pendingBlocks[blockID] = pending
 	}
-	qcore := q.quasar
-	validatorID := q.validatorID
+	if have := pending.by(q.validatorID); have != nil {
+		q.mu.Unlock()
+		return have, nil
+	}
+	core, validatorID := q.core, q.validatorID
 	q.mu.Unlock()
 
-	// Run both lanes in parallel
-	var (
-		blsSig *quasar.BLSSignature
-		pqSig  *quasar.CoronaSignature
-		blsErr error
-		pqErr  error
-	)
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// BLS signing (single round, fast path)
-	go func() {
-		defer wg.Done()
-		quasarSig, err := qcore.SignMessageWithContext(ctx, validatorID, blockHash)
-		if err != nil {
-			blsErr = err
-			return
-		}
-		blsSig = &quasar.BLSSignature{
-			Signature:   quasarSig.BLS,
-			ValidatorID: quasarSig.ValidatorID,
-			SignerIndex: quasarSig.SignerIndex,
-		}
-	}()
-
-	// Corona signing (Round 1 - D matrix + MACs)
-	go func() {
-		defer wg.Done()
-		sessionID := int(height) // Use height as session ID
-		// A digest, not a prefix. Slicing blockHash[:32] panicked on anything
-		// shorter, and the caller decides what it signs over — StampBlock takes
-		// an arbitrary message from the finality bridge.
-		digest := sha256.Sum256(blockHash)
-		round1Data, err := qcore.CoronaRound1(validatorID, sessionID, digest[:])
-		if err != nil {
-			pqErr = err
-			return
-		}
-		// Round1Data contains D matrix and MACs - we store the party ID and a marker
-		// The actual signature aggregation happens via Round2 + Finalize
-		pqSig = &quasar.CoronaSignature{
-			Signature:   []byte{byte(round1Data.PartyID)}, // Store party ID, full data in aggregation
-			ValidatorID: validatorID,
-			SignerIndex: round1Data.PartyID,
-			Round:       1,
-		}
-	}()
-
-	wg.Wait()
-
-	if blsErr != nil || pqErr != nil {
+	sig, err := core.SignMessageWithContext(ctx, validatorID, pending.BlockHash)
+	if err != nil {
 		// The entry was created for a signature that never arrived. Only a
 		// block this node signed is ever finalized, and only a finalized block
 		// is ever cleaned up, so leaving it behind leaks one map entry per
@@ -205,207 +179,141 @@ func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte
 			delete(q.pendingBlocks, blockID)
 			q.mu.Unlock()
 		}
-		if blsErr != nil {
-			return nil, fmt.Errorf("BLS sign failed: %w", blsErr)
-		}
-		return nil, fmt.Errorf("Corona sign failed: %w", pqErr)
+		return nil, fmt.Errorf("quantumvm: sign failed: %w", err)
 	}
 
-	// The counts are read under the same lock that appends them. Reading them
-	// afterwards for the log line raced every peer signature arriving through
-	// AddBLSSignature.
 	q.mu.Lock()
-	pending.addBLS(blsSig)
-	pending.addCorona(pqSig)
-	blsCount, coronaCount := len(pending.BLSSignatures), len(pending.CoronaSignatures)
-	q.mu.Unlock()
+	defer q.mu.Unlock()
+	if err := q.record(pending, sig); err != nil {
+		if have := pending.by(validatorID); have != nil {
+			return have, nil
+		}
+		return nil, err
+	}
 
-	q.log.Debug("Block signed with Quasar (BLS + Corona parallel)",
+	q.log.Debug("block signed",
 		"blockID", blockID,
 		"height", height,
-		"blsSigCount", blsCount,
-		"coronaSigCount", coronaCount,
-	)
-
-	return &BlockSigs{BLS: blsSig, Corona: pqSig}, nil
-}
-
-// errDuplicateSigner — a validator that already contributed a signature for this
-// block sent another. Both finality legs are counted by len(signatures) against
-// the threshold, so admitting a second signature from one validator would let a
-// single peer reach the threshold alone by resending.
-var errDuplicateSigner = errors.New("quantumvm: validator already signed this block")
-
-// addBLS records one BLS signature per validator and reports whether it was new.
-// Caller holds q.mu.
-func (p *PendingBlock) addBLS(sig *quasar.BLSSignature) bool {
-	for _, have := range p.BLSSignatures {
-		if have.ValidatorID == sig.ValidatorID {
-			return false
-		}
-	}
-	p.BLSSignatures = append(p.BLSSignatures, sig)
-	return true
-}
-
-// addCorona records one Corona signature per validator and reports whether it was
-// new. Caller holds q.mu.
-func (p *PendingBlock) addCorona(sig *quasar.CoronaSignature) bool {
-	for _, have := range p.CoronaSignatures {
-		if have.ValidatorID == sig.ValidatorID {
-			return false
-		}
-	}
-	p.CoronaSignatures = append(p.CoronaSignatures, sig)
-	return true
-}
-
-// AddBLSSignature adds a BLS signature from another validator
-func (q *Quasar) AddBLSSignature(blockID ids.ID, sig *quasar.BLSSignature) error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	pending := q.pendingBlocks[blockID]
-	if pending == nil {
-		return fmt.Errorf("pending block not found: %s", blockID)
-	}
-
-	if !pending.addBLS(sig) {
-		return fmt.Errorf("%w: %s (BLS)", errDuplicateSigner, sig.ValidatorID)
-	}
-
-	q.log.Debug("Added BLS signature",
-		"blockID", blockID,
-		"blsSigCount", len(pending.BLSSignatures),
+		"signatures", len(pending.Signatures),
 		"threshold", q.threshold,
 	)
-
-	return nil
+	return sig, nil
 }
 
-// AddCoronaSignature adds a Corona signature from another validator.
+// record admits one signature into a block's set. Caller holds q.mu.
 //
-// The Corona leg is finalized on count alone (TryFinalize does not verify Corona
-// signatures the way the BLS leg verifies its aggregate), so the count must be a
-// count of DISTINCT validators or the post-quantum half of quantum finality is
-// satisfied by one peer resending one signature.
-func (q *Quasar) AddCoronaSignature(blockID ids.ID, sig *quasar.CoronaSignature) error {
+// It VERIFIES before it counts, and it files the signature under the identity
+// that verification authenticated. Counting a caller-supplied name instead made
+// the quorum a count of strings: three fabricated validator ids finalized a
+// block, and five spellings of one name — case, a trailing space, a NUL, the
+// fullwidth forms — counted as five signers of one signature. Verification
+// looks the claimed id up in the committee and checks the signature against
+// THAT key over THIS block's hash, so a name nobody holds a key for fails, a
+// respelling resolves to no validator and fails, and a signature made for
+// another block fails against this one.
+func (q *Quasar) record(p *PendingBlock, sig *quasar.QuasarSig) error {
+	if sig == nil {
+		return errUnverifiedSigner
+	}
+	if !q.core.VerifyQuasarSig(p.BlockHash, sig) {
+		return fmt.Errorf("%w: %q on block %s", errUnverifiedSigner, sig.ValidatorID, p.BlockID)
+	}
+	if p.by(sig.ValidatorID) != nil {
+		return fmt.Errorf("%w: %s", errDuplicateSigner, sig.ValidatorID)
+	}
+	p.Signatures = append(p.Signatures, sig)
+	return nil
+}
+
+// AddSignature admits a peer's signature for a block this node is tracking.
+func (q *Quasar) AddSignature(blockID ids.ID, sig *quasar.QuasarSig) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	pending := q.pendingBlocks[blockID]
 	if pending == nil {
-		return fmt.Errorf("pending block not found: %s", blockID)
+		return fmt.Errorf("%w: %s", errUnknownBlock, blockID)
+	}
+	if err := q.record(pending, sig); err != nil {
+		return err
 	}
 
-	if !pending.addCorona(sig) {
-		return fmt.Errorf("%w: %s (Corona)", errDuplicateSigner, sig.ValidatorID)
-	}
-
-	q.log.Debug("Added Corona signature",
+	q.log.Debug("signature added",
 		"blockID", blockID,
-		"coronaSigCount", len(pending.CoronaSignatures),
+		"signatures", len(pending.Signatures),
 		"threshold", q.threshold,
 	)
-
 	return nil
 }
 
-// TryFinalize attempts to finalize a block if BOTH threshold signatures are collected.
-// Quantum finality requires both BLS AND Corona thresholds to be met.
+// VerifySignature reports whether one validator signature checks out over a
+// message.
+func (q *Quasar) VerifySignature(message []byte, sig *quasar.QuasarSig) bool {
+	if sig == nil {
+		return false
+	}
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.core.VerifyQuasarSig(message, sig)
+}
+
+// VerifyAggregate reports whether an aggregated signature checks out over a
+// message: the aggregate itself against the aggregated keys of the DISTINCT
+// registered validators it names, at or above the threshold.
+func (q *Quasar) VerifyAggregate(ctx context.Context, message []byte, agg *quasar.AggregatedSignature) bool {
+	if agg == nil {
+		return false
+	}
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.core.VerifyAggregatedSignatureWithContext(ctx, message, agg)
+}
+
+// TryFinalize finalizes a block once the quorum's signatures aggregate into a
+// signature that verifies over the block.
+//
+// Reaching the count is necessary and not sufficient: the aggregate is built
+// and checked, and only a check that passes finalizes anything.
 func (q *Quasar) TryFinalize(ctx context.Context, blockID ids.ID) (*quasar.AggregatedSignature, bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	pending := q.pendingBlocks[blockID]
 	if pending == nil {
-		return nil, false, fmt.Errorf("block %s not found", blockID)
-	}
-	qcore := q.quasar
-
-	// Check BLS threshold
-	if !pending.BLSFinalized {
-		if len(pending.BLSSignatures) >= q.threshold {
-			// Convert BLSSignatures to QuasarSigs for aggregation
-			quasarSigs := make([]*quasar.QuasarSig, len(pending.BLSSignatures))
-			for i, blsSig := range pending.BLSSignatures {
-				quasarSigs[i] = &quasar.QuasarSig{
-					BLS:         blsSig.Signature,
-					ValidatorID: blsSig.ValidatorID,
-					IsThreshold: blsSig.IsThreshold,
-					SignerIndex: blsSig.SignerIndex,
-				}
-			}
-
-			aggSig, err := qcore.AggregateSignaturesWithContext(ctx, pending.BlockHash, quasarSigs)
-			if err != nil {
-				return nil, false, fmt.Errorf("failed to aggregate BLS signatures: %w", err)
-			}
-
-			if qcore.VerifyAggregatedSignatureWithContext(ctx, pending.BlockHash, aggSig) {
-				pending.BLSFinalized = true
-				q.log.Debug("BLS threshold reached",
-					"blockID", blockID,
-					"count", len(pending.BLSSignatures),
-				)
-			}
-		}
+		return nil, false, fmt.Errorf("%w: %s", errUnknownBlock, blockID)
 	}
 
-	// Check Corona threshold
-	if !pending.CoronaFinalized {
-		if len(pending.CoronaSignatures) >= q.threshold {
-			// Corona finalized when threshold reached
-			pending.CoronaFinalized = true
-			q.log.Debug("Corona threshold reached",
-				"blockID", blockID,
-				"count", len(pending.CoronaSignatures),
-			)
-		}
+	if len(pending.Signatures) < q.threshold {
+		q.log.Debug("insufficient signatures to finalize",
+			"blockID", blockID,
+			"have", len(pending.Signatures),
+			"need", q.threshold,
+		)
+		return nil, false, nil
 	}
 
-	// Both must be finalized for quantum finality
-	if pending.BLSFinalized && pending.CoronaFinalized {
-		pending.Finalized = true
-		q.finalizedBlocks[blockID] = true
-
-		// Create aggregated signature with both components
-		quasarSigs := make([]*quasar.QuasarSig, len(pending.BLSSignatures))
-		for i, blsSig := range pending.BLSSignatures {
-			quasarSigs[i] = &quasar.QuasarSig{
-				BLS:         blsSig.Signature,
-				ValidatorID: blsSig.ValidatorID,
-				IsThreshold: blsSig.IsThreshold,
-				SignerIndex: blsSig.SignerIndex,
-			}
-		}
-		aggSig, _ := qcore.AggregateSignaturesWithContext(ctx, pending.BlockHash, quasarSigs)
-
-		q.log.Info("═══════════════════════════════════════════════════════════════════")
-		q.log.Info("║ Q-BLOCK FINALIZED with Quasar PQ-BFT                            ║")
-		q.log.Info("║ Block ID:", log.Stringer("blockID", blockID))
-		q.log.Info("║ Height:", log.Uint64("height", pending.Height))
-		q.log.Info("║ BLS Signatures:", log.Int("count", len(pending.BLSSignatures)))
-		q.log.Info("║ Corona Signatures:", log.Int("count", len(pending.CoronaSignatures)))
-		q.log.Info("║ Quantum Finality:", log.Bool("complete", true))
-		q.log.Info("═══════════════════════════════════════════════════════════════════")
-
-		return aggSig, true, nil
+	agg, err := q.core.AggregateSignaturesWithContext(ctx, pending.BlockHash, pending.Signatures)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to aggregate signatures: %w", err)
+	}
+	if !q.core.VerifyAggregatedSignatureWithContext(ctx, pending.BlockHash, agg) {
+		return nil, false, fmt.Errorf("%w: %s", errAggregateRefused, blockID)
 	}
 
-	q.log.Debug("Insufficient signatures for quantum finalization",
+	pending.Finalized = true
+	q.finalizedBlocks[blockID] = true
+
+	q.log.Info("Q-block finalized",
 		"blockID", blockID,
-		"blsHave", len(pending.BLSSignatures),
-		"coronaHave", len(pending.CoronaSignatures),
-		"blsFinalized", pending.BLSFinalized,
-		"coronaFinalized", pending.CoronaFinalized,
-		"need", q.threshold,
+		"height", pending.Height,
+		"signatures", len(pending.Signatures),
+		"threshold", q.threshold,
 	)
 
-	return nil, false, nil
+	return agg, true, nil
 }
 
-// IsFinalized checks if a block has been finalized with BOTH signature types
+// IsFinalized checks if a block has been finalized
 func (q *Quasar) IsFinalized(blockID ids.ID) bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
@@ -416,37 +324,60 @@ func (q *Quasar) IsFinalized(blockID ids.ID) bool {
 func (q *Quasar) GetQuasar() *quasar.Quasar {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	return q.quasar
+	return q.core
 }
 
-// GetThreshold returns the consensus threshold
+// GetThreshold returns how many validators must sign a block.
 func (q *Quasar) GetThreshold() int {
 	return q.threshold
 }
 
-// GetActiveValidators returns the count of active validators
+// Committee returns the committee size the threshold was derived from.
+func (q *Quasar) Committee() int {
+	return q.committee
+}
+
+// GetActiveValidators returns the count of registered validators.
 func (q *Quasar) GetActiveValidators() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	return q.quasar.GetActiveValidatorCount()
+	return len(q.validators)
 }
 
-// AddValidator adds a new validator to the Quasar consensus
+// AddValidator registers a validator with the consensus core. Only a registered
+// validator's signature can verify, so this is what decides whose statements
+// count toward the quorum.
+//
+// The committee is a SET, and it is the set the threshold was derived from.
+// Registering an id twice hands the core a fresh key for it, which silently
+// invalidates every signature that validator has already contributed;
+// registering more validators than the committee declares makes the threshold a
+// quorum of a committee that no longer exists.
 func (q *Quasar) AddValidator(validatorID string, weight uint64) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	_, err := q.quasar.AddValidator(validatorID, weight)
-	if err != nil {
-		return fmt.Errorf("failed to add validator: %w", err)
+	if validatorID == "" {
+		return errNoValidatorID
+	}
+	if _, have := q.validators[validatorID]; have {
+		return fmt.Errorf("%w: %s", errAlreadyRegistered, validatorID)
+	}
+	if len(q.validators) >= q.committee {
+		return fmt.Errorf("%w: %d of %d", errCommitteeFull, len(q.validators), q.committee)
 	}
 
-	activeCount := q.quasar.GetActiveValidatorCount()
+	if _, err := q.core.AddValidator(validatorID, weight); err != nil {
+		return fmt.Errorf("failed to add validator: %w", err)
+	}
+	q.validators[validatorID] = struct{}{}
 
-	q.log.Info("Validator added to Quasar PQ-BFT",
+	q.log.Info("validator registered",
 		"validatorID", validatorID,
 		"weight", weight,
-		"activeCount", activeCount,
+		"registered", len(q.validators),
+		"committee", q.committee,
+		"threshold", q.threshold,
 	)
 
 	return nil
@@ -471,8 +402,7 @@ func (q *Quasar) Cleanup(minHeight uint64) {
 	}
 }
 
-// QuasarBridge is an alias for Quasar - the hybrid P/Q consensus bridge
-// that connects P-Chain BLS + Q-Chain Corona for dual signature finality
+// QuasarBridge is the Q-Chain finality bridge.
 type QuasarBridge = Quasar
 
 // QuasarBridgeConfig is an alias for QuasarConfig

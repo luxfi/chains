@@ -81,7 +81,12 @@ func (k *MLDSAValidatorKey) signer(mode mldsa.Mode) (*mldsa.PrivateKey, error) {
 // NewQuantumSigner creates a new quantum signer with real ML-DSA.
 // algorithmVersion: 1=MLDSA44, 2=MLDSA65, 3=MLDSA87 — the parameter set
 // determines every key and signature width, so there is nothing else to size.
-func NewQuantumSigner(log log.Logger, algorithmVersion uint32, stampWindow time.Duration) *QuantumSigner {
+//
+// A version that does not exist is refused. Falling through to ML-DSA-65
+// instead meant an operator who asked for something else got a chain signing
+// under a parameter set nobody chose, and never heard about it — and it made
+// the signer disagree with the config about what "unset" means.
+func NewQuantumSigner(log log.Logger, algorithmVersion uint32, stampWindow time.Duration) (*QuantumSigner, error) {
 	var mode mldsa.Mode
 	switch algorithmVersion {
 	case AlgorithmMLDSA44:
@@ -91,8 +96,8 @@ func NewQuantumSigner(log log.Logger, algorithmVersion uint32, stampWindow time.
 	case AlgorithmMLDSA87:
 		mode = mldsa.MLDSA87
 	default:
-		mode = mldsa.MLDSA65 // Default to NIST Level 3
-		algorithmVersion = AlgorithmMLDSA65
+		return nil, fmt.Errorf("%w: %d (1=ML-DSA-44, 2=ML-DSA-65, 3=ML-DSA-87)",
+			ErrUnsupportedAlgorithm, algorithmVersion)
 	}
 
 	return &QuantumSigner{
@@ -100,7 +105,7 @@ func NewQuantumSigner(log log.Logger, algorithmVersion uint32, stampWindow time.
 		algorithmVersion: algorithmVersion,
 		mldsaMode:        mode,
 		stampWindow:      stampWindow,
-	}
+	}, nil
 }
 
 // GenerateCoronaKey generates a new ML-DSA validator identity key.
@@ -144,26 +149,25 @@ func (qs *QuantumSigner) Sign(message []byte, key *MLDSAValidatorKey) (*QuantumS
 		return nil, fmt.Errorf("failed to restore ML-DSA key: %w", err)
 	}
 
-	// Generate quantum stamp
-	stamp, err := qs.generateQuantumStamp(message, key)
+	// One reading of the clock: the stamp is derived from it, the signature
+	// covers it, and it is what the signature reports. Two readings would be
+	// two different times for one signature.
+	stamped := time.Now()
+
+	stamp, err := generateQuantumStamp(message, key, stamped)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate quantum stamp: %w", err)
 	}
 
-	// Create message to sign: message || stamp
-	data := make([]byte, len(message)+len(stamp))
-	copy(data, message)
-	copy(data[len(message):], stamp)
-
 	// Sign with ML-DSA (real post-quantum signature!)
-	signature, err := mldsaPriv.Sign(rand.Reader, data, nil)
+	signature, err := mldsaPriv.Sign(rand.Reader, signedData(message, stamp, stamped), nil)
 	if err != nil {
 		return nil, fmt.Errorf("ML-DSA signing failed: %w", err)
 	}
 
 	return &QuantumSignature{
 		Algorithm:    qs.algorithmVersion,
-		Timestamp:    time.Now(),
+		Timestamp:    stamped,
 		PublicKey:    key.PublicKey,
 		Signature:    signature,
 		CoronaKey:    key.PublicKey,
@@ -182,8 +186,11 @@ func (qs *QuantumSigner) Verify(message []byte, sig *QuantumSignature) error {
 		return ErrUnsupportedAlgorithm
 	}
 
-	// Verify timestamp
-	if time.Since(sig.Timestamp) > qs.stampWindow {
+	// The stamp is fresh in both directions. Only one side was checked, and
+	// time.Since goes NEGATIVE for a future date, so any timestamp ahead of now
+	// compared as arbitrarily fresh and never expired at all.
+	age := time.Since(sig.Timestamp)
+	if age > qs.stampWindow || age < -qs.stampWindow {
 		return ErrQuantumStampExpired
 	}
 
@@ -193,27 +200,37 @@ func (qs *QuantumSigner) Verify(message []byte, sig *QuantumSignature) error {
 		return fmt.Errorf("invalid ML-DSA public key: %w", err)
 	}
 
-	// Recreate the signed message: message || stamp
-	data := make([]byte, len(message)+len(sig.QuantumStamp))
-	copy(data, message)
-	copy(data[len(message):], sig.QuantumStamp)
-
 	// Verify with ML-DSA (real post-quantum verification!)
-	if !pubKey.VerifySignature(data, sig.Signature) {
+	if !pubKey.VerifySignature(signedData(message, sig.QuantumStamp, sig.Timestamp), sig.Signature) {
 		return ErrQuantumVerificationFailed
 	}
 
 	return nil
 }
 
+// signedData is what the ML-DSA signature covers: the message, the stamp, and
+// the TIME the stamp was made.
+//
+// The time was a plain field on the signature and nothing signed it, so the
+// freshness check ran against a number the holder could rewrite: an expired
+// stamp revived by setting its Timestamp to now, and the same edit forward
+// produced one that never expired. A field a verifier trusts has to be a field
+// the signature covers.
+func signedData(message, stamp []byte, stamped time.Time) []byte {
+	data := make([]byte, len(message)+len(stamp)+8)
+	copy(data, message)
+	copy(data[len(message):], stamp)
+	binary.BigEndian.PutUint64(data[len(message)+len(stamp):], uint64(stamped.UnixNano()))
+	return data
+}
+
 // generateQuantumStamp generates a quantum stamp for message authentication
-func (qs *QuantumSigner) generateQuantumStamp(message []byte, key *MLDSAValidatorKey) ([]byte, error) {
+func generateQuantumStamp(message []byte, key *MLDSAValidatorKey, stamped time.Time) ([]byte, error) {
 	// Combine message, key nonce, and timestamp
-	timestamp := time.Now().UnixNano()
 	data := make([]byte, len(message)+len(key.Nonce)+8)
 	copy(data, message)
 	copy(data[len(message):], key.Nonce)
-	binary.BigEndian.PutUint64(data[len(message)+len(key.Nonce):], uint64(timestamp))
+	binary.BigEndian.PutUint64(data[len(message)+len(key.Nonce):], uint64(stamped.UnixNano()))
 
 	// Generate quantum stamp using SHA-512
 	hash := sha512.Sum512(data)
@@ -261,6 +278,52 @@ func (qs *QuantumSigner) ParallelVerifyWithThreshold(messages [][]byte, signatur
 	return qs.cpuParallelVerify(messages, signatures)
 }
 
+// packBatch lays the batch out as three flat row-major buffers, one row per
+// signature, for tensor creation.
+//
+// Every copy is bounded at BOTH ends, and every input is measured before it is
+// copied. Slicing only the low end let row i run off the end of itself into row
+// i+1: an oversized signature or public key overwrote the NEXT entry's row, so a
+// caller supplying a matching over-long pair made row i+1 verify under a key of
+// its own choosing. ML-DSA widths are fixed by the parameter set, so anything
+// off-width is refused rather than padded.
+func (qs *QuantumSigner) packBatch(messages [][]byte, signatures []*QuantumSignature) (msgBuf, sigBuf, pkBuf []uint8, maxMsgLen int, err error) {
+	n := len(messages)
+	sigSize := mldsa.GetSignatureSize(qs.mldsaMode)
+	pkSize := mldsa.GetPublicKeySize(qs.mldsaMode)
+
+	full := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		sig := signatures[i]
+		if sig == nil {
+			return nil, nil, nil, 0, fmt.Errorf("signature %d: nil", i)
+		}
+		if len(sig.Signature) != sigSize {
+			return nil, nil, nil, 0, fmt.Errorf("signature %d: %d bytes, ML-DSA takes %d",
+				i, len(sig.Signature), sigSize)
+		}
+		if len(sig.PublicKey) != pkSize {
+			return nil, nil, nil, 0, fmt.Errorf("public key %d: %d bytes, ML-DSA takes %d",
+				i, len(sig.PublicKey), pkSize)
+		}
+		// The signed data is what Sign covered: message || stamp || stamp time.
+		full[i] = signedData(messages[i], sig.QuantumStamp, sig.Timestamp)
+		if len(full[i]) > maxMsgLen {
+			maxMsgLen = len(full[i])
+		}
+	}
+
+	msgBuf = make([]uint8, n*maxMsgLen)
+	sigBuf = make([]uint8, n*sigSize)
+	pkBuf = make([]uint8, n*pkSize)
+	for i := 0; i < n; i++ {
+		copy(msgBuf[i*maxMsgLen:(i+1)*maxMsgLen], full[i])
+		copy(sigBuf[i*sigSize:(i+1)*sigSize], signatures[i].Signature)
+		copy(pkBuf[i*pkSize:(i+1)*pkSize], signatures[i].PublicKey)
+	}
+	return msgBuf, sigBuf, pkBuf, maxMsgLen, nil
+}
+
 // gpuBatchVerify runs DilithiumVerifyBatch on GPU via accel session.
 func (qs *QuantumSigner) gpuBatchVerify(messages [][]byte, signatures []*QuantumSignature) error {
 	n := len(messages)
@@ -273,42 +336,12 @@ func (qs *QuantumSigner) gpuBatchVerify(messages [][]byte, signatures []*Quantum
 
 	latticeOps := sess.Lattice()
 
-	// Determine fixed sizes for this ML-DSA mode
+	msgBuf, sigBuf, pkBuf, maxMsgLen, err := qs.packBatch(messages, signatures)
+	if err != nil {
+		return err
+	}
 	sigSize := mldsa.GetSignatureSize(qs.mldsaMode)
 	pkSize := mldsa.GetPublicKeySize(qs.mldsaMode)
-
-	// Find max message length (messages include appended quantum stamp)
-	maxMsgLen := 0
-	for i := 0; i < n; i++ {
-		fullLen := len(messages[i]) + len(signatures[i].QuantumStamp)
-		if fullLen > maxMsgLen {
-			maxMsgLen = fullLen
-		}
-	}
-
-	// Pack into flat byte arrays for tensor creation
-	msgBuf := make([]uint8, n*maxMsgLen)
-	sigBuf := make([]uint8, n*sigSize)
-	pkBuf := make([]uint8, n*pkSize)
-
-	for i := 0; i < n; i++ {
-		sig := signatures[i]
-		if sig == nil || len(sig.Signature) == 0 {
-			return fmt.Errorf("signature %d: nil or empty", i)
-		}
-
-		// Reconstruct signed data: message || stamp
-		fullMsg := make([]byte, len(messages[i])+len(sig.QuantumStamp))
-		copy(fullMsg, messages[i])
-		copy(fullMsg[len(messages[i]):], sig.QuantumStamp)
-		copy(msgBuf[i*maxMsgLen:], fullMsg)
-
-		// Copy signature bytes (pad if shorter)
-		copy(sigBuf[i*sigSize:], sig.Signature)
-
-		// Copy public key bytes
-		copy(pkBuf[i*pkSize:], sig.PublicKey)
-	}
 
 	// Create tensors
 	msgTensor, err := accel.NewTensorWithData[uint8](sess, []int{n, maxMsgLen}, msgBuf)

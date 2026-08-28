@@ -220,10 +220,15 @@ type TransactionWorker struct {
 	quantumSigner *quantum.QuantumSigner
 }
 
-// ProcessBatch verifies and executes a batch, reporting what survived and what
-// did not. Both halves matter: the survivors go in the block, and the rest have
-// to leave the pool — a transaction whose quantum stamp has aged out will never
-// verify again, and left in place it holds its slot for good.
+// ProcessBatch VERIFIES a batch, reporting what survived and what did not. Both
+// halves matter: the survivors go in the block, and the rest have to leave the
+// pool — a transaction whose quantum stamp has aged out will never verify again,
+// and left in place it holds its slot for good.
+//
+// It does not execute anything. Effects belong to Accept, on every node, once:
+// running them here ran them on a block the network may never accept, ran them
+// twice when the builder rebuilt, and ran them nowhere at all on a node that
+// received the block rather than building it.
 //
 // Uses GPU batch ML-DSA verification when available and the batch is large enough.
 func (w *TransactionWorker) ProcessBatch(txs []Transaction) (valid, rejected []Transaction) {
@@ -274,15 +279,10 @@ func (w *TransactionWorker) ProcessBatch(txs []Transaction) (valid, rejected []T
 		}
 	}
 
-	// Phase 3: execute valid transactions
+	// Phase 3: separate what verified from what did not
 	valid = make([]Transaction, 0, len(verified))
 	for i, tx := range verified {
 		if !sigValid[i] {
-			rejected = append(rejected, tx)
-			continue
-		}
-		if err := tx.Execute(); err != nil {
-			w.vm.log.Debug("transaction execution failed", "txID", tx.ID(), "error", err)
 			rejected = append(rejected, tx)
 			continue
 		}

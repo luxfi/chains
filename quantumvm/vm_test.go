@@ -17,9 +17,17 @@ import (
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/runtime"
 	luxvm "github.com/luxfi/vm"
 	"github.com/stretchr/testify/require"
 )
+
+// testRuntime is the identity the node hands the VM: one chain, one node.
+func testRuntime() *runtime.Runtime {
+	return &runtime.Runtime{
+		NetworkID: testNetwork, ChainID: testChain, NodeID: ids.GenerateTestNodeID(),
+	}
+}
 
 // TestAnEmptyConfigStartsAUsableVM. The config is normalised in exactly one
 // place — Initialize — so a VM built by the factory and one built by hand start
@@ -31,17 +39,23 @@ func TestAnEmptyConfigStartsAUsableVM(t *testing.T) {
 	require.True(t, ok)
 
 	require.NoError(t, vm.Initialize(context.Background(), luxvm.Init{
-		DB:  memdb.New(),
-		Log: log.NewNoOpLogger(),
+		DB:      memdb.New(),
+		Log:     log.NewNoOpLogger(),
+		Runtime: testRuntime(),
 	}))
 	t.Cleanup(func() { _ = vm.Shutdown(context.Background()) })
 
 	require.Positive(t, vm.Config.MaxParallelTxs)
 	require.Positive(t, vm.Config.ParallelBatchSize)
 	require.Equal(t, config.AlgorithmDefault, vm.Config.QuantumAlgorithmVersion)
+	require.Equal(t, config.CommitteeMin, vm.Config.Committee)
 
-	// No Runtime was supplied, and the VM still starts — with a tip.
-	require.NotEqual(t, ids.Empty, vm.getLastAcceptedID())
+	// The settled config and the stock one agree on the parameter set. Two
+	// spellings of the default is a chain whose algorithm depends on which door
+	// its operator came through.
+	require.Equal(t, config.DefaultConfig().QuantumAlgorithmVersion, vm.Config.QuantumAlgorithmVersion)
+
+	require.NotEqual(t, ids.Empty, tipOf(t, vm))
 
 	// And it builds, verifies and accepts on those settled values.
 	vm.clock.Set(chainTime)
@@ -60,44 +74,82 @@ func TestInitializeRefusesAnAlgorithmThatDoesNotExist(t *testing.T) {
 	cfg.QuantumAlgorithmVersion = 42
 	vm := &VM{Config: cfg}
 	require.Error(t, vm.Initialize(context.Background(), luxvm.Init{
-		DB: memdb.New(), Log: log.NewNoOpLogger(),
+		DB: memdb.New(), Log: log.NewNoOpLogger(), Runtime: testRuntime(),
 	}))
+}
+
+// TestInitializeRefusesACommitteeThatSurvivesNoFault. The threshold is derived
+// from the committee, and ⌊2n/3⌋+1 is unanimity for every n below four: one
+// absent validator halts the chain, one dishonest validator decides it, and the
+// consensus core will not even build the key set for it.
+func TestInitializeRefusesACommitteeThatSurvivesNoFault(t *testing.T) {
+	for _, n := range []int{1, 2, 3} {
+		cfg := config.DefaultConfig()
+		cfg.Committee = n
+		vm := &VM{Config: cfg}
+		require.Error(t, vm.Initialize(context.Background(), luxvm.Init{
+			DB: memdb.New(), Log: log.NewNoOpLogger(), Runtime: testRuntime(),
+		}), "a committee of %d was accepted", n)
+	}
 }
 
 // TestInitializeWithoutALoggerDoesNotPanic: Initialize accepts a nil Log, so it
 // has to survive one. Every path out of Initialize logs.
 func TestInitializeWithoutALoggerDoesNotPanic(t *testing.T) {
 	vm := &VM{Config: config.DefaultConfig()}
-	require.NoError(t, vm.Initialize(context.Background(), luxvm.Init{DB: memdb.New()}))
+	require.NoError(t, vm.Initialize(context.Background(), luxvm.Init{
+		DB: memdb.New(), Runtime: testRuntime(),
+	}))
 	require.NoError(t, vm.Shutdown(context.Background()))
+}
+
+// TestInitializeRefusesANodeWithNoIdentity.
+//
+// Without a runtime the VM took the EMPTY node id and started anyway, so every
+// node that came up that way signed under one shared name: their signatures
+// arrived as duplicates of each other and no threshold above one could be met.
+// A node that cannot say who it is cannot be one of a number of distinct
+// signers, so it does not start.
+func TestInitializeRefusesANodeWithNoIdentity(t *testing.T) {
+	for _, rt := range []*runtime.Runtime{
+		nil,
+		{NetworkID: testNetwork, ChainID: testChain},
+		{NetworkID: testNetwork, ChainID: testChain, NodeID: ids.EmptyNodeID},
+	} {
+		vm := &VM{Config: config.DefaultConfig()}
+		require.ErrorIs(t, vm.Initialize(context.Background(), luxvm.Init{
+			DB: memdb.New(), Log: log.NewNoOpLogger(), Runtime: rt,
+		}), errNoIdentity)
+	}
 }
 
 // TestEveryNodeSignsUnderItsOwnName.
 //
-// Both finality legs count DISTINCT validator ids against the threshold, so the
-// id has to name the node. It named the CHAIN — a field that was never even
-// assigned, so every Q-Chain node in the world signed as the empty id. Each
-// peer's signature arrived as a duplicate of the first, the count never passed
-// one, and no threshold above one could ever be met.
+// The threshold counts DISTINCT validator ids, so the id has to name the NODE.
+// It named the CHAIN — which every node of a chain shares, by definition — so
+// each peer's signature arrived as a duplicate of the first, the count never
+// passed one, and no threshold above one could ever be met.
+//
+// The three VMs below share ONE chain id and hold three node ids, which is the
+// only shape production ever has. Giving each test VM its own chain id varied
+// the wrong field: under that shape the broken code prints three different
+// names too, and the test passes while the fleet cannot finalize anything.
 func TestEveryNodeSignsUnderItsOwnName(t *testing.T) {
 	a, _ := bootVM(t, quietConfig())
 	b, _ := bootVM(t, quietConfig())
+	c, _ := bootVM(t, quietConfig())
 
-	idA := a.GetQuasarBridge().validatorID
-	idB := b.GetQuasarBridge().validatorID
+	require.Equal(t, a.blockchainID, b.blockchainID, "precondition: one chain")
+	require.Equal(t, a.blockchainID, c.blockchainID, "precondition: one chain")
 
-	require.NotEqual(t, ids.EmptyNodeID.String(), idA, "the node signs as nobody")
-	require.NotEqual(t, idA, idB, "two nodes sign under one name, so their signatures cancel out")
-
-	// What that costs, concretely: their two signatures must count as two.
-	blockID := ids.GenerateTestID()
-	q, err := NewQuasar(QuasarConfig{ValidatorID: idA, TotalNodes: 3, Logger: log.NewNoOpLogger()})
-	require.NoError(t, err)
-	q.pendingBlocks[blockID] = &PendingBlock{BlockID: blockID, BlockHash: blockID[:], Height: 1}
-
-	require.NoError(t, q.AddBLSSignature(blockID, &quasar.BLSSignature{Signature: []byte{1}, ValidatorID: idA}))
-	require.NoError(t, q.AddBLSSignature(blockID, &quasar.BLSSignature{Signature: []byte{2}, ValidatorID: idB}))
-	require.Len(t, q.pendingBlocks[blockID].BLSSignatures, 2)
+	names := map[string]bool{}
+	for _, vm := range []*VM{a, b, c} {
+		id := vm.GetQuasarBridge().validatorID
+		require.NotEqual(t, ids.EmptyNodeID.String(), id, "the node signs as nobody")
+		require.NotEqual(t, vm.blockchainID.String(), id, "the node signs under the chain's name")
+		names[id] = true
+	}
+	require.Len(t, names, 3, "three nodes of one chain signed under fewer than three names")
 }
 
 // TestBuildBlockRefusesAnEmptyMempool: a block with nothing in it costs a round
@@ -166,6 +218,55 @@ func TestBuildBlockStampsNoEarlierThanItsParent(t *testing.T) {
 		"a node built a block it will not itself verify")
 }
 
+// TestBuildBlockRefusesWhenItsClockTrailsTheTipTooFar.
+//
+// The two halves of the clock rule contradicted each other. Clamping the
+// timestamp forward to the parent's keeps a slightly slow node building; but a
+// node whose clock trails the tip by MORE than the skew allowance clamps to a
+// value its own Verify then rejects for exceeding now+skew. The VM built a block
+// and immediately refused it, over and over. The node's clock is what is wrong,
+// so the node says so.
+func TestBuildBlockRefusesWhenItsClockTrailsTheTipTooFar(t *testing.T) {
+	vm, _ := bootVM(t, quietConfig())
+	parent := advance(t, vm, 1)
+
+	// Exactly at the allowance still builds, and still verifies.
+	vm.clock.Set(parent.timestamp.Add(-MaxFutureSkew))
+	blk := buildOn(t, vm)
+	require.NoError(t, blk.Verify(context.Background()))
+	require.NoError(t, blk.Accept(context.Background()))
+
+	// One second past it, the node refuses rather than producing a block it
+	// will not itself accept.
+	vm.clock.Set(blk.timestamp.Add(-MaxFutureSkew - time.Second))
+	require.NoError(t, vm.txPool.AddTransaction(stampedTx(77, "op")))
+	_, err := vm.BuildBlock(context.Background())
+	require.ErrorIs(t, err, errClockBehindTip)
+}
+
+// TestABlockTooLargeToHoldIsRefusedEverywhere.
+//
+// Nothing bounded a block anywhere: parse, verify and commit each walked
+// whatever arrived, so a peer decided how much memory this node allocated and
+// how much its store held.
+func TestABlockTooLargeToHoldIsRefusedEverywhere(t *testing.T) {
+	vm, _ := bootVM(t, quietConfig())
+	genesis, err := vm.blockAt(tipOf(t, vm))
+	require.NoError(t, err)
+
+	huge := blockOn(vm, genesis, stampedTx(1, string(make([]byte, MaxBlockSize))))
+	require.Greater(t, len(huge.Bytes()), MaxBlockSize, "precondition: over the bound")
+
+	_, err = vm.ParseBlock(context.Background(), huge.Bytes())
+	require.ErrorIs(t, err, errBlockTooLarge)
+	require.ErrorIs(t, huge.Verify(context.Background()), errBlockTooLarge)
+
+	// And the builder will not produce one either.
+	require.NoError(t, vm.txPool.AddTransaction(stampedTx(2, string(make([]byte, MaxBlockSize)))))
+	_, err = vm.BuildBlock(context.Background())
+	require.ErrorIs(t, err, errBlockTooLarge)
+}
+
 // TestBuildBlockRefusesDuringShutdown.
 func TestBuildBlockRefusesDuringShutdown(t *testing.T) {
 	vm, _ := bootVM(t, quietConfig())
@@ -189,7 +290,7 @@ func TestShutdownIsIdempotent(t *testing.T) {
 }
 
 // TestAcceptOnAClosedStoreFailsRatherThanClaimingSuccess: after Shutdown the
-// version layer is closed, so staging a write cannot succeed — and Accept must
+// version layer is closed, so nothing can be read or staged — and Accept must
 // say so instead of reporting a block it did not store.
 func TestAcceptOnAClosedStoreFailsRatherThanClaimingSuccess(t *testing.T) {
 	vm, _ := bootVM(t, quietConfig())
@@ -204,7 +305,7 @@ func TestAcceptOnAClosedStoreFailsRatherThanClaimingSuccess(t *testing.T) {
 // disagree.
 func TestHeightIndexAnswersEveryAcceptedHeight(t *testing.T) {
 	vm, _ := bootVM(t, quietConfig())
-	accepted := []ids.ID{vm.getLastAcceptedID()}
+	accepted := []ids.ID{tipOf(t, vm)}
 	for i := 0; i < 4; i++ {
 		accepted = append(accepted, advance(t, vm, 1).id)
 	}
@@ -259,6 +360,7 @@ func TestParseBlockRoundTripsWhatBuildBlockProduced(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, blk.id, parsed.ID())
 	require.Equal(t, blk.height, parsed.Height())
+	require.Len(t, parsed.(*Block).transactions, len(blk.transactions))
 
 	_, err = vm.ParseBlock(context.Background(), []byte("garbage"))
 	require.Error(t, err)
@@ -331,7 +433,7 @@ func TestVMLifecycleCallbacks(t *testing.T) {
 
 // TestStampBlockSurvivesAShortMessage.
 //
-// The Corona leg used the first 32 bytes of whatever it was handed as a PRF
+// The signing lane used the first 32 bytes of whatever it was handed as a PRF
 // key. StampBlock takes an arbitrary message from the finality bridge, so any
 // message under 32 bytes took the slice out of range and killed the process.
 func TestStampBlockSurvivesAShortMessage(t *testing.T) {
@@ -342,6 +444,22 @@ func TestStampBlockSurvivesAShortMessage(t *testing.T) {
 			_, _ = vm.StampBlock(ids.GenerateTestID(), 7, msg)
 		}, "a %d-byte message crashed the node", len(msg))
 	}
+}
+
+// TestStampBlockSignsWithTheNodesOwnKey, and the stamp verifies against the
+// message it attests — which it could not do while the node was not registered
+// with its own consensus core.
+func TestStampBlockSignsWithTheNodesOwnKey(t *testing.T) {
+	vm, _ := bootVM(t, quietConfig())
+
+	msg := []byte("a round digest to attest")
+	stamp, err := vm.StampBlock(ids.GenerateTestID(), 1, msg)
+	require.NoError(t, err)
+
+	sig, ok := stamp.(*quasar.QuasarSig)
+	require.True(t, ok, "the bridge is up and produced no Quasar signature")
+	require.NoError(t, vm.VerifyStamp(msg, sig))
+	require.Error(t, vm.VerifyStamp([]byte("a different digest"), sig))
 }
 
 // TestStampBlockFallsBackToMLDSA: with no bridge and no block id, the stamp is
@@ -357,39 +475,81 @@ func TestStampBlockFallsBackToMLDSA(t *testing.T) {
 	sig, ok := stamp.(*quantum.QuantumSignature)
 	require.True(t, ok)
 	require.NoError(t, vm.quantumSigner.Verify(msg, sig))
-	require.NoError(t, vm.VerifyStamp(sig))
+	require.NoError(t, vm.VerifyStamp(msg, sig))
+	require.Error(t, vm.VerifyStamp([]byte("another message"), sig))
 }
 
-// TestVerifyStampRefusesWhatItCannotCheck. Each arm is a shape a peer can send,
-// and an empty one must not read as verified.
-func TestVerifyStampRefusesWhatItCannotCheck(t *testing.T) {
+// TestVerifyStampChecksTheSignatureAgainstTheMessage.
+//
+// It took no message, so no arm could check a signature against anything: each
+// looked at the stamp's own SHAPE, and shape is what the sender chose. A
+// two-byte aggregate declaring three signers passed; so did a one-byte BLS
+// signature. A self-declared signer count is not evidence of anything.
+func TestVerifyStampChecksTheSignatureAgainstTheMessage(t *testing.T) {
+	ctx := context.Background()
 	vm, _ := bootVM(t, quietConfig())
-	threshold := vm.GetQuasarBridge().GetThreshold()
+	bridge := vm.GetQuasarBridge()
+	threshold := bridge.GetThreshold()
+	msg := []byte("the message under attestation")
 
-	require.NoError(t, vm.VerifyStamp(&quasar.QuasarSignature{
-		BLS: &quasar.BLSSignature{Signature: []byte{1}},
-	}))
-	require.Error(t, vm.VerifyStamp(&quasar.QuasarSignature{}), "a Quasar stamp with no BLS half")
-	require.Error(t, vm.VerifyStamp(&quasar.QuasarSignature{BLS: &quasar.BLSSignature{}}), "an empty BLS signature")
+	// A validator signature: the real one verifies, a forged shape does not.
+	sig, err := bridge.SignBlock(ctx, ids.GenerateTestID(), msg, 1)
+	require.NoError(t, err)
+	require.NoError(t, vm.VerifyStamp(msg, sig))
+	require.Error(t, vm.VerifyStamp(msg, &quasar.QuasarSig{
+		BLS: []byte{1}, ValidatorID: bridge.validatorID,
+	}), "a one-byte BLS signature was accepted")
+	require.Error(t, vm.VerifyStamp([]byte("another message"), sig),
+		"a signature was accepted for a message it does not sign")
 
-	require.NoError(t, vm.VerifyStamp(&quasar.AggregatedSignature{
-		BLSAggregated: []byte{1}, SignerCount: threshold,
-	}))
-	require.Error(t, vm.VerifyStamp(&quasar.AggregatedSignature{
-		BLSAggregated: []byte{1}, SignerCount: threshold - 1,
-	}), "an aggregate one signer short of the threshold")
-	require.Error(t, vm.VerifyStamp(&quasar.AggregatedSignature{SignerCount: threshold}),
+	// An aggregate: a self-declared signer count buys nothing.
+	require.Error(t, vm.VerifyStamp(msg, &quasar.AggregatedSignature{
+		BLSAggregated: []byte{1, 2}, SignerCount: threshold,
+	}), "two bytes declaring a quorum were accepted as an aggregate")
+	require.Error(t, vm.VerifyStamp(msg, &quasar.AggregatedSignature{
+		BLSAggregated: []byte{1}, SignerCount: threshold + 100,
+	}), "declaring more signers made a forgery verify")
+	require.Error(t, vm.VerifyStamp(msg, &quasar.AggregatedSignature{SignerCount: threshold}),
 		"an aggregate carrying no signature bytes")
 
-	require.Error(t, vm.VerifyStamp(&quantum.QuantumSignature{}), "an empty ML-DSA stamp")
-	require.Error(t, vm.VerifyStamp("a string"), "an unknown stamp type")
+	// An ML-DSA stamp is checked the same way.
+	require.Error(t, vm.VerifyStamp(msg, &quantum.QuantumSignature{}), "an empty ML-DSA stamp")
 
-	// With no bridge there is no threshold to check an aggregate against, so
-	// the aggregate is refused rather than waved through.
+	require.ErrorIs(t, vm.VerifyStamp(msg, nil), errNoStamp)
+	require.Error(t, vm.VerifyStamp(msg, "a string"), "an unknown stamp type")
+
+	// With no bridge there is nothing to check a Quasar stamp against, so it is
+	// refused rather than waved through.
 	vm.quasarBridge = nil
-	require.Error(t, vm.VerifyStamp(&quasar.AggregatedSignature{
+	require.Error(t, vm.VerifyStamp(msg, sig))
+	require.Error(t, vm.VerifyStamp(msg, &quasar.AggregatedSignature{
 		BLSAggregated: []byte{1}, SignerCount: threshold,
 	}))
+}
+
+// TestVerifyStampAcceptsAQuorumAggregate is the other half: an aggregate built
+// from a verified quorum verifies, over the message it was built on and no
+// other.
+func TestVerifyStampAcceptsAQuorumAggregate(t *testing.T) {
+	ctx := context.Background()
+	vm, _ := bootVM(t, quietConfig())
+	bridge := vm.GetQuasarBridge()
+
+	blockID := ids.GenerateTestID()
+	msg := blockID[:]
+	_, err := bridge.SignBlock(ctx, blockID, msg, 1)
+	require.NoError(t, err)
+
+	for _, peer := range []string{"peer-1", "peer-2"} {
+		require.NoError(t, bridge.AddValidator(peer, 1))
+		require.NoError(t, bridge.AddSignature(blockID, signAs(t, bridge, peer, msg)))
+	}
+
+	agg, finalized, err := bridge.TryFinalize(ctx, blockID)
+	require.NoError(t, err)
+	require.True(t, finalized)
+	require.NoError(t, vm.VerifyStamp(msg, agg))
+	require.Error(t, vm.VerifyStamp([]byte("another block"), agg))
 }
 
 // TestFeePolicyRefusesEveryUserTransaction. Q-Chain sells no blockspace: cert
