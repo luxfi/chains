@@ -237,27 +237,27 @@ type ModelRegistryEntry struct {
 
 // AuditAnchor mirrors aivm::cuda::AuditAnchor (128 bytes).
 type AuditAnchor struct {
-	CommitRoot                [32]byte
-	ParentRoot                [32]byte
-	ValidatorSetRootAtCommit  [32]byte
-	Height                    uint64
-	TimestampNS               uint64
-	Occupied                  uint32
-	_pad0                     uint32
-	_pad1                     uint64
+	CommitRoot               [32]byte
+	ParentRoot               [32]byte
+	ValidatorSetRootAtCommit [32]byte
+	Height                   uint64
+	TimestampNS              uint64
+	Occupied                 uint32
+	_pad0                    uint32
+	_pad1                    uint64
 }
 
 // AIVMEpochState mirrors aivm::cuda::AIVMEpochState (160 bytes).
 type AIVMEpochState struct {
-	CurrentEpoch             uint64
-	NextEpochHeight          uint64
-	TotalActiveAttestations  uint64
-	ActiveModelCount         uint32
-	ExpiredAttestationCount  uint32
-	AttestationRoot          [32]byte
-	ModelRegistryRoot        [32]byte
-	AuditRoot                [32]byte
-	AIVMStateRoot            [32]byte
+	CurrentEpoch            uint64
+	NextEpochHeight         uint64
+	TotalActiveAttestations uint64
+	ActiveModelCount        uint32
+	ExpiredAttestationCount uint32
+	AttestationRoot         [32]byte
+	ModelRegistryRoot       [32]byte
+	AuditRoot               [32]byte
+	AIVMStateRoot           [32]byte
 }
 
 // AIVMRoundDescriptor mirrors aivm::cuda::AIVMRoundDescriptor (96 bytes).
@@ -308,14 +308,14 @@ type ModelOp struct {
 
 // AnchorOp mirrors aivm::cuda::AnchorOp (128 bytes).
 type AnchorOp struct {
-	CommitRoot                [32]byte
-	ParentRoot                [32]byte
-	ValidatorSetRootAtCommit  [32]byte
-	Height                    uint64
-	TimestampNS               uint64
-	Epoch                     uint32
-	_pad0                     uint32
-	_pad1                     uint64
+	CommitRoot               [32]byte
+	ParentRoot               [32]byte
+	ValidatorSetRootAtCommit [32]byte
+	Height                   uint64
+	TimestampNS              uint64
+	Epoch                    uint32
+	_pad0                    uint32
+	_pad1                    uint64
 }
 
 // AIVMTransitionResult mirrors aivm::cuda::AIVMTransitionResult (192 bytes).
@@ -377,12 +377,12 @@ type InferenceOp struct {
 
 // InferenceResult mirrors aivm::cuda::InferenceResult (112 bytes).
 type InferenceResult struct {
-	Status            uint32
-	OutputLen         uint32
-	InputCommitment   [32]byte
-	OutputCommitment  [32]byte
-	AttestationRoot   [32]byte
-	_pad0             [8]uint8
+	Status           uint32
+	OutputLen        uint32
+	InputCommitment  [32]byte
+	OutputCommitment [32]byte
+	AttestationRoot  [32]byte
+	_pad0            [8]uint8
 }
 
 // ProofVerifyOp mirrors aivm::cuda::ProofVerifyOp (240 bytes).
@@ -451,16 +451,16 @@ func init() {
 // stored at package level by backend.go's init(); call ActiveGPUBackend()
 // to retrieve it.
 type GPUBackend struct {
-	mu        sync.Mutex
-	kind      BackendKind
-	handle    unsafe.Pointer // dlopen result
-	path      string
-	fnAttest  unsafe.Pointer
-	fnProv    unsafe.Pointer
-	fnAnchor  unsafe.Pointer
-	fnEpoch   unsafe.Pointer
-	fnInfer   unsafe.Pointer
-	fnProof   unsafe.Pointer
+	mu       sync.Mutex
+	kind     BackendKind
+	handle   unsafe.Pointer // dlopen result
+	path     string
+	fnAttest unsafe.Pointer
+	fnProv   unsafe.Pointer
+	fnAnchor unsafe.Pointer
+	fnEpoch  unsafe.Pointer
+	fnInfer  unsafe.Pointer
+	fnProof  unsafe.Pointer
 }
 
 // Kind returns which backend satisfied the dlopen probe.

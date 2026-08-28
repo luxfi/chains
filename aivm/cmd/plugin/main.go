@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/luxfi/log"
 	"github.com/luxfi/chains/aivm"
+	"github.com/luxfi/log"
 	"github.com/luxfi/sys/ulimit"
 	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/vm/rpc"

@@ -32,8 +32,8 @@ const ReceiptVersion uint16 = 1
 // reordered.
 type AInferenceReceipt struct {
 	Version             uint16         `json:"version"`
-	IntentID            common.Hash    `json:"intentId"`            // source C-chain intent id
-	TaskID              common.Hash    `json:"taskId"`              // A-chain task id (beacon anchor)
+	IntentID            common.Hash    `json:"intentId"` // source C-chain intent id
+	TaskID              common.Hash    `json:"taskId"`   // A-chain task id (beacon anchor)
 	CChainID            common.Hash    `json:"cChainId"`
 	AChainID            common.Hash    `json:"aChainId"`
 	Requester           common.Address `json:"requester"`
@@ -43,8 +43,8 @@ type AInferenceReceipt struct {
 	Status              uint8          `json:"status"`              // StatusCompleted / StatusFailed / ...
 	N                   uint16         `json:"n"`
 	Threshold           uint16         `json:"threshold"`
-	WinnersRoot         common.Hash    `json:"winnersRoot"`         // merkle root over winner addresses
-	OperatorsRoot       common.Hash    `json:"operatorsRoot"`       // merkle root over selected addresses
+	WinnersRoot         common.Hash    `json:"winnersRoot"`   // merkle root over winner addresses
+	OperatorsRoot       common.Hash    `json:"operatorsRoot"` // merkle root over selected addresses
 	FeePaid             *uint256.Int   `json:"feePaid"`
 	SettledAtHeight     uint64         `json:"settledAtHeight"`
 }

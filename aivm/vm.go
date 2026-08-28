@@ -297,13 +297,21 @@ type ProviderReg struct {
 }
 
 // Initialize initializes the VM with the unified Init struct
+// errRuntimeRequired is returned by Initialize when the consensus runtime is
+// absent. Every later method assumes it.
+var errRuntimeRequired = errors.New("aivm: Initialize requires a runtime")
+
 func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	vm.rt = init.Runtime
 	vm.db = init.DB
 	vm.toEngine = init.ToEngine
-	if vm.rt != nil {
-		vm.networkID = vm.rt.NetworkID
+	// A VM with no runtime has no logger, no network and no node identity.
+	// Guarding networkID and then dereferencing rt.Log on the next line meant
+	// the guard read as defensive while the panic happened anyway.
+	if vm.rt == nil {
+		return errRuntimeRequired
 	}
+	vm.networkID = vm.rt.NetworkID
 
 	if logger, ok := vm.rt.Log.(log.Logger); ok {
 		vm.log = logger

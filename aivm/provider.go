@@ -184,7 +184,11 @@ func (e *Engine) WithdrawStake(st QuorumState, lg QuorumLedger, operator common.
 		return nil, ErrOperatorUnknown
 	}
 	if !rec.Unbonding {
-		return nil, ErrOperatorUnbonding // must Deregister first
+		// The operator is still bonded, so there is nothing to withdraw yet.
+		// Reporting ErrOperatorUnbonding here said the opposite of what had
+		// happened, and an operator reading it would conclude it had already
+		// deregistered.
+		return nil, ErrOperatorBonded
 	}
 	if block < rec.UnbondBlock+UnbondCooldownBlocks {
 		return nil, ErrCooldownActive

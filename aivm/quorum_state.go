@@ -196,33 +196,33 @@ func (l *MemLedger) Restore(snap map[common.Address]*uint256.Int) {
 // ---------------------------------------------------------------------------
 
 var (
-	nsOperator    = []byte("av/op")          // operator registry meta
-	nsModelIndex  = []byte("av/mspec.idx")   // per-ModelSpec operator-array length
-	nsModelMember = []byte("av/mspec.mem")   // per-ModelSpec operator-array element
-	nsModelSeen   = []byte("av/mspec.seen")  // per-(ModelSpec,operator) membership flag
-	nsCredit      = []byte("av/cred")        // operator withdrawable credit ledger
-	nsReqNonce    = []byte("av/req.nonce")   // requester monotonic nonce
-	nsTask        = []byte("av/task")        // task record (status + params) *** also job_id domain
-	nsTaskReward  = []byte("av/task.reward") // task rewardPerOperator (uint256)
-	nsTaskEscrow  = []byte("av/task.escrow") // task remaining escrow (uint256)
-	nsTaskIntent  = []byte("av/task.intent") // task -> source C intent id
-	nsTaskFee     = []byte("av/task.fee")    // task fee paid (uint256, for the receipt)
-	nsSelected    = []byte("av/sel")         // per-(task,operator) selection flag
-	nsSelList     = []byte("av/sel.list")    // per-task selected-operator-array element
-	nsCommit      = []byte("av/commit")      // per-(task,operator) commit hash
-	nsReveal      = []byte("av/reveal")      // per-(task,operator) revealed output_hash
-	nsRevealFlag  = []byte("av/reveal.f")    // per-(task,operator) revealed flag
-	nsRevealList  = []byte("av/reveal.list") // per-task revealer-array element
-	nsRevealCount = []byte("av/reveal.cnt")  // per-task revealer count
-	nsSettled     = []byte("av/settled")     // per-task settled marker (replay guard)
-	nsCanonical   = []byte("av/canon")       // per-task canonical output_hash
-	nsReceiptRoot = []byte("av/receipt.root")// running receipt_root accumulator
-	nsReceiptIdx  = []byte("av/receipt.idx") // count of settled receipts in the root
-	nsReceiptLeaf = []byte("av/receipt.leaf")// settled receipt_hash by index (for proofs)
-	nsIntentSeen  = []byte("av/intent.seen") // per-C-intent consumed marker (anti-replay)
-	nsIntentTask  = []byte("av/intent.task") // per-C-intent -> A-chain task id
-	nsIntentRcpt  = []byte("av/intent.rcpt") // per-C-intent settled-receipt leaf index+1 (0 = unsettled)
-	nsTaskHeight  = []byte("av/task.height") // per-task settled height (so receipt is reproducible)
+	nsOperator    = []byte("av/op")           // operator registry meta
+	nsModelIndex  = []byte("av/mspec.idx")    // per-ModelSpec operator-array length
+	nsModelMember = []byte("av/mspec.mem")    // per-ModelSpec operator-array element
+	nsModelSeen   = []byte("av/mspec.seen")   // per-(ModelSpec,operator) membership flag
+	nsCredit      = []byte("av/cred")         // operator withdrawable credit ledger
+	nsReqNonce    = []byte("av/req.nonce")    // requester monotonic nonce
+	nsTask        = []byte("av/task")         // task record (status + params) *** also job_id domain
+	nsTaskReward  = []byte("av/task.reward")  // task rewardPerOperator (uint256)
+	nsTaskEscrow  = []byte("av/task.escrow")  // task remaining escrow (uint256)
+	nsTaskIntent  = []byte("av/task.intent")  // task -> source C intent id
+	nsTaskFee     = []byte("av/task.fee")     // task fee paid (uint256, for the receipt)
+	nsSelected    = []byte("av/sel")          // per-(task,operator) selection flag
+	nsSelList     = []byte("av/sel.list")     // per-task selected-operator-array element
+	nsCommit      = []byte("av/commit")       // per-(task,operator) commit hash
+	nsReveal      = []byte("av/reveal")       // per-(task,operator) revealed output_hash
+	nsRevealFlag  = []byte("av/reveal.f")     // per-(task,operator) revealed flag
+	nsRevealList  = []byte("av/reveal.list")  // per-task revealer-array element
+	nsRevealCount = []byte("av/reveal.cnt")   // per-task revealer count
+	nsSettled     = []byte("av/settled")      // per-task settled marker (replay guard)
+	nsCanonical   = []byte("av/canon")        // per-task canonical output_hash
+	nsReceiptRoot = []byte("av/receipt.root") // running receipt_root accumulator
+	nsReceiptIdx  = []byte("av/receipt.idx")  // count of settled receipts in the root
+	nsReceiptLeaf = []byte("av/receipt.leaf") // settled receipt_hash by index (for proofs)
+	nsIntentSeen  = []byte("av/intent.seen")  // per-C-intent consumed marker (anti-replay)
+	nsIntentTask  = []byte("av/intent.task")  // per-C-intent -> A-chain task id
+	nsIntentRcpt  = []byte("av/intent.rcpt")  // per-C-intent settled-receipt leaf index+1 (0 = unsettled)
+	nsTaskHeight  = []byte("av/task.height")  // per-task settled height (so receipt is reproducible)
 )
 
 // ---------------------------------------------------------------------------

@@ -566,7 +566,7 @@ func TestUnstakeCooldown(t *testing.T) {
 
 	// cannot withdraw before deregister.
 	_, err := e.WithdrawStake(st, lg, op, 1000)
-	require.ErrorIs(err, ErrOperatorUnbonding)
+	require.ErrorIs(err, ErrOperatorBonded)
 
 	require.NoError(e.DeregisterOperator(st, op, 100))
 	require.False(e.IsEligible(st, op, modelSpec), "unbonding op is ineligible immediately")
