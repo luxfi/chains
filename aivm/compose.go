@@ -37,7 +37,9 @@ type TaskSpec struct {
 	// Input is what they are asked to run it on.
 	Input common.Hash
 	// Candidates is the pool the draw runs over, already filtered by the
-	// composing VM's own policy. It must exceed N by the protocol margin.
+	// composing VM's own policy. Repeats are dropped before anything is counted,
+	// so the margin is over distinct addresses and a pool padded with one
+	// address cannot buy its way past it.
 	Candidates []common.Address
 	// N is how many operators answer; Threshold is how many must agree.
 	N         uint32
@@ -48,10 +50,18 @@ type TaskSpec struct {
 }
 
 // OpenTask opens a task over a caller-supplied candidate pool and returns its id.
-// Every guarantee the model path has holds here, because it is the same write
-// path: the pool must exceed the draw by the margin, the requester must be able to
-// afford escrow plus fee before either moves, the draw is the reproducible beacon
-// anchored in the task id, and a refusal leaves no state and no value touched.
+// It is the same write path the model intent uses: the distinct pool must exceed
+// the draw by the margin, the requester must be able to afford escrow plus fee
+// before either moves, the draw is the reproducible beacon anchored in the task
+// id, and a refusal leaves no state and no value touched.
+//
+// One guarantee does NOT come along, because it was never in this function. On
+// the model path the pool comes from eligibleSet, which reads an append-only set
+// and so cannot repeat an address; that is where its distinctness came from. A
+// caller's pool carries no such history, and N draws from a pool of one address
+// would be one party agreeing with itself N times. createTask therefore drops
+// repeats before it counts anything — see distinct() — so the property holds
+// here for a different reason than it holds there.
 func (e *Engine) OpenTask(st QuorumState, lg QuorumLedger, s TaskSpec, height uint64) (common.Hash, error) {
 	if s.Fee == nil || s.Reward == nil {
 		return common.Hash{}, ErrIntentNilAmount

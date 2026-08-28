@@ -186,12 +186,22 @@ func (e *Engine) createTask(st QuorumState, lg QuorumLedger, s taskSpec, height 
 		return common.Hash{}, ErrRewardOverflow
 	}
 
+	// DISTINCTNESS, then the margin. The draw is a partial shuffle that returns N
+	// entries of the pool; if the same address appears twice it can be drawn
+	// twice, and N operators would be one party agreeing with itself. eligibleSet
+	// cannot produce a duplicate, but the pool is a parameter now (see
+	// compose.go) and a caller's is not this package's to trust. Deduplicating
+	// here rather than rejecting keeps the one guard in the one place both
+	// callers pass through, and a pool that was already distinct is unchanged.
+	pool := distinct(s.candidates)
+
 	// CANDIDATE MARGIN: the pool must exceed the draw by requiredMargin(N).
+	// Counted over the DISTINCT pool, so padding with repeats cannot buy margin.
 	// Enforced BEFORE any money moves (fail-closed).
-	if uint32(len(s.candidates)) < s.n {
+	if uint32(len(pool)) < s.n {
 		return common.Hash{}, ErrNotEnoughEligible
 	}
-	if uint32(len(s.candidates)) < s.n+requiredMargin(s.n) {
+	if uint32(len(pool)) < s.n+requiredMargin(s.n) {
 		return common.Hash{}, ErrEligibleBelowMargin
 	}
 
@@ -202,7 +212,7 @@ func (e *Engine) createTask(st QuorumState, lg QuorumLedger, s taskSpec, height 
 	nonce := st.GetState(nonceSlot)
 	taskID := computeTaskID(s.requester, nonce, s.code, s.input, height, s.n, s.threshold)
 
-	selected, err := drawFromEligible(s.candidates, taskID, s.n)
+	selected, err := drawFromEligible(pool, taskID, s.n)
 	if err != nil {
 		return common.Hash{}, err
 	}
@@ -260,6 +270,24 @@ func (e *Engine) createTask(st QuorumState, lg QuorumLedger, s taskSpec, height 
 
 	bumpNonce(st, nonceSlot, nonce)
 	return taskID, nil
+}
+
+// distinct returns the addresses of pool in first-appearance order, dropping
+// repeats. Order is preserved because the draw is reproducible only against a
+// pool every validator builds identically, and sorting would discard the
+// registry order the model path's reproducibility argument rests on. The input
+// is not mutated: callers own their slice.
+func distinct(pool []common.Address) []common.Address {
+	seen := make(map[common.Address]struct{}, len(pool))
+	out := make([]common.Address, 0, len(pool))
+	for _, a := range pool {
+		if _, dup := seen[a]; dup {
+			continue
+		}
+		seen[a] = struct{}{}
+		out = append(out, a)
+	}
+	return out
 }
 
 // IsSelected reports whether op was selected for task (O(1) flag read).

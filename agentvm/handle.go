@@ -30,9 +30,15 @@ package agentvm
 // Nor does a pin make bytes available. SECURITY_review.md names data availability
 // as S-Chain's deepest unsolved blocker: no erasure-coded redundancy, no
 // availability sampling, so a committed manifest can point at bytes no honest node
-// holds. AgentVM cannot close that from here and does not pretend to. What it can
-// do is refuse to believe a durability claim that shows nothing, which is what the
-// replica witnesses below are for.
+// holds. AgentVM cannot close that from here and does not pretend to.
+//
+// What durability AgentVM does NOT model: replica counts, erasure coding, actual
+// placement and checksums are hanzoai/s3's, which has them already and answers
+// placement directly from its volume index. That index sees disks; nothing here
+// does, so re-deriving failure domains from fields an operator fills in would be
+// a weaker answer wearing a stronger one's clothes. This package keeps the half
+// no storage layer can supply: the object that came back hashes to the object
+// the handle names.
 
 import (
 	"github.com/luxfi/crypto"
@@ -128,22 +134,20 @@ func (p Pin) Digest(h Handle) common.Hash {
 	return common.BytesToHash(crypto.Keccak256(buf))
 }
 
-// Replica is one copy of an object that was actually read back, and where from.
+// Replica is one copy of an object that was actually read back.
 //
-// Witness is the digest of the bytes read IN FULL — not a length, not a
-// successful open. A short read in this estate turned out to be a dead volume
+// Witness is the digest of the bytes read IN FULL. Not a length, not a
+// successful open: a short read in this estate turned out to be a dead volume
 // server's stale address behind a good Stat, so a read that opens and returns
-// plausible bytes proves nothing. Only the digest does.
+// plausible bytes proves nothing. Only the digest does, and this is the one
+// thing about durability no storage layer can answer on your behalf — whether
+// the object that came back is the object that was asked for.
 //
-// Cluster and Host are the failure domains the copy sits in. They are what makes
-// a replication claim mean anything: a configured replication factor of four
-// against one process is one copy, and this chain counts domains rather than
-// configuration.
+// Shard indexes the pin's file list, which is the object store's own set of
+// addresses for this object. Copies are counted by those identifiers rather
+// than by any notion of failure domain invented here: the store's volume index
+// knows which disks its files are on, and this package does not second-guess it.
 type Replica struct {
-	Cluster common.Hash `json:"cluster"`
-	Host    common.Hash `json:"host"`
-	// Shard is which piece this copy holds, indexing the pin's file list. Zero
-	// for a whole object.
 	Shard   uint32      `json:"shard"`
 	Witness common.Hash `json:"witness"`
 }
@@ -161,49 +165,26 @@ func (d Durability) Digest(h Handle) common.Hash {
 	buf = append(buf, d.Pin.Digest(h).Bytes()...)
 	buf = append(buf, u32be(uint32(len(d.Replicas)))...)
 	for _, r := range d.Replicas {
-		buf = append(buf, r.Cluster.Bytes()...)
-		buf = append(buf, r.Host.Bytes()...)
 		buf = append(buf, u32be(r.Shard)...)
 		buf = append(buf, r.Witness.Bytes()...)
 	}
 	return common.BytesToHash(crypto.Keccak256([]byte(DomainPin), buf))
 }
 
-// whole returns the replicas that hold the object entire and read back the right
-// bytes: a witness equal to the handle's digest. A witness that does not match is
-// not a weaker copy, it is a different object, and it is dropped here rather than
-// counted.
+// whole returns the copies that hold the object entire and read back the right
+// bytes, at most one per store address. A witness that does not match is not a
+// weaker copy, it is a different object, and it is dropped rather than counted.
 func (d Durability) whole(h Handle) []Replica {
+	seen := make(map[uint32]struct{}, len(d.Replicas))
 	out := make([]Replica, 0, len(d.Replicas))
 	for _, r := range d.Replicas {
-		if r.Witness == h.Digest {
-			out = append(out, r)
-		}
-	}
-	return out
-}
-
-// domains counts the distinct values of one failure-domain field across replicas.
-func domains(rs []Replica, of func(Replica) common.Hash) int {
-	seen := make(map[common.Hash]struct{}, len(rs))
-	for _, r := range rs {
-		seen[of(r)] = struct{}{}
-	}
-	return len(seen)
-}
-
-// independent returns the replicas sitting in distinct (cluster, host) pairs.
-// Copies that share a host share its failure, so however many of them there are
-// they count once.
-func independent(rs []Replica) []Replica {
-	seen := make(map[common.Hash]struct{}, len(rs))
-	out := make([]Replica, 0, len(rs))
-	for _, r := range rs {
-		key := common.BytesToHash(crypto.Keccak256(r.Cluster.Bytes(), r.Host.Bytes()))
-		if _, dup := seen[key]; dup {
+		if r.Witness != h.Digest {
 			continue
 		}
-		seen[key] = struct{}{}
+		if _, dup := seen[r.Shard]; dup {
+			continue
+		}
+		seen[r.Shard] = struct{}{}
 		out = append(out, r)
 	}
 	return out
@@ -220,7 +201,7 @@ func (d Durability) coded(h Handle) []Replica {
 	}
 	byShard := make(map[uint32]Replica, len(d.Replicas))
 	max := uint32(0)
-	for _, r := range independent(d.Replicas) {
+	for _, r := range d.Replicas {
 		if _, dup := byShard[r.Shard]; dup {
 			continue
 		}

@@ -100,7 +100,14 @@ type Var struct {
 	Value string `json:"value"`
 }
 
-// Resource is what a run may consume, and — on a receipt — what it did consume.
+// Resource is what a run may consume. On a receipt it is what the run was
+// GIVEN, which is not the same as what it used: the shipped local runners
+// report the ask back verbatim and clamp the elapsed time to it, because a
+// process's true peak memory is not something they measure. Receipt.Check still
+// enforces Within, and the cluster runner reports the limits Kubernetes actually
+// applied, so an overrun there is caught -- but on the local path the check is
+// a bound that honest runners cannot exceed rather than a measurement of them.
+// Price is over the ask for the same reason (see price.go).
 type Resource struct {
 	CPU     uint32 `json:"cpu"`     // thousandths of a core
 	Memory  uint64 `json:"memory"`  // bytes

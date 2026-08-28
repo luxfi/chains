@@ -39,6 +39,7 @@ var (
 	ErrEvidenceKernel    = errors.New("agentvm: no guest kernel and root filesystem measurement")
 	ErrEvidenceFilter    = errors.New("agentvm: no syscall filter was applied")
 	ErrEvidenceSignature = errors.New("agentvm: evidence signature missing or not the operator's")
+	ErrEvidencePlacement = errors.New("agentvm: the run happened somewhere the workload did not ask for")
 	ErrEvidenceMissing   = errors.New("agentvm: no attestation for this answer")
 
 	// the hardware quote
@@ -52,10 +53,9 @@ var (
 	ErrRootEmpty          = errors.New("agentvm: state root is empty")
 	ErrRootNotAdmitted    = errors.New("agentvm: pin names a state root this chain has not admitted")
 	ErrDurabilityPin      = errors.New("agentvm: durability claim names no stored blob")
-	ErrDurabilityReplicas = errors.New("agentvm: too few copies in distinct failure domains")
+	ErrDurabilityReplicas = errors.New("agentvm: too few copies read back at distinct store addresses")
 	ErrDurabilityWitness  = errors.New("agentvm: no copy read back the bytes the handle names")
 	ErrDurabilityShards   = errors.New("agentvm: shards do not rebuild the handle's coding")
-	ErrDurabilitySpread   = errors.New("agentvm: copies do not span the failure domains demanded")
 
 	// the catalog
 	ErrCatalogVersion      = errors.New("agentvm: catalog version is zero")
@@ -65,13 +65,14 @@ var (
 	ErrCapabilityUnknown   = errors.New("agentvm: catalog does not hold this group")
 
 	// the advertisement
-	ErrOperatorUnknown     = errors.New("agentvm: operator is not registered and staked")
-	ErrAdvertiseMechanisms = errors.New("agentvm: advertisement offers no mechanism")
-	ErrAdvertiseStorage    = errors.New("agentvm: advertisement offers storage that is malformed or not storage")
-	ErrAdvertisePlacement  = errors.New("agentvm: advertisement names no placement")
-	ErrAdvertiseDomain     = errors.New("agentvm: advertisement names no failure domain")
-	ErrAdvertiseCapacity   = errors.New("agentvm: advertised capacity is zero or above the protocol bound")
-	ErrAdvertiseGroups     = errors.New("agentvm: advertised group is empty, oversized, or absent from the catalog")
+	ErrOperatorUnknown       = errors.New("agentvm: operator is not registered and staked")
+	ErrAdvertiseMechanisms   = errors.New("agentvm: advertisement offers no mechanism")
+	ErrAdvertisePlacement    = errors.New("agentvm: advertisement names no placement")
+	ErrAdvertiseDomain       = errors.New("agentvm: advertisement names no failure domain")
+	ErrAdvertiseCapacity     = errors.New("agentvm: advertised capacity is zero or above the protocol bound")
+	ErrAdvertiseGroups       = errors.New("agentvm: advertised group is empty, oversized, or absent from the catalog")
+	ErrAdvertiseUnauthorized = errors.New("agentvm: advertisement carries no signature recovering to its operator")
+	ErrAdvertiseReplay       = errors.New("agentvm: advertisement nonce does not exceed the last one accepted")
 
 	// the task lifecycle
 	ErrTaskUnknown     = errors.New("agentvm: task not found")

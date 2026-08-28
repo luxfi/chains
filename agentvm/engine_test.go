@@ -20,7 +20,7 @@ var runcOnly = Offer(MechanismRunc)
 // The verdict and the payment are A-Chain's; what this proves is that AgentVM
 // hands it a task it can settle and that the money moves.
 func TestLifecycle(t *testing.T) {
-	w := newWorld(t, 6, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 6, runcOnly)
 	wl := w.workload(t, Require(SyscallFiltered, KernelShared), 3, 0x01)
 
 	before := w.lg.Total()
@@ -77,7 +77,7 @@ func TestLifecycle(t *testing.T) {
 // The receipt never becomes a reveal, so it never reaches the tally and can never
 // settle. There is no separate settlement-time check to forget.
 func TestRevealRefusedWithoutEvidence(t *testing.T) {
-	w := newWorld(t, 6, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 6, runcOnly)
 	wl := w.workload(t, Require(SyscallFiltered), 3, 0x02)
 
 	taskID, err := w.e.Open(w.st, w.lg, wl, 100)
@@ -103,7 +103,7 @@ func TestRevealRefusedWithoutEvidence(t *testing.T) {
 // accept a container's evidence, so an operator that ran runc cannot be paid for
 // work that asked for gVisor.
 func TestAttestRefusesWeakerEvidence(t *testing.T) {
-	w := newWorld(t, 6, Offer(MechanismRunc, MechanismGVisor), Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 6, Offer(MechanismRunc, MechanismGVisor))
 	wl := w.workload(t, Require(SyscallMediated), 3, 0x03)
 
 	taskID, err := w.e.Open(w.st, w.lg, wl, 100)
@@ -120,7 +120,7 @@ func TestAttestRefusesWeakerEvidence(t *testing.T) {
 // TestAttestRefusesAnotherOperatorsEvidence: attestation is a statement and a
 // statement needs an author, whatever the demand happens to say about attestation.
 func TestAttestRefusesAnotherOperatorsEvidence(t *testing.T) {
-	w := newWorld(t, 6, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 6, runcOnly)
 	// A demand that asks for no attestation at all, so only the engine's own rule
 	// is in play.
 	wl := w.workload(t, Require(SyscallFiltered), 3, 0x04)
@@ -139,7 +139,7 @@ func TestAttestRefusesAnotherOperatorsEvidence(t *testing.T) {
 // TestAttestWindowIsTheRevealWindow: naming the output before every peer has
 // committed would hand them the answer.
 func TestAttestWindowIsTheRevealWindow(t *testing.T) {
-	w := newWorld(t, 6, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 6, runcOnly)
 	wl := w.workload(t, Require(SyscallFiltered), 3, 0x05)
 	taskID, err := w.e.Open(w.st, w.lg, wl, 100)
 	require.NoError(t, err)
@@ -170,14 +170,14 @@ func TestMarginIsNotWeakened(t *testing.T) {
 	require.Equal(t, uint32(2), aivm.RequiredMargin(5), "N=5 needs 7")
 	require.Equal(t, uint32(5), aivm.RequiredMargin(10), "N=10 needs 15")
 
-	w := newWorld(t, 4, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 4, runcOnly)
 	wl := w.workload(t, Require(SyscallFiltered), 3, 0x07)
 	_, err := w.e.Open(w.st, w.lg, wl, 100)
 	require.ErrorIs(t, err, aivm.ErrEligibleBelowMargin,
 		"four domains cannot field a draw of three")
 
 	// Five can.
-	w5 := newWorld(t, 5, runcOnly, Require(ReplicaOne, SpreadHost))
+	w5 := newWorld(t, 5, runcOnly)
 	wl5 := w5.workload(t, Require(SyscallFiltered), 3, 0x07)
 	_, err = w5.e.Open(w5.st, w5.lg, wl5, 100)
 	require.NoError(t, err)
@@ -187,17 +187,13 @@ func TestMarginIsNotWeakened(t *testing.T) {
 // entry to the pool, so a draw of N selects N independent parties rather than N
 // processes on one machine.
 func TestDuplicationDrawsDistinctDomains(t *testing.T) {
-	w := newWorld(t, 6, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 6, runcOnly)
 
 	// Put every operator in one domain, as a fleet of processes on one box would
 	// be if it declared honestly.
 	one := h(0xD0)
 	for _, op := range w.ops {
-		require.NoError(t, w.e.Advertise(w.st, op.addr(), Advertisement{
-			Mechanisms: runcOnly, Storage: Require(ReplicaOne, SpreadHost),
-			Placement: PlacementLocal, Domain: one, Catalog: w.cat,
-			Groups: []common.Hash{w.group}, Capacity: 4,
-		}))
+		require.NoError(t, w.advertise(t, op, 2, func(a *Advertisement) { a.Domain = one }))
 	}
 	wl := w.workload(t, Require(SyscallFiltered), 3, 0x08)
 	require.Len(t, w.e.Candidates(w.st, wl), 6, "all six are candidates")
@@ -211,7 +207,7 @@ func TestDuplicationDrawsDistinctDomains(t *testing.T) {
 // TestPoolIsOnePerDomainAndReproducible: the pool is a pure function of state and
 // the workload, so every validator builds the same one.
 func TestPoolIsOnePerDomainAndReproducible(t *testing.T) {
-	w := newWorld(t, 6, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 6, runcOnly)
 	wl := w.workload(t, Require(SyscallFiltered), 3, 0x09)
 
 	pool := w.e.Pool(w.st, wl)
@@ -229,7 +225,7 @@ func TestPoolIsOnePerDomainAndReproducible(t *testing.T) {
 // TestCandidatesFilterOnEveryAxis: an operator drops out for any reason it cannot
 // serve, and there is no relaxed second pass that puts it back.
 func TestCandidatesFilterOnEveryAxis(t *testing.T) {
-	w := newWorld(t, 6, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 6, runcOnly)
 	wl := w.workload(t, Require(SyscallFiltered), 3, 0x0A)
 	require.Len(t, w.e.Candidates(w.st, wl), 6)
 
@@ -239,9 +235,11 @@ func TestCandidatesFilterOnEveryAxis(t *testing.T) {
 	_, err := w.e.Open(w.st, w.lg, mediated, 100)
 	require.ErrorIs(t, err, aivm.ErrNotEnoughEligible)
 
-	// A storage demand nobody advertises does the same.
-	federated := w.workload(t, Require(SyscallFiltered, SpreadFederated), 3, 0x0C)
-	require.Empty(t, w.e.Candidates(w.st, federated))
+	// A storage demand does NOT narrow the candidates: what durability an object
+	// gets is the object store's answer, not a sandbox's, so it is checked when
+	// a run is attested rather than when an operator is chosen.
+	stored := w.workload(t, Require(SyscallFiltered, ReplicaMany), 3, 0x0C)
+	require.Len(t, w.e.Candidates(w.st, stored), 6)
 
 	// A placement nobody offers does the same.
 	remote := w.workload(t, Require(SyscallFiltered), 3, 0x0D)
@@ -253,13 +251,9 @@ func TestCandidatesFilterOnEveryAxis(t *testing.T) {
 // TestCapacityIsPerOperatorNotPerDomain: slots are how one operator runs several
 // workloads at once, and an operator with none is not a candidate.
 func TestCapacityIsPerOperatorNotPerDomain(t *testing.T) {
-	w := newWorld(t, 6, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 6, runcOnly)
 	for _, op := range w.ops {
-		require.NoError(t, w.e.Advertise(w.st, op.addr(), Advertisement{
-			Mechanisms: runcOnly, Storage: Require(ReplicaOne, SpreadHost),
-			Placement: PlacementLocal, Domain: w.e.DomainOf(w.st, op.addr()),
-			Catalog: w.cat, Groups: []common.Hash{w.group}, Capacity: 1,
-		}))
+		require.NoError(t, w.advertise(t, op, 2, func(a *Advertisement) { a.Capacity = 1 }))
 	}
 	first := w.workload(t, Require(SyscallFiltered), 3, 0x10)
 	_, err := w.e.Open(w.st, w.lg, first, 100)
@@ -276,7 +270,7 @@ func TestCapacityIsPerOperatorNotPerDomain(t *testing.T) {
 // TestWorkloadOpensOneTask: the id is over the content, so asking again needs a
 // different nonce and is a different workload.
 func TestWorkloadOpensOneTask(t *testing.T) {
-	w := newWorld(t, 6, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 6, runcOnly)
 	wl := w.workload(t, Require(SyscallFiltered), 3, 0x12)
 
 	taskID, err := w.e.Open(w.st, w.lg, wl, 100)
@@ -291,7 +285,7 @@ func TestWorkloadOpensOneTask(t *testing.T) {
 // TestOpenRefusesAnUnknownCapability: a workload naming a surface the chain has
 // never seen has nothing to agree on.
 func TestOpenRefusesAnUnknownCapability(t *testing.T) {
-	w := newWorld(t, 6, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 6, runcOnly)
 
 	wl := w.workload(t, Require(SyscallFiltered), 3, 0x13)
 	wl.Capability.Catalog = h(0xEE)
@@ -309,7 +303,7 @@ func TestOpenRefusesAnUnknownCapability(t *testing.T) {
 // TestOpenRefusesUnauthorizedSpending: anyone may deliver a workload; only its
 // payer can spend against their balance.
 func TestOpenRefusesUnauthorizedSpending(t *testing.T) {
-	w := newWorld(t, 6, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 6, runcOnly)
 	victim := newKey(t)
 
 	wl := w.workload(t, Require(SyscallFiltered), 3, 0x15)
@@ -325,7 +319,7 @@ func TestOpenRefusesUnauthorizedSpending(t *testing.T) {
 // TestFreshChainBelievesNothing: hardware attestation and pinned durability both
 // fail closed until something is admitted, and admitting is what turns them on.
 func TestFreshChainBelievesNothing(t *testing.T) {
-	w := newWorld(t, 6, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 6, runcOnly)
 	trust := w.e.Trust(w.st)
 
 	q, _ := newQuote(t, QuoteSEVSNP, h(0x42))
@@ -350,7 +344,7 @@ func TestFreshChainBelievesNothing(t *testing.T) {
 // fails and the requester is refunded. This is A-Chain's rule, unchanged; the
 // test is here to show AgentVM did not add a second one.
 func TestDisagreementFailsTheTask(t *testing.T) {
-	w := newWorld(t, 8, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 8, runcOnly)
 	wl := w.workload(t, Require(SyscallFiltered), 3, 0x16)
 	taskID, err := w.e.Open(w.st, w.lg, wl, 100)
 	require.NoError(t, err)
@@ -387,13 +381,13 @@ func TestPrice(t *testing.T) {
 	// Properties that cost more do cost more, and properties that are the absence
 	// of a guarantee cost nothing.
 	free := base
-	free.Demand = Require(KernelShared, SyscallDirect, MemoryPlain, AttestNone, SpreadHost)
+	free.Demand = Require(KernelShared, SyscallDirect, MemoryPlain, AttestNone, ReplicaOne)
 	freePrice, err := Price(free)
 	require.NoError(t, err)
 	require.Equal(t, plain.String(), freePrice.String())
 
 	dear := base
-	dear.Demand = Require(MemoryEncrypted, AttestHardware, KernelGuest, ReplicaMany, SpreadFederated)
+	dear.Demand = Require(MemoryEncrypted, AttestHardware, KernelGuest, ReplicaMany)
 	dearPrice, err := Price(dear)
 	require.NoError(t, err)
 	require.True(t, dearPrice.Gt(plain), "a stronger demand costs more")
@@ -428,7 +422,7 @@ func (w *world) selected(t *testing.T, taskID common.Hash, n uint32) []key {
 
 // TestConservation: whatever happens, the total never changes.
 func TestConservation(t *testing.T) {
-	w := newWorld(t, 8, runcOnly, Require(ReplicaOne, SpreadHost))
+	w := newWorld(t, 8, runcOnly)
 	before := w.lg.Total()
 	for i := byte(0); i < 3; i++ {
 		wl := w.workload(t, Require(SyscallFiltered), 3, 0x20+i)
@@ -440,4 +434,128 @@ func TestConservation(t *testing.T) {
 
 	// The escrow account holds exactly what is owed.
 	require.True(t, w.lg.GetBalance(aivm.EscrowAccount).Gt(uint256.NewInt(0)))
+}
+
+// TestRevealRequiresAttestationEvenWithNoDemand is the case that made the safe
+// path opt-in. Demand is a bitset in a struct field, so a workload that never
+// mentions isolation holds the empty set — and guarding the evidence check on a
+// non-empty demand meant exactly those workloads settled with no attestation at
+// all. AttestNone is how a workload says it requires nothing; saying nothing is
+// not the same thing.
+func TestRevealRequiresAttestationEvenWithNoDemand(t *testing.T) {
+	w := newWorld(t, 6, runcOnly)
+	wl := w.workload(t, 0, 3, 0x40)
+	require.Equal(t, Properties(0), wl.Demand)
+	require.True(t, wl.Demand.Wellformed(), "the empty demand is well formed, which is why it was dangerous")
+
+	taskID, err := w.e.Open(w.st, w.lg, wl, 100)
+	require.NoError(t, err)
+
+	op := w.selected(t, taskID, 3)[0]
+	out, nonce := outputHandle(), h(0x0E)
+	r := w.receipt(t, wl, op, runcEvidence())
+	require.NoError(t, w.e.Commit(w.st, taskID, op.addr(), w.e.Commitment(w.st, taskID, op.addr(), out, r.Hash(), nonce), 101))
+
+	require.ErrorIs(t, w.e.Reveal(w.st, taskID, op.addr(), out, r.Hash(), nonce, 141), ErrEvidenceMissing,
+		"a workload that asked for nothing still gets an attributable answer")
+
+	require.NoError(t, w.e.Attest(w.st, taskID, op.addr(), wl, r, 140))
+	require.NoError(t, w.e.Reveal(w.st, taskID, op.addr(), out, r.Hash(), nonce, 141))
+}
+
+// TestRevealRefusesAnAnswerAttestedForSomethingElse: the attestation names the
+// output it was for, so an operator cannot attest one answer and reveal another.
+func TestRevealRefusesAnAnswerAttestedForSomethingElse(t *testing.T) {
+	w := newWorld(t, 6, runcOnly)
+	wl := w.workload(t, Require(SyscallFiltered), 3, 0x41)
+	taskID, err := w.e.Open(w.st, w.lg, wl, 100)
+	require.NoError(t, err)
+
+	op := w.selected(t, taskID, 3)[0]
+	attested, nonce := outputHandle(), h(0x0E)
+	other := Handle{Digest: h(0x44), Size: 8, Bucket: "out", Key: "other"}
+
+	r := w.receipt(t, wl, op, runcEvidence())
+	require.NoError(t, w.e.Commit(w.st, taskID, op.addr(), w.e.Commitment(w.st, taskID, op.addr(), other, r.Hash(), nonce), 101))
+	require.NoError(t, w.e.Attest(w.st, taskID, op.addr(), wl, r, 140))
+	require.Equal(t, attested.ID(), r.Output.ID())
+
+	require.ErrorIs(t, w.e.Reveal(w.st, taskID, op.addr(), other, r.Hash(), nonce, 141), ErrEvidenceMissing)
+}
+
+// TestAttestChecksPlacement: a workload that named a place is answered from that
+// place. The task records where it asked to run and the evidence declares where
+// it did, so discarding either value would let a local demand accept a remote run.
+func TestAttestChecksPlacement(t *testing.T) {
+	w := newWorld(t, 6, runcOnly)
+	wl := w.workload(t, Require(SyscallFiltered), 3, 0x42)
+	require.Equal(t, PlacementLocal, wl.Placement)
+
+	taskID, err := w.e.Open(w.st, w.lg, wl, 100)
+	require.NoError(t, err)
+	_, placement, ok := w.e.Demanded(w.st, taskID)
+	require.True(t, ok)
+	require.Equal(t, PlacementLocal, placement, "the task remembers where it asked to run")
+
+	op := w.selected(t, taskID, 3)[0]
+
+	elsewhere := runcEvidence()
+	elsewhere.Placement = PlacementRemote
+	require.ErrorIs(t, w.e.Attest(w.st, taskID, op.addr(), wl, w.receipt(t, wl, op, elsewhere), 140),
+		ErrEvidencePlacement)
+
+	require.NoError(t, w.e.Attest(w.st, taskID, op.addr(), wl, w.receipt(t, wl, op, runcEvidence()), 140))
+}
+
+// TestAnyPlacementAcceptsAnywhere: a workload that does not care is answered from
+// wherever the run happened, because PlacementAny constrains nothing.
+func TestAnyPlacementAcceptsAnywhere(t *testing.T) {
+	w := newWorld(t, 6, runcOnly)
+	wl := w.workload(t, Require(SyscallFiltered), 3, 0x43)
+	wl.Placement = PlacementAny
+	require.NoError(t, wl.Authorize(w.payer))
+
+	taskID, err := w.e.Open(w.st, w.lg, wl, 100)
+	require.NoError(t, err)
+	op := w.selected(t, taskID, 3)[0]
+
+	for _, p := range []Placement{PlacementLocal, PlacementCluster, PlacementRemote} {
+		ev := runcEvidence()
+		ev.Placement = p
+		r := w.receipt(t, wl, op, ev)
+		// Each is admitted on its own; only the first is recorded, the rest are
+		// refused as a second attestation rather than as a wrong place.
+		err := w.e.Attest(w.st, taskID, op.addr(), wl, r, 140)
+		if p == PlacementLocal {
+			require.NoError(t, err)
+			continue
+		}
+		require.ErrorIs(t, err, ErrAlreadyAttested, "%s was not refused for its place", p)
+	}
+}
+
+// TestStorageDemandIsCheckedAtAttestNotAtSelection: what durability an object
+// gets is the object store's answer, so it narrows no operator and is proved when
+// a run is attested.
+func TestStorageDemandIsCheckedAtAttest(t *testing.T) {
+	w := newWorld(t, 6, runcOnly)
+	wl := w.workload(t, Require(SyscallFiltered, ReplicaMany), 3, 0x44)
+
+	require.Len(t, w.e.Candidates(w.st, wl), 6, "a storage demand narrows nobody")
+	taskID, err := w.e.Open(w.st, w.lg, wl, 100)
+	require.NoError(t, err)
+	op := w.selected(t, taskID, 3)[0]
+
+	// Nothing is admitted yet, so even a well-formed claim fails closed.
+	out := outputHandle()
+	ev := runcEvidence()
+	ev.Durability = Durability{
+		Pin:      Pin{Root: h(0x55), Files: []string{"a", "b"}},
+		Replicas: []Replica{{Shard: 0, Witness: out.Digest}, {Shard: 1, Witness: out.Digest}},
+	}
+	require.ErrorIs(t, w.e.Attest(w.st, taskID, op.addr(), wl, w.receipt(t, wl, op, ev), 140),
+		ErrRootNotAdmitted)
+
+	require.NoError(t, w.e.AdmitStateRoot(w.st, h(0x55)))
+	require.NoError(t, w.e.Attest(w.st, taskID, op.addr(), wl, w.receipt(t, wl, op, ev), 140))
 }

@@ -122,7 +122,7 @@ func TestPlacementFiltersWithoutRanking(t *testing.T) {
 // so it is not consulted when choosing what executes.
 func TestStorageDemandIsNotARunnersToGrant(t *testing.T) {
 	set := New(local(agentvm.MechanismRunc))
-	got, err := set.For(demand(agentvm.SyscallFiltered, agentvm.ReplicaMany, agentvm.SpreadFederated))
+	got, err := set.For(demand(agentvm.SyscallFiltered, agentvm.ReplicaMany))
 	require.NoError(t, err, "a storage demand does not change which mechanism runs the code")
 	require.Equal(t, agentvm.Mechanism(agentvm.MechanismRunc), got.Mechanism())
 }

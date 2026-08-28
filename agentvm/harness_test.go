@@ -69,11 +69,31 @@ type world struct {
 	domains []common.Hash
 }
 
+// advertise re-advertises for an operator, signing as that operator and carrying
+// a nonce past whatever it last used.
+func (w *world) advertise(t *testing.T, op key, nonce uint64, mutate func(*Advertisement)) error {
+	t.Helper()
+	ad := Advertisement{
+		Mechanisms: Offer(MechanismRunc),
+		Placement:  PlacementLocal,
+		Domain:     w.e.DomainOf(w.st, op.addr()),
+		Catalog:    w.cat,
+		Groups:     []common.Hash{w.group},
+		Capacity:   4,
+		Nonce:      nonce,
+	}
+	if mutate != nil {
+		mutate(&ad)
+	}
+	require.NoError(t, ad.Authorize(op.addr(), op))
+	return w.e.Advertise(w.st, op.addr(), ad)
+}
+
 // newWorld stakes n operators, each in its own domain. n must leave the pool
 // above A-Chain's margin for the duplication a test asks for; nothing here
 // relaxes that guard, so a test that stakes too few gets the refusal a real
 // network would.
-func newWorld(t *testing.T, n int, mechanisms Mechanisms, storage Properties) *world {
+func newWorld(t *testing.T, n int, mechanisms Mechanisms) *world {
 	t.Helper()
 	core := aivm.NewEngine(h(0xC1), h(0xA0))
 	e := New(core)
@@ -101,15 +121,17 @@ func newWorld(t *testing.T, n int, mechanisms Mechanisms, storage Properties) *w
 		// capability operator that is the group it serves.
 		require.NoError(t, core.RegisterOperator(st, lg, op.addr(), stake, group, h(byte(0x80+i))))
 		domains[i] = common.BytesToHash(crypto.Keccak256([]byte("domain"), []byte{byte(i)}))
-		require.NoError(t, e.Advertise(st, op.addr(), Advertisement{
+		ad := Advertisement{
 			Mechanisms: mechanisms,
-			Storage:    storage,
 			Placement:  PlacementLocal,
 			Domain:     domains[i],
 			Catalog:    cat,
 			Groups:     []common.Hash{group},
 			Capacity:   4,
-		}))
+			Nonce:      1,
+		}
+		require.NoError(t, ad.Authorize(op.addr(), op))
+		require.NoError(t, e.Advertise(st, op.addr(), ad))
 	}
 	return &world{e: e, st: st, lg: lg, cat: cat, group: group, payer: payer, ops: ops, domains: domains}
 }

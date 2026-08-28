@@ -44,7 +44,7 @@ var (
 	nsGroupMember  = []byte("ag/grp.mem")     // per-group operator-array element
 	nsGroupSeen    = []byte("ag/grp.seen")    // per-(group, operator) membership flag
 	nsAdMech       = []byte("ag/ad.mech")     // operator -> advertised mechanism set
-	nsAdStore      = []byte("ag/ad.store")    // operator -> advertised storage properties
+	nsAdNonce      = []byte("ag/ad.nonce")    // operator -> last accepted advertisement nonce
 	nsAdDomain     = []byte("ag/ad.domain")   // operator -> declared failure domain
 	nsAdPlace      = []byte("ag/ad.place")    // operator -> advertised placement
 	nsAdCatalog    = []byte("ag/ad.cat")      // operator -> advertised catalog digest

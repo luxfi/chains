@@ -38,12 +38,14 @@ Kernel        Shared | Guest              whose kernel executes the workload
 Syscall       Direct | Filtered | Mediated
 Memory        Plain  | Encrypted
 Attestation   None   | Software | Hardware
-Replication   One    | Many     | Erasure    where the bytes went
-Spread        Host   | Cluster  | Federated  how far apart the copies are
+Replication   One    | Many     | Erasure    how the bytes were stored
 ```
 
-`Properties` is a 16-bit set, one bit per value. A demand names properties; it
-never names a mechanism and never names a level.
+`Properties` is a 13-bit set. A bit outside those 13 makes a demand malformed
+rather than waived: `Each` walks only the properties this build defines, so an
+undefined bit would otherwise be invisible to the proof walk and silently met.
+
+A demand names properties; it never names a mechanism and never names a level.
 
 ### The grants table — the single source of truth
 
@@ -75,9 +77,10 @@ That is the whole selection rule. A mechanism serves a demand or it does not.
 There is no ordering to slide down, so there is no downgrade to defend against:
 an unavailable mechanism simply never enters the match.
 
-Storage properties are not a mechanism's to grant, so a provider's answer is
-asked of both halves — its mechanisms about execution, its advertised storage
-about storage (`Engine.Runs`).
+Storage properties are not a mechanism's to grant, so `Engine.Runs` asks a
+provider's mechanisms only about the execution half of a demand. What durability
+an object gets is the object store's answer, and it is checked when a run is
+attested rather than when an operator is chosen.
 
 ---
 
@@ -99,34 +102,54 @@ turn, what proving *that* property requires.
 | `attest.software` | a signature recovering to the selected operator, over the run **and every evidence fact** |
 | `attest.hardware` | a verified quote bound to this exact run |
 | `replica.one` | a pin on an admitted root, and one copy read back in full whose digest is the object's |
-| `replica.many` | the same, from at least two distinct hosts |
+| `replica.many` | the same, at two or more of the store addresses the pin names |
 | `replica.erasure` | shards covering every index whose digests rebuild the handle's shard commitment |
-| `spread.host` | nothing — sharing a host is not a claim |
-| `spread.cluster` | copies on at least two distinct hosts |
-| `spread.federated` | copies in at least two distinct clusters |
 
-### There is no "mechanism I claim to have used" field
+### `Witness.Serves` is a claimed mechanism, and the chain cannot check it
 
-The `Witness` is that statement, and it is the identity of whatever answered the
-run's syscalls, **read from inside the run**. Every execution check begins by
-asking `Grants` whether the witnessed mechanism provides the property at all.
+`Evidence.Witness.Serves` is a `Mechanism` the operator supplies, and
+`evidence.go` keys the whole `Grants` lookup on it. **An operator can put
+`MechanismGVisor` there having run the workload bare on the host.** The digest
+beside it is bound to nothing — any non-zero 32 bytes passes.
 
-So an operator that ran under runc cannot present its evidence for a demand of
-mediated syscalls: runc's row does not contain `SyscallMediated`, and no field it
-could fill in changes that. `TestRuncEvidenceRefusedForMediated`. The reverse
-holds too — gVisor does not satisfy a demand for a seccomp filter
-(`TestGvisorEvidenceRefusedForFiltered`).
+The consequence is worth stating plainly, because it is the opposite of
+comfortable: an operator that ran under runc and reports that **truthfully** is
+refused for a `syscall.mediated` demand, while the same operator reporting
+`MechanismGVisor` falsely is accepted. Below hardware attestation the chain
+refuses honesty and accepts a well-formed lie. Nothing in the type system
+changes that, and an earlier version of this document claimed otherwise.
+
+**Why it is not fixable here.** The chain sees a struct, not a machine. A
+remote verifier cannot distinguish a sentry's `/proc/version` that a runner
+genuinely read from inside a sandbox from the same bytes typed into a field —
+that gap is precisely what confidential computing exists to close, and closing
+it is what `attest.hardware` costs.
+
+**The honest runner path is sound and is not the weak link.**
+`gvisor.go:225-246` runs the probe *inside* the sandbox through the same argv
+builder the workload uses, and refuses with `ErrNotMediated` when the reply does
+not name a sentry. An operator running the shipped runner cannot accidentally
+over-claim. The gap is that the chain cannot tell that operator from one who
+skipped the runner.
 
 ### What is proven and what is attributed
 
-Below hardware attestation, **no cryptography can prove isolation to a remote
-party**. That is what confidential computing exists for. What the chain enforces
-there is structure and attribution: strictly more bound facts for a stronger
-property, and a signature naming who said it. Divergence between the independent
-operators a task selects is what catches a liar; the bond is what it costs.
+Below `attest.hardware` the guarantee is **attribution, divergence and bond**,
+not proof:
+
+- **attribution** — every attestation carries a signature recovering to the
+  selected operator, required by `Attest` whatever the demand says, so a false
+  statement is non-repudiably somebody's.
+- **divergence** — the task draws N operators in N declared domains and pays only
+  the group that agreed. A liar must out-number the honest majority, not merely
+  lie well.
+- **bond** — `MinProviderBond` is at stake for a withholder, and the forgery
+  floor is `threshold × MinProviderBond` regardless of how well-formed the lie is.
 
 At `attest.hardware` the guarantee is cryptographic: a quote signed on the
-vendor's curve by a key the chain admitted, whose report binds this run.
+vendor's curve by a key the chain admitted, whose report binds this run. That is
+the only property here that does not rest on an operator's bond — and it rests
+instead on whoever may call `AdmitAttestingKey` (see §11).
 
 ---
 
@@ -166,18 +189,30 @@ The digest is AgentVM's own keccak over the full object. It is **not** the
 manifest's ETag: `schain/object` computes that as `base64(md5(blob))` for S3 wire
 compatibility, and MD5 has been collision-broken for two decades.
 
-### Two production failures this encodes against
+### Durability has two homes, and this is not the one that owns it
 
-1. **A single pod once carried master + filer + gateway + the largest volume
-   server.** Configuration said distributed; the failure domain was one process.
-   So replication is counted over **distinct `(Cluster, Host)` pairs**, never off
-   a configured factor. Four copies on one host count once
-   (`TestFourCopiesInOneProcessAreOneCopy`).
-2. **A short read is a route, not a fact** — a truncated read there was a dead
-   volume server's stale address behind a good `Stat`. So a `Replica.Witness` is
-   the digest of the bytes read **in full**. A witness that does not match the
-   handle is not a weaker copy, it is a different object, and it is not counted
-   (`TestAWrongObjectIsNotAWeakCopy`).
+`hanzoai/s3` already owns durability: 218 files with replication, 186 with
+erasure coding, 62 `ec_`, 99 with checksums, and it answers placement directly
+from its volume index — `GetVolumeLocations(volumeID, collection)` in O(1), plus
+`GetECShardLocations` with per-disk `ShardIds`. That index **sees disks**.
+
+So AgentVM does not model replica counts, erasure coding or placement. An
+earlier version of this file counted copies over `(Cluster, Host)` pairs an
+operator filled in, which was a weaker answer wearing a stronger one's clothes.
+It is deleted.
+
+What AgentVM keeps is the half no storage layer can supply: **the object that
+came back hashes to the object the handle names.**
+
+- A `Replica.Witness` is the digest of the bytes read **in full**. Not a length,
+  not a successful open — a short read in this estate turned out to be a dead
+  volume server's stale address behind a good `Stat`.
+- A witness that does not match is not a weaker copy, it is a **different
+  object**, and it is not counted (`TestAWrongObjectIsNotAWeakCopy`).
+- Copies are counted against **the store's own addresses** — `Replica.Shard`
+  indexes the file list the pin carries — so one blob read four times is one copy
+  (`TestOneAddressReadTwiceIsOneCopy`), and whether those addresses sit on
+  independent hardware is the volume index's answer, not a field here.
 
 ### What a pin does and does not establish — measured
 
@@ -238,6 +273,13 @@ There is **no bootstrap flag, no development mode, no configurable floor**. A
 network that cannot field enough independent domains does not open the task
 (`TestMarginIsNotWeakened`, `TestDuplicationDrawsDistinctDomains`).
 
+**An advertisement is the operator's own.** `Advertise` requires a signature
+recovering to the operator it speaks for, and a `Nonce` that exceeds the last one
+accepted. Without the signature anyone could rewrite a victim's advertisement and
+collapse it out of the pool; without the nonce the victim's *own* older
+advertisement could be replayed to the same effect
+(`TestAdvertiseIsTheOperatorsOwn`, `TestAdvertiseRefusesAReplay`).
+
 **A domain is a CLAIM.** Nothing here proves two operators are independent, and a
 dishonest operator can declare as many domains as it likes. What the claim buys
 is a policy duplication can be written against and a statement the bond is behind.
@@ -291,11 +333,21 @@ Open  ──▶ Commit ──▶ Attest ──▶ Reveal ──▶ Settle
 
 ### Evidence stops work at reveal, not at settlement
 
-A task that demanded properties admits no reveal from an operator that has not
-attested the answer it is revealing. A receipt failing its evidence check never
-becomes a reveal, so it never reaches the tally and **can never settle**. That is
-why "settlement refuses weak evidence" is structural rather than a check somebody
-has to remember to run (`TestRevealRefusedWithoutEvidence`).
+**Unconditionally.** No operator answers a task without first attesting the
+answer, whatever the workload asked for. A receipt failing its evidence check
+never becomes a reveal, so it never reaches the tally and **can never settle**
+(`TestRevealRefusedWithoutEvidence`).
+
+The gate used to be guarded on a non-empty demand, which made the safe path the
+one a workload had to opt into: `Demand` is a bitset in a struct field, so a
+workload that never mentioned isolation held the empty set and settled with no
+attestation at all. `AttestNone` is how a workload says it requires nothing;
+saying nothing is not the same thing
+(`TestRevealRequiresAttestationEvenWithNoDemand`).
+
+A workload that named a `Placement` is also answered from that place: the task
+records where it asked to run, the evidence declares where it did, and `Attest`
+compares them (`TestAttestChecksPlacement`).
 
 `Engine` holds `*aivm.Engine` **privately rather than embedding it**: embedding
 would promote `RevealResponse` onto the type and give an operator a way to answer
@@ -357,10 +409,18 @@ unchanged, which is the proof.
 
 - **`aivm/compose.go`** (new file): `TaskSpec`, `OpenTask`, `Eligible`, `Staked`,
   `Draw`, `RequiredMargin`. A specialised VM supplies its own selection policy;
-  everything after the pool — margin, escrow, burn, draw, record — is the same one
-  mechanism the model path uses.
+  everything after the pool — distinctness, margin, escrow, burn, draw, record —
+  is the same one mechanism the model path uses.
+- **`aivm/compose_test.go`** (new file): the duplicate-pool refusal and the
+  distinctness of a draw.
 - **`aivm/task.go`**: `createTask` (unexported) takes its candidate pool as a
-  parameter instead of building it from a model spec. Behaviour-preserving.
+  parameter instead of building it from a model spec, and reduces it with
+  `distinct()` before the margin is counted. On the model path the pool comes
+  from `eligibleSet`, which reads an append-only set and cannot repeat an
+  address — so that call is a no-op and the behaviour is unchanged. A caller's
+  pool carries no such history, and without the reduction one address repeated
+  five times would have been drawn five times and produced a quorum of one party
+  agreeing with itself (`TestOpenTaskRefusesARepeatedPool`).
 - **`aivm/import_c_intent.go`**: passes `eligibleSet(...)` explicitly. The pool,
   its order and the resulting draw are identical.
 
@@ -370,21 +430,51 @@ proof.
 
 ---
 
-## 11. Files
+## 11. Who may call what
+
+Three entry points distrust their caller and three trust it. The difference is
+not accidental, but it is a **contract**, and only the first three enforce it:
+
+| entry point | authorization |
+|---|---|
+| `Open` | payer signature over the workload id |
+| `Attest` | evidence signature recovering to the calling operator |
+| `Advertise` | operator signature + monotonic nonce |
+| `AdmitAttestingKey` | **none — caller contract** |
+| `AdmitStateRoot` | **none — caller contract** |
+| `Revoke*` | **none — caller contract** |
+
+The admissions are governance operations. **Admitting one key satisfies every
+hardware-attestation demand on the chain** — the only guarantee here that does
+not rest on an operator's bond — so a VM binding MUST reach them only from the
+consensus-gated block path and MUST NOT route any request surface to them.
+
+This is the convention A-Chain already uses for `SetCommitVerifier`, and like
+that one it is a contract rather than a check: nothing in this package can tell
+an authorised caller from an unauthorised one, because the authority is the
+chain's own consensus and the engine type does not see it. They fail closed on a
+fresh chain (`TestFreshChainBelievesNothing`), which bounds the damage to
+whatever a binding chooses to expose — and that is the whole of the mitigation.
+
+---
+
+## 12. Files
 
 | file | lines | what |
 |---|---|---|
-| `mechanism.go` | 364 | Mechanism, Property, Properties, the grants table, Placement, Mechanisms |
-| `evidence.go` | 368 | Witness, Evidence, the per-property proof walk |
-| `workload.go` | 304 | Code, Var, Resource, Capability, Workload, authorization |
-| `handle.go` | 267 | Handle, Pin, Replica, Durability |
-| `scheduler.go` | 240 | Advertisement, candidates, the one-per-domain pool |
+| `engine.go` | 435 | Open, Commit, Attest, Reveal, Settle, Trust |
+| `mechanism.go` | 359 | Mechanism, Property, Properties, the grants table, Placement |
+| `evidence.go` | 348 | Witness, Evidence, the per-property proof walk |
+| `workload.go` | 311 | Code, Var, Resource, Capability, Workload, authorization |
+| `scheduler.go` | 304 | Advertisement + its signature, candidates, the one-per-domain pool |
+| `handle.go` | 248 | Handle, Pin, Replica, Durability |
 | `quote.go` | 208 | SEV-SNP / TDX report layouts, ECDSA verification |
-| `engine.go` | 407 | Open, Commit, Attest, Reveal, Settle, Trust |
 | `state.go` | 196 | slots, namespaces, encoders, the enumerable set |
 | `catalog.go` | 168 | Catalog, Group, on-chain registration |
-| `price.go` | 111 | the pure price function |
-| `errors.go` | 87 | every refusal |
+| `price.go` | 108 | the pure price function |
+| `errors.go` | 88 | every refusal |
 | `run.go` | 74 | Receipt, Claim, Check |
 | `runner/runner.go` | 135 | Runner, Attestor, Result, Set |
 | `cmd/catalog/` | 202 | the OpenAPI catalog generator |
+
+5,842 lines of code, 4,695 of tests, 278 tests, zero skips.

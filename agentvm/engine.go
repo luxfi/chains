@@ -23,11 +23,12 @@
 //	the capability  which slice of an API surface the work needs, and which
 //	                operators serve it
 //
-// The evidence check happens at reveal, not at settlement. A task that demanded
-// properties admits no reveal from an operator that has not shown them, so a
-// receipt failing its evidence never becomes a reveal, never reaches the tally,
-// and can never settle. That is why "settlement refuses weak evidence" is
-// structural here rather than a check somebody has to remember to run.
+// The evidence check happens at reveal, not at settlement, and it is
+// unconditional: no operator answers a task without first attesting the answer,
+// whatever the workload asked for. So a receipt failing its evidence never
+// becomes a reveal, never reaches the tally, and can never settle. That is why
+// "settlement refuses weak evidence" is structural here rather than a check
+// somebody has to remember to run.
 //
 // AgentVM drives A-Chain's engine over AgentVM's OWN state and ledger. No A-Chain
 // node serves those slots, so the two chains share code and share no state, and
@@ -218,7 +219,7 @@ func (e *Engine) Commit(st State, taskID common.Hash, op common.Address, commit 
 // operator could present a peer's evidence as its own. A demand naming
 // attest.software asks for the same fact from the requester's side.
 func (e *Engine) Attest(st State, taskID common.Hash, op common.Address, w Workload, r Receipt, height uint64) error {
-	demand, _, ok := e.Demanded(st, taskID)
+	demand, placement, ok := e.Demanded(st, taskID)
 	if !ok {
 		return ErrTaskNotAgentic
 	}
@@ -254,6 +255,13 @@ func (e *Engine) Attest(st State, taskID common.Hash, op common.Address, w Workl
 	if signer != op {
 		return ErrEvidenceSignature
 	}
+	// A workload that named a place is answered from that place. The evidence
+	// declares where the run happened and the task recorded where it was asked
+	// to happen, so comparing them costs nothing; discarding the value meant a
+	// workload demanding a local run accepted evidence saying it ran remotely.
+	if !placement.Admits(r.Evidence.Placement) {
+		return ErrEvidencePlacement
+	}
 	if err := r.Check(w, demand, e.Trust(st)); err != nil {
 		return err
 	}
@@ -279,15 +287,22 @@ func (e *Engine) Attested(st State, taskID common.Hash, op common.Address) (outp
 // answer. An operator running an agentic workload puts its receipt hash there, so
 // the commit binds which run produced the answer as well as what the answer was.
 func (e *Engine) Reveal(st State, taskID common.Hash, op common.Address, output Handle, aux, nonce common.Hash, height uint64) error {
-	demand, _, ok := e.Demanded(st, taskID)
-	if !ok {
+	if _, _, ok := e.Demanded(st, taskID); !ok {
 		return ErrTaskNotAgentic
 	}
 	answer := output.ID()
-	if demand != 0 {
-		if st.GetState(slotHashAddr(nsAttestOut, taskID, op)) != answer {
-			return ErrEvidenceMissing
-		}
+	// Unconditional. Guarding this on a non-empty demand made the safe path the
+	// one a workload had to opt into: Properties is a bitset and Demand is a
+	// struct field, so a workload that never mentions it holds the empty set,
+	// and the empty set would have waived the check entirely. A workload that
+	// genuinely requires nothing of a run says so with AttestNone, which is a
+	// property and passes; it does not say so by omission.
+	//
+	// Attest requires a signature whatever the demand says, so requiring an
+	// attestation here means every answer is attributable to the operator that
+	// gave it, on every task, however little the workload asked for.
+	if st.GetState(slotHashAddr(nsAttestOut, taskID, op)) != answer {
+		return ErrEvidenceMissing
 	}
 	return e.core.RevealResponse(st, taskID, op, answer, aux, nonce, height)
 }
@@ -374,6 +389,17 @@ func (e *Engine) Pending(st State) uint32 { return openCount(st) }
 // AdmitAttestingKey records that quotes signed by this key may be believed. The
 // certificate chain proving the key belongs to genuine hardware is validated
 // before admission; what the chain keeps is the resulting digest.
+//
+// CALLER CONTRACT. This is a governance operation and it carries no
+// authorization of its own. Admitting one key is enough to satisfy every
+// hardware-attestation demand on the chain, which is the only guarantee here
+// that does not rest on an operator's bond, so a VM binding MUST reach it only
+// from the consensus-gated block path and MUST NOT route any request surface to
+// it. The same holds for AdmitStateRoot and for the revocations. This is the
+// convention A-Chain already uses for SetCommitVerifier, and like that one it is
+// a contract rather than a check: nothing in this package can tell an authorised
+// caller from an unauthorised one, because the authority is the chain's own
+// consensus and this type does not see it.
 func (e *Engine) AdmitAttestingKey(st State, keyDigest common.Hash) error {
 	if keyDigest == (common.Hash{}) {
 		return ErrEmptyAttestingKey
@@ -393,6 +419,8 @@ func (e *Engine) RevokeAttestingKey(st State, keyDigest common.Hash) {
 // against. Admitting one is the act of saying "this root is S-Chain's". It has
 // the same shape as admitting an attesting key, and for the same reason: the
 // chain cannot verify the claim itself, so it names who it trusts to have.
+//
+// The caller contract on AdmitAttestingKey applies here unchanged.
 func (e *Engine) AdmitStateRoot(st State, root common.Hash) error {
 	if root == (common.Hash{}) {
 		return ErrRootEmpty

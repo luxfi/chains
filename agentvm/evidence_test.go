@@ -74,7 +74,7 @@ func TestMatchIsContainment(t *testing.T) {
 func TestDemandOnOneAxisIsRefused(t *testing.T) {
 	require.False(t, Require(SyscallDirect, SyscallMediated).Wellformed())
 	require.False(t, Require(ReplicaOne, ReplicaMany).Wellformed())
-	require.True(t, Require(SyscallMediated, KernelShared, ReplicaMany, SpreadCluster).Wellformed())
+	require.True(t, Require(SyscallMediated, KernelShared, ReplicaMany).Wellformed())
 
 	ev := gvisorEvidence()
 	err := ev.Proves(Require(SyscallDirect, SyscallMediated), h(1), outputHandle(), common.Address{}, yes{})
@@ -217,21 +217,33 @@ func TestEveryPropertyIsCheckedNotJustOne(t *testing.T) {
 		ErrEvidenceMechanism)
 }
 
-// TestUnknownPropertyProvesNothing: a bit this build does not know is a refusal,
-// never a pass.
+// TestUnknownPropertyProvesNothing: a bit this build does not define is a
+// refusal, never a pass. It cannot be a per-property refusal, because the walk
+// only visits properties the build knows and an unknown bit is invisible to it —
+// so it is refused as a malformed demand before the walk starts. Without that a
+// demand for an undefined property would be silently waived.
 func TestUnknownPropertyProvesNothing(t *testing.T) {
-	ev := runcEvidence()
-	unknown := Properties(1 << (propertyCount - 1))
-	unknown <<= 0 // the top known bit; construct one past it below
 	beyond := Properties(0)
 	for p := Property(propertyCount); p < 16; p++ {
 		beyond |= 1 << p
 	}
-	if beyond == 0 {
-		// Every bit of the word is a known property; there is no unknown bit to
-		// present, which is itself the guarantee.
-		require.Equal(t, 16, int(propertyCount))
-		return
-	}
-	require.ErrorIs(t, ev.Proves(beyond, h(1), outputHandle(), common.Address{}, yes{}), ErrUnknownProperty)
+	require.NotZero(t, beyond, "the property word has room for an undefined bit")
+
+	require.False(t, beyond.Wellformed())
+	require.False(t, Require(SyscallFiltered).Wellformed() && (Require(SyscallFiltered)|beyond).Wellformed(),
+		"one unknown bit spoils an otherwise good demand")
+
+	ev := runcEvidence()
+	require.ErrorIs(t,
+		ev.Proves(beyond, h(1), outputHandle(), common.Address{}, yes{}),
+		ErrDemandMalformed)
+	require.ErrorIs(t,
+		ev.Proves(Require(SyscallFiltered)|beyond, h(1), outputHandle(), common.Address{}, yes{}),
+		ErrDemandMalformed,
+		"an unknown bit is not waived just because the rest of the demand is met")
+
+	// A workload cannot be built around one either.
+	w := sample()
+	w.Demand = beyond
+	require.ErrorIs(t, w.Validate(), ErrDemandMalformed)
 }

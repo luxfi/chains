@@ -10,15 +10,30 @@ package agentvm
 // with nothing to show is refused, and a demand is met only when every one of its
 // properties is met.
 //
-// The evidence has one field per fact and no field that merely asserts a
-// conclusion. In particular there is no "mechanism I claim to have used" field:
-// the Witness is that statement, and it is the identity of whatever answered the
-// run's syscalls, read from INSIDE the run rather than declared from outside.
 // Every execution property check begins by asking the one table (Grants) whether
-// the witnessed mechanism provides the property at all, so an operator that ran
-// under runc cannot present its evidence for a demand of mediated syscalls:
-// runc's row does not contain SyscallMediated, and no field it could fill in
-// changes that.
+// the mechanism named in the Witness provides the property at all.
+//
+// BE CLEAR ABOUT WHAT THAT IS WORTH. Witness.Serves is a Mechanism the operator
+// supplies, and this file keys the whole Grants lookup on it, so it IS a claimed
+// mechanism: an operator can write MechanismGVisor there having run the workload
+// bare on the host, and the digest beside it is bound to nothing, so any non-zero
+// 32 bytes passes. The consequence is the uncomfortable one — an operator that
+// ran under runc and says so TRUTHFULLY is refused for a mediated demand, while
+// the same operator claiming gVisor falsely is admitted.
+//
+// It is not fixable in this file. A remote verifier cannot tell a sentry's
+// /proc/version that a runner genuinely read from inside a sandbox from the same
+// bytes typed into a struct field; closing that gap is exactly what a hardware
+// quote buys, and it is why AttestHardware is the one property here that does not
+// rest on a bond. The runner side does check honestly (runner/gvisor probes
+// inside the sandbox and refuses when the reply is not a sentry), so an operator
+// running the shipped runner cannot over-claim by accident. The chain simply
+// cannot distinguish that operator from one who skipped the runner.
+//
+// What the chain does enforce below hardware attestation is attribution,
+// divergence and bond: every attestation is signed by the operator that gave it,
+// N operators in N declared domains must agree before anyone is paid, and the
+// forgery floor is threshold * MinProviderBond however well-formed the lie.
 //
 // What each property costs to prove:
 //
@@ -27,9 +42,8 @@ package agentvm
 //	                   and a witness whose observed kernel IS that measurement
 //	syscall.direct     nothing
 //	syscall.filtered   the digest of the filter actually applied
-//	syscall.mediated   a witnessed identity for the user-space kernel that served
-//	                   the syscalls, so installing runsc is not the same as running
-//	                   under it
+//	syscall.mediated   a non-zero witnessed identity for the user-space kernel,
+//	                   subject to the caveat above about what a witness is worth
 //	memory.plain       nothing
 //	memory.encrypted   a verified hardware quote
 //	attest.none        nothing
@@ -39,25 +53,16 @@ package agentvm
 //	attest.hardware    a verified hardware quote bound to this exact run
 //	replica.one        a pin on an admitted root, and one copy read back in full
 //	                   whose digest is the object's
-//	replica.many       the same, from at least two distinct hosts
+//	replica.many       the same, at two or more of the store addresses the pin
+//	                   names
 //	replica.erasure    the same, from shards covering every index, whose digests
 //	                   rebuild the handle's shard commitment
-//	spread.host        nothing — sharing a host is not a claim
-//	spread.cluster     copies on at least two distinct hosts
-//	spread.federated   copies in at least two distinct clusters
 //
-// Every replica count is over DISTINCT FAILURE DOMAINS and every copy is
-// established by a digest over the full object. Configuration is not consulted:
-// this estate has run a "distributed" store whose master, filer, gateway and
-// largest volume server were one process, and a replication factor read off a
-// config would have called that four copies.
-//
-// Below hardware attestation no cryptography can prove isolation to a remote
-// party — that is what confidential computing exists for. What the chain enforces
-// there is structure and attribution: strictly more bound facts for a stronger
-// property, and a signature that names who said it. Divergence between the
-// independent operators a task selects is what catches a liar, and the bond is
-// what it costs.
+// A copy counts only when the bytes read back in full hash to the object the
+// handle names, and it is counted against the store's own address for it. How
+// many independent machines hold those addresses is the object store's volume
+// index to answer; this package does not re-derive it from fields an operator
+// fills in.
 
 import (
 	"github.com/luxfi/crypto"
@@ -86,13 +91,17 @@ type Trust interface {
 	Pins(root common.Hash) bool
 }
 
-// Witness is the identity of whatever served the run's syscalls, observed from
-// inside the run. Serves names the mechanism that identity belongs to; Digest is
-// the digest of the identity itself — the sentry's version string under gVisor,
-// the guest kernel's under a microVM or a TEE.
+// Witness is what the operator says served the run's syscalls. Serves names a
+// mechanism; Digest is the identity an honest runner read from inside the run —
+// the sentry's version string under gVisor, the guest kernel's under a microVM
+// or a TEE.
 //
-// The zero Witness reads as a bare process on the host kernel, which is exactly
-// what a run that observed nothing was.
+// It is a CLAIM. The shipped runners fill it from a probe executed inside the
+// sandbox and refuse when the reply does not match, but the chain receives only
+// the struct and cannot audit how it was filled. See the file header.
+//
+// The zero Witness reads as a bare process on the host kernel, which is what a
+// run that observed nothing was.
 type Witness struct {
 	Serves Mechanism   `json:"serves"`
 	Digest common.Hash `json:"digest"`
@@ -294,12 +303,11 @@ func (e Evidence) Proves(d Properties, claim common.Hash, out Handle, operator c
 			}
 
 		// ---- storage: the mechanism table says nothing about where bytes went,
-		// so these read the durability claim instead. Copies are counted over
-		// distinct failure domains and established by a digest over the full
-		// object, never by a configured factor and never by a successful open.
-		case SpreadHost:
-			// Sharing a host is not a claim.
-
+		// so these read the durability claim instead. What this chain checks is
+		// IDENTITY: the bytes read back hash to the object the handle names. How
+		// many independent places hold it, and whether those places share
+		// hardware, is the object store's volume index to answer -- it sees
+		// disks -- and is not re-derived here.
 		case ReplicaOne:
 			if err := pin(); err != nil {
 				fail(err)
@@ -314,7 +322,11 @@ func (e Evidence) Proves(d Properties, claim common.Hash, out Handle, operator c
 				fail(err)
 				return
 			}
-			if len(independent(e.Durability.whole(out))) < 2 {
+			// Copies are counted by the store's own addresses for them: the pin
+			// carries the file list the manifest names, a replica says which of
+			// those it read, and two whole copies mean two of those files each
+			// read back as the object entire.
+			if len(e.Durability.whole(out)) < 2 {
 				fail(ErrDurabilityReplicas)
 			}
 
@@ -327,24 +339,6 @@ func (e Evidence) Proves(d Properties, claim common.Hash, out Handle, operator c
 				fail(ErrDurabilityShards)
 			}
 
-		case SpreadCluster:
-			if err := pin(); err != nil {
-				fail(err)
-				return
-			}
-			if domains(e.Durability.held(out), replicaHost) < 2 {
-				fail(ErrDurabilitySpread)
-			}
-
-		case SpreadFederated:
-			if err := pin(); err != nil {
-				fail(err)
-				return
-			}
-			if domains(e.Durability.held(out), replicaCluster) < 2 {
-				fail(ErrDurabilitySpread)
-			}
-
 		default:
 			// A property this build does not know proves nothing.
 			fail(ErrUnknownProperty)
@@ -352,17 +346,3 @@ func (e Evidence) Proves(d Properties, claim common.Hash, out Handle, operator c
 	})
 	return failure
 }
-
-// held is the copies that read back correctly, however the object was stored:
-// whole copies when it was stored whole, verified shards when it was coded. It is
-// what a spread question is asked about, so spread does not depend on which of
-// the two a replication demand happened to name.
-func (d Durability) held(h Handle) []Replica {
-	if h.Shards != (common.Hash{}) {
-		return d.coded(h)
-	}
-	return independent(d.whole(h))
-}
-
-func replicaHost(r Replica) common.Hash    { return r.Host }
-func replicaCluster(r Replica) common.Hash { return r.Cluster }

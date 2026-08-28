@@ -48,9 +48,6 @@ var surcharge = [propertyCount]uint64{
 	ReplicaOne:      0,
 	ReplicaMany:     30,
 	ReplicaErasure:  20,
-	SpreadHost:      0,
-	SpreadCluster:   15,
-	SpreadFederated: 40,
 }
 
 // percent is the denominator the surcharges are expressed against.

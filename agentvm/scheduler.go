@@ -48,6 +48,10 @@ import (
 	"github.com/luxfi/chains/aivm"
 )
 
+// DomainAdvertise separates the advertisement signature's keyspace from every
+// other digest an operator signs.
+const DomainAdvertise = "lux/agentvm/advertise/v1"
+
 // MaxCapacity bounds what one operator may advertise holding at once.
 const MaxCapacity = 4096
 
@@ -71,6 +75,60 @@ type Advertisement struct {
 	// on its machines. Work spreads across an operator's slots; duplication
 	// spreads across domains. They are different questions.
 	Capacity uint32 `json:"capacity"`
+	// Nonce orders an operator's advertisements. It must exceed the last one
+	// accepted, so a signed advertisement cannot be replayed later to put an
+	// operator back into a state it has left. Without it a signature stops
+	// forgery but not a replay that collapses an operator's capacity or its
+	// declared domain.
+	Nonce uint64 `json:"nonce"`
+	// Signature is the operator's, over Digest. Anyone may deliver an
+	// advertisement; only its subject can say what it offers.
+	Signature []byte `json:"signature,omitempty"`
+}
+
+// Digest is what an operator signs to claim an advertisement as its own: the
+// address it speaks for and every field of the offer, length-framed so no two
+// different offers encode the same way.
+func (ad Advertisement) Digest(op common.Address) common.Hash {
+	buf := make([]byte, 0, 128+len(ad.Groups)*32)
+	buf = append(buf, []byte(DomainAdvertise)...)
+	buf = append(buf, op.Bytes()...)
+	buf = append(buf, byte(ad.Mechanisms), byte(ad.Placement))
+	buf = append(buf, ad.Domain.Bytes()...)
+	buf = append(buf, ad.Catalog.Bytes()...)
+	buf = append(buf, u32be(ad.Capacity)...)
+	buf = append(buf, u64be(ad.Nonce)...)
+	buf = append(buf, u32be(uint32(len(ad.Groups)))...)
+	for _, g := range ad.Groups {
+		buf = append(buf, g.Bytes()...)
+	}
+	return common.BytesToHash(crypto.Keccak256(buf))
+}
+
+// Authorize signs the advertisement as op.
+func (ad *Advertisement) Authorize(op common.Address, key Signer) error {
+	sig, err := key.Sign(ad.Digest(op))
+	if err != nil {
+		return err
+	}
+	ad.Signature = sig
+	return nil
+}
+
+// Authorized reports whether the advertisement carries a signature recovering to
+// the operator it speaks for.
+func (ad Advertisement) Authorized(op common.Address) error {
+	if len(ad.Signature) != 65 {
+		return ErrAdvertiseUnauthorized
+	}
+	pub, err := crypto.Ecrecover(ad.Digest(op).Bytes(), ad.Signature)
+	if err != nil {
+		return ErrAdvertiseUnauthorized
+	}
+	if common.BytesToAddress(crypto.Keccak256(pub[1:])[12:]) != op {
+		return ErrAdvertiseUnauthorized
+	}
+	return nil
 }
 
 // Advertise records what an operator offers. The operator must already be
@@ -84,9 +142,6 @@ func (e *Engine) Advertise(st State, op common.Address, ad Advertisement) error 
 	}
 	if ad.Mechanisms == 0 {
 		return ErrAdvertiseMechanisms
-	}
-	if !ad.Storage.Wellformed() || ad.Storage&^Storage != 0 {
-		return ErrAdvertiseStorage
 	}
 	if !ad.Placement.Known() || ad.Placement == PlacementAny {
 		return ErrAdvertisePlacement
@@ -108,9 +163,18 @@ func (e *Engine) Advertise(st State, op common.Address, ad Advertisement) error 
 			return ErrAdvertiseGroups
 		}
 	}
+	// The advertisement must be the operator's own and must be newer than the
+	// last one accepted. Checked last, so a malformed offer is refused as
+	// malformed rather than as unsigned.
+	if err := ad.Authorized(op); err != nil {
+		return err
+	}
+	if ad.Nonce <= readUint(st, slotAddr(nsAdNonce, op)).Uint64() {
+		return ErrAdvertiseReplay
+	}
 
+	st.SetState(slotAddr(nsAdNonce, op), h32(uint256.NewInt(ad.Nonce)))
 	st.SetState(slotAddr(nsAdMech, op), h32(uint256.NewInt(uint64(ad.Mechanisms))))
-	st.SetState(slotAddr(nsAdStore, op), h32(uint256.NewInt(uint64(ad.Storage))))
 	st.SetState(slotAddr(nsAdPlace, op), h32(uint256.NewInt(uint64(ad.Placement))))
 	st.SetState(slotAddr(nsAdDomain, op), ad.Domain)
 	st.SetState(slotAddr(nsAdCatalog, op), ad.Catalog)
@@ -123,13 +187,13 @@ func (e *Engine) Advertise(st State, op common.Address, ad Advertisement) error 
 }
 
 // Runs reports whether the operator advertises a mechanism that satisfies the
-// execution half of a demand, and storage that satisfies the storage half. One
-// predicate, asked of each domain of the demand, because a mechanism has nothing
-// to say about where bytes went.
+// execution half of a demand. The storage half is not asked of a mechanism: what
+// durability an object gets is the object store's answer, not a sandbox's, and
+// the evidence for it is checked when a run is attested rather than when an
+// operator is chosen.
 func (e *Engine) Runs(st State, op common.Address, d Properties) bool {
 	mech := Mechanisms(readUint(st, slotAddr(nsAdMech, op)).Uint64())
-	store := Properties(readUint(st, slotAddr(nsAdStore, op)).Uint64())
-	return mech.Serves(d&^Storage) && store.Contains(d&Storage)
+	return mech.Serves(d &^ Storage)
 }
 
 // PlacedAt reports where the operator runs workloads. PlacementAny means it has

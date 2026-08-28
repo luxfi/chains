@@ -118,14 +118,7 @@ const (
 	// object.
 	ReplicaErasure Property = 12
 
-	// SpreadHost: the copies share a host, so they share its failure.
-	SpreadHost Property = 13
-	// SpreadCluster: the copies sit on distinct hosts of one cluster.
-	SpreadCluster Property = 14
-	// SpreadFederated: the copies sit in distinct clusters.
-	SpreadFederated Property = 15
-
-	propertyCount = 16
+	propertyCount = 13
 )
 
 // String names the property.
@@ -157,25 +150,16 @@ func (p Property) String() string {
 		return "replica.many"
 	case ReplicaErasure:
 		return "replica.erasure"
-	case SpreadHost:
-		return "spread.host"
-	case SpreadCluster:
-		return "spread.cluster"
-	case SpreadFederated:
-		return "spread.federated"
 	default:
 		return "unknown"
 	}
 }
 
 // Storage is the set of properties about where the bytes went, as opposed to how
-// the code ran. A demand names properties from both domains and one predicate
-// answers it; this set exists only so a provider's execution mechanism is asked
-// about execution and its storage arrangement about storage.
-var Storage = Require(
-	ReplicaOne, ReplicaMany, ReplicaErasure,
-	SpreadHost, SpreadCluster, SpreadFederated,
-)
+// the code ran. It exists so the execution half of a demand can be asked of a
+// mechanism and the storage half of one cannot: a mechanism has nothing to say
+// about durability, and the object store has nothing to say about syscalls.
+var Storage = Require(ReplicaOne, ReplicaMany, ReplicaErasure)
 
 // Properties is a set of Property values, one bit each. It rides the wire as a
 // u16 and is a state word, so the encoding is fixed: bit i is Property(i).
@@ -216,18 +200,29 @@ func (s Properties) Len() int {
 	return n
 }
 
-// Wellformed reports whether the set names at most one value per axis. A set
-// naming two values on one axis (Direct and Mediated) describes no run and is
-// satisfied by no mechanism; refusing it at the boundary says so plainly instead
-// of leaving a workload that can never be scheduled.
+// known is every property bit this build defines. A demand carrying a bit
+// outside it names something this build cannot reason about.
+const known = Properties(1)<<propertyCount - 1
+
+// Wellformed reports whether the set names only properties this build defines,
+// and at most one value per axis.
+//
+// Both halves matter. A set naming two values on one axis (Direct and Mediated)
+// describes no run and is satisfied by no mechanism. A set carrying a bit this
+// build does not define would otherwise be WAIVED rather than refused: Each
+// walks the properties it knows, so an unknown bit is invisible to the proof
+// walk, and a demand for it would be silently met by evidence that shows nothing.
+// Refusing at the boundary is what makes an unknown property prove nothing.
 func (s Properties) Wellformed() bool {
+	if s&^known != 0 {
+		return false
+	}
 	axes := [][]Property{
 		{KernelShared, KernelGuest},
 		{SyscallDirect, SyscallFiltered, SyscallMediated},
 		{MemoryPlain, MemoryEncrypted},
 		{AttestNone, AttestSoftware, AttestHardware},
 		{ReplicaOne, ReplicaMany, ReplicaErasure},
-		{SpreadHost, SpreadCluster, SpreadFederated},
 	}
 	for _, axis := range axes {
 		n := 0
