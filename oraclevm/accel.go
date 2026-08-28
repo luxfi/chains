@@ -4,8 +4,15 @@
 package oraclevm
 
 import (
+	"errors"
+
 	"github.com/luxfi/accel"
 )
+
+// ErrNilVM is returned by NewAccelHost when there is no VM to wrap. A host
+// built around nothing defers its failure to whichever method the operator
+// calls first, arbitrarily far from the mistake.
+var ErrNilVM = errors.New("oraclevm: nil VM")
 
 // AccelHost wraps an O-Chain VM with a per-VM GPU acceleration session.
 // O-Chain is currently CPU-only; the session is allocated for future
@@ -22,9 +29,12 @@ type AccelHost struct {
 }
 
 // NewAccelHost creates a per-VM GPU session and binds it to vm.
-// Returns ErrEmptyVMID when vm is nil. The session is created with
-// PriorityNormal and no memory cap; tune via opts.
+// Returns ErrNilVM when vm is nil. The session is created with PriorityNormal
+// and no memory cap; tune via opts.
 func NewAccelHost(vm *VM, opts ...accel.VMSessionOption) (*AccelHost, error) {
+	if vm == nil {
+		return nil, ErrNilVM
+	}
 	s, err := accel.NewVMSession("oraclevm", opts...)
 	if err != nil {
 		return nil, err
