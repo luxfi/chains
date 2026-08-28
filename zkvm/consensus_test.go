@@ -408,28 +408,48 @@ func TestAssemblyDropsWhatItCannotBuild(t *testing.T) {
 	require.ErrorIs(t, err, errNoTransactions)
 }
 
-// A block the chain has passed makes room in the pool: without that, a
-// transaction that can never enter a block holds a slot forever and a pool full
-// of them refuses every honest arrival paying the same floor.
+// A block the chain has passed makes room in the pool. Assembly removes what
+// it PUTS IN a block; nothing else removed a transaction the chain has moved
+// past, so one that never fits in a block — because better-paying ones keep
+// filling it — held a slot forever, and a pool full of those refuses every
+// honest arrival paying the same floor.
 func TestAcceptDrainsWhatTheChainHasPassed(t *testing.T) {
 	ctx := context.Background()
 	vm := newVM(t)
+	vm.config.MaxTxPerBlock = 1
 
+	// A cheap transaction that expires at height 1, and richer ones that keep
+	// crowding it out of every block.
 	stale := spendTx(nullifier(8))
 	stale.Expiry = 1
+	stale.Fee = 1
 	stale.ID = stale.ComputeID()
 	acceptProofs(vm, stale)
 	require.NoError(t, vm.mempool.AddTransaction(stale))
 
-	blk := build(t, vm, spendTx(nullifier(9)))
-	require.Equal(t, 2, vm.mempool.Size())
+	for height := 1; height <= 2; height++ {
+		rich := spendTx(nullifier(byte(20 + height)))
+		rich.Fee = 1 << 40
+		rich.ID = rich.ComputeID()
+		acceptProofs(vm, rich)
+		require.NoError(t, vm.mempool.AddTransaction(rich))
 
-	blk.BlockHeight = 1
-	require.NoError(t, blk.Verify(ctx))
-	require.NoError(t, blk.Accept(ctx))
+		built, err := vm.BuildBlock(ctx)
+		require.NoError(t, err)
+		blk := built.(*Block)
+		require.Equal(t, []*Transaction{rich}, blk.Txs, "the block took the richer transaction")
+
+		require.NoError(t, blk.Verify(ctx))
+		require.NoError(t, blk.Accept(ctx))
+
+		if height == 1 {
+			require.Equal(t, 1, vm.mempool.Size(),
+				"the chain has not passed the height it expires at yet")
+		}
+	}
 
 	require.Zero(t, vm.mempool.Size(),
-		"the accepted transaction left, and so did the one the chain has passed")
+		"a transaction the chain has moved past holds no slot")
 }
 
 func TestVertexRefusals(t *testing.T) {
