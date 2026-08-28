@@ -16,26 +16,29 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+// run is the plugin: answer for the version, or serve the VM. It is a
+// function rather than the body of main so what it does is separable from how
+// a process reports it.
+func run() error {
 	if len(os.Args) > 1 && os.Args[1] == "version" {
-		fmt.Println("Bridge-VM/1.0.0")
-		os.Exit(0)
+		// The version comes from the VM, not from a second copy of the number
+		// here. Two declarations of one version disagree the first time either
+		// is bumped, and the one an operator reads is this one.
+		fmt.Printf("Bridge-VM/%s\n", bridgevm.Version)
+		return nil
 	}
-
 	if err := ulimit.Set(ulimit.DefaultFDLimit, log.Root()); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to set fd limit: %s\n", err)
-		os.Exit(1)
+		return fmt.Errorf("set fd limit: %w", err)
 	}
-
-	f := &bridgevm.Factory{}
-	raw, err := f.New(log.Root())
+	raw, err := (&bridgevm.Factory{}).New(log.Root())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "factory error: %s\n", err)
-		os.Exit(1)
+		return fmt.Errorf("build the VM: %w", err)
 	}
-
-	vm := raw.(chain.ChainVM)
-	if err := rpc.Serve(context.Background(), log.Root(), vm); err != nil {
-		fmt.Fprintf(os.Stderr, "rpc.Serve error: %s\n", err)
-		os.Exit(1)
-	}
+	return rpc.Serve(context.Background(), log.Root(), raw.(chain.ChainVM))
 }
