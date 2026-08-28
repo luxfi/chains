@@ -325,14 +325,17 @@ func TestMovingAByteBetweenFieldsChangesTheHash(t *testing.T) {
 		keygenCeremonyID("ab", quorum.MustNew(2, 3), parties(3)),
 		keygenCeremonyID("a", quorum.MustNew(2, 3), parties(3)))
 
-	// The same split, in the signing id, where the key id is caller-chosen.
+	// And in the signer list of a signing id, where an id could otherwise
+	// absorb its neighbour. The separator the old scheme used was a single zero
+	// byte with no length, so ONE signer named "a\x00b" hashed to exactly what
+	// TWO signers named "a" and "b" hash to — one party presenting as a quorum
+	// of two, in the id that is supposed to make a quorum unforgeable.
 	d := digestOf(1)
 	require.NotEqual(t,
-		ceremonyID("ab", d, parties(3)),
-		ceremonyID("a", append([]byte("b"), d[:31]...), parties(3)))
+		ceremonyID("vault", d, []party.ID{"a\x00b"}),
+		ceremonyID("vault", d, []party.ID{"a", "b"}))
 
-	// And in the participant list, where an id could otherwise absorb its
-	// neighbour.
+	// And in the participant list of a keygen id, for the same reason.
 	require.NotEqual(t,
 		keygenCeremonyID("k", quorum.MustNew(2, 3), []party.ID{"ab", "c", "d"}),
 		keygenCeremonyID("k", quorum.MustNew(2, 3), []party.ID{"a", "bc", "d"}))

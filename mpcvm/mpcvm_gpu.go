@@ -529,7 +529,7 @@ func (g *GPUBackend) CeremonyApply(
 		cerOpsPtr,
 		unsafe.Pointer(&emptyContribOps[0]), // contribution_ops: empty stream
 		cerPtr,
-		conPtr, // contributions: 1-slot placeholder (count=1)
+		conPtr, // contributions: one bound slot, count=1
 		unsafe.Pointer(&ceremonyApplied),
 		unsafe.Pointer(&contributionApplied),
 		C.uint32_t(len(ceremonies)),
@@ -618,7 +618,7 @@ func (g *GPUBackend) ContributionApply(
 		contributionApplied uint32
 		emptyCeremonyOps    [1]GPUCeremonyOp
 	)
-	conOpsPtr := unsafe.Pointer(&emptyCeremonyOps[0]) // bound buffer placeholder
+	conOpsPtr := unsafe.Pointer(&emptyCeremonyOps[0]) // ceremony_ops: one bound slot
 	conActualOpsPtr := unsafe.Pointer(&emptyCeremonyOps[0])
 	if len(contributionOps) > 0 {
 		conActualOpsPtr = unsafe.Pointer(&contributionOps[0])

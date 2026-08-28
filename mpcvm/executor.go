@@ -9,8 +9,9 @@ package mpcvm
 // ECDSA that produces signatures an external chain's ecrecover accepts. There
 // is no protocol registry and no selection: a custody key's Kind names the
 // protocol it was generated with, and cggmp21 is the only value that can be
-// written. A registry whose other entries return "not yet implemented" is not
-// a choice, it is a menu of failures, and it invites a caller to reach one.
+// written. A registry offering four protocols and implementing one is not a
+// choice, and a caller that reaches the other three finds an error where a
+// signature should be.
 //
 // Everything above this file speaks in ceremonies; everything below it is
 // github.com/luxfi/threshold. The MessageRouter is the seam: the executor
