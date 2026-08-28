@@ -4,6 +4,7 @@
 package keyvm
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -75,4 +76,70 @@ func TestGas_PolicyOpsAlgorithmIndependent(t *testing.T) {
 	b, err := FeeFor(&Transaction{Type: TxSetPolicy, Algorithm: ""})
 	require.NoError(t, err)
 	require.Equal(t, a, b, "SetPolicy must be algorithm-independent")
+}
+
+// TestGas_PayloadBytesArePriced is the regression test for unpriced bytes. The
+// schedule had no length term, so a megabyte of commitments rode on chain — into
+// the block AND into the key record, permanently — for the same flat fee as an
+// empty payload. Price must be strictly increasing in payload length, at the
+// declared rate, for every operation.
+func TestGas_PayloadBytesArePriced(t *testing.T) {
+	for _, op := range []uint8{TxRegisterKey, TxSetPolicy, TxAuthorize, TxRevokeKey} {
+		algo := ""
+		if usesAlgorithm(op) {
+			algo = "ml-dsa-65"
+		}
+		empty, err := GasFor(&Transaction{Type: op, Algorithm: algo})
+		require.NoError(t, err)
+		small, err := GasFor(&Transaction{Type: op, Algorithm: algo, Payload: make([]byte, 100)})
+		require.NoError(t, err)
+		large, err := GasFor(&Transaction{Type: op, Algorithm: algo, Payload: make([]byte, 1_000_000)})
+		require.NoError(t, err)
+
+		require.Greaterf(t, small, empty, "op %d: 100 bytes must cost more than none", op)
+		require.Greaterf(t, large, small, "op %d: a megabyte must cost more than 100 bytes", op)
+		require.Equalf(t, empty+100*GasPerPayloadByte, small,
+			"op %d: bytes must be priced at the declared rate", op)
+		require.Equalf(t, empty+1_000_000*GasPerPayloadByte, large, "op %d", op)
+	}
+}
+
+// TestGas_PayloadPricingReachesThePayer proves the byte term is not an isolated
+// arithmetic fact: a payer submitting a larger payload is charged more real
+// balance, and the surplus is burned.
+func TestGas_PayloadPricingReachesThePayer(t *testing.T) {
+	small, large := newTestKey(t), newTestKey(t)
+	const fund = uint64(100_000_000_000)
+	vm := newTestVM(t, map[string]uint64{small.hexAddr(): fund, large.hexAddr(): fund})
+	defer func() { _ = vm.Shutdown(context.Background()) }()
+
+	tiny := registerTx(t, small, "a", 100_000_000, 1)
+
+	// The same operation carrying 64 KiB of PUBLIC commitments.
+	bulk := make([][]byte, 64)
+	for i := range bulk {
+		bulk[i] = make([]byte, 1024)
+	}
+	payload := mustJSONRaw(RegisterKeyPayload{
+		Name: "b", PublicKey: []byte("PUB"), Threshold: 1, TotalShares: 1, Commitments: bulk,
+	})
+	fat := &Transaction{
+		Type: TxRegisterKey, Algorithm: "ml-dsa-65", Payer: large.addr,
+		KeyID: deriveKeyID("b"), GasLimit: 100_000_000, Nonce: 1, Payload: payload,
+	}
+	large.sign(t, fat)
+
+	acceptOne(t, vm, tiny)
+	acceptOne(t, vm, fat)
+
+	tinyBal, err := vm.Balance(small.addr)
+	require.NoError(t, err)
+	fatBal, err := vm.Balance(large.addr)
+	require.NoError(t, err)
+	require.Less(t, fatBal, tinyBal, "a bigger payload must cost the payer more")
+
+	burned, err := vm.Burned()
+	require.NoError(t, err)
+	require.Equal(t, (fund-tinyBal)+(fund-fatBal), burned,
+		"everything both payers lost was burned")
 }

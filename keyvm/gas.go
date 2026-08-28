@@ -46,6 +46,18 @@ var algoGas = map[string]fee.Gas{
 	"secp256k1":     15_000, // ECDSA threshold (CMP/Doerner) authorize
 }
 
+// GasPerPayloadByte prices each byte of a transaction's payload.
+//
+// The payload is the ONLY caller-controlled variable-length field an accepted
+// block carries: the header is fixed-width, and Auth/Sig are fixed-width because
+// authenticate() parses them as ML-DSA-65 and refuses any other length. Those
+// bytes are stored twice and forever — once in the block, and (for RegisterKey)
+// again in the key record. Without a length term a megabyte of commitments rides
+// on chain for the same flat fee as an empty payload, which is storage bought
+// for nothing. 16 gas/byte is the EVM's non-zero calldata price, the calibrated
+// analogue for permanently-stored caller-supplied bytes.
+const GasPerPayloadByte = fee.Gas(16)
+
 // usesAlgorithm reports whether an operation's price depends on the key
 // algorithm. RegisterKey and Authorize dispatch committee cryptography and so
 // are algorithm-priced; SetPolicy and RevokeKey are pure policy writes and are
@@ -54,10 +66,10 @@ func usesAlgorithm(txType uint8) bool {
 	return txType == TxRegisterKey || txType == TxAuthorize
 }
 
-// GasFor returns the metered gas for a transaction, pricing by operation and —
-// for committee-dispatching operations — by algorithm. It fails closed on an
-// unknown operation type or an unknown/missing algorithm for an operation that
-// requires one.
+// GasFor returns the metered gas for a transaction: the operation's structural
+// cost, plus — for committee-dispatching operations — the algorithm's cost, plus
+// the payload's per-byte cost. It fails closed on an unknown operation type or an
+// unknown/missing algorithm for an operation that requires one.
 func GasFor(tx *Transaction) (fee.Gas, error) {
 	base, ok := opBaseGas[tx.Type]
 	if !ok {
@@ -71,16 +83,35 @@ func GasFor(tx *Transaction) (fee.Gas, error) {
 		}
 		total += ag
 	}
-	return total, nil
+	return total + GasPerPayloadByte*fee.Gas(len(tx.Payload)), nil
 }
 
-// FeeFor returns the nLUX fee a transaction settles: GasFor(tx) * GasPrice.
+// FeeFor returns the nLUX a transaction settles: GasFor(tx) * GasPrice. It is
+// the price of the operation itself, independent of what the payer declared it
+// would pay — the fee-schedule RPC quotes it before a payer has picked a limit.
 func FeeFor(tx *Transaction) (uint64, error) {
 	g, err := GasFor(tx)
 	if err != nil {
 		return 0, err
 	}
 	return fee.Cost(g, GasPrice)
+}
+
+// meter prices a transaction AGAINST its declared gas limit: FeeFor plus the
+// payer's own ceiling. Admission, block assembly, consensus Verify and
+// settlement all price through this one function, so no two of them can charge
+// or refuse on a different number. A transaction whose real cost exceeds the
+// limit its payer signed is refused with fee.ErrOutOfGas at every layer.
+func meter(tx *Transaction) (uint64, error) {
+	g, err := GasFor(tx)
+	if err != nil {
+		return 0, err
+	}
+	m := fee.NewGasMeter(fee.Gas(tx.GasLimit))
+	if err := m.Consume(g); err != nil {
+		return 0, err
+	}
+	return fee.Cost(m.Used(), GasPrice)
 }
 
 // SupportedAlgorithm reports whether algo is priced (and therefore accepted) by
@@ -94,13 +125,13 @@ func SupportedAlgorithm(algo string) bool {
 // cheapest base operation at GasPrice). gas_test.go asserts it is
 // >= node/vms/types/fee.MinTxFeeFloor.
 func MinScheduledFee() uint64 {
-	min := fee.Gas(0)
+	cheapest := fee.Gas(0)
 	first := true
 	for _, g := range opBaseGas {
-		if first || g < min {
-			min, first = g, false
+		if first || g < cheapest {
+			cheapest, first = g, false
 		}
 	}
-	f, _ := fee.Cost(min, GasPrice)
+	f, _ := fee.Cost(cheapest, GasPrice)
 	return f
 }

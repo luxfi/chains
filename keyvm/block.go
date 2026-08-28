@@ -52,71 +52,55 @@ func (b *Block) Parent() ids.ID       { return b.parentID }
 func (b *Block) Height() uint64       { return b.height }
 func (b *Block) Timestamp() time.Time { return b.timestamp }
 
-// Verify checks the block can be accepted WITHOUT mutating state: the parent
-// exists, every transaction is well-formed and authenticated, and every payer
-// can afford its fee — including the cumulative fees of multiple transactions
-// from the same payer within this block. A block that fails any check is never
-// accepted (fail closed); verifying a block never moves funds.
+// Verify checks the block can be accepted WITHOUT mutating state.
+//
+// Position first: the parent must exist, this block must sit exactly one above
+// it, and its timestamp must not move backwards or run more than maxFutureSkew
+// ahead of the verifying node. Those are not bookkeeping. Block time is the
+// clock every authorization decision below is made against (AuthPolicy.
+// ExpiresAt), so an unbounded timestamp lets a proposer rewind past an expiry
+// and revive a permit the chain has already retired — or jump forward and retire
+// one early. Unbounded height lets a proposer rewind the chain's height, and a
+// block claiming height 0 used to skip the parent check outright.
+//
+// Then content: every transaction is well-formed, authenticated, correctly
+// ordered by nonce, authorized, and affordable — including the cumulative fees
+// of several transactions from the same payer. A block that fails any check is
+// never accepted (fail closed); verifying a block never moves funds.
 func (b *Block) Verify(ctx context.Context) error {
-	if b.height > 0 {
-		if _, err := b.vm.GetBlock(ctx, b.parentID); err != nil {
-			return fmt.Errorf("keyvm: verify parent: %w", err)
-		}
-	}
-
 	b.vm.stateLock.RLock()
 	defer b.vm.stateLock.RUnlock()
 
-	spent := make(map[fee.Account]uint64)         // running per-payer debit within this block
-	expectedNonce := make(map[fee.Account]uint64) // running per-payer nonce within this block
+	parent, err := b.vm.getBlockLocked(b.parentID)
+	if err != nil {
+		return fmt.Errorf("keyvm: verify parent: %w", err)
+	}
+	if b.height != parent.height+1 {
+		return fmt.Errorf("keyvm: %w: %d after parent %d", ErrBadHeight, b.height, parent.height)
+	}
+	if b.timestamp.Before(parent.timestamp) {
+		return ErrTimeRewound
+	}
+	// The ceiling is the local clock plus the skew allowance, but never below the
+	// parent: the chain already accepted that time, so reusing it must stay legal
+	// even on a node whose own clock has slipped behind the tip. Without the
+	// floor such a node refuses every block including the ones it builds itself,
+	// and can never catch up.
+	ceiling := b.vm.clock.Time().Add(maxFutureSkew)
+	if parent.timestamp.After(ceiling) {
+		ceiling = parent.timestamp
+	}
+	if b.timestamp.After(ceiling) {
+		return ErrTimeAhead
+	}
+
+	r := newRunning()
 	for _, tx := range b.transactions {
-		if err := tx.SyntacticVerify(); err != nil {
+		if err := b.vm.checkTx(tx, b.timestamp.Unix(), r); err != nil {
 			return err
 		}
-		if err := tx.authenticate(); err != nil {
-			return err
-		}
-		// Replay/order guard runs BEFORE authorization so a replayed tx is
-		// rejected as such regardless of the operation's other preconditions.
-		expN, ok := expectedNonce[tx.Payer]
-		if !ok {
-			expN = b.vm.nonceOf(tx.Payer) + 1
-		}
-		if tx.Nonce != expN {
-			return ErrBadNonce
-		}
-		expectedNonce[tx.Payer] = expN + 1
-		if err := tx.checkAuth(b.vm, b.timestamp.Unix()); err != nil {
-			return err
-		}
-		gasUsed, err := GasFor(tx)
-		if err != nil {
-			return err
-		}
-		if uint64(gasUsed) > tx.GasLimit {
-			return fmt.Errorf("keyvm: %w: gas %d > limit %d", fee.ErrOutOfGas, gasUsed, tx.GasLimit)
-		}
-		feeAmt, err := fee.Cost(gasUsed, GasPrice)
-		if err != nil {
-			return err
-		}
-		bal, err := b.vm.ledger.Balance(tx.Payer)
-		if err != nil {
-			return err
-		}
-		prev := spent[tx.Payer]
-		next, over := addBlockSpend(prev, feeAmt)
-		if over || bal < next {
-			return fee.ErrInsufficientFunds
-		}
-		spent[tx.Payer] = next
 	}
 	return nil
-}
-
-func addBlockSpend(a, b uint64) (uint64, bool) {
-	s := a + b
-	return s, s < a
 }
 
 // Accept settles and applies the block atomically. For each transaction it
@@ -136,12 +120,8 @@ func (b *Block) Accept(ctx context.Context) error {
 		return err
 	}
 
-	// Persist block + last-accepted pointer in the same commit.
-	if err := b.vm.state.Put(append([]byte(BlockPrefix), b.id[:]...), b.Bytes()); err != nil {
-		b.abort()
-		return err
-	}
-	if err := b.vm.state.Put(lastAcceptedKey, b.id[:]); err != nil {
+	// Block, height index and last-accepted pointer land in the same commit.
+	if err := b.vm.recordAccepted(b); err != nil {
 		b.abort()
 		return err
 	}
@@ -150,12 +130,12 @@ func (b *Block) Accept(ctx context.Context) error {
 		return fmt.Errorf("keyvm: commit block %s: %w", b.id, err)
 	}
 
+	// In-memory state advances only AFTER the commit landed. Advancing it first
+	// would leave the VM serving a tip whose writes are not durable.
 	b.vm.lastAccepted = b.id
 	b.vm.lastBlock = b
 	b.vm.height = b.height
-	b.vm.shutdownLock.Lock()
-	delete(b.vm.pendingBlocks, b.id)
-	b.vm.shutdownLock.Unlock()
+	b.vm.prunePending(b.height)
 	b.vm.dropFromMempool(b.transactions)
 
 	b.vm.log.Info("K-Chain block accepted",
@@ -184,16 +164,10 @@ func (b *Block) settleAndApply(now int64) error {
 		if tx.Nonce != b.vm.nonceOf(tx.Payer)+1 {
 			return ErrBadNonce
 		}
-		gasUsed, err := GasFor(tx)
-		if err != nil {
-			return err
-		}
-		// Pillar (b): meter the operation against the payer's gas limit.
-		meter := fee.NewGasMeter(fee.Gas(tx.GasLimit))
-		if err := meter.Consume(gasUsed); err != nil {
-			return err
-		}
-		feeAmt, err := fee.Cost(meter.Used(), GasPrice)
+		// Pillar (b): meter the operation against the payer's gas limit — the same
+		// function admission and Verify priced it with, so settlement can never
+		// charge a number either of them did not check.
+		feeAmt, err := meter(tx)
 		if err != nil {
 			return err
 		}
@@ -216,10 +190,10 @@ func (b *Block) settleAndApply(now int64) error {
 // Reject discards the block and returns its transactions to the mempool so they
 // can be retried in a later block.
 func (b *Block) Reject(ctx context.Context) error {
-	b.vm.shutdownLock.Lock()
+	b.vm.stateLock.Lock()
 	delete(b.vm.pendingBlocks, b.id)
-	b.vm.shutdownLock.Unlock()
 	b.vm.requeue(b.transactions)
+	b.vm.stateLock.Unlock()
 	return nil
 }
 
@@ -230,7 +204,7 @@ func (b *Block) Status() uint8 {
 	if b.id == b.vm.lastAccepted {
 		return 1
 	}
-	if ok, _ := b.vm.state.Has(append([]byte(BlockPrefix), b.id[:]...)); ok {
+	if ok, _ := b.vm.versdb.Has(append([]byte(BlockPrefix), b.id[:]...)); ok {
 		return 1
 	}
 	return 0

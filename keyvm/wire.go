@@ -187,6 +187,12 @@ func (b *Block) Bytes() []byte {
 	return bld.Finish()
 }
 
+// parseBlock decodes a block from its wire encoding. Canonical, for the same
+// reason ParseTransaction is: zap follows the root offset and ignores both
+// unreferenced padding inside a message and blob bytes past the last declared
+// transaction length, so without this check two distinct byte-strings decode to
+// one block — same transactions, same id, different bytes on the wire and in
+// every peer's store. Exactly one byte-string encodes a block.
 func parseBlock(vm *VM, data []byte) (*Block, error) {
 	msg, err := zap.Parse(data)
 	if err != nil {
@@ -215,6 +221,9 @@ func parseBlock(vm *VM, data []byte) (*Block, error) {
 		}
 		b.transactions = append(b.transactions, tx)
 		pos += int(l)
+	}
+	if !bytes.Equal(data, b.Bytes()) {
+		return nil, fmt.Errorf("keyvm: %w: non-canonical block encoding", ErrInvalidPayload)
 	}
 	b.id = b.computeID()
 	return b, nil

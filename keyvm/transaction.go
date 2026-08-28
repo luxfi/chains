@@ -175,80 +175,86 @@ func deriveKeyID(name string) ids.ID {
 
 // checkAuth is the single, read-only authorization predicate for a transaction:
 // it decides whether tx may take effect against the CURRENT committed state at
-// time now. It mutates nothing. It is the one place the policy model is
-// enforced, called at three layers so unauthorized transactions are rejected at
-// the earliest gate and never charged: admission (SubmitTx), consensus
-// (Block.Verify), and — as defense in depth — application (Apply). The caller
+// time now, and RESOLVES the key record the operation targets. It mutates
+// nothing. It is the one place the policy model is enforced, called at three
+// layers so unauthorized transactions are rejected at the earliest gate and
+// never charged: admission (SubmitTx), block assembly (BuildBlock) and consensus
+// (Block.Verify). Apply then works from the record this returned rather than
+// resolving and re-authorizing it a second time — one resolution, one decision.
+// A registration has no target record yet, so it resolves to nil. The caller
 // holds the appropriate stateLock.
-func (tx *Transaction) checkAuth(vm *VM, now int64) error {
+func (tx *Transaction) checkAuth(vm *VM, now int64) (*KeyRecord, error) {
 	switch tx.Type {
 	case TxRegisterKey:
 		var p RegisterKeyPayload
 		if err := json.Unmarshal(tx.Payload, &p); err != nil {
-			return fmt.Errorf("keyvm: %w: register", ErrInvalidPayload)
+			return nil, fmt.Errorf("keyvm: %w: register", ErrInvalidPayload)
 		}
 		if _, ok := vm.getKey(deriveKeyID(p.Name)); ok {
-			return ErrKeyExists
+			return nil, ErrKeyExists
 		}
-		return nil
+		return nil, nil
 	case TxSetPolicy:
 		rec, ok := vm.getKey(tx.KeyID)
 		if !ok {
-			return ErrKeyNotFound
+			return nil, ErrKeyNotFound
 		}
 		if rec.Status != StatusActive {
-			return ErrKeyRevoked
+			return nil, ErrKeyRevoked
 		}
 		if !rec.Policy.MayAdmin(tx.Payer) {
-			return ErrUnauthorized
+			return nil, ErrUnauthorized
 		}
-		return nil
+		return rec, nil
 	case TxAuthorize:
 		rec, ok := vm.getKey(tx.KeyID)
 		if !ok {
-			return ErrKeyNotFound
+			return nil, ErrKeyNotFound
 		}
 		if rec.Status != StatusActive {
-			return ErrKeyRevoked
+			return nil, ErrKeyRevoked
 		}
 		if !rec.Policy.MayInvoke(tx.Payer, now) {
-			return ErrUnauthorized
+			return nil, ErrUnauthorized
 		}
-		return nil
+		return rec, nil
 	case TxRevokeKey:
 		rec, ok := vm.getKey(tx.KeyID)
 		if !ok {
-			return ErrKeyNotFound
+			return nil, ErrKeyNotFound
 		}
 		if !rec.Policy.MayAdmin(tx.Payer) {
-			return ErrUnauthorized
+			return nil, ErrUnauthorized
 		}
-		return nil
+		return rec, nil
 	default:
-		return ErrInvalidTxType
+		return nil, ErrInvalidTxType
 	}
 }
 
 // Apply mutates VM state for an already-verified, already-paid transaction. It
 // runs inside block.Accept, writing through the VM's versiondb so the effect
 // commits atomically with the fee burn. now is the accepting block's unix time.
-// It re-runs checkAuth (defense in depth) before mutating.
+// It authorizes through checkAuth and applies to the record checkAuth resolved.
 func (tx *Transaction) Apply(vm *VM, now int64) error {
-	if err := tx.checkAuth(vm, now); err != nil {
+	rec, err := tx.checkAuth(vm, now)
+	if err != nil {
 		return err
 	}
 	switch tx.Type {
 	case TxRegisterKey:
 		return tx.applyRegister(vm, now)
 	case TxSetPolicy:
-		return tx.applySetPolicy(vm, now)
+		return tx.applySetPolicy(vm, now, rec)
 	case TxAuthorize:
 		return tx.applyAuthorize(vm, now)
 	case TxRevokeKey:
-		return tx.applyRevoke(vm, now)
-	default:
-		return ErrInvalidTxType
+		return tx.applyRevoke(vm, now, rec)
 	}
+	// checkAuth is the type gate, so no other value reaches here. The arm stays
+	// because a fifth operation added to checkAuth and not to this switch must
+	// fail closed, never fall through into whichever apply sits last.
+	return ErrInvalidTxType
 }
 
 func (tx *Transaction) applyRegister(vm *VM, now int64) error {
@@ -280,14 +286,10 @@ func (tx *Transaction) applyRegister(vm *VM, now int64) error {
 	return vm.putKey(rec)
 }
 
-func (tx *Transaction) applySetPolicy(vm *VM, now int64) error {
+func (tx *Transaction) applySetPolicy(vm *VM, now int64, rec *KeyRecord) error {
 	var p SetPolicyPayload
 	if err := json.Unmarshal(tx.Payload, &p); err != nil {
 		return fmt.Errorf("keyvm: %w: setpolicy", ErrInvalidPayload)
-	}
-	rec, ok := vm.getKey(tx.KeyID)
-	if !ok {
-		return ErrKeyNotFound
 	}
 	// The owner remains an admin no matter what the new policy says — a key's
 	// owner can never be evicted by a policy update (fail-secure).
@@ -326,14 +328,7 @@ func (tx *Transaction) applyAuthorize(vm *VM, now int64) error {
 	return vm.putCeremony(c)
 }
 
-func (tx *Transaction) applyRevoke(vm *VM, now int64) error {
-	rec, ok := vm.getKey(tx.KeyID)
-	if !ok {
-		return ErrKeyNotFound
-	}
-	if !rec.Policy.MayAdmin(tx.Payer) {
-		return ErrUnauthorized
-	}
+func (tx *Transaction) applyRevoke(vm *VM, now int64, rec *KeyRecord) error {
 	rec.Status = StatusRevoked
 	rec.UpdatedAt = now
 	return vm.putKey(rec)

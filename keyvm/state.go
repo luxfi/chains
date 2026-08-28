@@ -26,7 +26,7 @@ import (
 // secret-typed or secret-named field, and (2) a scan of the package source
 // rejects any call that could generate, parse, reconstruct, or sign with a
 // secret. Together they make holding-a-secret and reconstructing-a-secret
-// structurally impossible in this package, not merely unimplemented.
+// structurally impossible in this package, not merely absent from it.
 
 // Key lifecycle states.
 const (
