@@ -16,6 +16,14 @@ import (
 	luxvm "github.com/luxfi/vm"
 )
 
+var (
+	errPoolClosed   = errors.New("quantumvm: transaction pool is closed")
+	errPoolFull     = errors.New("quantumvm: transaction pool is full")
+	errDuplicateTx  = errors.New("quantumvm: transaction already in the pool")
+	errTxNotInPool  = errors.New("quantumvm: transaction not in the pool")
+	errMissingStamp = errors.New("quantumvm: missing quantum signature")
+)
+
 // Transaction represents a QVM transaction
 type Transaction interface {
 	ID() ids.ID
@@ -24,8 +32,8 @@ type Transaction interface {
 	Execute() error
 	GetQuantumSignature() *quantum.QuantumSignature
 	Timestamp() time.Time
-	// Fee returns the user-paid tx burn in nLUX. Must satisfy the
-	// chain's FeePolicy (>= fee.MinTxFeeFloor on Q-Chain).
+	// Fee returns the user-paid tx burn in nLUX. Q-Chain's policy is the
+	// committee-only sentinel, which refuses every amount (LP-0130 §6).
 	Fee() uint64
 }
 
@@ -60,42 +68,32 @@ func (tx *BaseTransaction) Timestamp() time.Time {
 	return tx.timestamp
 }
 
-// Fee returns the user-paid tx burn (nLUX). Defaults to zero on a
-// zero-value BaseTransaction — callers must set it explicitly for the
-// fee gate to accept the tx.
+// Fee returns the user-paid tx burn (nLUX).
 func (tx *BaseTransaction) Fee() uint64 {
 	return tx.fee
 }
 
-// SetFee sets the user-paid tx burn in nLUX. Convenience setter for
-// tests + tx builders; production callers should pass the fee at
-// construction time.
-func (tx *BaseTransaction) SetFee(f uint64) { tx.fee = f }
-
 // Verify verifies the transaction
 func (tx *BaseTransaction) Verify() error {
 	if tx.quantumSignature == nil {
-		return errors.New("missing quantum signature")
+		return errMissingStamp
 	}
 	return nil
 }
 
 // Execute executes the transaction
 func (tx *BaseTransaction) Execute() error {
-	// Implementation depends on transaction type
 	return nil
 }
 
 // TransactionPool manages pending transactions
 type TransactionPool struct {
-	pending   map[ids.ID]Transaction
-	queue     []Transaction
-	maxSize   int
-	batchSize int
-	log       log.Logger
-	mu        sync.RWMutex
-	closed    bool
-	closeChan chan struct{}
+	pending map[ids.ID]Transaction
+	queue   []Transaction
+	maxSize int
+	log     log.Logger
+	mu      sync.RWMutex
+	closed  bool
 
 	// work tells consensus a block can be built. The pool is what learns that
 	// first, whichever path the transaction arrived by.
@@ -103,14 +101,12 @@ type TransactionPool struct {
 }
 
 // NewTransactionPool creates a new transaction pool
-func NewTransactionPool(maxSize, batchSize int, logger log.Logger) *TransactionPool {
+func NewTransactionPool(maxSize int, logger log.Logger) *TransactionPool {
 	return &TransactionPool{
-		pending:   make(map[ids.ID]Transaction),
-		queue:     make([]Transaction, 0, maxSize),
-		maxSize:   maxSize,
-		batchSize: batchSize,
-		log:       logger,
-		closeChan: make(chan struct{}),
+		pending: make(map[ids.ID]Transaction),
+		queue:   make([]Transaction, 0, maxSize),
+		maxSize: maxSize,
+		log:     logger,
 	}
 }
 
@@ -120,19 +116,16 @@ func (p *TransactionPool) AddTransaction(tx Transaction) error {
 	defer p.mu.Unlock()
 
 	if p.closed {
-		return errors.New("pool is closed")
+		return errPoolClosed
 	}
-
 	if len(p.pending) >= p.maxSize {
-		return errors.New("pool is full")
+		return errPoolFull
 	}
 
 	txID := tx.ID()
 	if _, exists := p.pending[txID]; exists {
-		return errors.New("transaction already exists")
+		return errDuplicateTx
 	}
-
-	// Verify transaction
 	if err := tx.Verify(); err != nil {
 		return err
 	}
@@ -152,18 +145,32 @@ func (p *TransactionPool) WaitForEvent(ctx context.Context) (luxvm.Message, erro
 	return p.work.WaitForEvent(ctx)
 }
 
+// signalIfWork re-arms the builder while the pool still holds anything.
+//
+// The latch carries one signal, so N arrivals wake one build and a build that
+// takes fewer than N leaves the rest with nothing to wake them: they sit in the
+// pool until some unrelated transaction arrives, which on a quiet chain is
+// never. Whoever drains the pool says so afterwards.
+func (p *TransactionPool) signalIfWork() {
+	p.mu.RLock()
+	work := len(p.queue) > 0
+	p.mu.RUnlock()
+	if work {
+		p.work.Signal()
+	}
+}
+
 // RemoveTransaction removes a transaction from the pool
 func (p *TransactionPool) RemoveTransaction(txID ids.ID) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if _, exists := p.pending[txID]; !exists {
-		return errors.New("transaction not found")
+		return errTxNotInPool
 	}
 
 	delete(p.pending, txID)
 
-	// Remove from queue
 	newQueue := make([]Transaction, 0, len(p.queue)-1)
 	for _, tx := range p.queue {
 		if tx.ID() != txID {
@@ -202,12 +209,9 @@ func (p *TransactionPool) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if !p.closed {
-		p.closed = true
-		close(p.closeChan)
-		p.pending = nil
-		p.queue = nil
-	}
+	p.closed = true
+	p.pending = nil
+	p.queue = nil
 }
 
 // TransactionWorker processes transactions in parallel
@@ -216,25 +220,27 @@ type TransactionWorker struct {
 	quantumSigner *quantum.QuantumSigner
 }
 
-// ProcessBatch processes a batch of transactions.
-// Uses GPU batch ML-DSA verification when available and batch is large enough.
-func (w *TransactionWorker) ProcessBatch(txs []Transaction) ([]Transaction, error) {
-	// Phase 1: basic validation (no crypto)
+// ProcessBatch verifies and executes a batch, reporting what survived and what
+// did not. Both halves matter: the survivors go in the block, and the rest have
+// to leave the pool — a transaction whose quantum stamp has aged out will never
+// verify again, and left in place it holds its slot for good.
+//
+// Uses GPU batch ML-DSA verification when available and the batch is large enough.
+func (w *TransactionWorker) ProcessBatch(txs []Transaction) (valid, rejected []Transaction) {
+	// Phase 1: basic validation. A missing signature is caught here, by the
+	// transaction itself; phase 2 decides whether the one present is good.
 	var verified []Transaction
 	for _, tx := range txs {
 		if err := tx.Verify(); err != nil {
 			w.vm.log.Debug("transaction verification failed", "txID", tx.ID(), "error", err)
-			continue
-		}
-		if w.vm.Config.QuantumStampEnabled && tx.GetQuantumSignature() == nil {
-			w.vm.log.Debug("missing quantum signature", "txID", tx.ID())
+			rejected = append(rejected, tx)
 			continue
 		}
 		verified = append(verified, tx)
 	}
 
 	if len(verified) == 0 {
-		return nil, nil
+		return nil, rejected
 	}
 
 	// Phase 2: quantum signature verification (GPU batch when possible)
@@ -248,9 +254,7 @@ func (w *TransactionWorker) ProcessBatch(txs []Transaction) ([]Transaction, erro
 		}
 
 		// ParallelVerifyWithThreshold picks GPU or CPU automatically
-		err := w.quantumSigner.ParallelVerifyWithThreshold(msgs, sigs, w.vm.Config.GPUBatchThreshold)
-		if err == nil {
-			// All passed
+		if err := w.quantumSigner.ParallelVerifyWithThreshold(msgs, sigs, w.vm.Config.GPUBatchThreshold); err == nil {
 			for i := range sigValid {
 				sigValid[i] = true
 			}
@@ -271,17 +275,19 @@ func (w *TransactionWorker) ProcessBatch(txs []Transaction) ([]Transaction, erro
 	}
 
 	// Phase 3: execute valid transactions
-	validTxs := make([]Transaction, 0, len(verified))
+	valid = make([]Transaction, 0, len(verified))
 	for i, tx := range verified {
 		if !sigValid[i] {
+			rejected = append(rejected, tx)
 			continue
 		}
 		if err := tx.Execute(); err != nil {
 			w.vm.log.Debug("transaction execution failed", "txID", tx.ID(), "error", err)
+			rejected = append(rejected, tx)
 			continue
 		}
-		validTxs = append(validTxs, tx)
+		valid = append(valid, tx)
 	}
 
-	return validTxs, nil
+	return valid, rejected
 }

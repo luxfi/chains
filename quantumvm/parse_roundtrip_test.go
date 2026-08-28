@@ -78,29 +78,37 @@ func TestGenesisParses(t *testing.T) {
 	}
 }
 
-// TestBothParsePathsAgree pins the asymmetry itself.
+// TestServeAndReceiveAgree pins the asymmetry itself.
 //
-// The responder answers a catch-up request through vm.parseBlock; the requester
-// admits the reply through VM.ParseBlock. They are two doors into one format, so
-// a check on only one of them means the fleet serves what it will not accept.
-// Whatever either door does to a block, both must reach the same verdict.
-func TestBothParsePathsAgree(t *testing.T) {
+// A responder answers a catch-up request with the bytes it stored; the
+// requester admits the reply through ParseBlock. They are two doors into one
+// format, so a check on only one of them means the fleet serves what it will
+// not accept. Whatever either door does to a block, both must reach the same
+// verdict.
+func TestServeAndReceiveAgree(t *testing.T) {
 	vm := parseVM(t)
+	if err := vm.seedGenesis(); err != nil {
+		t.Fatalf("seedGenesis: %v", err)
+	}
 
 	blk := &Block{
 		timestamp: time.Unix(2000, 0).UTC(),
-		height:    3,
-		parentID:  ids.GenerateTestID(),
+		height:    1,
+		parentID:  vm.getLastAcceptedID(),
 		vm:        vm,
 	}
 	blk.id = blk.computeID()
-	raw := blk.Bytes()
+	if err := blk.Accept(context.Background()); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
 
-	_, servErr := vm.parseBlock(raw)          // responder side
-	_, recvErr := vm.ParseBlock(context.Background(), raw) // requester side
-
+	served, servErr := vm.GetBlock(context.Background(), blk.id) // responder side
+	received, recvErr := vm.ParseBlock(context.Background(), blk.Bytes())
 	if (servErr == nil) != (recvErr == nil) {
-		t.Fatalf("the two parse paths disagree on identical bytes: serve=%v receive=%v\n"+
+		t.Fatalf("the two paths disagree on identical bytes: serve=%v receive=%v\n"+
 			"every node would serve this block and every node would refuse it", servErr, recvErr)
+	}
+	if servErr == nil && served.ID() != received.ID() {
+		t.Fatalf("one block read back under two ids: %s vs %s", served.ID(), received.ID())
 	}
 }

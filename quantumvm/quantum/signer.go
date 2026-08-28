@@ -14,14 +14,12 @@ import (
 
 	"github.com/luxfi/accel"
 	"github.com/luxfi/crypto/mldsa"
-	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/cache"
 )
 
 var (
 	ErrInvalidQuantumSignature   = errors.New("invalid quantum signature")
-	ErrInvalidCoronaKey        = errors.New("invalid corona key")
+	ErrInvalidCoronaKey          = errors.New("invalid corona key")
 	ErrQuantumStampExpired       = errors.New("quantum stamp expired")
 	ErrQuantumVerificationFailed = errors.New("quantum verification failed")
 	ErrUnsupportedAlgorithm      = errors.New("unsupported quantum algorithm")
@@ -40,7 +38,6 @@ type QuantumSigner struct {
 	algorithmVersion uint32
 	mldsaMode        mldsa.Mode
 	stampWindow      time.Duration
-	sigCache         *cache.LRU[ids.ID, *QuantumSignature]
 	mu               sync.RWMutex
 }
 
@@ -50,7 +47,7 @@ type QuantumSignature struct {
 	Timestamp    time.Time
 	PublicKey    []byte
 	Signature    []byte
-	CoronaKey  []byte
+	CoronaKey    []byte
 	QuantumStamp []byte
 }
 
@@ -81,10 +78,10 @@ func (k *MLDSAValidatorKey) signer(mode mldsa.Mode) (*mldsa.PrivateKey, error) {
 	return k.mldsaPriv, k.parseErr
 }
 
-// NewQuantumSigner creates a new quantum signer with real ML-DSA
-// algorithmVersion: 1=MLDSA44, 2=MLDSA65, 3=MLDSA87
-// keySize is ignored (determined by algorithm)
-func NewQuantumSigner(log log.Logger, algorithmVersion uint32, keySize int, stampWindow time.Duration, cacheSize int) *QuantumSigner {
+// NewQuantumSigner creates a new quantum signer with real ML-DSA.
+// algorithmVersion: 1=MLDSA44, 2=MLDSA65, 3=MLDSA87 — the parameter set
+// determines every key and signature width, so there is nothing else to size.
+func NewQuantumSigner(log log.Logger, algorithmVersion uint32, stampWindow time.Duration) *QuantumSigner {
 	var mode mldsa.Mode
 	switch algorithmVersion {
 	case AlgorithmMLDSA44:
@@ -103,7 +100,6 @@ func NewQuantumSigner(log log.Logger, algorithmVersion uint32, keySize int, stam
 		algorithmVersion: algorithmVersion,
 		mldsaMode:        mode,
 		stampWindow:      stampWindow,
-		sigCache:         &cache.LRU[ids.ID, *QuantumSignature]{Size: cacheSize},
 	}
 }
 
@@ -165,20 +161,14 @@ func (qs *QuantumSigner) Sign(message []byte, key *MLDSAValidatorKey) (*QuantumS
 		return nil, fmt.Errorf("ML-DSA signing failed: %w", err)
 	}
 
-	sig := &QuantumSignature{
+	return &QuantumSignature{
 		Algorithm:    qs.algorithmVersion,
 		Timestamp:    time.Now(),
 		PublicKey:    key.PublicKey,
 		Signature:    signature,
-		CoronaKey:  key.PublicKey,
+		CoronaKey:    key.PublicKey,
 		QuantumStamp: stamp,
-	}
-
-	// Cache the signature
-	sigID := qs.computeSignatureID(sig)
-	qs.sigCache.Put(sigID, sig)
-
-	return sig, nil
+	}, nil
 }
 
 // Verify verifies a quantum signature using ML-DSA
@@ -239,19 +229,6 @@ func (qs *QuantumSigner) generateQuantumStamp(message []byte, key *MLDSAValidato
 	copy(stamp[len(hash):], noise)
 
 	return stamp, nil
-}
-
-// computeSignatureID computes a unique ID for a signature
-func (qs *QuantumSigner) computeSignatureID(sig *QuantumSignature) ids.ID {
-	data := make([]byte, 0, len(sig.Signature)+len(sig.PublicKey)+8)
-	data = append(data, sig.Signature...)
-	data = append(data, sig.PublicKey...)
-	timestampBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestampBytes, uint64(sig.Timestamp.Unix()))
-	data = append(data, timestampBytes...)
-
-	id, _ := ids.ToID(data)
-	return id
 }
 
 // ParallelVerify verifies multiple signatures in parallel.

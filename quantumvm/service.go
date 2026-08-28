@@ -4,15 +4,13 @@
 package quantumvm
 
 import (
-	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 
-	"encoding/json"
-
-	"github.com/luxfi/ids"
 	"github.com/luxfi/chains/quantumvm/quantum"
+	"github.com/luxfi/ids"
 )
 
 // Service provides QVM RPC service
@@ -25,13 +23,20 @@ type GetBlockArgs struct {
 	BlockID string `json:"blockID"`
 }
 
+// BlockSummary is how a block appears over RPC.
+type BlockSummary struct {
+	ID       string `json:"id"`
+	ParentID string `json:"parentID"`
+	Height   uint64 `json:"height"`
+}
+
 // GetBlockReply is the reply for GetBlock
 type GetBlockReply struct {
-	Block      json.RawMessage `json:"block"`
-	Height     uint64          `json:"height"`
-	Timestamp  int64           `json:"timestamp"`
-	TxCount    int             `json:"txCount"`
-	QuantumSig bool            `json:"quantumSig"`
+	Block      BlockSummary `json:"block"`
+	Height     uint64       `json:"height"`
+	Timestamp  int64        `json:"timestamp"`
+	TxCount    int          `json:"txCount"`
+	QuantumSig bool         `json:"quantumSig"`
 }
 
 // GetBlock returns a block by ID
@@ -41,29 +46,19 @@ func (s *Service) GetBlock(r *http.Request, args *GetBlockArgs, reply *GetBlockR
 		return fmt.Errorf("invalid block ID: %w", err)
 	}
 
-	block, err := s.vm.GetBlock(context.Background(), blockID)
+	block, err := s.vm.block(blockID)
 	if err != nil {
 		return fmt.Errorf("failed to get block: %w", err)
 	}
 
-	qBlock, ok := block.(*Block)
-	if !ok {
-		return errors.New("invalid block type")
+	reply.Block = BlockSummary{
+		ID:       block.ID().String(),
+		ParentID: block.parentID.String(),
+		Height:   block.height,
 	}
-
-	blockData, err := json.Marshal(map[string]interface{}{
-		"id":       qBlock.ID().String(),
-		"parentID": qBlock.parentID.String(),
-		"height":   qBlock.height,
-	})
-	if err != nil {
-		return err
-	}
-
-	reply.Block = blockData
-	reply.Height = qBlock.height
-	reply.Timestamp = qBlock.timestamp.Unix()
-	reply.TxCount = len(qBlock.transactions)
+	reply.Height = block.height
+	reply.Timestamp = block.timestamp.Unix()
+	reply.TxCount = len(block.transactions)
 	reply.QuantumSig = false // blocks carry no stamp; see signBlockWithQuasar
 
 	return nil
@@ -134,10 +129,16 @@ type GetPendingTransactionsArgs struct {
 	Limit int `json:"limit"`
 }
 
+// TransactionSummary is how a pending transaction appears over RPC.
+type TransactionSummary struct {
+	ID        string `json:"id"`
+	Timestamp int64  `json:"timestamp"`
+}
+
 // GetPendingTransactionsReply is the reply for GetPendingTransactions
 type GetPendingTransactionsReply struct {
-	Transactions []json.RawMessage `json:"transactions"`
-	Count        int               `json:"count"`
+	Transactions []TransactionSummary `json:"transactions"`
+	Count        int                  `json:"count"`
 }
 
 // GetPendingTransactions returns pending transactions
@@ -148,17 +149,13 @@ func (s *Service) GetPendingTransactions(r *http.Request, args *GetPendingTransa
 	}
 
 	txs := s.vm.txPool.GetPendingTransactions(limit)
-	reply.Transactions = make([]json.RawMessage, len(txs))
+	reply.Transactions = make([]TransactionSummary, len(txs))
 
 	for i, tx := range txs {
-		txData, err := json.Marshal(map[string]interface{}{
-			"id":        tx.ID().String(),
-			"timestamp": tx.Timestamp().Unix(),
-		})
-		if err != nil {
-			return err
+		reply.Transactions[i] = TransactionSummary{
+			ID:        tx.ID().String(),
+			Timestamp: tx.Timestamp().Unix(),
 		}
-		reply.Transactions[i] = txData
 	}
 
 	reply.Count = len(txs)
@@ -173,24 +170,21 @@ type GetHealthReply struct {
 	Healthy         bool   `json:"healthy"`
 	Version         string `json:"version"`
 	QuantumEnabled  bool   `json:"quantumEnabled"`
-	CoronaEnabled bool   `json:"coronaEnabled"`
+	CoronaEnabled   bool   `json:"coronaEnabled"`
 	PendingTxCount  int    `json:"pendingTxCount"`
 	ParallelWorkers int    `json:"parallelWorkers"`
 }
 
 // GetHealth returns the health status of the QVM
 func (s *Service) GetHealth(r *http.Request, args *GetHealthArgs, reply *GetHealthReply) error {
-	health, err := s.vm.HealthCheck(context.Background())
-	if err != nil {
-		return err
-	}
+	health := s.vm.health()
 
 	reply.Healthy = health.Healthy
 	reply.Version = health.Details["version"]
 	reply.QuantumEnabled = s.vm.Config.QuantumStampEnabled
 	reply.CoronaEnabled = s.vm.Config.CoronaEnabled
 	reply.PendingTxCount = s.vm.txPool.PendingCount()
-	reply.ParallelWorkers = s.vm.parallelWorkers
+	reply.ParallelWorkers = s.vm.Config.MaxParallelTxs
 
 	return nil
 }
@@ -198,27 +192,20 @@ func (s *Service) GetHealth(r *http.Request, args *GetHealthArgs, reply *GetHeal
 // GetConfigArgs are the arguments for GetConfig
 type GetConfigArgs struct{}
 
-// GetConfigReply is the reply for GetConfig
+// GetConfigReply is the reply for GetConfig. It reports what actually governs
+// the chain — no fee schedule, because Q-Chain charges none (LP-0130 §6).
 type GetConfigReply struct {
-	TxFee                   uint64 `json:"txFee"`
-	CreateAssetTxFee        uint64 `json:"createAssetTxFee"`
-	QuantumVerificationFee  uint64 `json:"quantumVerificationFee"`
 	MaxParallelTxs          int    `json:"maxParallelTxs"`
 	QuantumAlgorithmVersion uint32 `json:"quantumAlgorithmVersion"`
-	CoronaKeySize         int    `json:"coronaKeySize"`
 	QuantumStampEnabled     bool   `json:"quantumStampEnabled"`
-	CoronaEnabled         bool   `json:"coronaEnabled"`
+	CoronaEnabled           bool   `json:"coronaEnabled"`
 	ParallelBatchSize       int    `json:"parallelBatchSize"`
 }
 
 // GetConfig returns the QVM configuration
 func (s *Service) GetConfig(r *http.Request, args *GetConfigArgs, reply *GetConfigReply) error {
-	reply.TxFee = s.vm.Config.TxFee
-	reply.CreateAssetTxFee = s.vm.Config.CreateAssetTxFee
-	reply.QuantumVerificationFee = s.vm.Config.QuantumVerificationFee
 	reply.MaxParallelTxs = s.vm.Config.MaxParallelTxs
 	reply.QuantumAlgorithmVersion = s.vm.Config.QuantumAlgorithmVersion
-	reply.CoronaKeySize = s.vm.Config.CoronaKeySize
 	reply.QuantumStampEnabled = s.vm.Config.QuantumStampEnabled
 	reply.CoronaEnabled = s.vm.Config.CoronaEnabled
 	reply.ParallelBatchSize = s.vm.Config.ParallelBatchSize

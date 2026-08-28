@@ -97,6 +97,15 @@ func parseBlockBytes(vm *VM, data []byte) (*Block, error) {
 		return nil, fmt.Errorf("quantumvm: block trailing bytes")
 	}
 	o := msg.Root()
+	// A field read past the end of the buffer answers zero rather than
+	// failing, so a wire too short to hold the header does not decode to
+	// nothing — it decodes to height 0, time 0 and the empty parent. Every
+	// truncation would name that one value, under as many different ids as
+	// there are ways to truncate.
+	if o.Offset()+blkSize > msg.Size() {
+		return nil, fmt.Errorf("quantumvm: block wire ends %d bytes into a %d-byte header",
+			msg.Size()-o.Offset(), blkSize)
+	}
 	b := &Block{vm: vm, bytes: data}
 	b.timestamp = time.Unix(o.Int64(blkTime), 0)
 	b.height = o.Uint64(blkHeight)

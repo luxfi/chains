@@ -20,8 +20,7 @@ func seedVM(t *testing.T) (*VM, *memdb.Database) {
 	t.Helper()
 	db := memdb.New()
 	vm := &VM{log: log.NewNoOpLogger(), db: db}
-	vm.versiondb = versiondb.New(db)
-	vm.state = vm.versiondb
+	vm.state = versiondb.New(db)
 	return vm, db
 }
 
@@ -127,8 +126,7 @@ func TestSeedGenesisSurvivesRestart(t *testing.T) {
 
 	// Restart: a new version layer over the SAME underlying store.
 	restarted := &VM{log: log.NewNoOpLogger(), db: db}
-	restarted.versiondb = versiondb.New(db)
-	restarted.state = restarted.versiondb
+	restarted.state = versiondb.New(db)
 
 	if got := restarted.getLastAcceptedID(); got != want {
 		t.Fatalf("genesis did not survive restart: %s != %s (uncommitted)", got, want)
