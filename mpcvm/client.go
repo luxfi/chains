@@ -14,15 +14,16 @@ import (
 	"time"
 )
 
-// Client provides access to mpcvm services. Per LP-134, this serves
-// M-Chain (MPC mode) and F-Chain (FHE mode); legacy T-Chain MPC routes here.
+// Client reads one M-Chain node over its JSON-RPC endpoint: the custody
+// registry, the ceremony log, the state root, and what the node itself is.
 type Client struct {
 	endpoint   string
 	chainID    string // Requesting chain's ID
 	httpClient *http.Client
 }
 
-// NewClient creates a new T-Chain client
+// NewClient builds a client bound to one endpoint, identifying itself as
+// chainID for the RPCs that report per-chain quota.
 func NewClient(endpoint, chainID string) *Client {
 	return &Client{
 		endpoint: endpoint,
@@ -128,65 +129,12 @@ type CeremonyInfo struct {
 	Height          uint64   `json:"height,omitempty"`
 }
 
-// KeygenRequest contains parameters for key generation.
-type KeygenRequest struct {
-	KeyID string `json:"keyId"`
-	// Policy is the quorum in operator form, "3-of-5". Empty means the chain's
-	// default.
-	Policy string `json:"policy,omitempty"`
-}
-
-// KeygenResponse is a COMPLETED key generation.
-type KeygenResponse struct {
-	Ceremony CeremonyInfo `json:"ceremony"`
-	Key      KeyInfo      `json:"key"`
-}
-
-// Keygen runs a distributed key generation and returns when the key exists.
-// There is no status to poll afterwards: the ceremony either produced a
-// registered key or returned an error.
-func (c *Client) Keygen(ctx context.Context, req KeygenRequest) (*KeygenResponse, error) {
-	params := map[string]interface{}{
-		"keyId":       req.KeyID,
-		"requestedBy": c.chainID,
-	}
-	if req.Policy != "" {
-		params["policy"] = req.Policy
-	}
-
-	var result KeygenResponse
-	if err := c.call(ctx, "threshold_keygen", params, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
-}
-
-// SignRequest contains parameters for signing.
-type SignRequest struct {
-	KeyID string `json:"keyId"`
-	// MessageHash is the exact 32 bytes to sign. The caller owns its signing
-	// domain; M-Chain signs what it is given and never re-hashes.
-	MessageHash []byte `json:"messageHash"`
-}
-
-// Sign runs a threshold signing ceremony and returns the finished signature.
-//
-// The call blocks for the duration of the ceremony. The returned CeremonyID is
-// the durable handle: GetCeremony re-reads the same signature from replicated
-// state once the block carrying it is accepted.
-func (c *Client) Sign(ctx context.Context, req SignRequest) (*CeremonyInfo, error) {
-	params := map[string]interface{}{
-		"keyId":           req.KeyID,
-		"messageHash":     hex.EncodeToString(req.MessageHash),
-		"requestingChain": c.chainID,
-	}
-
-	var result CeremonyInfo
-	if err := c.call(ctx, "threshold_sign", params, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
-}
+// This client READS. It does not run ceremonies: a ceremony is requested BY a
+// chain over the cross-chain transport that authenticates which chain is
+// asking, and HTTP authenticates nobody. There were a Keygen and a Sign method
+// here calling threshold_keygen and threshold_sign, which the server refuses
+// unconditionally — two entry points that could only ever return an error, and
+// an invitation to make the server stop refusing.
 
 // GetCeremony reads one recorded ceremony from replicated state.
 func (c *Client) GetCeremony(ctx context.Context, ceremonyID string) (*CeremonyInfo, error) {
@@ -294,44 +242,6 @@ func (c *Client) GetAddress(ctx context.Context, keyID string) ([]byte, error) {
 }
 
 // =============================================================================
-// Protocol Information
-// =============================================================================
-
-// ProtocolInfo contains protocol information
-type ProtocolInfo struct {
-	Name            string   `json:"name"`
-	Description     string   `json:"description"`
-	SupportedCurves []string `json:"supportedCurves"`
-	KeySize         int      `json:"keySize"`
-	SignatureSize   int      `json:"signatureSize"`
-	IsPostQuantum   bool     `json:"isPostQuantum"`
-	SupportsReshare bool     `json:"supportsReshare"`
-	SupportsRefresh bool     `json:"supportsRefresh"`
-}
-
-// GetProtocols retrieves all supported protocols
-func (c *Client) GetProtocols(ctx context.Context) ([]ProtocolInfo, error) {
-	var result []ProtocolInfo
-	if err := c.call(ctx, "threshold_getProtocols", nil, &result); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-// GetProtocolInfo retrieves info for a specific protocol
-func (c *Client) GetProtocolInfo(ctx context.Context, protocol string) (*ProtocolInfo, error) {
-	params := map[string]string{
-		"protocol": protocol,
-	}
-
-	var result ProtocolInfo
-	if err := c.call(ctx, "threshold_getProtocolInfo", params, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
-}
-
-// =============================================================================
 // Network Information
 // =============================================================================
 
@@ -371,7 +281,7 @@ type NetworkStats struct {
 	SignaturesByChain map[string]uint64 `json:"signaturesByChain"`
 }
 
-// GetStats retrieves T-Chain statistics
+// GetStats retrieves this node's ceremony counters.
 func (c *Client) GetStats(ctx context.Context) (*NetworkStats, error) {
 	var result NetworkStats
 	if err := c.call(ctx, "threshold_getStats", nil, &result); err != nil {

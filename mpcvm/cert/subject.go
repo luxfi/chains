@@ -11,7 +11,7 @@ import (
 // Roots is the set of upstream roots a Quasar 3.0 certificate_subject
 // binds, mirroring the QuasarRoundDescriptor in LP-134.
 //
-// All seven roots are required, including both MChain and FChain —
+// All ten roots are required, including both MChain and FChain —
 // this is the structural property that makes cross-chain replay
 // impossible. The substrate does not let a caller skip a root: a zero
 // value is still a value, and the chain that owns the root is

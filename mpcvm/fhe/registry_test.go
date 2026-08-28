@@ -4,9 +4,12 @@
 package fhe
 
 import (
+	"bytes"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/luxfi/database"
 	"github.com/luxfi/database/memdb"
 	"github.com/luxfi/ids"
 	"github.com/stretchr/testify/require"
@@ -523,4 +526,338 @@ func TestRegistrySetAndGetEpoch(t *testing.T) {
 	epochInfo.Epoch = 100
 	require.NoError(t, registry.SetEpoch(100, epochInfo))
 	require.Equal(t, uint64(100), registry.GetCurrentEpoch())
+}
+
+// ---------------------------------------------------------------------------
+// What the registry does when the database does not cooperate
+// ---------------------------------------------------------------------------
+
+// errFault is what a database returns when it is neither working nor absent.
+// Telling those two apart is the whole point of the tests below: "not found"
+// means the record does not exist, anything else means the answer is unknown,
+// and a store that conflates them reports emptiness it has not established.
+var errFault = errors.New("disk fell over")
+
+// faultyDB is a database that consults a hook before each read and each write.
+// A hook returning an error refuses that one operation, so a test can place a
+// failure on a particular key, on the nth call, or on everything, without the
+// fake growing a knob per shape.
+type faultyDB struct {
+	database.Database
+	refuseGet func(key []byte) error
+	refusePut func(key []byte) error
+}
+
+func (f *faultyDB) Get(key []byte) ([]byte, error) {
+	if f.refuseGet != nil {
+		if err := f.refuseGet(key); err != nil {
+			return nil, err
+		}
+	}
+	return f.Database.Get(key)
+}
+
+func (f *faultyDB) Put(key, value []byte) error {
+	if f.refusePut != nil {
+		if err := f.refusePut(key); err != nil {
+			return err
+		}
+	}
+	return f.Database.Put(key, value)
+}
+
+// always refuses every key, which is what a dead disk looks like.
+func always(key []byte) error { return errFault }
+
+// under refuses only the keys a subsystem owns, which is how a test fails one
+// record while the rest of a multi-write operation succeeds.
+func under(prefix string) func([]byte) error {
+	return func(key []byte) error {
+		if bytes.HasPrefix(key, []byte(prefix)) {
+			return errFault
+		}
+		return nil
+	}
+}
+
+// afterFirst lets one call through and refuses the rest, which separates two
+// reads of the same key inside one operation.
+func afterFirst() func([]byte) error {
+	seen := 0
+	return func([]byte) error {
+		seen++
+		if seen > 1 {
+			return errFault
+		}
+		return nil
+	}
+}
+
+// newFaultyRegistry returns a registry over a working database plus the switch
+// that breaks it, so a test can populate state first and fail afterwards.
+func newFaultyRegistry(t *testing.T) (*Registry, *faultyDB) {
+	t.Helper()
+	db := &faultyDB{Database: memdb.New()}
+	registry, err := NewRegistry(db)
+	require.NoError(t, err)
+	return registry, db
+}
+
+// corrupt writes bytes that are not JSON under a key, which is what a torn
+// write or a format change leaves behind.
+func corrupt(t *testing.T, r *Registry, prefix []byte, suffix []byte) {
+	t.Helper()
+	require.NoError(t, r.db.Put(append(prefix, suffix...), []byte("{not json")))
+}
+
+// TestNewRegistryRefusesAnUnreadableEpochPointer holds that a registry whose
+// stored epoch cannot be read fails to open. Starting at epoch 0 instead would
+// silently rewind the chain's key schedule and register new ciphertexts under
+// an epoch whose committee has long since rotated out.
+func TestNewRegistryRefusesAnUnreadableEpochPointer(t *testing.T) {
+	registry, err := NewRegistry(&faultyDB{Database: memdb.New(), refuseGet: always})
+	require.ErrorIs(t, err, errFault)
+	require.Nil(t, registry)
+}
+
+// TestRegistryReportsUnreadableRecords holds that every read distinguishes
+// "absent" from "unknown". Each getter maps a missing record to its own
+// not-found error, and everything else has to come back as the failure it was.
+func TestRegistryReportsUnreadableRecords(t *testing.T) {
+	registry, db := newFaultyRegistry(t)
+	db.refuseGet = always
+
+	_, err := registry.GetCiphertextMeta([32]byte{1})
+	require.ErrorIs(t, err, errFault)
+	require.NotErrorIs(t, err, ErrCiphertextNotFound)
+
+	_, err = registry.GetDecryptRequest([32]byte{1})
+	require.ErrorIs(t, err, errFault)
+	require.NotErrorIs(t, err, ErrRequestNotFound)
+
+	_, err = registry.GetPermit([32]byte{1})
+	require.ErrorIs(t, err, errFault)
+	require.NotErrorIs(t, err, ErrPermitNotFound)
+
+	_, err = registry.GetSession("s")
+	require.ErrorIs(t, err, errFault)
+	require.NotErrorIs(t, err, ErrSessionNotFound)
+
+	_, err = registry.GetEpoch(1)
+	require.ErrorIs(t, err, errFault)
+
+	require.ErrorIs(t, registry.UpdateDecryptRequest([32]byte{1}, RequestCompleted, [32]byte{}, ""), errFault)
+}
+
+// TestRegistryReportsCorruptRecords holds that bytes that are not the record
+// they claim to be are reported, not returned as a zero-valued record. A
+// zero-valued CiphertextMeta names owner 0x00..00, which is an address an
+// attacker can plausibly control.
+func TestRegistryReportsCorruptRecords(t *testing.T) {
+	registry := newTestRegistry(t)
+
+	corrupt(t, registry, ciphertextPrefix, make([]byte, 32))
+	_, err := registry.GetCiphertextMeta([32]byte{})
+	require.ErrorContains(t, err, "unmarshal ciphertext meta")
+
+	corrupt(t, registry, decryptRequestPrefix, make([]byte, 32))
+	_, err = registry.GetDecryptRequest([32]byte{})
+	require.ErrorContains(t, err, "unmarshal decrypt request")
+	require.ErrorContains(t,
+		registry.UpdateDecryptRequest([32]byte{}, RequestCompleted, [32]byte{}, ""),
+		"unmarshal decrypt request")
+
+	corrupt(t, registry, permitPrefix, make([]byte, 32))
+	_, err = registry.GetPermit([32]byte{})
+	require.ErrorContains(t, err, "unmarshal permit")
+
+	corrupt(t, registry, sessionPrefix, []byte("s"))
+	_, err = registry.GetSession("s")
+	require.ErrorContains(t, err, "unmarshal session")
+
+	corrupt(t, registry, epochPrefix, encodeUint64(0))
+	_, err = registry.GetEpoch(0)
+	require.ErrorContains(t, err, "unmarshal epoch info")
+	_, err = registry.GetCommittee()
+	require.ErrorContains(t, err, "unmarshal epoch info")
+	require.ErrorContains(t, registry.AddCommitteeMember(&CommitteeMember{}), "unmarshal epoch info")
+	require.ErrorContains(t, registry.RemoveCommitteeMember(ids.GenerateTestNodeID()), "unmarshal epoch info")
+}
+
+// TestRegistryReportsFailedWrites holds that a write that did not land is
+// reported. A silent failure here loses a permit, a request or an epoch while
+// the caller carries on as though it were stored.
+func TestRegistryReportsFailedWrites(t *testing.T) {
+	registry, db := newFaultyRegistry(t)
+	db.refusePut = always
+
+	require.ErrorIs(t, registry.RegisterCiphertext(&CiphertextMeta{}), errFault)
+	require.ErrorIs(t, registry.CreateDecryptRequest(&DecryptRequest{}), errFault)
+	require.ErrorIs(t, registry.CreatePermit(&Permit{}), errFault)
+	require.ErrorIs(t, registry.SaveSession(&SessionState{SessionID: "s"}), errFault)
+	require.ErrorIs(t, registry.SetEpoch(1, &EpochInfo{}), errFault)
+	require.ErrorIs(t, registry.AddCommitteeMember(&CommitteeMember{NodeID: ids.GenerateTestNodeID()}), errFault)
+}
+
+// TestGetCommitteeDistinguishesEmptyFromUnreadable is the property that a
+// committee of nobody is a fact about the chain, not a symptom of a broken
+// disk. Reporting a read failure as an empty committee is a silent-empty: the
+// lifecycle manager would weigh the committee at zero, index every new member
+// at 0 on top of the existing ones, and open a DKG with no participants -- all
+// without an error anywhere.
+func TestGetCommitteeDistinguishesEmptyFromUnreadable(t *testing.T) {
+	registry, db := newFaultyRegistry(t)
+
+	// No epoch configured yet: genuinely empty.
+	members, err := registry.GetCommittee()
+	require.NoError(t, err)
+	require.Empty(t, members)
+
+	db.refuseGet = always
+	members, err = registry.GetCommittee()
+	require.ErrorIs(t, err, errFault)
+	require.Nil(t, members)
+
+	_, err = registry.GetCommitteeMember(ids.GenerateTestNodeID())
+	require.ErrorIs(t, err, errFault)
+}
+
+// TestAddCommitteeMemberKeepsTheCommitteeItCannotRead holds that a failed read
+// does not become a fresh epoch record. The old code fell back to a blank
+// EpochInfo on any error, so one unreadable Get replaced the whole committee
+// with the single member being added -- and then wrote that over the real one.
+func TestAddCommitteeMemberKeepsTheCommitteeItCannotRead(t *testing.T) {
+	registry, db := newFaultyRegistry(t)
+
+	seated := make([]CommitteeMember, 4)
+	for i := range seated {
+		seated[i] = CommitteeMember{NodeID: ids.GenerateTestNodeID(), Weight: 10, Index: i}
+	}
+	require.NoError(t, registry.SetEpoch(1, &EpochInfo{Epoch: 1, Committee: seated, Threshold: 3}))
+
+	db.refuseGet = always
+	require.ErrorIs(t, registry.AddCommitteeMember(&CommitteeMember{NodeID: ids.GenerateTestNodeID()}), errFault)
+
+	db.refuseGet = nil
+	after, err := registry.GetCommittee()
+	require.NoError(t, err)
+	require.Len(t, after, 4, "a failed read must not shrink the committee")
+}
+
+// TestRemoveCommitteeMemberReportsAnUnreadableEpoch holds that "removed" is
+// only reported when a removal happened. SlashMember treats a nil error as a
+// completed eviction and then emits the slashing event, so a swallowed read
+// failure penalizes a validator that is still seated and still holding a key
+// share.
+func TestRemoveCommitteeMemberReportsAnUnreadableEpoch(t *testing.T) {
+	registry, db := newFaultyRegistry(t)
+
+	node := ids.GenerateTestNodeID()
+	require.NoError(t, registry.SetEpoch(1, &EpochInfo{
+		Epoch:     1,
+		Committee: []CommitteeMember{{NodeID: node}},
+	}))
+
+	db.refuseGet = always
+	require.ErrorIs(t, registry.RemoveCommitteeMember(node), errFault)
+
+	db.refuseGet = nil
+	members, err := registry.GetCommittee()
+	require.NoError(t, err)
+	require.Len(t, members, 1, "the member was never removed")
+
+	db.refusePut = always
+	require.ErrorIs(t, registry.RemoveCommitteeMember(node), errFault)
+}
+
+// TestAddCommitteeMemberSeatsTheFirstMemberWithoutAnEpoch holds that the first
+// member can be registered before any epoch record exists, which is how a
+// committee is bootstrapped.
+func TestAddCommitteeMemberSeatsTheFirstMemberWithoutAnEpoch(t *testing.T) {
+	registry := newTestRegistry(t)
+
+	node := ids.GenerateTestNodeID()
+	require.NoError(t, registry.AddCommitteeMember(&CommitteeMember{NodeID: node, Weight: 7}))
+
+	members, err := registry.GetCommittee()
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	require.Equal(t, node, members[0].NodeID)
+
+	// And the epoch it created is active with the default threshold.
+	info, err := registry.GetEpoch(0)
+	require.NoError(t, err)
+	require.Equal(t, EpochActive, info.Status)
+	require.Equal(t, 67, info.Threshold)
+}
+
+// TestRemoveCommitteeMemberIsSilentWithoutAnEpoch holds that removing from a
+// committee that was never seated is not an error -- there is nothing to
+// remove, and that is a fact, not a failure.
+func TestRemoveCommitteeMemberIsSilentWithoutAnEpoch(t *testing.T) {
+	registry := newTestRegistry(t)
+	require.NoError(t, registry.RemoveCommitteeMember(ids.GenerateTestNodeID()))
+}
+
+// TestVerifyPermitBindsToHandleGranteeOperationAndExpiry holds all four gates a
+// permit carries. Each one alone is the difference between a permit and a
+// blanket key: the handle stops it opening a different ciphertext, the grantee
+// stops it being presented by someone else, the operation bitmask stops a
+// compute grant being spent on a decryption, and the expiry stops it living
+// forever.
+func TestVerifyPermitBindsToHandleGranteeOperationAndExpiry(t *testing.T) {
+	registry := newTestRegistry(t)
+
+	handle := [32]byte{1}
+	grantee := [20]byte{2}
+	permitID := [32]byte{3}
+	require.NoError(t, registry.CreatePermit(&Permit{
+		PermitID:   permitID,
+		Handle:     handle,
+		Grantee:    grantee,
+		Operations: PermitOpCompute,
+		Expiry:     time.Now().Add(time.Hour).Unix(),
+	}))
+
+	require.NoError(t, registry.VerifyPermit(permitID, handle, grantee, PermitOpCompute))
+
+	require.ErrorIs(t, registry.VerifyPermit(permitID, [32]byte{9}, grantee, PermitOpCompute), ErrPermitInvalid)
+	require.ErrorIs(t, registry.VerifyPermit(permitID, handle, [20]byte{9}, PermitOpCompute), ErrPermitInvalid)
+	require.ErrorIs(t, registry.VerifyPermit(permitID, handle, grantee, PermitOpDecrypt), ErrPermitInvalid)
+	require.ErrorIs(t, registry.VerifyPermit([32]byte{9}, handle, grantee, PermitOpCompute), ErrPermitNotFound)
+}
+
+// TestPermitExpiryIsInclusiveAtTheDeadline holds where the expiry boundary
+// falls: the check is `now > expiry`, so a permit is still valid during the
+// second it names and dead from the next one. Both sides are pinned because a
+// boundary that moves by one second changes which requests a rotation admits.
+func TestPermitExpiryIsInclusiveAtTheDeadline(t *testing.T) {
+	registry := newTestRegistry(t)
+
+	handle := [32]byte{1}
+	grantee := [20]byte{2}
+	now := time.Now().Unix()
+
+	live := [32]byte{10}
+	require.NoError(t, registry.CreatePermit(&Permit{
+		PermitID: live, Handle: handle, Grantee: grantee,
+		Operations: PermitOpDecrypt, Expiry: now,
+	}))
+	require.NoError(t, registry.VerifyPermit(live, handle, grantee, PermitOpDecrypt),
+		"a permit is valid through the second it expires at")
+
+	dead := [32]byte{11}
+	require.NoError(t, registry.CreatePermit(&Permit{
+		PermitID: dead, Handle: handle, Grantee: grantee,
+		Operations: PermitOpDecrypt, Expiry: now - 1,
+	}))
+	require.ErrorIs(t, registry.VerifyPermit(dead, handle, grantee, PermitOpDecrypt), ErrPermitExpired)
+
+	forever := [32]byte{12}
+	require.NoError(t, registry.CreatePermit(&Permit{
+		PermitID: forever, Handle: handle, Grantee: grantee,
+		Operations: PermitOpDecrypt, Expiry: 0,
+	}))
+	require.NoError(t, registry.VerifyPermit(forever, handle, grantee, PermitOpDecrypt),
+		"expiry 0 means no expiry")
 }

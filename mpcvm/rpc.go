@@ -10,8 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-
-	"github.com/luxfi/threshold/pkg/quorum"
 )
 
 // RPCRequest represents a JSON-RPC request
@@ -54,7 +52,6 @@ const (
 	RPCErrorQuotaExceeded    = -32003
 	RPCErrorCeremonyNotFound = -32004
 	RPCErrorKeyNotFound      = -32005
-	RPCErrorProtocolNotFound = -32006
 )
 
 // createRPCHandler creates the JSON-RPC handler
@@ -75,11 +72,7 @@ func (vm *VM) createRPCHandler() http.Handler {
 
 		result, err := vm.handleRPCMethod(r.Context(), req.Method, req.Params)
 		if err != nil {
-			rpcErr, ok := err.(*RPCError)
-			if !ok {
-				rpcErr = &RPCError{Code: RPCErrorInternal, Message: err.Error()}
-			}
-			writeRPCResponse(w, req.ID, nil, rpcErr)
+			writeRPCResponse(w, req.ID, nil, asRPCError(err))
 			return
 		}
 
@@ -141,12 +134,6 @@ func (vm *VM) handleRPCMethod(ctx context.Context, method string, params json.Ra
 	case "mpc_getStateRoot":
 		return vm.rpcGetStateRoot()
 
-	// Protocol Information
-	case "threshold_getProtocols":
-		return vm.rpcGetProtocols()
-	case "threshold_getProtocolInfo":
-		return vm.rpcGetProtocolInfo(params)
-
 	// Network Information
 	case "threshold_getInfo":
 		return vm.rpcGetInfo()
@@ -172,10 +159,18 @@ func (vm *VM) handleRPCMethod(ctx context.Context, method string, params json.Ra
 	}
 }
 
-// asRPCError maps a VM error to its JSON-RPC code. Written once so every method
-// classifies the same failure the same way, and matched with errors.Is because
-// the VM wraps its errors with context.
+// asRPCError maps an error to its JSON-RPC code. It is the ONE classifier: the
+// handler runs it over whatever a method returned, so a method that already
+// classified its own failure keeps that code and one that did not gets the code
+// this table gives it. Two classifiers would eventually disagree about the same
+// failure.
+//
+// Matching is by errors.Is/As because the VM wraps its errors with context.
 func asRPCError(err error) *RPCError {
+	var already *RPCError
+	if errors.As(err, &already) {
+		return already
+	}
 	switch {
 	case errors.Is(err, ErrUnauthorizedChain):
 		return &RPCError{Code: RPCErrorUnauthorized, Message: err.Error()}
@@ -191,35 +186,6 @@ func asRPCError(err error) *RPCError {
 // =============================================================================
 // Ceremony RPCs
 // =============================================================================
-
-// KeygenParams contains parameters for key generation.
-type KeygenParams struct {
-	KeyID       string `json:"keyId"`
-	RequestedBy string `json:"requestedBy"` // Chain ID; must be authorised to keygen
-	// Policy is the quorum in operator form, "3-of-5". Omit it to use the
-	// chain's default. It is deliberately not a pair of numbers: a caller
-	// cannot express the quorum ambiguously, and the polynomial degree is
-	// derived from it inside the ceremony rather than passed alongside it.
-	Policy quorum.Policy `json:"policy,omitempty"`
-}
-
-// KeygenResult is a COMPLETED key generation: the ceremony that ran and the
-// key it registered. There is no status to poll — a keygen that returns has a
-// key, and one that fails returns an error.
-type KeygenResult struct {
-	Ceremony CeremonyInfo `json:"ceremony"`
-	Key      KeyInfo      `json:"key"`
-}
-
-// SignParams contains parameters for signing.
-type SignParams struct {
-	KeyID string `json:"keyId"`
-	// MessageHash is the exact 32 bytes to sign, hex encoded. M-Chain does not
-	// hash on the caller's behalf: the caller owns its signing domain, and a
-	// chain that re-hashed would sign a preimage nobody authorised.
-	MessageHash     string `json:"messageHash"`
-	RequestingChain string `json:"requestingChain"`
-}
 
 // =============================================================================
 // Custody registry RPCs (replicated state)
@@ -363,50 +329,6 @@ func ceremonyInfoOf(c *CeremonyRecord) CeremonyInfo {
 		info.V = int(c.Artifact[64])
 	}
 	return info
-}
-
-// pendingRecord is the ceremony record a completed operation WILL be written
-// as, once the block carrying it is accepted. Height is zero until then: the
-// ceremony has happened, but the chain has not yet placed it at a height.
-func pendingRecord(op *Operation) *CeremonyRecord {
-	return &CeremonyRecord{
-		ID:              op.CeremonyID,
-		Kind:            op.Type,
-		KeyID:           op.KeyID,
-		Digest:          op.Digest,
-		Signers:         op.Signers,
-		Artifact:        op.Artifact,
-		RequestingChain: op.RequestingChain,
-	}
-}
-
-// =============================================================================
-// Protocol Information RPCs
-// =============================================================================
-
-func (vm *VM) rpcGetProtocols() ([]ProtocolInfo, error) {
-	return GetProtocolInfo(), nil
-}
-
-// GetProtocolInfoParams contains parameters for getting protocol info
-type GetProtocolInfoParams struct {
-	Protocol string `json:"protocol"`
-}
-
-func (vm *VM) rpcGetProtocolInfo(params json.RawMessage) (*ProtocolInfo, error) {
-	var p GetProtocolInfoParams
-	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, &RPCError{Code: RPCErrorInvalidParams, Message: "invalid parameters"}
-	}
-
-	protocols := GetProtocolInfo()
-	for _, info := range protocols {
-		if string(info.Name) == p.Protocol {
-			return &info, nil
-		}
-	}
-
-	return nil, &RPCError{Code: RPCErrorProtocolNotFound, Message: "protocol not found"}
 }
 
 // =============================================================================
@@ -583,13 +505,4 @@ func (vm *VM) rpcHealthCheck(ctx context.Context) (map[string]interface{}, error
 		result[k] = v
 	}
 	return result, nil
-}
-
-// Helper functions
-
-func stripHexPrefix(s string) string {
-	if len(s) >= 2 && s[:2] == "0x" {
-		return s[2:]
-	}
-	return s
 }

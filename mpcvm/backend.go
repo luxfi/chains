@@ -118,22 +118,3 @@ func backendDylibLeaves(kind GPUBackendKind) []string {
 		return nil
 	}
 }
-
-// backendBuildDirname maps each backend to its cmake build subdirectory
-// under the lux GPU plugin build/.
-func backendBuildDirname(kind GPUBackendKind) string {
-	switch kind {
-	case GPUBackendCUDA:
-		return "cuda_backend"
-	case GPUBackendHIP:
-		return "hip_backend"
-	case GPUBackendMetal:
-		return "metal_backend"
-	case GPUBackendVulkan:
-		return "vulkan_backend"
-	case GPUBackendWebGPU:
-		return "webgpu_backend"
-	default:
-		return ""
-	}
-}

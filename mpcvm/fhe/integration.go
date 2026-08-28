@@ -43,6 +43,48 @@ func DefaultThresholdConfig() ThresholdConfig {
 	}
 }
 
+// checkThreshold rejects a (threshold, total) pair that is not a quorum.
+// Both decryption paths finalize a session on shareCount >= threshold, so the
+// pair is the only thing standing between a ciphertext and its plaintext:
+// a threshold below 1 finalizes on the first share to arrive, a threshold of 1
+// over more than one party lets any single party decrypt alone -- which is the
+// one property a t-of-n scheme exists to deny -- and a threshold above the
+// party count can never be met, so every request hangs until it expires.
+func checkThreshold(threshold, total int) error {
+	if total < 1 {
+		return fmt.Errorf("%w: committee of %d parties", ErrInvalidThreshold, total)
+	}
+	least := 2
+	if total == 1 {
+		least = 1
+	}
+	if threshold < least || threshold > total {
+		return fmt.Errorf("%w: %d of %d parties, want %d to %d", ErrInvalidThreshold, threshold, total, least, total)
+	}
+	return nil
+}
+
+// parseCiphertext deserializes ciphertext bytes that arrived from off this
+// chain. rlwe's decoder sizes its allocations from lengths it reads out of the
+// input, so a crafted payload reaches make() with a length out of range and
+// panics instead of returning an error -- sixteen bytes are enough. Both
+// callers run on a goroutine that services cross-chain requests and neither
+// recovers, so that panic ends the process. Every other malformed input already
+// comes back as an error here; this makes the crafted one do the same.
+func parseCiphertext(params ckks.Parameters, data []byte) (ct *rlwe.Ciphertext, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			ct, err = nil, fmt.Errorf("unmarshal ciphertext: %v", r)
+		}
+	}()
+
+	ct = rlwe.NewCiphertext(params.Parameters, 1, params.MaxLevel())
+	if err := ct.UnmarshalBinary(data); err != nil {
+		return nil, fmt.Errorf("unmarshal ciphertext: %w", err)
+	}
+	return ct, nil
+}
+
 // ThresholdFHEIntegration integrates threshold FHE with ThresholdVM
 type ThresholdFHEIntegration struct {
 	logger  log.Logger
@@ -87,6 +129,10 @@ type DecryptionSession struct {
 
 // NewThresholdFHEIntegration creates a new integration instance
 func NewThresholdFHEIntegration(logger log.Logger, config ThresholdConfig, partyID int) (*ThresholdFHEIntegration, error) {
+	if err := checkThreshold(config.Threshold, config.TotalParties); err != nil {
+		return nil, err
+	}
+
 	service := NewFHEDecryptionService(logger)
 
 	// Create E2S protocol
@@ -139,9 +185,9 @@ func (i *ThresholdFHEIntegration) InitiateDecryption(
 	}
 
 	// Deserialize ciphertext
-	ct := rlwe.NewCiphertext(i.params.Parameters, 1, i.params.MaxLevel())
-	if err := ct.UnmarshalBinary(ciphertextBytes); err != nil {
-		return fmt.Errorf("unmarshal ciphertext: %w", err)
+	ct, err := parseCiphertext(i.params, ciphertextBytes)
+	if err != nil {
+		return err
 	}
 
 	i.sessions[sessionID] = &DecryptionSession{
@@ -246,9 +292,7 @@ func (i *ThresholdFHEIntegration) ContributeShare(
 
 	// Check if we have enough shares
 	if session.ShareCount >= i.config.Threshold {
-		if err := i.completeDecryption(session); err != nil {
-			return false, fmt.Errorf("complete decryption: %w", err)
-		}
+		i.completeDecryption(session)
 		return true, nil
 	}
 
@@ -256,7 +300,7 @@ func (i *ThresholdFHEIntegration) ContributeShare(
 }
 
 // completeDecryption finishes decryption when threshold is reached
-func (i *ThresholdFHEIntegration) completeDecryption(session *DecryptionSession) error {
+func (i *ThresholdFHEIntegration) completeDecryption(session *DecryptionSession) {
 	i.logger.Info("Threshold reached, completing decryption",
 		"sessionID", session.ID,
 		"shares", session.ShareCount,
@@ -283,10 +327,10 @@ func (i *ThresholdFHEIntegration) completeDecryption(session *DecryptionSession)
 	values := make([]complex128, len(recoveredShare.Value))
 	scale := new(big.Float).SetPrec(256).SetFloat64(math.Pow(2, float64(i.params.DefaultScale().Log2())))
 
+	// Every entry is allocated by multiparty.NewAdditiveShareBigint, which
+	// fills the slice with new(big.Int); GetShare only writes into them. There
+	// is no nil to skip.
 	for idx, v := range recoveredShare.Value {
-		if v == nil {
-			continue
-		}
 		fv := new(big.Float).SetPrec(256).SetInt(v)
 		fv.Quo(fv, scale)
 		realVal, _ := fv.Float64()
@@ -302,8 +346,6 @@ func (i *ThresholdFHEIntegration) completeDecryption(session *DecryptionSession)
 		"requestID", session.RequestID.Hex(),
 		"resultLen", len(session.Result),
 	)
-
-	return nil
 }
 
 // GetSessionResult retrieves the result of a completed session

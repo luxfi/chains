@@ -160,6 +160,14 @@ func (r *KeyRecord) Validate() error {
 	if len(r.Address) != 20 {
 		return fmt.Errorf("mpcvm: key %s address is %d bytes, want 20", r.KeyID, len(r.Address))
 	}
+	// Generation counts resharings of the same public key, and M-Chain has no
+	// resharing ceremony, so the only generation a key can honestly be at is
+	// its first. Left unchecked the field is proposer-chosen: a registration
+	// could enter consensus state claiming a rotation history the chain has no
+	// record of, and every reader of the registry would believe it.
+	if r.Generation != 0 {
+		return fmt.Errorf("mpcvm: key %s registers at generation %d; a key is registered once, at 0", r.KeyID, r.Generation)
+	}
 	return nil
 }
 
@@ -285,8 +293,12 @@ func advance(root [32]byte, opDigest [32]byte) [32]byte {
 
 // PutKey registers a custody key. Registration is once-only: a key id is a
 // permanent binding to a group public key, and silently rebinding it would let
-// a later ceremony redirect custody of live funds. Rotation is a new
-// Generation of the same record via ReplaceKey, never a fresh PutKey.
+// a later ceremony redirect custody of live funds.
+//
+// It is the ONLY writer of the key registry. There was a second — a ReplaceKey
+// that overwrote a record in place for a resharing path that does not exist —
+// and a second writer into a registry whose whole value is "this binding never
+// moves" is a rebinding waiting for its first caller.
 func (s *State) PutKey(r *KeyRecord) error {
 	if err := r.Validate(); err != nil {
 		return err
@@ -298,34 +310,7 @@ func (s *State) PutKey(r *KeyRecord) error {
 	case has:
 		return fmt.Errorf("%w: %s", ErrKeyExists, r.KeyID)
 	}
-	b, err := marshalKeyRecord(r)
-	if err != nil {
-		return err
-	}
-	return s.db.Put(k, b)
-}
-
-// ReplaceKey overwrites an existing key record — the resharing/refresh path,
-// where the group public key is unchanged but the shares and generation move.
-func (s *State) ReplaceKey(r *KeyRecord) error {
-	if err := r.Validate(); err != nil {
-		return err
-	}
-	prev, err := s.GetKey(r.KeyID)
-	if err != nil {
-		return err
-	}
-	if string(prev.GroupPublicKey) != string(r.GroupPublicKey) {
-		return fmt.Errorf("mpcvm: refusing to rebind custody key %s to a different public key", r.KeyID)
-	}
-	if r.Generation <= prev.Generation {
-		return fmt.Errorf("mpcvm: key %s generation must increase (%d -> %d)", r.KeyID, prev.Generation, r.Generation)
-	}
-	b, err := marshalKeyRecord(r)
-	if err != nil {
-		return err
-	}
-	return s.db.Put(append(append([]byte(nil), prefixKeyRecord...), r.KeyID...), b)
+	return s.db.Put(k, marshalKeyRecord(r))
 }
 
 // GetKey reads a registered custody key.
@@ -379,11 +364,7 @@ func (s *State) PutCeremony(c *CeremonyRecord) error {
 	case has:
 		return fmt.Errorf("%w: %s", ErrCeremonyExists, c.ID)
 	}
-	b, err := marshalCeremonyRecord(c)
-	if err != nil {
-		return err
-	}
-	return s.db.Put(k, b)
+	return s.db.Put(k, marshalCeremonyRecord(c))
 }
 
 // GetCeremony reads a recorded ceremony.
@@ -531,4 +512,20 @@ func sortedUnique(ps []party.ID) bool {
 		}
 	}
 	return true
+}
+
+// samePartySet reports whether two canonical party lists are the same set. Both
+// sides are sorted and de-duplicated wherever this is called, so equality of
+// the sequences is equality of the sets, and a caller cannot smuggle a
+// difference past it by reordering or repeating a name.
+func samePartySet(a, b []party.ID) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return sortedUnique(a)
 }

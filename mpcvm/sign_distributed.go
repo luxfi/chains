@@ -26,7 +26,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"sort"
 
 	"github.com/luxfi/ids"
 	"github.com/luxfi/threshold/pkg/party"
@@ -46,18 +45,21 @@ const ceremonyDomainTag = "LUX_MPC_CEREMONY_v1"
 // for a given signing task. It binds the key, the exact 32-byte digest, and the
 // (order-independent) signer set: distinct keys, messages or quorums get
 // distinct ceremony ids, and the same task always maps to the same id.
+//
+// Every field is length-prefixed, through the same writers every other digest
+// in this package uses. It used to concatenate the key id and the digest raw
+// and separate signers with a zero byte, which is the one hash here that could
+// be forged by moving a byte from the end of a caller-chosen key id into the
+// front of the digest. Nothing does today — the digest is pinned at 32 bytes on
+// both the produce and the verify path, which fixes the split — but the
+// property then belongs to a check two files away instead of to the hash, and
+// the day someone relaxes that check the forge is live.
 func ceremonyID(keyID string, digest []byte, signers []party.ID) string {
-	sorted := append([]party.ID(nil), signers...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-
 	h := sha256.New()
-	h.Write([]byte(ceremonyDomainTag))
-	h.Write([]byte(keyID))
-	h.Write(digest)
-	for _, s := range sorted {
-		h.Write([]byte{0x00}) // length-free separator; party ids are ascii node ids
-		h.Write([]byte(s))
-	}
+	writeTagged(h, ceremonyDomainTag)
+	writeField(h, []byte(keyID))
+	writeField(h, digest)
+	writeParties(h, canonicalParties(signers))
 	return "mpc/" + hex.EncodeToString(h.Sum(nil))
 }
 

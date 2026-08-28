@@ -440,6 +440,10 @@ func NewThresholdDecryptor(
 	logBound uint,
 	broadcastShare func(sessionID string, share []byte) error,
 ) (*ThresholdDecryptor, error) {
+	if err := checkThreshold(threshold, totalParties); err != nil {
+		return nil, err
+	}
+
 	e2sProtocol, err := mpckks.NewEncToShareProtocol(params, params.Xe())
 	if err != nil {
 		return nil, fmt.Errorf("create E2S protocol: %w", err)
@@ -470,9 +474,9 @@ func (d *ThresholdDecryptor) Decrypt(ctx context.Context, sessionID string, ciph
 	}
 
 	// Parse ciphertext
-	ct := rlwe.NewCiphertext(d.params.Parameters, 1, d.params.MaxLevel())
-	if err := ct.UnmarshalBinary(ciphertextBytes); err != nil {
-		return nil, fmt.Errorf("unmarshal ciphertext: %w", err)
+	ct, err := parseCiphertext(d.params, ciphertextBytes)
+	if err != nil {
+		return nil, err
 	}
 
 	// Allocate shares
@@ -571,11 +575,7 @@ func (d *ThresholdDecryptor) AddShare(sessionID string, partyID int, shareBytes 
 
 	// Check if we have enough shares
 	if session.shareCount >= d.threshold {
-		result, err := d.completeDecryption(session)
-		if err != nil {
-			return fmt.Errorf("complete decryption: %w", err)
-		}
-		session.result = result
+		session.result = d.completeDecryption(session)
 		session.complete = true
 		close(session.completedChan)
 	}
@@ -584,7 +584,7 @@ func (d *ThresholdDecryptor) AddShare(sessionID string, partyID int, shareBytes 
 }
 
 // completeDecryption finishes decryption when threshold is reached
-func (d *ThresholdDecryptor) completeDecryption(session *decryptorSession) ([]byte, error) {
+func (d *ThresholdDecryptor) completeDecryption(session *decryptorSession) []byte {
 	d.logger.Info("Threshold reached, completing decryption",
 		"sessionID", session.sessionID,
 		"shares", session.shareCount,
@@ -610,10 +610,10 @@ func (d *ThresholdDecryptor) completeDecryption(session *decryptorSession) ([]by
 	values := make([]complex128, len(recoveredShare.Value))
 	scale := new(big.Float).SetPrec(256).SetFloat64(math.Pow(2, float64(d.params.DefaultScale().Log2())))
 
+	// Every entry is allocated by multiparty.NewAdditiveShareBigint, which
+	// fills the slice with new(big.Int); GetShare only writes into them. There
+	// is no nil to skip.
 	for i, v := range recoveredShare.Value {
-		if v == nil {
-			continue
-		}
 		fv := new(big.Float).SetPrec(256).SetInt(v)
 		fv.Quo(fv, scale)
 		realVal, _ := fv.Float64()
@@ -628,7 +628,7 @@ func (d *ThresholdDecryptor) completeDecryption(session *decryptorSession) ([]by
 		"resultLen", len(result),
 	)
 
-	return result, nil
+	return result
 }
 
 // encodeComplexValues converts complex values to bytes for output

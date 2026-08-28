@@ -1,5 +1,3 @@
-//go:build cgo
-
 // Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
@@ -420,7 +418,7 @@ func TestContributeShareSuccess(t *testing.T) {
 
 	params, _ := ckks.NewParametersFromLiteral(ckks.ExampleParameters128BitLogN14LogQP438)
 	config := ThresholdConfig{
-		Threshold:    1, // Low threshold for testing
+		Threshold:    2, // Smallest quorum the constructor accepts
 		TotalParties: 3,
 		CKKSParams:   params,
 		LogBound:     128,
@@ -437,13 +435,17 @@ func TestContributeShareSuccess(t *testing.T) {
 	err := integration.InitiateDecryption(sessionID, requestID, ctBytes)
 	require.NoError(err)
 
-	shareBytes, err := integration.GenerateShare(sessionID)
+	first, err := integration.GenerateShare(sessionID)
 	require.NoError(err)
+	complete, err := integration.ContributeShare(sessionID, ids.GenerateTestNodeID(), first)
+	require.NoError(err)
+	require.False(complete) // one of two
 
-	nodeID := ids.GenerateTestNodeID()
-	complete, err := integration.ContributeShare(sessionID, nodeID, shareBytes)
+	second, err := integration.GenerateShare(sessionID)
 	require.NoError(err)
-	require.True(complete) // threshold is 1
+	complete, err = integration.ContributeShare(sessionID, ids.GenerateTestNodeID(), second)
+	require.NoError(err)
+	require.True(complete)
 }
 
 func TestContributeShareInvalidSession(t *testing.T) {
@@ -499,7 +501,7 @@ func TestContributeShareSessionAlreadyComplete(t *testing.T) {
 
 	params, _ := ckks.NewParametersFromLiteral(ckks.ExampleParameters128BitLogN14LogQP438)
 	config := ThresholdConfig{
-		Threshold:    1, // Completes with 1 share
+		Threshold:    2, // Completes on the second share
 		TotalParties: 3,
 		CKKSParams:   params,
 		LogBound:     128,
@@ -516,18 +518,21 @@ func TestContributeShareSessionAlreadyComplete(t *testing.T) {
 	err := integration.InitiateDecryption(sessionID, requestID, ctBytes)
 	require.NoError(err)
 
-	shareBytes, err := integration.GenerateShare(sessionID)
+	// Complete the session
+	first, err := integration.GenerateShare(sessionID)
+	require.NoError(err)
+	_, err = integration.ContributeShare(sessionID, ids.GenerateTestNodeID(), first)
 	require.NoError(err)
 
-	// Complete the session
-	nodeID1 := ids.GenerateTestNodeID()
-	complete, err := integration.ContributeShare(sessionID, nodeID1, shareBytes)
+	second, err := integration.GenerateShare(sessionID)
+	require.NoError(err)
+	complete, err := integration.ContributeShare(sessionID, ids.GenerateTestNodeID(), second)
 	require.NoError(err)
 	require.True(complete)
 
 	// Try to contribute to already complete session
-	nodeID2 := ids.GenerateTestNodeID()
-	complete, err = integration.ContributeShare(sessionID, nodeID2, shareBytes)
+	nodeID3 := ids.GenerateTestNodeID()
+	complete, err = integration.ContributeShare(sessionID, nodeID3, second)
 	require.NoError(err)
 	require.True(complete) // returns true because already complete
 }
@@ -623,7 +628,7 @@ func TestGetSessionResultSuccess(t *testing.T) {
 
 	params, _ := ckks.NewParametersFromLiteral(ckks.ExampleParameters128BitLogN14LogQP438)
 	config := ThresholdConfig{
-		Threshold:    1,
+		Threshold:    2,
 		TotalParties: 2,
 		CKKSParams:   params,
 		LogBound:     128,
@@ -640,12 +645,12 @@ func TestGetSessionResultSuccess(t *testing.T) {
 	err := integration.InitiateDecryption(sessionID, requestID, ctBytes)
 	require.NoError(err)
 
-	shareBytes, err := integration.GenerateShare(sessionID)
-	require.NoError(err)
-
-	nodeID := ids.GenerateTestNodeID()
-	_, err = integration.ContributeShare(sessionID, nodeID, shareBytes)
-	require.NoError(err)
+	for i := 0; i < 2; i++ {
+		shareBytes, shareErr := integration.GenerateShare(sessionID)
+		require.NoError(shareErr)
+		_, err = integration.ContributeShare(sessionID, ids.GenerateTestNodeID(), shareBytes)
+		require.NoError(err)
+	}
 
 	result, complete, err := integration.GetSessionResult(sessionID)
 	require.NoError(err)
@@ -912,7 +917,7 @@ func TestMultipleSessionsParallel(t *testing.T) {
 
 	params, _ := ckks.NewParametersFromLiteral(ckks.ExampleParameters128BitLogN14LogQP438)
 	config := ThresholdConfig{
-		Threshold:    1,
+		Threshold:    2,
 		TotalParties: 2,
 		CKKSParams:   params,
 		LogBound:     128,
@@ -933,12 +938,14 @@ func TestMultipleSessionsParallel(t *testing.T) {
 
 	// Complete each session
 	for _, sessionID := range sessionIDs {
-		shareBytes, err := integration.GenerateShare(sessionID)
-		require.NoError(err)
+		var complete bool
+		for i := 0; i < 2; i++ {
+			shareBytes, err := integration.GenerateShare(sessionID)
+			require.NoError(err)
 
-		nodeID := ids.GenerateTestNodeID()
-		complete, err := integration.ContributeShare(sessionID, nodeID, shareBytes)
-		require.NoError(err)
+			complete, err = integration.ContributeShare(sessionID, ids.GenerateTestNodeID(), shareBytes)
+			require.NoError(err)
+		}
 		require.True(complete)
 	}
 
@@ -1037,4 +1044,56 @@ func BenchmarkDecodeComplexValues(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = decodeComplexValuesFromBytes(encoded)
 	}
+}
+
+// TestNewThresholdFHEIntegrationRejectsUnusableParameters holds that a
+// parameter set the E2S protocol cannot be built over is refused at
+// construction, not at the first decryption request.
+func TestNewThresholdFHEIntegrationRejectsUnusableParameters(t *testing.T) {
+	integration, err := NewThresholdFHEIntegration(log.Noop(), ThresholdConfig{
+		Threshold: 1, TotalParties: 1, CKKSParams: ckks.Parameters{}, LogBound: 128,
+	}, 0)
+	require.ErrorContains(t, err, "E2S protocol")
+	require.Nil(t, integration)
+}
+
+// TestGenerateShareRefusesAnOversizedMask holds that a LogBound too large for
+// the ciphertext's level is refused. The mask is what hides this party's share
+// of the plaintext from everyone else; a mask wider than the modulus does not
+// wrap around harmlessly, it makes the share unrecoverable, so the protocol
+// refuses rather than emitting a share nobody can combine.
+func TestGenerateShareRefusesAnOversizedMask(t *testing.T) {
+	params, err := ckks.NewParametersFromLiteral(ckks.ExampleParameters128BitLogN14LogQP438)
+	require.NoError(t, err)
+
+	integration, err := NewThresholdFHEIntegration(log.Noop(), ThresholdConfig{
+		Threshold: 2, TotalParties: 3, CKKSParams: params, LogBound: 100_000,
+	}, 0)
+	require.NoError(t, err)
+
+	ctBytes, sk := newTestCiphertext(t, params)
+	integration.SetSecretKey(sk)
+	require.NoError(t, integration.InitiateDecryption("s", common.HexToHash("0x1"), ctBytes))
+
+	_, err = integration.GenerateShare("s")
+	require.ErrorContains(t, err, "generate share")
+}
+
+// TestContributeShareRejectsBytesThatAreNotAShare holds that a peer's gossip is
+// deserialized before it is counted, so garbage cannot occupy one of the
+// threshold's slots and stall the session at count-1 forever.
+func TestContributeShareRejectsBytesThatAreNotAShare(t *testing.T) {
+	integration := newTestIntegration(t, nil)
+	ctBytes, sk := newTestCiphertext(t, integration.params)
+	integration.SetSecretKey(sk)
+	require.NoError(t, integration.InitiateDecryption("s", common.HexToHash("0x1"), ctBytes))
+
+	complete, err := integration.ContributeShare("s", ids.GenerateTestNodeID(), []byte("junk"))
+	require.ErrorContains(t, err, "unmarshal public share")
+	require.False(t, complete)
+
+	integration.sessionsMu.RLock()
+	count := integration.sessions["s"].ShareCount
+	integration.sessionsMu.RUnlock()
+	require.Zero(t, count)
 }

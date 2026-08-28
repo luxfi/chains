@@ -6,6 +6,7 @@ package fhe
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"testing"
 	"time"
 
@@ -1310,4 +1311,324 @@ func TestFHEServiceRegisterCiphertextWithChainID(t *testing.T) {
 	err := service.RegisterCiphertext(context.Background(), args, reply)
 	require.NoError(err)
 	require.NotEmpty(reply.Handle)
+}
+
+// ---------------------------------------------------------------------------
+// Who the RPC surface will answer, and what it refuses
+// ---------------------------------------------------------------------------
+
+// callerFrom is an Authenticator that reports a fixed address, or a failure to
+// establish one, which is the difference between an authenticated caller and an
+// anonymous connection.
+type callerFrom struct {
+	address [20]byte
+	err     error
+}
+
+func (c callerFrom) GetCallerAddress(context.Context) ([20]byte, error) {
+	if c.err != nil {
+		return [20]byte{}, c.err
+	}
+	return c.address, nil
+}
+
+// TestWithAuthenticatorInstallsTheCallerCheck holds that the option reaches the
+// service, because every ownership check below is a no-op without it.
+func TestWithAuthenticatorInstallsTheCallerCheck(t *testing.T) {
+	auth := callerFrom{address: [20]byte{1}}
+	service := NewFHEService(nil, nil, log.NewNoOpLogger(), ids.GenerateTestID(), WithAuthenticator(auth))
+	require.NotNil(t, service)
+	require.Equal(t, auth, service.auth)
+
+	// Without the option there is no authenticator, and the constructor says so
+	// rather than failing: the RPC surface is usable unauthenticated.
+	require.Nil(t, NewFHEService(nil, nil, log.NewNoOpLogger(), ids.GenerateTestID()).auth)
+}
+
+// TestRegisterCiphertextRequiresTheOwnerToBeTheCaller holds that a ciphertext
+// is registered only by the address it names as owner. Without it any caller
+// can claim a handle under someone else's address, and CreatePermit then treats
+// that address as entitled to grant access to it.
+func TestRegisterCiphertextRequiresTheOwnerToBeTheCaller(t *testing.T) {
+	owner := [20]byte{0xaa}
+	handle := hex.EncodeToString(make([]byte, 32))
+
+	register := func(auth Authenticator) error {
+		service := newTestFHEService(t)
+		service.auth = auth
+		return service.RegisterCiphertext(context.Background(), &RegisterCiphertextArgs{
+			Handle: handle,
+			Owner:  hex.EncodeToString(owner[:]),
+		}, &RegisterCiphertextReply{})
+	}
+
+	require.NoError(t, register(callerFrom{address: owner}))
+
+	err := register(callerFrom{address: [20]byte{0xbb}})
+	require.ErrorIs(t, err, ErrUnauthorized)
+
+	err = register(callerFrom{err: errors.New("no client certificate")})
+	require.ErrorIs(t, err, ErrAuthRequired)
+}
+
+// TestCreatePermitRequiresTheGrantorToBeTheCallerAndTheOwner holds both halves
+// of granting access: the caller must be the grantor they name, and that
+// grantor must own the ciphertext. Dropping either turns permit creation into
+// an open door -- anyone could mint a permit over anyone's ciphertext.
+func TestCreatePermitRequiresTheGrantorToBeTheCallerAndTheOwner(t *testing.T) {
+	owner := [20]byte{0xaa}
+	stranger := [20]byte{0xbb}
+	handle := make([]byte, 32)
+	handle[0] = 7
+
+	service := newTestFHEService(t)
+	require.NoError(t, service.registry.RegisterCiphertext(&CiphertextMeta{
+		Handle: [32]byte(handle), Owner: owner,
+	}))
+
+	args := &CreatePermitArgs{
+		Handle:     hex.EncodeToString(handle),
+		Grantee:    hex.EncodeToString(stranger[:]),
+		Grantor:    hex.EncodeToString(owner[:]),
+		Operations: PermitOpDecrypt,
+	}
+
+	service.auth = callerFrom{address: owner}
+	require.NoError(t, service.CreatePermit(context.Background(), args, &CreatePermitReply{}))
+
+	service.auth = callerFrom{address: stranger}
+	require.ErrorIs(t, service.CreatePermit(context.Background(), args, &CreatePermitReply{}), ErrUnauthorized)
+
+	service.auth = callerFrom{err: errors.New("no client certificate")}
+	require.ErrorIs(t, service.CreatePermit(context.Background(), args, &CreatePermitReply{}), ErrAuthRequired)
+
+	// The grantor must also be the owner, even when it is the caller.
+	service.auth = callerFrom{address: stranger}
+	require.ErrorContains(t, service.CreatePermit(context.Background(), &CreatePermitArgs{
+		Handle:  hex.EncodeToString(handle),
+		Grantee: hex.EncodeToString(owner[:]),
+		Grantor: hex.EncodeToString(stranger[:]),
+	}, &CreatePermitReply{}), "not the ciphertext owner")
+}
+
+// TestRequestDecryptRefusesWithoutAValidPermit holds that a decryption request
+// is admitted only when the permit names this ciphertext, this callback and the
+// decrypt operation. This is the only gate on the request path: RequestDecrypt
+// does not consult the authenticator at all, so the permit is what stands
+// between a stored ciphertext and a settlement sent to the grantee.
+func TestRequestDecryptRefusesWithoutAValidPermit(t *testing.T) {
+	service := newTestFHEService(t)
+
+	handle := [32]byte{9}
+	grantee := [20]byte{0xcc}
+	require.NoError(t, service.registry.RegisterCiphertext(&CiphertextMeta{Handle: handle, Owner: [20]byte{1}}))
+
+	permitID := [32]byte{4}
+	require.NoError(t, service.registry.CreatePermit(&Permit{
+		PermitID: permitID, Handle: handle, Grantee: grantee,
+		Operations: PermitOpCompute, // not decrypt
+	}))
+
+	args := &RequestDecryptArgs{
+		CiphertextHandle: hex.EncodeToString(handle[:]),
+		PermitID:         hex.EncodeToString(permitID[:]),
+		Callback:         hex.EncodeToString(grantee[:]),
+		CallbackSelector: "deadbeef",
+	}
+	err := service.RequestDecrypt(context.Background(), args, &RequestDecryptReply{})
+	require.ErrorIs(t, err, ErrPermitInvalid)
+
+	// A permit for a different ciphertext is refused for this one.
+	otherPermit := [32]byte{5}
+	require.NoError(t, service.registry.CreatePermit(&Permit{
+		PermitID: otherPermit, Handle: [32]byte{99}, Grantee: grantee,
+		Operations: PermitOpDecrypt,
+	}))
+	args.PermitID = hex.EncodeToString(otherPermit[:])
+	require.ErrorIs(t, service.RequestDecrypt(context.Background(), args, &RequestDecryptReply{}), ErrPermitInvalid)
+
+	// The right permit is admitted.
+	good := [32]byte{6}
+	require.NoError(t, service.registry.CreatePermit(&Permit{
+		PermitID: good, Handle: handle, Grantee: grantee,
+		Operations: PermitOpDecrypt,
+	}))
+	args.PermitID = hex.EncodeToString(good[:])
+	reply := &RequestDecryptReply{}
+	require.NoError(t, service.RequestDecrypt(context.Background(), args, reply))
+	require.Len(t, reply.RequestID, 64)
+	require.Equal(t, RequestPending.String(), reply.Status)
+}
+
+// TestRequestDecryptCarriesTheNamedSourceChain holds that a caller-supplied
+// source chain is parsed and recorded, and that an unparseable one is refused
+// rather than silently replaced by this chain -- the fulfillment is addressed
+// back to whatever is recorded here.
+func TestRequestDecryptCarriesTheNamedSourceChain(t *testing.T) {
+	service := newTestFHEService(t)
+
+	handle := [32]byte{9}
+	grantee := [20]byte{0xcc}
+	permitID := [32]byte{4}
+	require.NoError(t, service.registry.RegisterCiphertext(&CiphertextMeta{Handle: handle}))
+	require.NoError(t, service.registry.CreatePermit(&Permit{
+		PermitID: permitID, Handle: handle, Grantee: grantee, Operations: PermitOpDecrypt,
+	}))
+
+	args := &RequestDecryptArgs{
+		CiphertextHandle: hex.EncodeToString(handle[:]),
+		PermitID:         hex.EncodeToString(permitID[:]),
+		Callback:         hex.EncodeToString(grantee[:]),
+		CallbackSelector: "deadbeef",
+		SourceChain:      "not-a-chain-id",
+	}
+	require.ErrorContains(t, service.RequestDecrypt(context.Background(), args, &RequestDecryptReply{}),
+		"invalid source chain")
+
+	source := ids.GenerateTestID()
+	args.SourceChain = source.String()
+	args.Expiry = time.Now().Add(time.Hour).Unix()
+	reply := &RequestDecryptReply{}
+	require.NoError(t, service.RequestDecrypt(context.Background(), args, reply))
+
+	raw, err := hex.DecodeString(reply.RequestID)
+	require.NoError(t, err)
+	stored, err := service.registry.GetDecryptRequest([32]byte(raw))
+	require.NoError(t, err)
+	require.Equal(t, source, stored.SourceChain)
+	require.Equal(t, args.Expiry, stored.Expiry)
+}
+
+// TestUninitializedServiceRefusesEveryCall holds that a service with no
+// registry answers ErrNotInitialized everywhere instead of dereferencing nil.
+// These methods are reachable over the wire the moment the RPC handler is
+// registered, which can happen before the registry is attached.
+func TestUninitializedServiceRefusesEveryCall(t *testing.T) {
+	service := &FHEService{logger: log.NewNoOpLogger()}
+	ctx := context.Background()
+
+	require.ErrorIs(t, service.GetPublicParams(ctx, &GetPublicParamsArgs{}, &GetPublicParamsReply{}), ErrNotInitialized)
+	require.ErrorIs(t, service.GetCommittee(ctx, &GetCommitteeArgs{}, &GetCommitteeReply{}), ErrNotInitialized)
+	require.ErrorIs(t, service.RegisterCiphertext(ctx, &RegisterCiphertextArgs{}, &RegisterCiphertextReply{}), ErrNotInitialized)
+	require.ErrorIs(t, service.GetCiphertextMeta(ctx, &GetCiphertextMetaArgs{}, &GetCiphertextMetaReply{}), ErrNotInitialized)
+	require.ErrorIs(t, service.RequestDecrypt(ctx, &RequestDecryptArgs{}, &RequestDecryptReply{}), ErrNotInitialized)
+	require.ErrorIs(t, service.GetDecryptResult(ctx, &GetDecryptResultArgs{}, &GetDecryptResultReply{}), ErrNotInitialized)
+	require.ErrorIs(t, service.GetRequestReceipt(ctx, &GetRequestReceiptArgs{}, &GetRequestReceiptReply{}), ErrNotInitialized)
+	require.ErrorIs(t, service.CreatePermit(ctx, &CreatePermitArgs{}, &CreatePermitReply{}), ErrNotInitialized)
+	require.ErrorIs(t, service.VerifyPermit(ctx, &VerifyPermitArgs{}, &VerifyPermitReply{}), ErrNotInitialized)
+}
+
+// TestGetPublicParamsNeedsAnEpoch holds that the parameters a client encrypts
+// against are reported only when there is an epoch to report them for. Serving
+// a zero threshold and an empty public key would have clients encrypt to
+// nothing.
+func TestGetPublicParamsNeedsAnEpoch(t *testing.T) {
+	registry, err := NewRegistry(memdb.New())
+	require.NoError(t, err)
+	service := &FHEService{registry: registry, logger: log.NewNoOpLogger()}
+
+	require.ErrorContains(t,
+		service.GetPublicParams(context.Background(), &GetPublicParamsArgs{}, &GetPublicParamsReply{}),
+		"failed to get epoch info")
+}
+
+// TestGetCiphertextMetaRejectsMalformedHandles holds that a handle that is not
+// 32 hex-encoded bytes is refused before it reaches storage, so a short handle
+// cannot be zero-extended into a different, existing one.
+func TestGetCiphertextMetaRejectsMalformedHandles(t *testing.T) {
+	service := newTestFHEService(t)
+	for _, handle := range []string{"", "zz", hex.EncodeToString(make([]byte, 31)), hex.EncodeToString(make([]byte, 33))} {
+		require.ErrorIs(t,
+			service.GetCiphertextMeta(context.Background(), &GetCiphertextMetaArgs{Handle: handle}, &GetCiphertextMetaReply{}),
+			ErrInvalidHandle, "handle %q", handle)
+	}
+}
+
+// TestRegistryFailuresReachTheRPCCaller holds that a store that cannot write is
+// reported to the caller rather than answered with a success. A client that
+// believes a ciphertext is registered will go on to request its decryption.
+func TestRegistryFailuresReachTheRPCCaller(t *testing.T) {
+	registry, db := newFaultyRegistry(t)
+	service := &FHEService{registry: registry, logger: log.NewNoOpLogger(), chainID: ids.GenerateTestID()}
+
+	handle := make([]byte, 32)
+	require.NoError(t, registry.RegisterCiphertext(&CiphertextMeta{Handle: [32]byte(handle)}))
+	permitID := [32]byte{1}
+	require.NoError(t, registry.CreatePermit(&Permit{
+		PermitID: permitID, Handle: [32]byte(handle), Operations: PermitOpDecrypt,
+	}))
+
+	db.refusePut = always
+	require.ErrorContains(t, service.RegisterCiphertext(context.Background(), &RegisterCiphertextArgs{
+		Handle: hex.EncodeToString(handle),
+		Owner:  hex.EncodeToString(make([]byte, 20)),
+	}, &RegisterCiphertextReply{}), "failed to register ciphertext")
+
+	require.ErrorContains(t, service.RequestDecrypt(context.Background(), &RequestDecryptArgs{
+		CiphertextHandle: hex.EncodeToString(handle),
+		PermitID:         hex.EncodeToString(permitID[:]),
+		Callback:         hex.EncodeToString(make([]byte, 20)),
+		CallbackSelector: "deadbeef",
+	}, &RequestDecryptReply{}), "failed to create request")
+
+	require.ErrorContains(t, service.CreatePermit(context.Background(), &CreatePermitArgs{
+		Handle:  hex.EncodeToString(handle),
+		Grantee: hex.EncodeToString(make([]byte, 20)),
+		Grantor: hex.EncodeToString(make([]byte, 20)),
+	}, &CreatePermitReply{}), "failed to create permit")
+}
+
+// TestGetDecryptResultReportsTheResultHandleOnlyWhenCompleted holds that the
+// result handle appears exactly when the request is completed. Reporting the
+// zero handle on a pending request would have a caller fetch ciphertext 0x00.
+func TestGetDecryptResultReportsTheResultHandleOnlyWhenCompleted(t *testing.T) {
+	service := newTestFHEService(t)
+
+	requestID := [32]byte{7}
+	require.NoError(t, service.registry.CreateDecryptRequest(&DecryptRequest{RequestID: requestID}))
+
+	reply := &GetDecryptResultReply{}
+	require.NoError(t, service.GetDecryptResult(context.Background(),
+		&GetDecryptResultArgs{RequestID: hex.EncodeToString(requestID[:])}, reply))
+	require.Equal(t, RequestPending.String(), reply.Status)
+	require.Empty(t, reply.ResultHandle)
+
+	resultHandle := [32]byte{0xab}
+	require.NoError(t, service.registry.UpdateDecryptRequest(requestID, RequestCompleted, resultHandle, ""))
+
+	reply = &GetDecryptResultReply{}
+	require.NoError(t, service.GetDecryptResult(context.Background(),
+		&GetDecryptResultArgs{RequestID: hex.EncodeToString(requestID[:])}, reply))
+	require.Equal(t, RequestCompleted.String(), reply.Status)
+	require.Equal(t, hex.EncodeToString(resultHandle[:]), reply.ResultHandle)
+	require.NotZero(t, reply.CompletedAt)
+}
+
+// TestBatchCallsAreBoundedAndFailAsAUnit holds two properties of the batch
+// entry points: neither will accept more than MaxBatchSize, and a batch of
+// requests fails at the first bad member rather than half-applying. The read
+// batch is deliberately the other way around -- one unknown id must not hide
+// the results of the others -- so both shapes are pinned here.
+func TestBatchCallsAreBoundedAndFailAsAUnit(t *testing.T) {
+	service := newTestFHEService(t)
+	ctx := context.Background()
+
+	oversized := make([]RequestDecryptArgs, MaxBatchSize+1)
+	require.ErrorIs(t, service.RequestDecryptBatch(ctx, &RequestDecryptBatchArgs{Requests: oversized},
+		&RequestDecryptBatchReply{}), ErrBatchTooLarge)
+
+	oversizedIDs := make([]string, MaxBatchSize+1)
+	require.ErrorIs(t, service.GetDecryptBatchResult(ctx, &GetDecryptBatchResultArgs{RequestIDs: oversizedIDs},
+		&GetDecryptBatchResultReply{}), ErrBatchTooLarge)
+
+	require.ErrorContains(t, service.RequestDecryptBatch(ctx, &RequestDecryptBatchArgs{
+		Requests: []RequestDecryptArgs{{CiphertextHandle: "not hex"}},
+	}, &RequestDecryptBatchReply{}), "request 0 failed")
+
+	// A read batch reports per-entry failures inside the results.
+	reply := &GetDecryptBatchResultReply{}
+	require.NoError(t, service.GetDecryptBatchResult(ctx,
+		&GetDecryptBatchResultArgs{RequestIDs: []string{hex.EncodeToString(make([]byte, 32))}}, reply))
+	require.Len(t, reply.Results, 1)
+	require.NotEmpty(t, reply.Results[0].Error)
 }

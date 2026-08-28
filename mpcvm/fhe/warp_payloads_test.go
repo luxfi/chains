@@ -768,3 +768,140 @@ func TestParsePayloadAcceptsNoExpiryRequest(t *testing.T) {
 	require.Equal(PayloadTypeFHEDecryptRequestV1, payloadType)
 	require.NotNil(parsed)
 }
+
+// TestParsePayloadReturnsNilPayloadOnError holds that a failed parse hands back
+// a nil payload, not a nil pointer boxed in a non-nil interface. Four of the
+// five branches used to return the typed pointer alongside the error, so a
+// caller writing `if payload != nil { use(payload) }` -- the ordinary Go shape
+// -- accepted a decrypt result that never parsed and read zero values out of
+// it: a zero request id, a zero epoch, an empty plaintext, all of which look
+// like a legitimate settlement.
+func TestParsePayloadReturnsNilPayloadOnError(t *testing.T) {
+	for _, payloadType := range []uint8{
+		PayloadTypeFHEDecryptRequestV1,
+		PayloadTypeFHEDecryptResultV1,
+		PayloadTypeFHEReencryptRequestV1,
+		PayloadTypeFHETaskResultV1,
+		PayloadTypeFHEKeyRotationV1,
+	} {
+		truncated := make([]byte, 10)
+		truncated[0] = PayloadVersionV1
+		truncated[1] = payloadType
+
+		gotType, payload, err := ParsePayload(truncated)
+		require.ErrorIs(t, err, ErrPayloadTooShort, "type 0x%02x", payloadType)
+		require.Equal(t, payloadType, gotType)
+
+		// The comparison is against the interface, not require.Nil: a nil
+		// *FHEDecryptResultV1 inside an interface satisfies require.Nil, and it
+		// is exactly the value a caller's `!= nil` accepts.
+		require.True(t, payload == nil,
+			"type 0x%02x returned a %T alongside an error", payloadType, payload)
+	}
+}
+
+// TestParsePayloadRejectsTruncatedDecryptRequest holds that the dispatcher
+// reports the underlying parse failure rather than a valid-looking request. The
+// request branch is the only one that also validates expiry, so it is the only
+// one where a parse error and a policy error arrive through the same return.
+func TestParsePayloadRejectsTruncatedDecryptRequest(t *testing.T) {
+	full := (&FHEDecryptRequestV1{RequestID: [32]byte{1}}).Bytes()
+
+	gotType, payload, err := ParsePayload(full[:201])
+	require.ErrorIs(t, err, ErrPayloadTooShort)
+	require.Equal(t, PayloadTypeFHEDecryptRequestV1, gotType)
+	require.True(t, payload == nil)
+
+	// One more byte and it parses.
+	_, payload, err = ParsePayload(full)
+	require.NoError(t, err)
+	require.NotNil(t, payload)
+}
+
+// TestFixedWidthFieldsSurviveTheExactMinimumLength holds that every fixed-width
+// field is inside the length floor each parser checks. A field that reached
+// past it would be zero-padded by copy() without any error, producing a
+// well-formed envelope naming the wrong ciphertext or the wrong chain -- the
+// classic way a wire format silently lies.
+func TestFixedWidthFieldsSurviveTheExactMinimumLength(t *testing.T) {
+	request := &FHEDecryptRequestV1{
+		RequestID:        [32]byte{0xff},
+		CiphertextHandle: [32]byte{31: 0xff},
+		PermitID:         [32]byte{0xaa, 31: 0xbb},
+		SourceChainID:    ids.ID{31: 0xcc},
+		Epoch:            ^uint64(0),
+		Nonce:            ^uint64(0),
+		Expiry:           0,
+		Requester:        [20]byte{19: 0xdd},
+		Callback:         [20]byte{0xee},
+		CallbackSelector: [4]byte{0xde, 0xad, 0xbe, 0xef},
+		GasLimit:         ^uint32(0),
+	}
+	encoded := request.Bytes()
+	require.Len(t, encoded, 202, "the wire size is the parser's length floor")
+
+	parsed, err := ParseFHEDecryptRequestV1(encoded)
+	require.NoError(t, err)
+	require.Equal(t, request, parsed)
+
+	result := &FHEDecryptResultV1{
+		RequestID:          [32]byte{31: 0x11},
+		ResultHandle:       [32]byte{0x22},
+		SourceChainID:      ids.ID{31: 0x33},
+		Epoch:              ^uint64(0),
+		Status:             DecryptStatusDenied,
+		CommitteeSignature: [32]byte{31: 0x44},
+	}
+	encodedResult := result.Bytes()
+	require.Len(t, encodedResult, 143)
+	parsedResult, err := ParseFHEDecryptResultV1(encodedResult)
+	require.NoError(t, err)
+	require.Equal(t, result.RequestID, parsedResult.RequestID)
+	require.Equal(t, result.ResultHandle, parsedResult.ResultHandle)
+	require.Equal(t, result.SourceChainID, parsedResult.SourceChainID)
+	require.Equal(t, result.Epoch, parsedResult.Epoch)
+	require.Equal(t, result.Status, parsedResult.Status)
+	require.Equal(t, result.CommitteeSignature, parsedResult.CommitteeSignature)
+	require.Empty(t, parsedResult.Plaintext)
+
+	task := &FHETaskResultV1{
+		TaskID:           [32]byte{31: 0x55},
+		ResultHandle:     [32]byte{0x66},
+		SourceChainID:    ids.ID{31: 0x77},
+		Epoch:            ^uint64(0),
+		Status:           TaskStatusTimeout,
+		Callback:         [20]byte{19: 0x88},
+		CallbackSelector: [4]byte{0xca, 0xfe, 0xba, 0xbe},
+		Signature:        [32]byte{31: 0x99},
+	}
+	encodedTask := task.Bytes()
+	require.Len(t, encodedTask, 163)
+	parsedTask, err := ParseFHETaskResultV1(encodedTask)
+	require.NoError(t, err)
+	require.Equal(t, task, parsedTask)
+}
+
+// TestVariableLengthPayloadsIgnoreTrailingBytes records that a declared length
+// shorter than the bytes that follow it parses, and the surplus is dropped. Two
+// different byte strings therefore decode to the same payload. That is safe
+// here only because the Warp envelope is signed over the whole message, so the
+// surplus cannot be added after signing -- if that ever stops being true, this
+// is where the malleability lives.
+func TestVariableLengthPayloadsIgnoreTrailingBytes(t *testing.T) {
+	result := &FHEDecryptResultV1{Plaintext: []byte("abc")}
+	withSurplus := append(result.Bytes(), 0xde, 0xad, 0xbe, 0xef)
+
+	parsed, err := ParseFHEDecryptResultV1(withSurplus)
+	require.NoError(t, err)
+	require.Equal(t, []byte("abc"), parsed.Plaintext)
+
+	rotation := &FHEKeyRotationV1{NewPublicKey: []byte("pk")}
+	parsedRotation, err := ParseFHEKeyRotationV1(append(rotation.Bytes(), 0xff))
+	require.NoError(t, err)
+	require.Equal(t, []byte("pk"), parsedRotation.NewPublicKey)
+
+	reencrypt := &FHEReencryptRequestV1{RecipientPublicKey: []byte("pk")}
+	parsedReencrypt, err := ParseFHEReencryptRequestV1(append(reencrypt.Bytes(), 0xff))
+	require.NoError(t, err)
+	require.Equal(t, []byte("pk"), parsedReencrypt.RecipientPublicKey)
+}

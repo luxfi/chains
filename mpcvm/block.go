@@ -56,7 +56,40 @@ var (
 	ErrInvalidOperation = errors.New("mpcvm: invalid operation")
 	ErrBadArtifact      = errors.New("mpcvm: ceremony artifact does not verify")
 	ErrQuorumTooSmall   = errors.New("mpcvm: signer set smaller than the key's policy requires")
+	ErrStaleParent      = errors.New("mpcvm: parent block is not this node's applied state")
+	ErrBlockTooLarge    = errors.New("mpcvm: block carries more operations than a block may")
+	ErrFutureBlock      = errors.New("mpcvm: block timestamp is too far ahead of this node's clock")
 )
+
+// maxOpsPerBlock bounds the operations one block may carry.
+//
+// It is a CONSTANT, not configuration, because it is a consensus rule: Verify
+// enforces it on every block this node receives, and a bound each operator
+// could set independently would let two honestly-configured validators reach
+// opposite verdicts on the same block. It bounds the work an arriving block can
+// make every validator do — each sign operation costs an ECDSA verification, so
+// an unbounded block is an unbounded verification cost paid by the whole
+// network at whatever rate a proposer chooses.
+//
+// The same constant bounds assembly, so this node never builds a block its
+// peers would refuse. One predicate, three places.
+const maxOpsPerBlock = 64
+
+// maxBlockBytes bounds the wire encoding a block may arrive as, checked before
+// anything is decoded. maxOpsPerBlock operations of the largest shape M-Chain
+// produces — a keygen carrying a key record with N party ids — is on the order
+// of 50 KiB, so this is roughly twenty times the largest honest block and still
+// small enough that a peer cannot make this node allocate against it.
+const maxBlockBytes = 1 << 20
+
+// maxFutureSkew is how far ahead of this node's clock a block's timestamp may
+// be. Timestamps are monotonic (Verify refuses one below its parent's), so an
+// unbounded timestamp is not a one-block error: it raises the floor every later
+// block must clear, and one block dated a year out stops the chain producing
+// for a year. The bound is loose enough to absorb ordinary clock disagreement
+// between honest validators and tight enough that the damage from an
+// out-of-range one is a single rejected block.
+const maxFutureSkew = 10 * time.Second
 
 // Operation is one verifiable state transition.
 //
@@ -80,8 +113,7 @@ type Operation struct {
 	// Signers is the participating set, canonically ordered.
 	Signers []party.ID
 	// Key is the registration carried by a keygen operation; nil otherwise.
-	Key       *KeyRecord
-	Timestamp int64
+	Key *KeyRecord
 }
 
 // digest returns the operation's contribution to the state root. Domain
@@ -138,17 +170,11 @@ func (b *Block) ChoicesStatus() choices.Status   { return b.status }
 func (b *Block) SetStatus(status choices.Status) { b.status = status }
 
 // Bytes returns the block's canonical wire encoding.
-func (b *Block) Bytes() []byte {
-	raw, _ := b.Marshal()
-	return raw
-}
+func (b *Block) Bytes() []byte { return b.Marshal() }
 
 // computeID is the block id: the hash of its canonical bytes. Because
 // StateRoot is inside those bytes, the id commits to the post-state.
-func (b *Block) computeID() ids.ID {
-	raw, _ := b.Marshal()
-	return ids.ID(sha256.Sum256(raw))
-}
+func (b *Block) computeID() ids.ID { return ids.ID(sha256.Sum256(b.Marshal())) }
 
 // Verify re-checks the proposed transition against this validator's own state.
 // It mutates nothing: a rejected block must leave state untouched.
@@ -174,8 +200,14 @@ func (b *Block) Verify(ctx context.Context) error {
 	if b.BlockTimestamp < parent.BlockTimestamp {
 		return fmt.Errorf("mpcvm: timestamp %d precedes parent %d", b.BlockTimestamp, parent.BlockTimestamp)
 	}
+	if skew := time.Until(b.Timestamp()); skew > maxFutureSkew {
+		return fmt.Errorf("%w: %s ahead, at most %s allowed", ErrFutureBlock, skew, maxFutureSkew)
+	}
 	if len(b.Operations) == 0 {
 		return errors.New("mpcvm: empty block")
+	}
+	if len(b.Operations) > maxOpsPerBlock {
+		return fmt.Errorf("%w: %d operations, at most %d", ErrBlockTooLarge, len(b.Operations), maxOpsPerBlock)
 	}
 
 	vm.mu.RLock()
@@ -184,6 +216,21 @@ func (b *Block) Verify(ctx context.Context) error {
 	// Fold the operations, checking each against state plus the effects of the
 	// operations before it in this same block, and accumulating the root.
 	root := vm.state.Root()
+
+	// Every check below reads APPLIED state — the registry, the ceremony log,
+	// this node's own shares — so the transition is only meaningful as an
+	// extension of what is applied. A block whose parent's post-state is not
+	// this node's current state is being checked against the wrong state, and
+	// the accumulated root would be right for a history the chain does not
+	// have: it verifies now and fails at Accept, after consensus has decided
+	// it, which is the divergence the root exists to prevent. Comparing the
+	// parent's declared post-state to ours says exactly that, and says it
+	// whether the parent is an unapplied sibling, an ancestor, or a block still
+	// in flight above the tip.
+	if parent.StateRoot != root {
+		return fmt.Errorf("%w: parent %s leaves root %x, this node is at %x",
+			ErrStaleParent, b.ParentID_, parent.StateRoot[:8], root[:8])
+	}
 	pending := make(map[string]*KeyRecord, len(b.Operations))
 	seen := make(map[string]struct{}, len(b.Operations))
 
@@ -270,6 +317,26 @@ func (vm *VM) verifyKeygen(op *Operation, pending map[string]*KeyRecord) error {
 		return fmt.Errorf("%w: %s", ErrKeyExists, rec.KeyID)
 	}
 
+	// The signer set of a keygen IS its participant set: a DKG has no K-subset,
+	// every party runs every round. Leaving it unchecked let a proposer write
+	// any names it liked into the ceremony log's Signers — the log is the
+	// replicated evidence of who generated a custody key, and unverified
+	// evidence is worse than none.
+	if !samePartySet(op.Signers, rec.Participants) {
+		return fmt.Errorf("%w: keygen signers are not the key's participant set", ErrInvalidOperation)
+	}
+	// The ceremony id must be the one this exact registration derives —
+	// domain-separated from a signing id, so the two can never collide.
+	//
+	// Leaving it unchecked made the id proposer-chosen, and a recorded id is
+	// permanently unusable (verifyOperation refuses a ceremony already in the
+	// log). A keygen carrying the DERIVED id of some future signing task would
+	// therefore censor that task forever, and signing ids are derived from
+	// public inputs, so the task to censor can be named in advance.
+	if want := keygenCeremonyID(rec.KeyID, rec.Policy, rec.Participants); want != op.CeremonyID {
+		return fmt.Errorf("%w: ceremony id %q is not derived from this registration (want %q)",
+			ErrInvalidOperation, op.CeremonyID, want)
+	}
 	// The ceremony must have signed the commit digest for exactly this record.
 	commit := KeyCommitDigest(rec)
 	if string(op.Digest) != string(commit[:]) {

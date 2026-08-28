@@ -60,16 +60,6 @@ func NewParticipantSet(ceremonyID CeremonyID, members []Participant) (*Participa
 	return &ParticipantSet{CeremonyID: ceremonyID, Members: out}, nil
 }
 
-// Lookup returns the participant for a node, or false if absent.
-func (ps *ParticipantSet) Lookup(node NodeID) (Participant, bool) {
-	for _, p := range ps.Members {
-		if p.Node == node {
-			return p, true
-		}
-	}
-	return Participant{}, false
-}
-
 // Digest returns the canonical 32-byte digest of the set. Used as the
 // participant_root when a ceremony is registered, and as input to the
 // stake-weighted VRF for the next ceremony.

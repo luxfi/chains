@@ -41,7 +41,7 @@ func runKeygenViaTransport(
 	threshold int,
 ) map[party.ID]*cmpconfig.Config {
 	t.Helper()
-	net, routers := newInProcRouters(parties)
+	net, routers := newMeshRouters(parties)
 	defer net.close()
 
 	var mu sync.Mutex
@@ -76,7 +76,7 @@ func runSignViaTransport(
 	digest []byte,
 ) map[party.ID]*ECDSASignature {
 	t.Helper()
-	net, routers := newInProcRouters(signers)
+	net, routers := newMeshRouters(signers)
 	defer net.close()
 
 	var mu sync.Mutex
