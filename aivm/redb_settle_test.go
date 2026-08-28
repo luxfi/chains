@@ -150,4 +150,3 @@ func TestProbe_CommitRevealWindowsDisjoint(t *testing.T) {
 	require.Equal(uint64(160), info.RevealDeadline)
 	// commit window: [reqHeight, 130]; reveal window: (130, 160]. Disjoint at 130/131.
 }
-

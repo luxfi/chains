@@ -39,14 +39,14 @@ import (
 
 // SettleResult is the outcome of Settle, returned for callers + tests.
 type SettleResult struct {
-	Status        TaskState     // TaskSettled or TaskFailed
-	CanonicalHash common.Hash   // winning output_hash (zero if Failed)
-	WinnerCount   uint32        // size of the winning group (0 if Failed)
-	Paid          *uint256.Int  // total wei paid out as rewards (0 if Failed)
-	Slashed       *uint256.Int  // total wei slashed from withholders
+	Status        TaskState         // TaskSettled or TaskFailed
+	CanonicalHash common.Hash       // winning output_hash (zero if Failed)
+	WinnerCount   uint32            // size of the winning group (0 if Failed)
+	Paid          *uint256.Int      // total wei paid out as rewards (0 if Failed)
+	Slashed       *uint256.Int      // total wei slashed from withholders
 	Receipt       AInferenceReceipt // the emitted cross-chain receipt
-	ReceiptHash   common.Hash   // keccak(DomainReceipt || encoding)
-	ReceiptRoot   common.Hash   // receipt_root AFTER folding this receipt
+	ReceiptHash   common.Hash       // keccak(DomainReceipt || encoding)
+	ReceiptRoot   common.Hash       // receipt_root AFTER folding this receipt
 }
 
 // Settle finalizes a task. height must be > revealDeadline. Idempotent.

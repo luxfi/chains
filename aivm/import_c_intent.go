@@ -47,12 +47,12 @@ import (
 // operator (carried alongside the intent; the C-side Fee is the user-facing fee
 // that funds it + the burn).
 type CIntent struct {
-	IntentID          common.Hash    `json:"intentId"`          // committed on C; must equal ComputeIntentID(...)
+	IntentID          common.Hash    `json:"intentId"` // committed on C; must equal ComputeIntentID(...)
 	CChainID          common.Hash    `json:"cChainId"`
 	AChainID          common.Hash    `json:"aChainId"`
-	CTxHash           common.Hash    `json:"cTxHash"`           // C tx that emitted the intent
-	CallIndex         uint32         `json:"callIndex"`         // index within that tx
-	Caller            common.Address `json:"caller"`            // the C-side requester
+	CTxHash           common.Hash    `json:"cTxHash"`   // C tx that emitted the intent
+	CallIndex         uint32         `json:"callIndex"` // index within that tx
+	Caller            common.Address `json:"caller"`    // the C-side requester
 	ModelSpecHash     common.Hash    `json:"modelSpecHash"`
 	PromptHash        common.Hash    `json:"promptHash"`
 	N                 uint16         `json:"n"`
