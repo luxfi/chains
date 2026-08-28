@@ -4,7 +4,6 @@
 package identityvm
 
 import (
-	"context"
 	"encoding/base64"
 	"net/http"
 	"time"
@@ -12,507 +11,432 @@ import (
 	"github.com/luxfi/ids"
 )
 
-// Service provides RPC access to the IdentityVM
+// Service provides RPC access to the IdentityVM.
+//
+// A mutating call SUBMITS a signed record. It does not create one: the caller
+// holds the key, so the caller signs, and the chain checks. The service used
+// to build the record itself from a public key the caller named — which is why
+// registering an issuer, and revoking anyone's credential, took nothing but
+// the request.
 type Service struct {
 	vm *VM
 }
 
-// ======== Identity API ========
+// ======== submissions ========
 
-// CreateIdentityArgs are arguments for CreateIdentity
-type CreateIdentityArgs struct {
-	PublicKey string            `json:"publicKey"` // Base64-encoded
-	Metadata  map[string]string `json:"metadata"`
-	// Fee is the user-paid tx burn in nLUX; must satisfy MinTxFeeFloor.
-	Fee uint64 `json:"fee"`
+// SubmitIdentityArgs registers a DID: a public key and a signature by it.
+type SubmitIdentityArgs struct {
+	PublicKey string            `json:"publicKey"` // base64
+	Signature string            `json:"signature"` // base64
+	Created   int64             `json:"created"`   // UnixNano
+	Metadata  map[string]string `json:"metadata,omitempty"`
+	Fee       uint64            `json:"fee"`
 }
 
-// CreateIdentityReply is the reply for CreateIdentity
-type CreateIdentityReply struct {
-	ID  string `json:"id"`
-	DID string `json:"did"`
-}
-
-// CreateIdentity creates a new decentralized identity
-func (s *Service) CreateIdentity(r *http.Request, args *CreateIdentityArgs, reply *CreateIdentityReply) error {
-	if err := s.vm.gateUserFee(args.Fee); err != nil {
-		return err
-	}
-	publicKey, err := base64.StdEncoding.DecodeString(args.PublicKey)
-	if err != nil {
-		return err
-	}
-
-	identity, err := s.vm.CreateIdentity(publicKey, args.Metadata)
-	if err != nil {
-		return err
-	}
-
-	reply.ID = identity.ID.String()
-	reply.DID = identity.DID
-	return nil
-}
-
-// GetIdentityArgs are arguments for GetIdentity
-type GetIdentityArgs struct {
+// SubmitReply names what was accepted into the queue.
+type SubmitReply struct {
 	ID string `json:"id"`
 }
 
-// IdentityReply represents an identity in RPC responses
+// SubmitIdentity queues a new identity.
+func (s *Service) SubmitIdentity(r *http.Request, args *SubmitIdentityArgs, reply *SubmitReply) error {
+	if err := s.vm.gateUserTx(args.Fee); err != nil {
+		return err
+	}
+	publicKey, signature, err := decodePair(args.PublicKey, args.Signature)
+	if err != nil {
+		return err
+	}
+
+	identity := &Identity{
+		PublicKey: publicKey,
+		Created:   time.Unix(0, args.Created).UTC(),
+		Metadata:  args.Metadata,
+		Signature: signature,
+	}
+	identity.ID = identityID(publicKey)
+
+	if err := s.vm.Submit(&Change{Identity: identity}); err != nil {
+		return err
+	}
+	reply.ID = identity.ID.String()
+	return nil
+}
+
+// SubmitIssuerArgs registers an issuer.
+type SubmitIssuerArgs struct {
+	Name       string   `json:"name"`
+	PublicKey  string   `json:"publicKey"` // base64
+	Signature  string   `json:"signature"` // base64
+	Types      []string `json:"types,omitempty"`
+	TrustLevel int      `json:"trustLevel"`
+	CreatedAt  int64    `json:"createdAt"` // UnixNano
+	Fee        uint64   `json:"fee"`
+}
+
+// SubmitIssuer queues a new issuer.
+func (s *Service) SubmitIssuer(r *http.Request, args *SubmitIssuerArgs, reply *SubmitReply) error {
+	if err := s.vm.gateUserTx(args.Fee); err != nil {
+		return err
+	}
+	publicKey, signature, err := decodePair(args.PublicKey, args.Signature)
+	if err != nil {
+		return err
+	}
+
+	issuer := &Issuer{
+		Name:       args.Name,
+		PublicKey:  publicKey,
+		Types:      args.Types,
+		TrustLevel: args.TrustLevel,
+		CreatedAt:  time.Unix(0, args.CreatedAt).UTC(),
+		Signature:  signature,
+	}
+	issuer.ID = issuerID(publicKey)
+
+	if err := s.vm.Submit(&Change{Issuer: issuer}); err != nil {
+		return err
+	}
+	reply.ID = issuer.ID.String()
+	return nil
+}
+
+// SubmitCredentialArgs issues a credential, signed by its issuer.
+type SubmitCredentialArgs struct {
+	Type       []string               `json:"type,omitempty"`
+	Issuer     string                 `json:"issuer"`
+	Subject    string                 `json:"subject"`
+	Issuance   int64                  `json:"issuance"`   // UnixNano
+	Expiration int64                  `json:"expiration"` // UnixNano; 0 means the chain's default
+	Claims     map[string]interface{} `json:"claims,omitempty"`
+	Signature  string                 `json:"signature"` // base64
+	Fee        uint64                 `json:"fee"`
+}
+
+// SubmitCredential queues a new credential.
+func (s *Service) SubmitCredential(r *http.Request, args *SubmitCredentialArgs, reply *SubmitReply) error {
+	if err := s.vm.gateUserTx(args.Fee); err != nil {
+		return err
+	}
+	issuer, err := ids.FromString(args.Issuer)
+	if err != nil {
+		return err
+	}
+	subject, err := ids.FromString(args.Subject)
+	if err != nil {
+		return err
+	}
+	signature, err := base64.StdEncoding.DecodeString(args.Signature)
+	if err != nil {
+		return err
+	}
+
+	cred := &Credential{
+		Type:           args.Type,
+		Issuer:         issuer,
+		Subject:        subject,
+		IssuanceDate:   time.Unix(0, args.Issuance).UTC(),
+		ExpirationDate: s.vm.expiry(args.Issuance, args.Expiration),
+		Claims:         args.Claims,
+		Signature:      signature,
+	}
+	cred.ID = tag("identityvm/credential", cred.signable())
+
+	if err := s.vm.Submit(&Change{Credential: cred}); err != nil {
+		return err
+	}
+	reply.ID = cred.ID.String()
+	return nil
+}
+
+// expiry is when a credential lapses: what the issuer named, or the chain's
+// default measured from issuance. A caller-supplied lifetime used to be added
+// to the wall clock without a sign check, so a NEGATIVE one produced a
+// credential that was already expired — admitted, queued, put into every block
+// this node proposed, and refused by every node including this one.
+func (vm *VM) expiry(issuance, expiration int64) time.Time {
+	if expiration > 0 {
+		return time.Unix(0, expiration).UTC()
+	}
+	return time.Unix(0, issuance).UTC().Add(time.Duration(vm.config.CredentialTTL) * time.Second)
+}
+
+// SubmitRevocationArgs withdraws a credential, signed by its issuer or its
+// subject.
+type SubmitRevocationArgs struct {
+	CredentialID string `json:"credentialId"`
+	RevokedBy    string `json:"revokedBy"`
+	RevokedAt    int64  `json:"revokedAt"` // UnixNano
+	Reason       string `json:"reason,omitempty"`
+	Signature    string `json:"signature"` // base64
+	Fee          uint64 `json:"fee"`
+}
+
+// SubmitRevocation queues a revocation.
+func (s *Service) SubmitRevocation(r *http.Request, args *SubmitRevocationArgs, reply *SubmitReply) error {
+	if err := s.vm.gateUserTx(args.Fee); err != nil {
+		return err
+	}
+	credID, err := ids.FromString(args.CredentialID)
+	if err != nil {
+		return err
+	}
+	revoker, err := ids.FromString(args.RevokedBy)
+	if err != nil {
+		return err
+	}
+	signature, err := base64.StdEncoding.DecodeString(args.Signature)
+	if err != nil {
+		return err
+	}
+
+	rev := &Revocation{
+		CredentialID: credID,
+		RevokedBy:    revoker,
+		RevokedAt:    time.Unix(0, args.RevokedAt).UTC(),
+		Reason:       args.Reason,
+		Signature:    signature,
+	}
+
+	if err := s.vm.Submit(&Change{Revocation: rev}); err != nil {
+		return err
+	}
+	reply.ID = credID.String()
+	return nil
+}
+
+// ======== queries ========
+
+// IDArgs names a record by id.
+type IDArgs struct {
+	ID string `json:"id"`
+}
+
+// IdentityReply represents an identity in RPC responses.
 type IdentityReply struct {
 	ID        string            `json:"id"`
 	DID       string            `json:"did"`
 	PublicKey string            `json:"publicKey"`
 	Created   string            `json:"created"`
-	Updated   string            `json:"updated"`
-	Metadata  map[string]string `json:"metadata"`
-	Services  []ServiceEndpoint `json:"services"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
 }
 
-// GetIdentityReply is the reply for GetIdentity
-type GetIdentityReply struct {
-	Identity IdentityReply `json:"identity"`
-}
-
-// GetIdentity returns an identity by ID
-func (s *Service) GetIdentity(r *http.Request, args *GetIdentityArgs, reply *GetIdentityReply) error {
-	identityID, err := ids.FromString(args.ID)
+// GetIdentity returns an identity by id.
+func (s *Service) GetIdentity(r *http.Request, args *IDArgs, reply *IdentityReply) error {
+	id, err := ids.FromString(args.ID)
 	if err != nil {
 		return err
 	}
-
-	identity, err := s.vm.GetIdentity(identityID)
+	identity, err := s.vm.Identity(id)
 	if err != nil {
 		return err
 	}
-
-	reply.Identity = IdentityReply{
-		ID:        identity.ID.String(),
-		DID:       identity.DID,
-		PublicKey: base64.StdEncoding.EncodeToString(identity.PublicKey),
-		Created:   identity.Created.Format(time.RFC3339),
-		Updated:   identity.Updated.Format(time.RFC3339),
-		Metadata:  identity.Metadata,
-		Services:  identity.Services,
-	}
-
+	*reply = describeIdentity(identity)
 	return nil
 }
 
-// ResolveIdentityArgs are arguments for ResolveIdentity
-type ResolveIdentityArgs struct {
+// ResolveArgs names an identity by DID.
+type ResolveArgs struct {
 	DID string `json:"did"`
 }
 
-// ResolveIdentityReply is the reply for ResolveIdentity
-type ResolveIdentityReply struct {
-	Identity IdentityReply `json:"identity"`
-}
-
-// ResolveIdentity resolves an identity by DID
-func (s *Service) ResolveIdentity(r *http.Request, args *ResolveIdentityArgs, reply *ResolveIdentityReply) error {
-	identity, err := s.vm.ResolveIdentity(args.DID)
+// ResolveIdentity returns the identity a DID names.
+func (s *Service) ResolveIdentity(r *http.Request, args *ResolveArgs, reply *IdentityReply) error {
+	identity, err := s.vm.Resolve(args.DID)
 	if err != nil {
 		return err
 	}
-
-	reply.Identity = IdentityReply{
-		ID:        identity.ID.String(),
-		DID:       identity.DID,
-		PublicKey: base64.StdEncoding.EncodeToString(identity.PublicKey),
-		Created:   identity.Created.Format(time.RFC3339),
-		Updated:   identity.Updated.Format(time.RFC3339),
-		Metadata:  identity.Metadata,
-		Services:  identity.Services,
-	}
-
+	*reply = describeIdentity(identity)
 	return nil
 }
 
-// ======== Credential API ========
-
-// IssueCredentialArgs are arguments for IssueCredential
-type IssueCredentialArgs struct {
-	IssuerID   string                 `json:"issuerId"`
-	SubjectID  string                 `json:"subjectId"`
-	Type       []string               `json:"type"`
-	Claims     map[string]interface{} `json:"claims"`
-	TTLSeconds int64                  `json:"ttlSeconds"` // Optional, uses default if 0
-	// Fee is the user-paid tx burn in nLUX.
-	Fee uint64 `json:"fee"`
-}
-
-// IssueCredentialReply is the reply for IssueCredential
-type IssueCredentialReply struct {
-	CredentialID   string `json:"credentialId"`
-	ExpirationDate string `json:"expirationDate"`
-}
-
-// IssueCredential issues a new verifiable credential
-func (s *Service) IssueCredential(r *http.Request, args *IssueCredentialArgs, reply *IssueCredentialReply) error {
-	if err := s.vm.gateUserFee(args.Fee); err != nil {
-		return err
-	}
-	issuerID, err := ids.FromString(args.IssuerID)
-	if err != nil {
-		return err
-	}
-
-	subjectID, err := ids.FromString(args.SubjectID)
-	if err != nil {
-		return err
-	}
-
-	ttl := time.Duration(args.TTLSeconds) * time.Second
-
-	cred, err := s.vm.IssueCredential(issuerID, subjectID, args.Type, args.Claims, ttl)
-	if err != nil {
-		return err
-	}
-
-	reply.CredentialID = cred.ID.String()
-	reply.ExpirationDate = cred.ExpirationDate.Format(time.RFC3339)
-	return nil
-}
-
-// GetCredentialArgs are arguments for GetCredential
-type GetCredentialArgs struct {
-	CredentialID string `json:"credentialId"`
-}
-
-// CredentialReply represents a credential in RPC responses
+// CredentialReply represents a credential in RPC responses.
 type CredentialReply struct {
-	ID             string                 `json:"id"`
-	Type           []string               `json:"type"`
-	Issuer         string                 `json:"issuer"`
-	Subject        string                 `json:"subject"`
-	IssuanceDate   string                 `json:"issuanceDate"`
-	ExpirationDate string                 `json:"expirationDate"`
-	Claims         map[string]interface{} `json:"claims"`
-	Status         string                 `json:"status"`
+	ID         string                 `json:"id"`
+	Type       []string               `json:"type,omitempty"`
+	Issuer     string                 `json:"issuer"`
+	Subject    string                 `json:"subject"`
+	Issuance   string                 `json:"issuance"`
+	Expiration string                 `json:"expiration"`
+	Claims     map[string]interface{} `json:"claims,omitempty"`
+	Status     string                 `json:"status"`
 }
 
-// GetCredentialReply is the reply for GetCredential
-type GetCredentialReply struct {
-	Credential CredentialReply `json:"credential"`
-}
-
-// GetCredential returns a credential by ID
-func (s *Service) GetCredential(r *http.Request, args *GetCredentialArgs, reply *GetCredentialReply) error {
-	credID, err := ids.FromString(args.CredentialID)
+// GetCredential returns a credential and its status.
+func (s *Service) GetCredential(r *http.Request, args *IDArgs, reply *CredentialReply) error {
+	id, err := ids.FromString(args.ID)
 	if err != nil {
 		return err
 	}
-
-	cred, err := s.vm.GetCredential(credID)
+	cred, status, err := s.vm.Credential(id)
 	if err != nil {
 		return err
 	}
-
-	reply.Credential = CredentialReply{
-		ID:             cred.ID.String(),
-		Type:           cred.Type,
-		Issuer:         cred.Issuer.String(),
-		Subject:        cred.Subject.String(),
-		IssuanceDate:   cred.IssuanceDate.Format(time.RFC3339),
-		ExpirationDate: cred.ExpirationDate.Format(time.RFC3339),
-		Claims:         cred.Claims,
-		Status:         cred.Status,
+	*reply = CredentialReply{
+		ID:         cred.ID.String(),
+		Type:       cred.Type,
+		Issuer:     cred.Issuer.String(),
+		Subject:    cred.Subject.String(),
+		Issuance:   cred.IssuanceDate.Format(time.RFC3339),
+		Expiration: cred.ExpirationDate.Format(time.RFC3339),
+		Claims:     cred.Claims,
+		Status:     status,
 	}
-
 	return nil
 }
 
-// VerifyCredentialArgs are arguments for VerifyCredential
-type VerifyCredentialArgs struct {
-	CredentialID string `json:"credentialId"`
+// VerifyReply reports whether a credential is usable now.
+type VerifyReply struct {
+	Valid  bool   `json:"valid"`
+	Reason string `json:"reason,omitempty"`
 }
 
-// VerifyCredentialReply is the reply for VerifyCredential
-type VerifyCredentialReply struct {
-	Valid   bool   `json:"valid"`
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
-}
-
-// VerifyCredential verifies a credential
-func (s *Service) VerifyCredential(r *http.Request, args *VerifyCredentialArgs, reply *VerifyCredentialReply) error {
-	credID, err := ids.FromString(args.CredentialID)
+// VerifyCredential reports whether a credential is recorded, unrevoked and
+// unexpired. A refusal is an ANSWER, not an error: the caller asked a question
+// and "no, because it is revoked" is the answer to it.
+func (s *Service) VerifyCredential(r *http.Request, args *IDArgs, reply *VerifyReply) error {
+	id, err := ids.FromString(args.ID)
 	if err != nil {
 		return err
 	}
-
-	valid, err := s.vm.VerifyCredential(credID)
-	if err != nil {
-		reply.Valid = false
-		reply.Message = err.Error()
-
-		// Determine status based on error
-		switch err {
-		case errCredentialRevoked:
-			reply.Status = CredentialRevoked
-		case errCredentialExpired:
-			reply.Status = CredentialExpired
-		default:
-			reply.Status = "invalid"
-		}
+	if err := s.vm.Verify(id); err != nil {
+		reply.Valid, reply.Reason = false, err.Error()
 		return nil
 	}
-
-	reply.Valid = valid
-	reply.Status = CredentialActive
+	reply.Valid = true
 	return nil
 }
 
-// RevokeCredentialArgs are arguments for RevokeCredential
-type RevokeCredentialArgs struct {
-	CredentialID string `json:"credentialId"`
-	RevokerID    string `json:"revokerId"`
-	Reason       string `json:"reason"`
-	// Fee is the user-paid tx burn in nLUX.
-	Fee uint64 `json:"fee"`
+// ProofArgs asks for a selective-disclosure artifact.
+type ProofArgs struct {
+	ID         string `json:"id"`
+	Disclosure string `json:"disclosure"` // base64
 }
 
-// RevokeCredentialReply is the reply for RevokeCredential
-type RevokeCredentialReply struct {
-	Success bool `json:"success"`
-}
-
-// RevokeCredential revokes a credential
-func (s *Service) RevokeCredential(r *http.Request, args *RevokeCredentialArgs, reply *RevokeCredentialReply) error {
-	if err := s.vm.gateUserFee(args.Fee); err != nil {
-		return err
-	}
-	credID, err := ids.FromString(args.CredentialID)
-	if err != nil {
-		return err
-	}
-
-	revokerID, err := ids.FromString(args.RevokerID)
-	if err != nil {
-		return err
-	}
-
-	if err := s.vm.RevokeCredential(credID, revokerID, args.Reason); err != nil {
-		return err
-	}
-
-	reply.Success = true
-	return nil
-}
-
-// CreateProofArgs are arguments for CreateProof
-type CreateProofArgs struct {
-	CredentialID        string   `json:"credentialId"`
-	ZKProof             string   `json:"zkProof,omitempty"` // Base64-encoded
-	SelectiveDisclosure []string `json:"selectiveDisclosure,omitempty"`
-	// Fee is the user-paid tx burn in nLUX.
-	Fee uint64 `json:"fee"`
-}
-
-// CreateProofReply is the reply for CreateProof
-type CreateProofReply struct {
+// ProofReply carries the artifact.
+type ProofReply struct {
 	CredentialID     string `json:"credentialId"`
 	IssuerDID        string `json:"issuerDid"`
 	SubjectDID       string `json:"subjectDid"`
-	CredType         string `json:"credentialType"`
-	ClaimsCommitment string `json:"claimsCommitment"` // Base64-encoded
-	IssuedAt         int64  `json:"issuedAt"`
-	ExpiresAt        int64  `json:"expiresAt"`
+	CredType         string `json:"credType,omitempty"`
+	ClaimsCommitment string `json:"claimsCommitment"`
+	IssuedAt         string `json:"issuedAt"`
+	ExpiresAt        string `json:"expiresAt"`
 }
 
-// CreateProof creates a credential proof artifact
-func (s *Service) CreateProof(r *http.Request, args *CreateProofArgs, reply *CreateProofReply) error {
-	if err := s.vm.gateUserFee(args.Fee); err != nil {
-		return err
-	}
-	credID, err := ids.FromString(args.CredentialID)
+// CreateProof builds a selective-disclosure artifact for a credential.
+func (s *Service) CreateProof(r *http.Request, args *ProofArgs, reply *ProofReply) error {
+	id, err := ids.FromString(args.ID)
 	if err != nil {
 		return err
 	}
-
-	var zkProof []byte
-	if args.ZKProof != "" {
-		zkProof, err = base64.StdEncoding.DecodeString(args.ZKProof)
-		if err != nil {
-			return err
-		}
-	}
-
-	proof, err := s.vm.CreateCredentialProof(credID, zkProof, args.SelectiveDisclosure)
+	disclosure, err := base64.StdEncoding.DecodeString(args.Disclosure)
 	if err != nil {
 		return err
 	}
-
-	reply.CredentialID = proof.CredentialID.String()
-	reply.IssuerDID = proof.IssuerDID
-	reply.SubjectDID = proof.SubjectDID
-	reply.CredType = proof.CredType
-	reply.ClaimsCommitment = base64.StdEncoding.EncodeToString(proof.ClaimsCommitment[:])
-	reply.IssuedAt = proof.IssuedAt.Unix()
-	reply.ExpiresAt = proof.ExpiresAt.Unix()
+	proof, err := s.vm.Proof(id, disclosure)
+	if err != nil {
+		return err
+	}
+	*reply = ProofReply{
+		CredentialID:     proof.CredentialID.String(),
+		IssuerDID:        proof.IssuerDID,
+		SubjectDID:       proof.SubjectDID,
+		CredType:         proof.CredType,
+		ClaimsCommitment: base64.StdEncoding.EncodeToString(proof.ClaimsCommitment[:]),
+		IssuedAt:         proof.IssuedAt.Format(time.RFC3339),
+		ExpiresAt:        proof.ExpiresAt.Format(time.RFC3339),
+	}
 	return nil
 }
 
-// ======== Issuer API ========
-
-// RegisterIssuerArgs are arguments for RegisterIssuer
-type RegisterIssuerArgs struct {
-	Name       string   `json:"name"`
-	PublicKey  string   `json:"publicKey"` // Base64-encoded
-	Types      []string `json:"types"`
-	TrustLevel int      `json:"trustLevel"`
-	// Fee is the user-paid tx burn in nLUX.
-	Fee uint64 `json:"fee"`
-}
-
-// RegisterIssuerReply is the reply for RegisterIssuer
-type RegisterIssuerReply struct {
-	IssuerID string `json:"issuerId"`
-}
-
-// RegisterIssuer registers a new credential issuer
-func (s *Service) RegisterIssuer(r *http.Request, args *RegisterIssuerArgs, reply *RegisterIssuerReply) error {
-	if err := s.vm.gateUserFee(args.Fee); err != nil {
-		return err
-	}
-	publicKey, err := base64.StdEncoding.DecodeString(args.PublicKey)
-	if err != nil {
-		return err
-	}
-
-	issuer, err := s.vm.RegisterIssuer(args.Name, publicKey, args.Types, args.TrustLevel)
-	if err != nil {
-		return err
-	}
-
-	reply.IssuerID = issuer.ID.String()
-	return nil
-}
-
-// GetIssuerArgs are arguments for GetIssuer
-type GetIssuerArgs struct {
-	IssuerID string `json:"issuerId"`
-}
-
-// IssuerReply represents an issuer in RPC responses
+// IssuerReply represents an issuer in RPC responses.
 type IssuerReply struct {
 	ID         string   `json:"id"`
 	Name       string   `json:"name"`
 	PublicKey  string   `json:"publicKey"`
-	Types      []string `json:"types"`
+	Types      []string `json:"types,omitempty"`
 	TrustLevel int      `json:"trustLevel"`
 	CreatedAt  string   `json:"createdAt"`
-	Status     string   `json:"status"`
 }
 
-// GetIssuerReply is the reply for GetIssuer
-type GetIssuerReply struct {
-	Issuer IssuerReply `json:"issuer"`
-}
-
-// GetIssuer returns an issuer by ID
-func (s *Service) GetIssuer(r *http.Request, args *GetIssuerArgs, reply *GetIssuerReply) error {
-	issuerID, err := ids.FromString(args.IssuerID)
+// GetIssuer returns an issuer by id.
+func (s *Service) GetIssuer(r *http.Request, args *IDArgs, reply *IssuerReply) error {
+	id, err := ids.FromString(args.ID)
 	if err != nil {
 		return err
 	}
-
-	issuer, err := s.vm.GetIssuer(issuerID)
+	issuer, err := s.vm.Issuer(id)
 	if err != nil {
 		return err
 	}
-
-	reply.Issuer = IssuerReply{
-		ID:         issuer.ID.String(),
-		Name:       issuer.Name,
-		PublicKey:  base64.StdEncoding.EncodeToString(issuer.PublicKey),
-		Types:      issuer.Types,
-		TrustLevel: issuer.TrustLevel,
-		CreatedAt:  issuer.CreatedAt.Format(time.RFC3339),
-		Status:     issuer.Status,
-	}
-
+	*reply = describeIssuer(issuer)
 	return nil
 }
 
-// ListIssuersArgs are arguments for ListIssuers
-type ListIssuersArgs struct {
-	Type   string `json:"type,omitempty"`   // Filter by credential type
-	Status string `json:"status,omitempty"` // Filter by status
-}
+// EmptyArgs is a call that names nothing.
+type EmptyArgs struct{}
 
-// ListIssuersReply is the reply for ListIssuers
+// ListIssuersReply carries every issuer the chain holds, in id order.
 type ListIssuersReply struct {
 	Issuers []IssuerReply `json:"issuers"`
 }
 
-// ListIssuers lists all issuers
-func (s *Service) ListIssuers(r *http.Request, args *ListIssuersArgs, reply *ListIssuersReply) error {
-	s.vm.chain.RLock()
-	defer s.vm.chain.RUnlock()
-
-	reply.Issuers = make([]IssuerReply, 0, len(s.vm.issuers))
-
-	for _, issuer := range s.vm.issuers {
-		// Apply filters
-		if args.Status != "" && issuer.Status != args.Status {
-			continue
-		}
-
-		if args.Type != "" {
-			found := false
-			for _, t := range issuer.Types {
-				if t == args.Type {
-					found = true
-					break
-				}
-			}
-			if !found {
-				continue
-			}
-		}
-
-		reply.Issuers = append(reply.Issuers, IssuerReply{
-			ID:         issuer.ID.String(),
-			Name:       issuer.Name,
-			PublicKey:  base64.StdEncoding.EncodeToString(issuer.PublicKey),
-			Types:      issuer.Types,
-			TrustLevel: issuer.TrustLevel,
-			CreatedAt:  issuer.CreatedAt.Format(time.RFC3339),
-			Status:     issuer.Status,
-		})
+// ListIssuers returns every issuer, in id order.
+func (s *Service) ListIssuers(r *http.Request, args *EmptyArgs, reply *ListIssuersReply) error {
+	for _, issuer := range s.vm.Issuers() {
+		reply.Issuers = append(reply.Issuers, describeIssuer(issuer))
 	}
-
 	return nil
 }
 
-// ======== Health Check ========
-
-// HealthArgs are arguments for Health
-type HealthArgs struct{}
-
-// HealthReply is the reply for Health
+// HealthReply reports what the chain holds.
 type HealthReply struct {
-	Healthy     bool `json:"healthy"`
-	Identities  int  `json:"identities"`
-	Credentials int  `json:"credentials"`
-	Issuers     int  `json:"issuers"`
+	Healthy bool              `json:"healthy"`
+	Details map[string]string `json:"details"`
 }
 
-// Health returns health status
-func (s *Service) Health(r *http.Request, args *HealthArgs, reply *HealthReply) error {
-	health, err := s.vm.HealthCheck(context.Background())
+// Health reports the chain's health.
+func (s *Service) Health(r *http.Request, args *EmptyArgs, reply *HealthReply) error {
+	health, err := s.vm.HealthCheck(r.Context())
 	if err != nil {
 		return err
 	}
-
-	s.vm.chain.RLock()
-	defer s.vm.chain.RUnlock()
-
-	reply.Healthy = health.Healthy
-	reply.Identities = len(s.vm.identities)
-	reply.Credentials = len(s.vm.credentials)
-	reply.Issuers = len(s.vm.issuers)
+	reply.Healthy, reply.Details = health.Healthy, health.Details
 	return nil
+}
+
+// ======== helpers ========
+
+func decodePair(publicKey, signature string) ([]byte, []byte, error) {
+	pub, err := base64.StdEncoding.DecodeString(publicKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	sig, err := base64.StdEncoding.DecodeString(signature)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pub, sig, nil
+}
+
+func describeIdentity(i *Identity) IdentityReply {
+	return IdentityReply{
+		ID:        i.ID.String(),
+		DID:       i.DID(),
+		PublicKey: base64.StdEncoding.EncodeToString(i.PublicKey),
+		Created:   i.Created.Format(time.RFC3339),
+		Metadata:  i.Metadata,
+	}
+}
+
+func describeIssuer(s *Issuer) IssuerReply {
+	return IssuerReply{
+		ID:         s.ID.String(),
+		Name:       s.Name,
+		PublicKey:  base64.StdEncoding.EncodeToString(s.PublicKey),
+		Types:      s.Types,
+		TrustLevel: s.TrustLevel,
+		CreatedAt:  s.CreatedAt.Format(time.RFC3339),
+	}
 }
