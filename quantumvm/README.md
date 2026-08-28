@@ -33,20 +33,20 @@ The QVM can be configured through the `config.Config` structure:
 
 ```go
 type Config struct {
-    TxFee                   uint64        // Base transaction fee
-    CreateAssetTxFee        uint64        // Asset creation fee
-    QuantumVerificationFee  uint64        // Fee for quantum signature verification
     MaxParallelTxs          int           // Maximum parallel transactions
-    QuantumAlgorithmVersion uint32        // Quantum algorithm version
-    CoronaKeySize           int           // Size of Corona keys in bytes
+    QuantumAlgorithmVersion uint32        // 1=ML-DSA-44, 2=ML-DSA-65, 3=ML-DSA-87
     QuantumStampEnabled     bool          // Enable quantum stamp validation
     QuantumStampWindow      time.Duration // Validity window for quantum stamps
     ParallelBatchSize       int           // Batch size for parallel processing
-    QuantumSigCacheSize     int           // Cache size for quantum signatures
     CoronaEnabled           bool          // Enable Corona key support
-    MinQuantumConfirmations uint32        // Minimum confirmations for quantum stamps
+    GPUBatchThreshold       int           // Batch size at which GPU verification takes over
 }
 ```
+
+There is no fee schedule. Q-Chain has no user-payable blockspace (LP-0130 §6):
+finality-cert inclusion is a validator obligation paid through P-Chain reward
+distribution, so `IssueTx` refuses every user transaction whatever it offers,
+and state advances only through consensus-internal cert aggregation.
 
 ## Architecture
 
@@ -63,7 +63,9 @@ type Config struct {
 2. Worker threads process transactions in parallel batches
 3. Quantum signatures are verified using the quantum signer
 4. Valid transactions are included in blocks
-5. Blocks are signed with quantum stamps
+5. Blocks are signed at the CONSENSUS layer (Quasar BLS + Corona), never on the
+   wire — the block id is the hash of its own bytes, so a signature inside it
+   would give two honest nodes two ids for one block
 
 ### RPC API
 

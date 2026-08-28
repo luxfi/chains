@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luxfi/accel"
 	"github.com/luxfi/log"
 )
 
@@ -22,7 +23,7 @@ func runtimeCollect() {
 
 func signer(t *testing.T) *QuantumSigner {
 	t.Helper()
-	return NewQuantumSigner(log.NewNoOpLogger(), AlgorithmMLDSA65, 0, time.Minute, 8)
+	return NewQuantumSigner(log.NewNoOpLogger(), AlgorithmMLDSA65, time.Minute)
 }
 
 // stored is a validator key in the shape it takes coming back from storage or
@@ -122,5 +123,197 @@ func TestSignRejectsUnparseableSecret(t *testing.T) {
 		if _, err := qs.Sign([]byte("round digest"), key); err == nil {
 			t.Fatalf("Sign %d accepted an unparseable secret", i)
 		}
+	}
+}
+
+// TestVerifyRefusesAnExpiredStamp: a stamp is only good inside its window. The
+// window is the whole reason a stamp exists — without the check, a signature
+// captured once is replayable for as long as the chain runs.
+func TestVerifyRefusesAnExpiredStamp(t *testing.T) {
+	qs := NewQuantumSigner(log.NewNoOpLogger(), AlgorithmMLDSA65, 50*time.Millisecond)
+	key := stored(t, qs)
+	msg := []byte("round digest")
+
+	sig, err := qs.Sign(msg, key)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if err := qs.Verify(msg, sig); err != nil {
+		t.Fatalf("a fresh signature did not verify: %v", err)
+	}
+
+	time.Sleep(120 * time.Millisecond)
+	if err := qs.Verify(msg, sig); err != ErrQuantumStampExpired {
+		t.Fatalf("Verify past the window = %v, want ErrQuantumStampExpired", err)
+	}
+}
+
+// TestVerifyRefusesAnotherAlgorithm: a signature made under one ML-DSA
+// parameter set must not be accepted by a signer running another. The key and
+// signature widths differ, so accepting one would mean verifying against a
+// truncated key.
+func TestVerifyRefusesAnotherAlgorithm(t *testing.T) {
+	weak := NewQuantumSigner(log.NewNoOpLogger(), AlgorithmMLDSA44, time.Minute)
+	strong := NewQuantumSigner(log.NewNoOpLogger(), AlgorithmMLDSA87, time.Minute)
+
+	sig, err := weak.Sign([]byte("digest"), stored(t, weak))
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if err := strong.Verify([]byte("digest"), sig); err != ErrUnsupportedAlgorithm {
+		t.Fatalf("Verify across parameter sets = %v, want ErrUnsupportedAlgorithm", err)
+	}
+}
+
+// TestVerifyRefusesAlteredMessageAndNilSignature covers the two ways a caller
+// arrives with nothing valid: a signature over other bytes, and none at all.
+func TestVerifyRefusesAlteredMessageAndNilSignature(t *testing.T) {
+	qs := signer(t)
+	sig, err := qs.Sign([]byte("the real message"), stored(t, qs))
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if err := qs.Verify([]byte("a different message"), sig); err != ErrQuantumVerificationFailed {
+		t.Fatalf("Verify over other bytes = %v, want ErrQuantumVerificationFailed", err)
+	}
+	if err := qs.Verify([]byte("the real message"), nil); err != ErrInvalidQuantumSignature {
+		t.Fatalf("Verify(nil) = %v, want ErrInvalidQuantumSignature", err)
+	}
+	if _, err := qs.Sign([]byte("x"), nil); err != ErrInvalidCoronaKey {
+		t.Fatalf("Sign(nil key) = %v, want ErrInvalidCoronaKey", err)
+	}
+}
+
+// TestVerifyRefusesAnUnparseablePublicKey: the key travels with the signature,
+// so it is attacker-controlled and must fail closed rather than panic.
+func TestVerifyRefusesAnUnparseablePublicKey(t *testing.T) {
+	qs := signer(t)
+	sig, err := qs.Sign([]byte("digest"), stored(t, qs))
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	sig.PublicKey = []byte("not a key")
+	if err := qs.Verify([]byte("digest"), sig); err == nil {
+		t.Fatal("Verify accepted a signature carrying an unparseable public key")
+	}
+}
+
+// TestParallelVerifyFailsOnOneBadSignature: the batch verdict is the AND of its
+// members. A batch that passed while holding one bad signature would let a
+// forged transaction into a block on the strength of the honest ones beside it.
+func TestParallelVerifyFailsOnOneBadSignature(t *testing.T) {
+	qs := signer(t)
+	const n = 12
+	msgs := make([][]byte, n)
+	sigs := make([]*QuantumSignature, n)
+	for i := range msgs {
+		msgs[i] = []byte{byte(i), 'm', 's', 'g'}
+		sig, err := qs.Sign(msgs[i], stored(t, qs))
+		if err != nil {
+			t.Fatalf("Sign %d: %v", i, err)
+		}
+		sigs[i] = sig
+	}
+
+	if err := qs.ParallelVerify(msgs, sigs); err != nil {
+		t.Fatalf("a batch of good signatures did not verify: %v", err)
+	}
+
+	sigs[n/2].Signature[0] ^= 0xFF
+	if err := qs.ParallelVerify(msgs, sigs); err == nil {
+		t.Fatal("a batch holding one forged signature verified")
+	}
+
+	// The same holds on the batch path the VM actually calls, at a threshold
+	// low enough to take it.
+	if err := qs.ParallelVerifyWithThreshold(msgs, sigs, 4); err == nil {
+		t.Fatal("the thresholded batch path accepted one forged signature")
+	}
+}
+
+// TestParallelVerifyRefusesMismatchedInputs: a message with no signature beside
+// it is not a thing to verify, and pairing them off by index would verify the
+// wrong pair.
+func TestParallelVerifyRefusesMismatchedInputs(t *testing.T) {
+	qs := signer(t)
+	if err := qs.ParallelVerify([][]byte{{1}, {2}}, []*QuantumSignature{nil}); err == nil {
+		t.Fatal("two messages and one signature were accepted as a batch")
+	}
+	if err := qs.ParallelVerify(nil, nil); err != nil {
+		t.Fatalf("an empty batch is a no-op, got %v", err)
+	}
+}
+
+// TestSignerReportsItsWidths: the caller sizes buffers from these, so they must
+// come from the mode rather than a configured guess.
+func TestSignerReportsItsWidths(t *testing.T) {
+	for _, tc := range []struct{ version uint32 }{
+		{AlgorithmMLDSA44}, {AlgorithmMLDSA65}, {AlgorithmMLDSA87},
+		{99}, // anything unknown settles on the level-3 default
+	} {
+		qs := NewQuantumSigner(log.NewNoOpLogger(), tc.version, time.Minute)
+		key, err := qs.GenerateCoronaKey()
+		if err != nil {
+			t.Fatalf("GenerateCoronaKey: %v", err)
+		}
+		if got := len(key.PublicKey); got != qs.GetPublicKeySize() {
+			t.Fatalf("version %d: key is %d bytes, GetPublicKeySize says %d", tc.version, got, qs.GetPublicKeySize())
+		}
+		sig, err := qs.Sign([]byte("digest"), key)
+		if err != nil {
+			t.Fatalf("Sign: %v", err)
+		}
+		if got := len(sig.Signature); got > qs.GetSignatureSize() {
+			t.Fatalf("version %d: signature is %d bytes, over the %d the mode allows", tc.version, got, qs.GetSignatureSize())
+		}
+		// A second signer named the same way agrees on the mode, so it can
+		// verify what the first produced.
+		peer := NewQuantumSigner(log.NewNoOpLogger(), tc.version, time.Minute)
+		if peer.GetMode() != qs.GetMode() {
+			t.Fatalf("version %d resolved to two different modes", tc.version)
+		}
+		if err := peer.Verify([]byte("digest"), sig); err != nil {
+			t.Fatalf("version %d: a peer on the same version could not verify: %v", tc.version, err)
+		}
+	}
+}
+
+// TestGPUVerifyFailsClosedWhenThereIsNoGPU.
+//
+// The batch path asks the accelerator first and falls back to CPU on any error.
+// That fallback is only safe if a missing accelerator is an ERROR — a GPU path
+// that returned nil when it had verified nothing would report every signature
+// in the batch as good, and the CPU check that should have caught them would
+// never run.
+func TestGPUVerifyFailsClosedWhenThereIsNoGPU(t *testing.T) {
+	if accel.Available() {
+		t.Fatalf("this host has an accelerator, so the no-GPU contract cannot be observed here; " +
+			"run the GPU batch tests instead")
+	}
+
+	qs := signer(t)
+	msgs := [][]byte{[]byte("one"), []byte("two")}
+	sigs := make([]*QuantumSignature, len(msgs))
+	for i := range msgs {
+		sig, err := qs.Sign(msgs[i], stored(t, qs))
+		if err != nil {
+			t.Fatalf("Sign: %v", err)
+		}
+		sigs[i] = sig
+	}
+
+	if err := qs.gpuBatchVerify(msgs, sigs); err == nil {
+		t.Fatal("the GPU path reported success with no accelerator to verify on")
+	}
+
+	// And the caller routes around it: the same batch verifies on the CPU.
+	if err := qs.ParallelVerifyWithThreshold(msgs, sigs, 1); err != nil {
+		t.Fatalf("the CPU fallback did not run: %v", err)
+	}
+
+	// A forged one is still caught after the fallback.
+	sigs[1].Signature[0] ^= 0xFF
+	if err := qs.ParallelVerifyWithThreshold(msgs, sigs, 1); err == nil {
+		t.Fatal("the fallback accepted a forged signature")
 	}
 }

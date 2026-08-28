@@ -13,12 +13,11 @@ package quantumvm
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
 
-	"github.com/luxfi/accel"
-	accellattice "github.com/luxfi/accel/ops/lattice"
 	"github.com/luxfi/consensus/protocol/quasar"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
@@ -27,7 +26,7 @@ import (
 // BlockSigs contains both BLS and Corona signatures for a block.
 // Both are produced in parallel during signing.
 type BlockSigs struct {
-	BLS      *quasar.BLSSignature
+	BLS    *quasar.BLSSignature
 	Corona *quasar.CoronaSignature
 }
 
@@ -61,14 +60,14 @@ type Quasar struct {
 // Both BLS AND Corona must reach threshold for quantum finality.
 // Signatures are collected in parallel - either can complete first.
 type PendingBlock struct {
-	BlockID            ids.ID
-	BlockHash          []byte
-	Height             uint64
-	BLSSignatures      []*quasar.BLSSignature      // Classical threshold signatures (parallel)
+	BlockID          ids.ID
+	BlockHash        []byte
+	Height           uint64
+	BLSSignatures    []*quasar.BLSSignature    // Classical threshold signatures (parallel)
 	CoronaSignatures []*quasar.CoronaSignature // Post-quantum threshold signatures (parallel)
-	BLSFinalized       bool                        // BLS threshold reached
-	CoronaFinalized  bool                        // Corona threshold reached
-	Finalized          bool                        // BOTH complete = quantum finality
+	BLSFinalized     bool                      // BLS threshold reached
+	CoronaFinalized  bool                      // Corona threshold reached
+	Finalized        bool                      // BOTH complete = quantum finality
 }
 
 // QuasarConfig configures the Quasar PQ-BFT consensus
@@ -79,13 +78,22 @@ type QuasarConfig struct {
 	Logger      log.Logger
 }
 
-// NewQuasar creates a new Quasar PQ-BFT consensus engine
+// NewQuasar creates a new Quasar PQ-BFT consensus engine.
+//
+// The committee size is settled BEFORE the threshold is derived from it.
+// Deriving first read TotalNodes while it was still zero, so a config that left
+// it unset got (0*2/3)+1 = 1 — a one-of-three quorum on the three-node network
+// the very next line then assumed. Any single validator would have finalized
+// alone.
 func NewQuasar(cfg QuasarConfig) (*Quasar, error) {
+	if cfg.TotalNodes < 1 {
+		cfg.TotalNodes = 3 // Default 3-node network
+	}
 	if cfg.Threshold < 1 {
 		cfg.Threshold = (cfg.TotalNodes * 2 / 3) + 1 // 2/3+1 BFT threshold
 	}
-	if cfg.TotalNodes < 1 {
-		cfg.TotalNodes = 3 // Default 3-node network
+	if cfg.Logger == nil {
+		cfg.Logger = log.NewNoOpLogger()
 	}
 
 	// Initialize Quasar core with BLS + Corona
@@ -121,13 +129,13 @@ func NewQuasar(cfg QuasarConfig) (*Quasar, error) {
 // Returns both signatures; both must reach threshold for quantum finality.
 func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte, height uint64) (*BlockSigs, error) {
 	q.mu.Lock()
-	pending := q.pendingBlocks[blockID]
-	if pending == nil {
+	pending, tracked := q.pendingBlocks[blockID]
+	if !tracked {
 		pending = &PendingBlock{
-			BlockID:            blockID,
-			BlockHash:          blockHash,
-			Height:             height,
-			BLSSignatures:      make([]*quasar.BLSSignature, 0),
+			BlockID:          blockID,
+			BlockHash:        blockHash,
+			Height:           height,
+			BLSSignatures:    make([]*quasar.BLSSignature, 0),
 			CoronaSignatures: make([]*quasar.CoronaSignature, 0),
 		}
 		q.pendingBlocks[blockID] = pending
@@ -135,10 +143,6 @@ func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte
 	qcore := q.quasar
 	validatorID := q.validatorID
 	q.mu.Unlock()
-
-	if qcore == nil {
-		return nil, fmt.Errorf("quasar core not initialized")
-	}
 
 	// Run both lanes in parallel
 	var (
@@ -170,8 +174,11 @@ func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte
 	go func() {
 		defer wg.Done()
 		sessionID := int(height) // Use height as session ID
-		prfKey := blockHash[:32] // Use block hash prefix as PRF key
-		round1Data, err := qcore.CoronaRound1(validatorID, sessionID, prfKey)
+		// A digest, not a prefix. Slicing blockHash[:32] panicked on anything
+		// shorter, and the caller decides what it signs over — StampBlock takes
+		// an arbitrary message from the finality bridge.
+		digest := sha256.Sum256(blockHash)
+		round1Data, err := qcore.CoronaRound1(validatorID, sessionID, digest[:])
 		if err != nil {
 			pqErr = err
 			return
@@ -188,23 +195,36 @@ func (q *Quasar) SignBlock(ctx context.Context, blockID ids.ID, blockHash []byte
 
 	wg.Wait()
 
-	if blsErr != nil {
-		return nil, fmt.Errorf("BLS sign failed: %w", blsErr)
-	}
-	if pqErr != nil {
+	if blsErr != nil || pqErr != nil {
+		// The entry was created for a signature that never arrived. Only a
+		// block this node signed is ever finalized, and only a finalized block
+		// is ever cleaned up, so leaving it behind leaks one map entry per
+		// failure for the life of the process.
+		if !tracked {
+			q.mu.Lock()
+			delete(q.pendingBlocks, blockID)
+			q.mu.Unlock()
+		}
+		if blsErr != nil {
+			return nil, fmt.Errorf("BLS sign failed: %w", blsErr)
+		}
 		return nil, fmt.Errorf("Corona sign failed: %w", pqErr)
 	}
 
+	// The counts are read under the same lock that appends them. Reading them
+	// afterwards for the log line raced every peer signature arriving through
+	// AddBLSSignature.
 	q.mu.Lock()
 	pending.addBLS(blsSig)
 	pending.addCorona(pqSig)
+	blsCount, coronaCount := len(pending.BLSSignatures), len(pending.CoronaSignatures)
 	q.mu.Unlock()
 
 	q.log.Debug("Block signed with Quasar (BLS + Corona parallel)",
 		"blockID", blockID,
 		"height", height,
-		"blsSigCount", len(pending.BLSSignatures),
-		"coronaSigCount", len(pending.CoronaSignatures),
+		"blsSigCount", blsCount,
+		"coronaSigCount", coronaCount,
 	)
 
 	return &BlockSigs{BLS: blsSig, Corona: pqSig}, nil
@@ -301,11 +321,7 @@ func (q *Quasar) TryFinalize(ctx context.Context, blockID ids.ID) (*quasar.Aggre
 	if pending == nil {
 		return nil, false, fmt.Errorf("block %s not found", blockID)
 	}
-
 	qcore := q.quasar
-	if qcore == nil {
-		return nil, false, fmt.Errorf("quasar not initialized")
-	}
 
 	// Check BLS threshold
 	if !pending.BLSFinalized {
@@ -412,9 +428,6 @@ func (q *Quasar) GetThreshold() int {
 func (q *Quasar) GetActiveValidators() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	if q.quasar == nil {
-		return 0
-	}
 	return q.quasar.GetActiveValidatorCount()
 }
 
@@ -439,53 +452,19 @@ func (q *Quasar) AddValidator(validatorID string, weight uint64) error {
 	return nil
 }
 
-// NTTForwardCorona transforms Corona polynomial coefficients to NTT domain
-// using GPU acceleration when available. This enables O(n log n) polynomial
-// multiplication in the Ring-LWE scheme used by Corona threshold signatures.
-func (q *Quasar) NTTForwardCorona(coefficients []uint64) ([]uint64, error) {
-	params := accellattice.NTTParams{
-		N:       256,     // Ring dimension for Corona (X^256 + 1)
-		Modulus: 8380417, // Dilithium prime q
-		Root:    1753,    // Primitive 256th root of unity mod q
-	}
-	return accellattice.NTTForward(params, coefficients)
-}
-
-// NTTInverseCorona transforms NTT-domain values back to coefficient form
-// using GPU acceleration when available.
-func (q *Quasar) NTTInverseCorona(evaluations []uint64) ([]uint64, error) {
-	params := accellattice.NTTParams{
-		N:       256,
-		Modulus: 8380417,
-		Root:    1753,
-	}
-	return accellattice.NTTInverse(params, evaluations)
-}
-
-// BatchNTTForwardCorona transforms multiple polynomials in parallel on GPU.
-// Used when processing multiple Corona signature shares simultaneously.
-func (q *Quasar) BatchNTTForwardCorona(polys [][]uint64) ([][]uint64, error) {
-	params := accellattice.NTTParams{
-		N:       256,
-		Modulus: 8380417,
-		Root:    1753,
-	}
-	return accellattice.BatchNTTForward(params, polys)
-}
-
-// GPUAccelAvailable reports whether GPU acceleration is available for
-// lattice operations (NTT, batch ML-DSA verify).
-func (q *Quasar) GPUAccelAvailable() bool {
-	return accel.Available()
-}
-
-// Cleanup removes finalized blocks older than the given height
+// Cleanup drops every block tracked below minHeight.
+//
+// The height is the caller's finalized frontier, so a block beneath it will
+// never gather another signature whether it finalized or not. Keeping only the
+// finalized ones meant the entries that could not be cleaned up were exactly
+// the ones that accumulated: every proposal that lost, timed out, or failed to
+// sign stayed in both maps for the life of the process.
 func (q *Quasar) Cleanup(minHeight uint64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	for blockID, pending := range q.pendingBlocks {
-		if pending.Height < minHeight && pending.Finalized {
+		if pending.Height < minHeight {
 			delete(q.pendingBlocks, blockID)
 			delete(q.finalizedBlocks, blockID)
 		}
@@ -500,7 +479,6 @@ type QuasarBridge = Quasar
 type QuasarBridgeConfig = QuasarConfig
 
 // NewQuasarBridge creates a new Quasar bridge (alias for NewQuasar)
-// The quantumSigner parameter is reserved for future quantum signer integration
-func NewQuasarBridge(cfg QuasarBridgeConfig, _ interface{}) (*QuasarBridge, error) {
+func NewQuasarBridge(cfg QuasarBridgeConfig) (*QuasarBridge, error) {
 	return NewQuasar(cfg)
 }

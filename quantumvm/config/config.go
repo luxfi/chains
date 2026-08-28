@@ -3,48 +3,38 @@
 
 package config
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
-// Config contains all the foundational parameters of the QVM
+// Config contains all the foundational parameters of the QVM.
+//
+// Every field here governs behaviour. Q-Chain charges no user fee at all
+// (LP-0130 §6 — finality-cert inclusion is a validator obligation, not
+// purchasable blockspace), so the config declares no fee schedule: a number
+// nothing reads is a price the chain does not actually charge, and reporting
+// one over RPC tells operators otherwise.
 type Config struct {
-	// Fee that is burned by every non-asset creating transaction
-	TxFee uint64
-
-	// Fee that must be burned by every asset creating transaction
-	CreateAssetTxFee uint64
-
-	// Fee for quantum signature verification
-	QuantumVerificationFee uint64
-
 	// Maximum parallel transactions to process
 	MaxParallelTxs int
 
-	// Quantum signature algorithm version
+	// Quantum signature algorithm version: 1=ML-DSA-44, 2=ML-DSA-65,
+	// 3=ML-DSA-87. The parameter set fixes every key and signature width.
+	// Zero means unset and settles on ML-DSA-65; anything else is refused.
 	QuantumAlgorithmVersion uint32
-
-	// Corona key size in bytes
-	CoronaKeySize int
 
 	// Enable quantum stamp validation
 	QuantumStampEnabled bool
 
-	// Quantum stamp validity window (in seconds)
+	// How long a quantum stamp stays valid after it is made
 	QuantumStampWindow time.Duration
-
-	// Time of the Quantum network upgrade
-	QuantumTime time.Time
 
 	// Parallel processing batch size
 	ParallelBatchSize int
 
-	// Maximum quantum signature cache size
-	QuantumSigCacheSize int
-
 	// Enable Corona key support
 	CoronaEnabled bool
-
-	// Minimum confirmations for quantum stamps
-	MinQuantumConfirmations uint32
 
 	// Minimum batch size before GPU acceleration kicks in
 	GPUBatchThreshold int
@@ -53,44 +43,48 @@ type Config struct {
 // DefaultConfig returns a Config with default values
 func DefaultConfig() Config {
 	return Config{
-		TxFee:                   1000,
-		CreateAssetTxFee:        10000,
-		QuantumVerificationFee:  500,
 		MaxParallelTxs:          100,
 		QuantumAlgorithmVersion: 1,
-		CoronaKeySize:         1024,
 		QuantumStampEnabled:     true,
 		QuantumStampWindow:      30 * time.Second,
-		QuantumTime:             time.Unix(1704067200, 0), // Jan 1, 2025
 		ParallelBatchSize:       10,
-		QuantumSigCacheSize:     10000,
-		CoronaEnabled:         true,
-		MinQuantumConfirmations: 1,
+		CoronaEnabled:           true,
 		GPUBatchThreshold:       8,
 	}
 }
 
-// IsQuantumActivated returns true if the quantum features are activated
-func (c *Config) IsQuantumActivated(timestamp time.Time) bool {
-	return !timestamp.Before(c.QuantumTime)
-}
+// AlgorithmDefault is the parameter set an unset config settles on: ML-DSA-65,
+// NIST level 3.
+const AlgorithmDefault uint32 = 2
 
-// Validate ensures the configuration is valid
+// Validate replaces any non-positive sizing with its default and refuses an
+// algorithm that does not exist.
+//
+// Each sizing divides or bounds a loop, so zero is not a weaker setting — it is
+// a VM that batches nothing, caches nothing and builds empty blocks. The
+// algorithm is different: an unrecognised number used to fall through to
+// ML-DSA-65 inside the signer, so an operator who asked for something else got
+// a chain signing under a parameter set nobody chose, and never heard about it.
 func (c *Config) Validate() error {
+	switch c.QuantumAlgorithmVersion {
+	case 0:
+		c.QuantumAlgorithmVersion = AlgorithmDefault
+	case 1, 2, 3:
+	default:
+		return fmt.Errorf("config: quantum algorithm %d does not exist (1=ML-DSA-44, 2=ML-DSA-65, 3=ML-DSA-87)",
+			c.QuantumAlgorithmVersion)
+	}
 	if c.MaxParallelTxs <= 0 {
 		c.MaxParallelTxs = 100
 	}
 	if c.ParallelBatchSize <= 0 {
 		c.ParallelBatchSize = 10
 	}
-	if c.QuantumSigCacheSize <= 0 {
-		c.QuantumSigCacheSize = 10000
-	}
-	if c.CoronaKeySize < 512 {
-		c.CoronaKeySize = 1024
-	}
 	if c.GPUBatchThreshold <= 0 {
 		c.GPUBatchThreshold = 8
+	}
+	if c.QuantumStampWindow <= 0 {
+		c.QuantumStampWindow = 30 * time.Second
 	}
 	return nil
 }

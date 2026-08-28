@@ -21,8 +21,6 @@ import (
 	"github.com/luxfi/database/versiondb"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/metric"
-	"github.com/luxfi/node/cache"
 	"github.com/luxfi/node/utils/json"
 	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/timer/mockable"
@@ -31,23 +29,14 @@ import (
 	"github.com/luxfi/vm/chain"
 )
 
-const (
-	// Version of the QVM
-	Version = "1.0.0"
-
-	// MaxParallelVerifications is the maximum number of parallel verifications
-	MaxParallelVerifications = 100
-
-	// DefaultBatchSize is the default batch size for parallel processing
-	DefaultBatchSize = 10
-)
+// Version of the QVM
+const Version = "1.0.0"
 
 var (
-	errNotImplemented           = errors.New("not implemented")
-	errNoPendingTxs             = errors.New("no pending transactions")
-	errVMShutdown               = errors.New("VM is shutting down")
-	errInvalidQuantumStamp      = errors.New("invalid quantum stamp")
-	errParallelProcessingFailed = errors.New("parallel transaction processing failed")
+	errNoPendingTxs             = errors.New("quantumvm: no pending transactions")
+	errVMShutdown               = errors.New("quantumvm: VM is shutting down")
+	errParallelProcessingFailed = errors.New("quantumvm: no pending transaction survived verification")
+	errNoBlockAtHeight          = errors.New("quantumvm: no block at height")
 
 	// Compile-time check that *VM satisfies chain.ChainVM (= block.ChainVM)
 	// AND the consensus engine's BlockBuilder. Together these prove Q-Chain
@@ -59,74 +48,59 @@ var (
 	_ consensuschain.BlockBuilder = (*VM)(nil)
 )
 
-// BCLookup provides blockchain alias lookup
-type BCLookup interface {
-	Lookup(string) (ids.ID, error)
-	PrimaryAlias(ids.ID) (string, error)
-}
+// Store keys. Every key is a distinct length, so no two can collide: a block
+// id is 32 bytes, a height index entry is 9, "lastAccepted" is 12 and
+// "height" is 6.
+var (
+	lastAcceptedKey = []byte("lastAccepted")
+	tipHeightKey    = []byte("height")
+)
 
-// SharedMemory provides cross-chain shared memory
-type SharedMemory interface {
-	Get(peerChainID ids.ID, keys [][]byte) ([][]byte, error)
-	Apply(map[ids.ID]interface{}, ...interface{}) error
+// heightKey indexes the accepted block at a height, so a peer asking for
+// height n gets an answer without walking the chain.
+func heightKey(h uint64) []byte {
+	k := make([]byte, 9)
+	k[0] = 'h'
+	binary.BigEndian.PutUint64(k[1:], h)
+	return k
 }
 
 // VM implements the Q-chain Virtual Machine with quantum features
 type VM struct {
 	config.Config
 
-	// Core components
-	// consensusRuntime    *runtime.Runtime
 	log          log.Logger
 	db           database.Database
-	versiondb    *versiondb.Database
 	blockchainID ids.ID
-	ChainAlias   string
 	NetworkID    uint32
+
+	// state is the version layer over db. Writes buffer here and reach db
+	// only at Commit, which is what makes a block's writes one unit.
+	state *versiondb.Database
 
 	// Quantum components
 	quantumSigner *quantum.QuantumSigner
-	quantumCache  *cache.LRU[ids.ID, *quantum.QuantumSignature]
 
 	// Hybrid P/Q consensus bridge (connects P-Chain BLS + Q-Chain Corona)
 	// Uses Quasar consensus for dual BLS+Corona threshold signatures
 	quasarBridge *QuasarBridge
 
-	// Consensus and validation
-	// validators      validators.Manager
-	// versionManager  consensusversion.Manager
-	// consensusEngine consensus.Consensus
-
-	// Metrics and monitoring
-	metrics metric.Registry
-
-	// State management
-	state          database.Database
 	shuttingDown   bool
 	shuttingDownMu sync.RWMutex
 
 	// Transaction processing
-	txPool          *TransactionPool
-	parallelWorkers int
-	workerPool      *sync.Pool
+	txPool     *TransactionPool
+	workerPool *sync.Pool
 
-	// Clock and timing
 	clock mockable.Clock
 
-	// Network communication
-	bcLookup     BCLookup
-	sharedMemory SharedMemory
-
-	// HTTP service
-	httpServer *http.Server
-	rpcServer  *rpc.Server
+	rpcServer *rpc.Server
 
 	// Fee policy gating user-submitted tx admission (IssueTx).
-	// FlatPolicy at MinTxFeeFloor on Q-Chain; consensus-internal
-	// callers bypass via txPool.AddTransaction.
+	// NoUserTxPolicy on Q-Chain; consensus-internal callers bypass it
+	// via txPool.AddTransaction.
 	feePolicy fee.Policy
 
-	// Synchronization
 	lock sync.RWMutex
 }
 
@@ -136,56 +110,41 @@ func (vm *VM) Initialize(ctx context.Context, init luxvm.Init) error {
 	defer vm.lock.Unlock()
 
 	_ = ctx
+	// One place normalises the config, so nothing downstream has to ask again
+	// whether a batch size or a cache size is usable.
+	if err := vm.Config.Validate(); err != nil {
+		return fmt.Errorf("quantumvm: config: %w", err)
+	}
 	vm.db = init.DB
 	if init.Log != nil {
 		vm.log = init.Log
 	}
-	genesisBytes := init.Genesis
-	// vm.blockchainID = chainRuntime.ChainID
-	// vm.NetworkID = chainRuntime.NetworkID
+	if vm.log == nil {
+		vm.log = log.NewNoOpLogger()
+	}
 
-	// Initialize logger
-	// if vm.log.IsZero() {
-	//	vm.log = chainRuntime.Log
-	// }
-	// vm.log.Info("initializing QVM",
-	//	"version", Version,
-	//	"chainID", vm.blockchainID,
-	//	"networkID", vm.NetworkID,
-	// )
+	// The node's own identity, which is what a validator signature is
+	// attributed to. Without it every node on the chain signs under the same
+	// name — see the ValidatorID note below.
+	nodeID := ids.EmptyNodeID
+	if init.Runtime != nil {
+		vm.NetworkID = init.Runtime.NetworkID
+		vm.blockchainID = init.Runtime.ChainID
+		nodeID = init.Runtime.NodeID
+	}
 
-	// Initialize quantum components
 	vm.quantumSigner = quantum.NewQuantumSigner(
 		vm.log,
 		vm.Config.QuantumAlgorithmVersion,
-		vm.Config.CoronaKeySize,
 		vm.Config.QuantumStampWindow,
-		vm.Config.QuantumSigCacheSize,
 	)
 
-	// Initialize transaction pool
-	vm.txPool = NewTransactionPool(
-		vm.Config.MaxParallelTxs,
-		vm.Config.ParallelBatchSize,
-		vm.log,
-	)
+	vm.txPool = NewTransactionPool(vm.Config.MaxParallelTxs, vm.log)
 
-	// Pin fee policy. Q-Chain accepts user-submitted txs through
-	// IssueTx so attach the canonical FlatPolicy at MinTxFeeFloor;
-	// fee.Validate refuses zero-fee user-facing chains at boot.
-	if init.Runtime != nil {
-		vm.NetworkID = init.Runtime.NetworkID
-	}
-	vm.feePolicy = newFeePolicy(vm.NetworkID)
-	if err := fee.Validate(vm.feePolicy); err != nil {
-		return fmt.Errorf("quantumvm: fee policy: %w", err)
-	}
+	// Q-Chain sells no blockspace, so the policy is the committee-only
+	// sentinel — a constant, which is why nothing here re-validates it.
+	vm.feePolicy = fee.NoUserTxPolicy{}
 
-	// Set up worker pool for parallel processing
-	vm.parallelWorkers = vm.Config.MaxParallelTxs
-	if vm.parallelWorkers <= 0 {
-		vm.parallelWorkers = MaxParallelVerifications
-	}
 	vm.workerPool = &sync.Pool{
 		New: func() interface{} {
 			return &TransactionWorker{
@@ -195,21 +154,11 @@ func (vm *VM) Initialize(ctx context.Context, init luxvm.Init) error {
 		},
 	}
 
-	// Initialize version database
-	vm.versiondb = versiondb.New(vm.db)
+	vm.state = versiondb.New(vm.db)
 
-	// Metrics are not yet available via chainRuntime; the quantumvm
-	// operates without per-chain metrics until runtime exposes them.
-
-	// Parse genesis if provided
-	if len(genesisBytes) > 0 {
-		if err := vm.parseGenesis(genesisBytes); err != nil {
-			return fmt.Errorf("failed to parse genesis: %w", err)
-		}
+	if len(init.Genesis) > 0 {
+		vm.log.Info("genesis loaded", "size", len(init.Genesis))
 	}
-
-	// Initialize state
-	vm.state = vm.versiondb
 
 	// A chain with no block cannot answer the frontier query bootstrap starts
 	// with, so write height 0 before anything asks.
@@ -217,72 +166,105 @@ func (vm *VM) Initialize(ctx context.Context, init luxvm.Init) error {
 		return fmt.Errorf("failed to seed genesis: %w", err)
 	}
 
-	// Set up HTTP handlers
 	if err := vm.initializeHTTPHandlers(); err != nil {
 		return fmt.Errorf("failed to initialize HTTP handlers: %w", err)
 	}
 
-	// Initialize Quasar hybrid consensus bridge (BLS + Corona)
-	quasarCfg := QuasarBridgeConfig{
-		ValidatorID: vm.blockchainID.String(),
-		Threshold:   0, // Will be set to 2/3+1 based on total nodes
+	// ValidatorID is the NODE's id, not the chain's. Both signature legs count
+	// DISTINCT ValidatorIDs against the threshold, so naming the chain here
+	// gave every node on Q-Chain the same signer identity: each peer's
+	// signature arrived as a duplicate of the first, the count never passed
+	// one, and quantum finality was unreachable on any threshold above 1.
+	quasarBridge, err := NewQuasarBridge(QuasarBridgeConfig{
+		ValidatorID: nodeID.String(),
 		TotalNodes:  3, // Default 3-node network, can be updated
 		Logger:      vm.log,
-	}
-	quasarBridge, err := NewQuasarBridge(quasarCfg, vm.quantumSigner)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize Quasar bridge: %w", err)
 	}
 	vm.quasarBridge = quasarBridge
 
-	vm.log.Info("═══════════════════════════════════════════════════════════════════")
-	vm.log.Info("║ QVM INITIALIZED with Quasar PQ-BFT Consensus                    ║")
-	vm.log.Info("───────────────────────────────────────────────────────────────────")
-	vm.log.Info("║ Quantum Signatures: ML-DSA (NIST PQC)", log.Bool("enabled", vm.Config.QuantumStampEnabled))
-	vm.log.Info("║ Corona Threshold: Ring-LWE PQ", log.Bool("enabled", vm.Config.CoronaEnabled))
-	vm.log.Info("║ BLS Threshold: Classical fast path", log.Bool("enabled", true))
-	vm.log.Info("║ Quasar Hybrid: BLS + Corona dual signing", log.Bool("enabled", true))
-	vm.log.Info("║ Parallel TX Processing:", log.Int("maxParallel", vm.Config.MaxParallelTxs))
-	vm.log.Info("═══════════════════════════════════════════════════════════════════")
+	vm.log.Info("QVM initialized",
+		"quantumStamps", vm.Config.QuantumStampEnabled,
+		"corona", vm.Config.CoronaEnabled,
+		"threshold", quasarBridge.GetThreshold(),
+		"maxParallel", vm.Config.MaxParallelTxs,
+	)
 
 	return nil
 }
 
 // BuildBlock builds a new block with pending transactions. Implements chain.ChainVM.
 func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
+	block, err := vm.buildBlock()
+	if err != nil {
+		return nil, err
+	}
+	// Signing reaches the consensus core and waits on it, so it happens with
+	// no VM lock held — a Verify arriving meanwhile must not queue behind it.
+	vm.signBlockWithQuasar(block)
+	return block, nil
+}
+
+func (vm *VM) buildBlock() (*Block, error) {
 	vm.lock.Lock()
 	defer vm.lock.Unlock()
 
-	// Check if VM is shutting down
 	if vm.isShuttingDown() {
 		return nil, errVMShutdown
 	}
 
-	// Get pending transactions from pool
+	// Whatever this call leaves behind in the pool has to wake a builder
+	// again. The latch holds one signal: two transactions arriving together
+	// wake one build, and work the batch limit left over would otherwise sit
+	// there until some unrelated transaction happened to arrive.
+	defer vm.txPool.signalIfWork()
+
 	pendingTxs := vm.txPool.GetPendingTransactions(vm.Config.ParallelBatchSize)
 	if len(pendingTxs) == 0 {
 		return nil, errNoPendingTxs
 	}
 
-	// Process transactions in parallel
-	validTxs, err := vm.processTransactionsParallel(pendingTxs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to process transactions: %w", err)
+	validTxs, rejected := vm.processTransactionsParallel(pendingTxs)
+
+	// A transaction that cannot verify now will not verify later — a quantum
+	// stamp only gets staler. Left in place it holds a pool slot for good, and
+	// enough of them fill the pool and stop the chain accepting anything.
+	for _, tx := range rejected {
+		// It came out of this pool a moment ago under this same lock, so the
+		// removal is the reverse of a step that just happened.
+		_ = vm.txPool.RemoveTransaction(tx.ID())
+	}
+	if len(validTxs) == 0 {
+		return nil, errParallelProcessingFailed
 	}
 
-	// Create new block with valid transactions. The id is the content hash of
-	// the canonical wire (computeID = sha256(Bytes())); it is derived AFTER the
-	// structural fields are set, and the wire does not carry the id, so
-	// Bytes()/id are independent of ordering.
+	parentID := vm.getLastAcceptedID()
+	parent, err := vm.blockAt(parentID)
+	if err != nil {
+		return nil, fmt.Errorf("quantumvm: read tip %s: %w", parentID, err)
+	}
+
+	// Never stamp behind the parent. Verify rejects a block that moves chain
+	// time backwards, so a node whose clock trails its own tip would otherwise
+	// build blocks that it — and every peer — refuses.
+	timestamp := vm.clock.Time()
+	if timestamp.Before(parent.timestamp) {
+		timestamp = parent.timestamp
+	}
+
+	// The id is the content hash of the canonical wire (computeID =
+	// sha256(Bytes())); it is derived AFTER the structural fields are set, and
+	// the wire does not carry the id, so Bytes()/id are independent of ordering.
 	block := &Block{
-		timestamp:    vm.clock.Time(),
-		height:       vm.getHeight() + 1,
-		parentID:     vm.getLastAcceptedID(),
+		timestamp:    timestamp,
+		height:       parent.height + 1,
+		parentID:     parentID,
 		transactions: validTxs,
 		vm:           vm,
 	}
 	block.id = block.computeID()
-	vm.signBlockWithQuasar(block)
 
 	vm.log.Debug("built block",
 		"blockID", block.ID(),
@@ -295,65 +277,63 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 
 // ParseBlock parses a block from bytes. Implements chain.ChainVM.
 func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (chain.Block, error) {
-	vm.lock.RLock()
-	defer vm.lock.RUnlock()
-
-	block, err := vm.parseBlock(blockBytes)
+	block, err := parseBlockBytes(vm, blockBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse block: %w", err)
 	}
-
 	return block, nil
 }
 
 // GetBlock retrieves a block by its ID. Implements chain.ChainVM.
 func (vm *VM) GetBlock(ctx context.Context, blockID ids.ID) (chain.Block, error) {
+	return vm.block(blockID)
+}
+
+// block is GetBlock at the concrete type, so callers inside the VM read a
+// *Block without an assertion that cannot fail.
+func (vm *VM) block(blockID ids.ID) (*Block, error) {
 	vm.lock.RLock()
 	defer vm.lock.RUnlock()
+	return vm.blockAt(blockID)
+}
 
+// blockAt reads a stored block. It takes no lock, so callers already holding
+// one can use it — which is the whole point: the exported GetBlock takes the
+// read lock, and a caller that took it too would deadlock against any writer
+// that arrived in between.
+func (vm *VM) blockAt(blockID ids.ID) (*Block, error) {
 	blockBytes, err := vm.state.Get(blockID[:])
 	if err != nil {
 		return nil, fmt.Errorf("failed to get block %s: %w", blockID, err)
 	}
-
-	return vm.parseBlock(blockBytes)
+	return parseBlockBytes(vm, blockBytes)
 }
 
 // SetState sets the VM state. Implements chain.ChainVM.
 func (vm *VM) SetState(ctx context.Context, state uint32) error {
-	vm.lock.Lock()
-	defer vm.lock.Unlock()
-
-	// Q-Chain uses quantum state management - log state transitions generically
 	vm.log.Info("QVM state transition", "state", state)
-
 	return nil
 }
 
 // Shutdown gracefully shuts down the VM
 func (vm *VM) Shutdown(ctx context.Context) error {
 	vm.shuttingDownMu.Lock()
+	alreadyDown := vm.shuttingDown
 	vm.shuttingDown = true
 	vm.shuttingDownMu.Unlock()
-
-	vm.log.Info("shutting down QVM")
-
-	// Stop HTTP server
-	if vm.httpServer != nil {
-		if err := vm.httpServer.Shutdown(ctx); err != nil {
-			vm.log.Error("failed to shutdown HTTP server", "error", err)
-		}
+	if alreadyDown {
+		return nil
 	}
 
-	// Close transaction pool
+	vm.lock.Lock()
+	defer vm.lock.Unlock()
+
 	if vm.txPool != nil {
 		vm.txPool.Close()
 	}
-
-	// Close database
-	if vm.versiondb != nil {
-		if err := vm.versiondb.Close(); err != nil {
-			vm.log.Error("failed to close versiondb", "error", err)
+	if vm.state != nil {
+		if err := vm.state.Close(); err != nil {
+			vm.log.Error("failed to close state", "error", err)
 		}
 	}
 
@@ -361,60 +341,39 @@ func (vm *VM) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// processTransactionsParallel processes transactions in parallel batches
-func (vm *VM) processTransactionsParallel(txs []Transaction) ([]Transaction, error) {
-	if len(txs) == 0 {
-		return nil, nil
-	}
-
-	// Determine batch size
+// processTransactionsParallel verifies and executes the batch, reporting both
+// what survived and what did not. The caller needs both: the survivors go in
+// the block, and the rest have to leave the pool.
+func (vm *VM) processTransactionsParallel(txs []Transaction) (valid, rejected []Transaction) {
 	batchSize := vm.Config.ParallelBatchSize
-	if batchSize <= 0 {
-		batchSize = DefaultBatchSize
-	}
 
-	var validTxs []Transaction
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	// Process in batches
 	for i := 0; i < len(txs); i += batchSize {
 		end := i + batchSize
 		if end > len(txs) {
 			end = len(txs)
 		}
 
-		batch := txs[i:end]
 		wg.Add(1)
-
 		go func(batch []Transaction) {
 			defer wg.Done()
 
-			// Get worker from pool
 			worker := vm.workerPool.Get().(*TransactionWorker)
 			defer vm.workerPool.Put(worker)
 
-			// Process batch
-			validBatch, err := worker.ProcessBatch(batch)
-			if err != nil {
-				vm.log.Error("batch processing failed", "error", err)
-				return
-			}
+			okBatch, badBatch := worker.ProcessBatch(batch)
 
-			// Add valid transactions
 			mu.Lock()
-			validTxs = append(validTxs, validBatch...)
+			valid = append(valid, okBatch...)
+			rejected = append(rejected, badBatch...)
 			mu.Unlock()
-		}(batch)
+		}(txs[i:end])
 	}
 
 	wg.Wait()
-
-	if len(validTxs) == 0 {
-		return nil, errParallelProcessingFailed
-	}
-
-	return validTxs, nil
+	return valid, rejected
 }
 
 // Quasar signs the block for the CONSENSUS layer, which is where a block-level
@@ -428,21 +387,45 @@ func (vm *VM) processTransactionsParallel(txs []Transaction) ([]Transaction, err
 // it exists only on the object the builder made and is gone the moment the block
 // is serialized, which is every time it leaves this process.
 func (vm *VM) signBlockWithQuasar(block *Block) {
-	if vm.quasarBridge == nil {
+	bridge := vm.GetQuasarBridge()
+	if bridge == nil {
 		return
 	}
-	if _, err := vm.quasarBridge.SignBlock(context.Background(), block.ID(), block.Bytes(), block.Height()); err != nil {
+	if _, err := bridge.SignBlock(context.Background(), block.ID(), block.Bytes(), block.Height()); err != nil {
 		vm.log.Warn("quasar block signing failed", "blockID", block.ID(), "error", err)
 		return
 	}
 	vm.log.Debug("block signed with quasar BLS threshold", "blockID", block.ID(), "height", block.Height())
 }
 
-// parseGenesis parses genesis data
-func (vm *VM) parseGenesis(genesisBytes []byte) error {
-	// Genesis parsing for quantumvm is a no-op; initial state is derived
-	// from the quantum signer configuration and the empty state trie.
-	vm.log.Info("genesis loaded", "size", len(genesisBytes))
+// commitBlock stores the block, indexes it by height and moves the tip — as one
+// versiondb commit. A failure anywhere aborts the whole set, so the pointers can
+// never name a block the store does not hold. Caller holds vm.lock.
+//
+// The commit is what makes the write durable. Buffered in the version layer and
+// never committed, an accepted block is gone at the next start and the node
+// rewinds to genesis, having told its peers it held a tip it cannot serve.
+func (vm *VM) commitBlock(b *Block) error {
+	heightBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(heightBytes, b.height)
+
+	for _, w := range []struct {
+		key, value []byte
+	}{
+		{b.id[:], b.Bytes()},
+		{heightKey(b.height), b.id[:]},
+		{lastAcceptedKey, b.id[:]},
+		{tipHeightKey, heightBytes},
+	} {
+		if err := vm.state.Put(w.key, w.value); err != nil {
+			vm.state.Abort()
+			return fmt.Errorf("quantumvm: stage block %s: %w", b.id, err)
+		}
+	}
+	if err := vm.state.Commit(); err != nil {
+		vm.state.Abort()
+		return fmt.Errorf("quantumvm: commit block %s: %w", b.id, err)
+	}
 	return nil
 }
 
@@ -474,43 +457,24 @@ func (vm *VM) seedGenesis() error {
 	}
 	block.id = block.computeID()
 
-	if err := vm.state.Put(block.id[:], block.Bytes()); err != nil {
-		return fmt.Errorf("store genesis block: %w", err)
-	}
-	if err := vm.state.Put([]byte("lastAccepted"), block.id[:]); err != nil {
-		return fmt.Errorf("set genesis last-accepted: %w", err)
-	}
-	heightBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(heightBytes, block.height)
-	if err := vm.state.Put([]byte("height"), heightBytes); err != nil {
-		return fmt.Errorf("set genesis height: %w", err)
-	}
-	// Commit, or the tip exists only in memory and the next start is back to
-	// naming no block.
-	if err := vm.versiondb.Commit(); err != nil {
-		return fmt.Errorf("commit genesis: %w", err)
+	if err := vm.commitBlock(block); err != nil {
+		return err
 	}
 
 	vm.log.Info("genesis block written", "blockID", block.id, "height", block.height)
 	return nil
 }
 
-// parseBlock parses a block from its ZAP wire (see wire.go). The transaction set
-// is not reconstructed — the concrete Transaction is an interface with no
-// on-chain deserializer; the raw wire is retained for signature re-verification.
-func (vm *VM) parseBlock(blockBytes []byte) (*Block, error) {
-	return parseBlockBytes(vm, blockBytes)
-}
+// rpcPath is where the VM's JSON-RPC service is mounted.
+const rpcPath = "/rpc"
 
 // initializeHTTPHandlers sets up HTTP handlers
 func (vm *VM) initializeHTTPHandlers() error {
 	vm.rpcServer = rpc.NewServer()
 
-	// Register QVM service
-	service := &Service{vm: vm}
 	vm.rpcServer.RegisterCodec(json.NewCodec(), "application/json")
 	vm.rpcServer.RegisterCodec(json.NewCodec(), "application/json;charset=UTF-8")
-	return vm.rpcServer.RegisterService(service, "quantumvm")
+	return vm.rpcServer.RegisterService(&Service{vm: vm}, "quantumvm")
 }
 
 // isShuttingDown returns true if VM is shutting down
@@ -522,11 +486,8 @@ func (vm *VM) isShuttingDown() bool {
 
 // getHeight returns current blockchain height
 func (vm *VM) getHeight() uint64 {
-	heightBytes, err := vm.state.Get([]byte("height"))
-	if err != nil {
-		return 0
-	}
-	if len(heightBytes) != 8 {
+	heightBytes, err := vm.state.Get(tipHeightKey)
+	if err != nil || len(heightBytes) != 8 {
 		return 0
 	}
 	return binary.BigEndian.Uint64(heightBytes)
@@ -534,11 +495,8 @@ func (vm *VM) getHeight() uint64 {
 
 // getLastAcceptedID returns the last accepted block ID
 func (vm *VM) getLastAcceptedID() ids.ID {
-	lastAcceptedBytes, err := vm.state.Get([]byte("lastAccepted"))
-	if err != nil {
-		return ids.Empty
-	}
-	if len(lastAcceptedBytes) != 32 {
+	lastAcceptedBytes, err := vm.state.Get(lastAcceptedKey)
+	if err != nil || len(lastAcceptedBytes) != 32 {
 		return ids.Empty
 	}
 	var id ids.ID
@@ -563,11 +521,14 @@ func (vm *VM) Disconnected(ctx context.Context, nodeID ids.NodeID) error {
 	return nil
 }
 
-// HealthCheck returns the health status of the VM
+// HealthCheck returns the health status of the VM. Implements chain.ChainVM,
+// whose signature carries an error the VM has no way to produce.
 func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
-	vm.lock.RLock()
-	defer vm.lock.RUnlock()
+	return vm.health(), nil
+}
 
+// health is the one place the VM says how it is doing.
+func (vm *VM) health() chain.HealthResult {
 	return chain.HealthResult{
 		Healthy: !vm.isShuttingDown(),
 		Details: map[string]string{
@@ -576,15 +537,12 @@ func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
 			"coronaEnabled":  fmt.Sprintf("%v", vm.Config.CoronaEnabled),
 			"pendingTxs":     fmt.Sprintf("%d", vm.txPool.PendingCount()),
 		},
-	}, nil
+	}
 }
 
 // CreateHandlers returns HTTP handlers for the VM
 func (vm *VM) CreateHandlers(ctx context.Context) (map[string]http.Handler, error) {
-	handlers := map[string]http.Handler{
-		"/rpc": vm.rpcServer,
-	}
-	return handlers, nil
+	return map[string]http.Handler{rpcPath: vm.rpcServer}, nil
 }
 
 // CreateStaticHandlers returns static HTTP handlers
@@ -594,17 +552,8 @@ func (vm *VM) CreateStaticHandlers(ctx context.Context) (map[string]http.Handler
 
 // NewHTTPHandler returns the VM's HTTP handler. Implements chain.ChainVM.
 func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
-	handlers, err := vm.CreateHandlers(ctx)
-	if err != nil {
-		return nil, err
-	}
 	mux := http.NewServeMux()
-	for path, h := range handlers {
-		if path == "" {
-			path = "/"
-		}
-		mux.Handle(path, h)
-	}
+	mux.Handle(rpcPath, vm.rpcServer)
 	return mux, nil
 }
 
@@ -622,16 +571,26 @@ func (vm *VM) LastAccepted(ctx context.Context) (ids.ID, error) {
 	return vm.getLastAcceptedID(), nil
 }
 
-// GetBlockIDAtHeight returns the block ID at the given height. Implements chain.ChainVM.
-// Q-Chain does not yet maintain a height index, so this returns errNotImplemented
-// until indexer integration lands.
+// GetBlockIDAtHeight answers what block this node accepted at a height, from
+// the index Accept writes in the same commit as the block itself. A peer
+// catching up asks by height; the index is what lets the answer be one read
+// rather than a walk back from the tip.
 func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
-	return ids.Empty, errNotImplemented
+	vm.lock.RLock()
+	defer vm.lock.RUnlock()
+
+	raw, err := vm.state.Get(heightKey(height))
+	if err != nil {
+		return ids.Empty, fmt.Errorf("%w %d: %w", errNoBlockAtHeight, height, err)
+	}
+	if len(raw) != 32 {
+		return ids.Empty, fmt.Errorf("%w %d: index holds %d bytes", errNoBlockAtHeight, height, len(raw))
+	}
+	var id ids.ID
+	copy(id[:], raw)
+	return id, nil
 }
 
-// WaitForEvent blocks until an event triggers block building. Implements chain.ChainVM.
-// CRITICAL: must block on ctx.Done() to avoid the notification flood loop in
-// node/chains/manager.go (matches the relayvm contract).
 // WaitForEvent blocks until there is a transaction to build a block from, or
 // the VM stops. Waiting only on the context would mean BuildBlock is never
 // called and the chain never leaves genesis, however many transactions the pool
@@ -648,65 +607,28 @@ func (vm *VM) GetQuasarBridge() *QuasarBridge {
 	return vm.quasarBridge
 }
 
-// GetHybridBridge returns the hybrid finality bridge for P/Q chain consensus
-// This connects P-Chain BLS signatures with Q-Chain Corona for quantum finality
-// Deprecated: Use GetQuasarBridge() for proper type safety
-func (vm *VM) GetHybridBridge() interface{} {
-	return vm.GetQuasarBridge()
-}
-
-// SetHybridBridge sets the hybrid finality bridge (called by chain manager)
-// Deprecated: Bridge is now auto-initialized in VM.Initialize()
-func (vm *VM) SetHybridBridge(bridge interface{}) {
-	vm.lock.Lock()
-	defer vm.lock.Unlock()
-	if qb, ok := bridge.(*QuasarBridge); ok {
-		vm.quasarBridge = qb
-	}
-}
-
-// StampBlock implements QChainStamper interface for hybrid finality
-// Uses Quasar BLS+Corona for dual post-quantum threshold signatures
-func (vm *VM) StampBlock(blockID interface{}, pChainHeight uint64, message []byte) (interface{}, error) {
-	vm.lock.RLock()
-	defer vm.lock.RUnlock()
-
+// StampBlock implements QChainStamper for hybrid finality: a Quasar BLS+Corona
+// threshold signature when the bridge is up, an ML-DSA signature otherwise.
+func (vm *VM) StampBlock(blockID ids.ID, pChainHeight uint64, message []byte) (interface{}, error) {
 	ctx := context.Background()
 
-	// Convert blockID to ids.ID if possible
-	var blkID ids.ID
-	switch v := blockID.(type) {
-	case ids.ID:
-		blkID = v
-	case string:
-		parsed, err := ids.FromString(v)
+	if bridge := vm.GetQuasarBridge(); bridge != nil && blockID != ids.Empty {
+		hybridSig, err := bridge.SignBlock(ctx, blockID, message, pChainHeight)
 		if err == nil {
-			blkID = parsed
-		}
-	}
-
-	// Use Quasar bridge for BLS threshold signature if available
-	if vm.quasarBridge != nil && blkID != ids.Empty {
-		hybridSig, err := vm.quasarBridge.SignBlock(ctx, blkID, message, pChainHeight)
-		if err != nil {
-			vm.log.Warn("Quasar BLS stamp failed, using ML-DSA fallback", "error", err)
-		} else {
 			vm.log.Info("Quasar BLS stamp created",
-				"blockID", blkID,
+				"blockID", blockID,
 				"pChainHeight", pChainHeight,
-				"threshold", vm.quasarBridge.GetThreshold(),
+				"threshold", bridge.GetThreshold(),
 			)
-			// Return hybrid signature for BLS finality
 			return hybridSig, nil
 		}
+		vm.log.Warn("Quasar BLS stamp failed, using ML-DSA fallback", "error", err)
 	}
 
-	// Fallback: Generate quantum stamp using ML-DSA signer
 	key, err := vm.quantumSigner.GenerateCoronaKey()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate key for stamp: %w", err)
 	}
-
 	sig, err := vm.quantumSigner.Sign(message, key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create quantum stamp: %w", err)
@@ -716,44 +638,36 @@ func (vm *VM) StampBlock(blockID interface{}, pChainHeight uint64, message []byt
 		"pChainHeight", pChainHeight,
 		"sigLen", len(sig.Signature),
 	)
-
 	return sig, nil
 }
 
-// VerifyStamp implements QChainStamper interface for quasar finality
+// VerifyStamp implements QChainStamper for quasar finality
 // Supports both Quasar QuasarSignature and ML-DSA QuantumSignature
 func (vm *VM) VerifyStamp(stamp interface{}) error {
 	switch s := stamp.(type) {
 	case *quasar.QuasarSignature:
-		// Quasar BLS + Corona threshold signature
 		if s.BLS == nil || len(s.BLS.Signature) == 0 {
-			return errors.New("invalid Quasar BLS signature")
+			return errors.New("quantumvm: invalid Quasar BLS signature")
 		}
-		vm.log.Debug("Verified Quasar stamp",
-			"validatorID", s.BLS.ValidatorID,
-			"threshold", s.BLS.IsThreshold,
-		)
 		return nil
 
 	case *quasar.AggregatedSignature:
-		// Aggregated threshold signature
-		if len(s.BLSAggregated) == 0 || s.SignerCount < vm.quasarBridge.GetThreshold() {
-			return errors.New("insufficient aggregated signature")
+		bridge := vm.GetQuasarBridge()
+		if bridge == nil {
+			return errors.New("quantumvm: no Quasar bridge to check the threshold against")
 		}
-		vm.log.Debug("Verified aggregated Quasar stamp",
-			"signerCount", s.SignerCount,
-			"threshold", s.IsThreshold,
-		)
+		if len(s.BLSAggregated) == 0 || s.SignerCount < bridge.GetThreshold() {
+			return errors.New("quantumvm: insufficient aggregated signature")
+		}
 		return nil
 
 	case *quantum.QuantumSignature:
-		// ML-DSA quantum signature
 		if len(s.Signature) == 0 || len(s.QuantumStamp) == 0 {
-			return errors.New("invalid quantum stamp structure")
+			return errors.New("quantumvm: invalid quantum stamp structure")
 		}
 		return nil
 
 	default:
-		return errors.New("unsupported stamp type")
+		return errors.New("quantumvm: unsupported stamp type")
 	}
 }

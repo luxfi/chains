@@ -4,10 +4,10 @@
 package quantumvm
 
 import (
+	"github.com/luxfi/chains/quantumvm/config"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/vms"
-	"github.com/luxfi/chains/quantumvm/config"
 )
 
 var _ vms.Factory = (*Factory)(nil)
@@ -20,18 +20,9 @@ type Factory struct {
 	config.Config
 }
 
-// New creates a new QVM instance
+// New creates a new QVM instance. The config is normalised and checked once,
+// in Initialize, so a VM built here and a VM built by hand start from the same
+// rules.
 func (f *Factory) New(logger log.Logger) (interface{}, error) {
-	// Validate configuration
-	if err := f.Config.Validate(); err != nil {
-		return nil, err
-	}
-
-	// Create and return new QVM instance
-	vm := &VM{
-		Config: f.Config,
-		log:    logger,
-	}
-
-	return vm, nil
+	return &VM{Config: f.Config, log: logger}, nil
 }
