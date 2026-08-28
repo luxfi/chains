@@ -41,7 +41,7 @@ package aivm
 
 import (
 	"context"
-	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,14 +49,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/holiman/uint256"
 	"github.com/luxfi/accel"
 	"github.com/luxfi/database"
 	"github.com/luxfi/database/versiondb"
-	"github.com/luxfi/geth/common"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/runtime"
+	"github.com/luxfi/timer/mockable"
 	vmcore "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
 
@@ -219,26 +218,40 @@ type VM struct {
 	// Core AI VM from luxfi/ai package
 	core *aivm.VM
 
+	// view is what an ACCEPTING block writes through: a versiondb over db,
+	// committed exactly once per block together with the block itself, its
+	// height entry and the tip pointer. It is empty at every other moment, which
+	// is what stops one block's writes riding out on another block's commit.
+	view *versiondb.Database
+
 	// A-Chain-native quorum settlement engine (the AI task quorum-settlement
 	// state machine: provider registry, stake/slash, selection, commit-reveal,
-	// settlement, receipts, and the cross-chain seam). State lives in qstate
-	// (DB-backed, committed under consensus); custody in qledger. quorum is the
-	// stateless handle bound to the deployment's chain ids.
+	// settlement, receipts, and the cross-chain seam). qstate is COMMITTED
+	// engine state; custody is in qledger. quorum is the stateless handle bound
+	// to the deployment's chain ids.
 	quorum         *Engine
 	qstate         QuorumState
-	qdb            *versiondb.Database // engine-state staging layer over vm.db; committed at Block.Accept
 	qledger        QuorumLedger
-	qledgerSnap    map[common.Address]*uint256.Int // last committed ledger balances (for abort rollback)
-	ccv            CCommitVerifier                 // proves a C intent is committed before it can create a task
-	pendingIntents []CIntent                       // committed intents buffered for consensus-gated import
+	ccv            CCommitVerifier // proves a C intent is committed before it can create a task
+	pendingIntents []CIntent       // committed intents buffered for consensus-gated import
 
 	// Attestation verifier (local nvtrust - no cloud dependency)
 	verifier *attestation.Verifier
 
-	// Block management
-	lastAcceptedID ids.ID
-	lastAccepted   *Block
-	pendingBlocks  map[ids.ID]*Block
+	// The chain: the accepted tip and the blocks verified above it. The tip is
+	// the ONE in-memory answer to "where is this chain" — it is read back from
+	// the same commit that wrote it, so a restart resumes rather than replaying
+	// from genesis.
+	lastAccepted *Block
+	flight       map[ids.ID]*Block
+
+	// chainID names this chain. Block ids are derived under it and it never
+	// travels on the wire, so a block cannot be carried between chains.
+	chainID ids.ID
+
+	// clock is chain time as this node sees it. Mockable so a test can state
+	// what "now" is rather than racing it.
+	clock mockable.Clock
 
 	// Consensus
 	toEngine chan<- vmcore.Message
@@ -260,46 +273,36 @@ type VM struct {
 	running bool
 }
 
-// Block represents an AIVM block
-type Block struct {
-	ID_        ids.ID    `json:"id"`
-	ParentID_  ids.ID    `json:"parentID"`
-	Height_    uint64    `json:"height"`
-	Timestamp_ time.Time `json:"timestamp"`
+// Keys. Blocks, the height index and the tip pointer are the chain's own;
+// engine slots live under av/state/ and cannot collide with these.
+var (
+	tipKey       = []byte("av/tip")
+	blockPrefix  = []byte("av/block/")
+	heightPrefix = []byte("av/height/")
+	vertexPrefix = []byte("av/vertex/")
+)
 
-	// AI-specific data
-	Tasks        []aivm.Task       `json:"tasks,omitempty"`
-	Results      []aivm.TaskResult `json:"results,omitempty"`
-	MerkleRoot   [32]byte          `json:"merkleRoot"`
-	ProviderRegs []ProviderReg     `json:"providerRegs,omitempty"`
-
-	// ImportedIntents are the committed C-Chain intents that this block turned
-	// into A-Chain quorum tasks (under consensus, via the verified inbound seam).
-	// Recorded so Block.Verify can deterministically re-run the same imports and
-	// every validator reaches identical engine state.
-	ImportedIntents []CIntent `json:"importedIntents,omitempty"`
-
-	// ReceiptRoot is the engine's committed receipt_root as of this block — the
-	// single commitment the A->C boundary exports.
-	ReceiptRoot common.Hash `json:"receiptRoot"`
-
-	bytes []byte
-	vm    *VM
+func blockKey(id ids.ID) []byte {
+	return append(append([]byte(nil), blockPrefix...), id[:]...)
 }
 
-// ProviderReg represents a provider registration in a block
-type ProviderReg struct {
-	ProviderID     string                        `json:"providerId"`
-	WalletAddress  string                        `json:"walletAddress"`
-	Endpoint       string                        `json:"endpoint"`
-	CPUAttestation *attestation.AttestationQuote `json:"cpuAttestation,omitempty"`
-	GPUAttestation *attestation.GPUAttestation   `json:"gpuAttestation,omitempty"`
+func heightKey(h uint64) []byte {
+	var u [8]byte
+	binary.BigEndian.PutUint64(u[:], h)
+	return append(append([]byte(nil), heightPrefix...), u[:]...)
+}
+
+func vertexKey(id ids.ID) []byte {
+	return append(append([]byte(nil), vertexPrefix...), id[:]...)
 }
 
 // Initialize initializes the VM with the unified Init struct
 // errRuntimeRequired is returned by Initialize when the consensus runtime is
 // absent. Every later method assumes it.
-var errRuntimeRequired = errors.New("aivm: Initialize requires a runtime")
+var (
+	errRuntimeRequired = errors.New("aivm: Initialize requires a runtime")
+	errChainIDRequired = errors.New("aivm: Initialize requires a chain id")
+)
 
 func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	vm.rt = init.Runtime
@@ -312,6 +315,13 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 		return errRuntimeRequired
 	}
 	vm.networkID = vm.rt.NetworkID
+	// Block ids are derived under the chain id. Without one every A-Chain
+	// deployment names its blocks identically and a block built on one is
+	// resolvable on the next.
+	vm.chainID = vm.rt.ChainID
+	if vm.chainID == ids.Empty {
+		return errChainIDRequired
+	}
 
 	if logger, ok := vm.rt.Log.(log.Logger); ok {
 		vm.log = logger
@@ -319,7 +329,7 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 		return errors.New("invalid logger type")
 	}
 
-	vm.pendingBlocks = make(map[ids.ID]*Block)
+	vm.flight = make(map[ids.ID]*Block)
 
 	// Parse configuration
 	if len(init.Config) > 0 {
@@ -346,7 +356,7 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	// inbound C-intent seam defaults to a FAIL-CLOSED verifier — until a real
 	// CCommitVerifier is installed (SetCommitVerifier), NO intent is treated as
 	// committed and no task can be created from the boundary.
-	vm.initQuorum(nil)
+	vm.initQuorum()
 	if vm.ccv == nil {
 		vm.ccv = VerifierFunc(func(CIntent) error { return ErrIntentNotCommitted })
 	}
@@ -367,17 +377,22 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 		return fmt.Errorf("failed to start core AI VM: %w", err)
 	}
 
-	// Create genesis block
+	// Where this chain is. A fresh chain starts at genesis; one that has run
+	// before resumes at the tip its last Accept committed.
 	genesisBlock := &Block{
-		ID_:        ids.Empty,
 		ParentID_:  ids.Empty,
 		Height_:    0,
 		Timestamp_: time.Unix(genesis.Timestamp, 0),
 		vm:         vm,
 	}
-	genesisBlock.ID_ = genesisBlock.computeID()
-	vm.lastAcceptedID = genesisBlock.ID_
-	vm.lastAccepted = genesisBlock
+	if err := genesisBlock.name(); err != nil {
+		return fmt.Errorf("aivm: encode genesis: %w", err)
+	}
+	tip, err := vm.openTip(genesisBlock)
+	if err != nil {
+		return err
+	}
+	vm.lastAccepted = tip
 
 	vm.running = true
 	if !vm.log.IsZero() {
@@ -395,6 +410,19 @@ type Genesis struct {
 	Version   int    `json:"version"`
 	Message   string `json:"message"`
 	Timestamp int64  `json:"timestamp"`
+}
+
+// live reports whether the VM is running.
+//
+// It is a METHOD because `running` is written under vm.mu by Shutdown, and a
+// read of it that does not take the lock is a data race — one the race detector
+// reports on the first concurrent request. Eight read paths took that shortcut,
+// so the fix is one reader that all of them use. The paths that already hold the
+// lock read the field directly; taking it twice would deadlock.
+func (vm *VM) live() bool {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+	return vm.running
 }
 
 // Shutdown shuts down the VM
@@ -495,7 +523,7 @@ func (vm *VM) RegisterProvider(provider *aivm.Provider) error {
 
 // VerifyGPUAttestation verifies GPU attestation (local nvtrust - no cloud)
 func (vm *VM) VerifyGPUAttestation(att *attestation.GPUAttestation) (*attestation.DeviceStatus, error) {
-	if !vm.running {
+	if !vm.live() {
 		return nil, ErrNotInitialized
 	}
 	return vm.verifier.VerifyGPUAttestation(att)
@@ -531,7 +559,7 @@ func (vm *VM) SubmitTask(task *aivm.Task) error {
 
 // GetTask returns a task by ID
 func (vm *VM) GetTask(taskID string) (*aivm.Task, error) {
-	if !vm.running {
+	if !vm.live() {
 		return nil, ErrNotInitialized
 	}
 	return vm.core.GetTask(taskID)
@@ -555,7 +583,7 @@ func (vm *VM) SubmitResult(result *aivm.TaskResult) error {
 
 // GetProviders returns all registered providers
 func (vm *VM) GetProviders() []*aivm.Provider {
-	if !vm.running {
+	if !vm.live() {
 		return nil
 	}
 	return vm.core.GetProviders()
@@ -563,7 +591,7 @@ func (vm *VM) GetProviders() []*aivm.Provider {
 
 // GetModels returns available AI models
 func (vm *VM) GetModels() []*aivm.ModelInfo {
-	if !vm.running {
+	if !vm.live() {
 		return nil
 	}
 	return vm.core.GetModels()
@@ -571,7 +599,7 @@ func (vm *VM) GetModels() []*aivm.ModelInfo {
 
 // GetStats returns VM statistics
 func (vm *VM) GetStats() map[string]interface{} {
-	if !vm.running {
+	if !vm.live() {
 		return nil
 	}
 	return vm.core.GetStats()
@@ -579,7 +607,7 @@ func (vm *VM) GetStats() map[string]interface{} {
 
 // GetMerkleRoot returns merkle root for Q-Chain anchoring
 func (vm *VM) GetMerkleRoot() [32]byte {
-	if !vm.running {
+	if !vm.live() {
 		return [32]byte{}
 	}
 	return vm.core.GetMerkleRoot()
@@ -587,7 +615,7 @@ func (vm *VM) GetMerkleRoot() [32]byte {
 
 // ClaimRewards claims pending rewards for a provider
 func (vm *VM) ClaimRewards(providerID string) (string, error) {
-	if !vm.running {
+	if !vm.live() {
 		return "", ErrNotInitialized
 	}
 	return vm.core.ClaimRewards(providerID)
@@ -595,7 +623,7 @@ func (vm *VM) ClaimRewards(providerID string) (string, error) {
 
 // GetRewardStats returns reward statistics for a provider
 func (vm *VM) GetRewardStats(providerID string) (map[string]interface{}, error) {
-	if !vm.running {
+	if !vm.live() {
 		return nil, ErrNotInitialized
 	}
 	return vm.core.GetRewardStats(providerID)
@@ -611,7 +639,16 @@ func (vm *VM) SetState(ctx context.Context, state uint32) error {
 	return nil
 }
 
-// BuildBlock implements chain.ChainVM interface
+// BuildBlock proposes the next block. It DECIDES what the block carries and
+// changes nothing: the candidate intents are applied to an overlay over
+// committed state and a clone of the ledger, both discarded here, and what
+// survives is the list of intents that imported cleanly plus the receipt root
+// they reach. Every validator, including this one at Accept, re-derives that
+// root from the same inputs.
+//
+// The buffered intents are NOT drained. A proposal that loses the round has
+// consumed nothing, so the next proposer can still carry the same work; draining
+// at build time destroyed it.
 func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
@@ -619,89 +656,85 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 	if !vm.running {
 		return nil, ErrNotInitialized
 	}
-
 	parent := vm.lastAccepted
 	if parent == nil {
-		return nil, errors.New("no parent block")
+		return nil, errors.New("aivm: no parent block")
+	}
+
+	// Chain time never runs backwards, so a proposer whose clock has not moved
+	// past its parent stamps the parent's time rather than building a block its
+	// own Verify would refuse.
+	stamp := vm.clock.Time()
+	if !stamp.After(parent.Timestamp_) {
+		stamp = parent.Timestamp_
 	}
 
 	height := parent.Height_ + 1
+	scratch := newOverlay(vm.qstate)
+	carried, root := vm.pick(scratch, newStateLedger(scratch), height)
 
-	// Snapshot the ledger so that if this proposed block is never accepted, the
-	// engine-state delta (staged in vm.qdb) is aborted AND the ledger is rolled
-	// back — no value or state moves outside consensus.
-	vm.snapshotLedger()
-
-	// Drain buffered committed C-Chain intents into A-Chain quorum tasks UNDER
-	// CONSENSUS (this is the block-build path). importPending is the only caller
-	// of the engine's verified inbound seam; a live request can never reach it.
-	// Writes land in the staging versiondb, not the durable DB.
-	imported := vm.importPending(height)
-
-	// Give a verdict to every task whose reveal window has closed. This is what
-	// pays operators: without it a task sits revealed and unsettled forever, and
-	// the work the network did for it is never credited to anyone.
-	vm.settleDue(height)
-
-	// Create new block, recording the imported intents and the resulting
-	// receipt_root so Verify can re-derive identical engine state on every node.
 	blk := &Block{
 		ParentID_:       parent.ID_,
 		Height_:         height,
-		Timestamp_:      time.Now(),
-		ImportedIntents: imported,
+		Timestamp_:      stamp,
+		ImportedIntents: carried,
+		ReceiptRoot:     root,
 		vm:              vm,
 	}
-	if vm.quorum != nil && vm.qstate != nil {
-		blk.ReceiptRoot = vm.quorum.ReceiptRoot(vm.qstate)
-	}
-	blk.ID_ = blk.computeID()
-
-	vm.pendingBlocks[blk.ID_] = blk
-	return blk, nil
-}
-
-// ParseBlock implements chain.ChainVM interface
-func (vm *VM) ParseBlock(ctx context.Context, bytes []byte) (chain.Block, error) {
-	blk := &Block{vm: vm}
-	if err := parseBlock(bytes, blk); err != nil {
+	if err := blk.name(); err != nil {
 		return nil, err
 	}
-	blk.ID_ = blk.computeID()
-	blk.bytes = bytes
+	// A block this node builds is held to the size a block off the wire is held
+	// to, so a proposer cannot produce one its own peers refuse to parse.
+	if n := len(blk.bytes); n > MaxBlockSize {
+		return nil, fmt.Errorf("%w: %d bytes exceeds %d", ErrInvalidBlock, n, MaxBlockSize)
+	}
+	vm.track(blk)
 	return blk, nil
 }
 
-// GetBlock implements chain.ChainVM interface
+// ParseBlock decodes a block off the wire. The size bound is checked BEFORE the
+// decode, so the work a peer can make this node do is bounded by a number rather
+// than by the peer.
+func (vm *VM) ParseBlock(ctx context.Context, wire []byte) (chain.Block, error) {
+	if n := len(wire); n > MaxBlockSize {
+		return nil, fmt.Errorf("%w: %d bytes exceeds %d", ErrInvalidBlock, n, MaxBlockSize)
+	}
+	return vm.parseBlock(wire)
+}
+
+// parseBlock decodes wire into a Block belonging to this chain, and names it.
+// The name is derived from the block's own canonical encoding rather than from
+// the bytes handed over, so a buffer carrying padding the decoder ignores can
+// never be stored under the id of the canonical one.
+func (vm *VM) parseBlock(wire []byte) (*Block, error) {
+	blk := &Block{vm: vm}
+	if err := parseBlock(wire, blk); err != nil {
+		return nil, err
+	}
+	if err := blk.name(); err != nil {
+		return nil, err
+	}
+	return blk, nil
+}
+
+// GetBlock returns a block by id: one in flight, the tip, or one read back from
+// committed state.
 func (vm *VM) GetBlock(ctx context.Context, id ids.ID) (chain.Block, error) {
 	vm.mu.RLock()
 	defer vm.mu.RUnlock()
 
-	// Check pending blocks (nil-safe for early calls before initialization)
-	if vm.pendingBlocks != nil {
-		if blk, exists := vm.pendingBlocks[id]; exists {
-			return blk, nil
-		}
+	if blk, ok := vm.flight[id]; ok {
+		return blk, nil
 	}
-
-	// Check if it's the last accepted
 	if vm.lastAccepted != nil && vm.lastAccepted.ID_ == id {
 		return vm.lastAccepted, nil
 	}
-
-	// Try to get from database
-	bytes, err := vm.db.Get(id[:])
+	wire, err := vm.db.Get(blockKey(id))
 	if err != nil {
 		return nil, err
 	}
-
-	blk := &Block{vm: vm}
-	if err := parseBlock(bytes, blk); err != nil {
-		return nil, err
-	}
-	blk.ID_ = id
-	blk.bytes = bytes
-	return blk, nil
+	return vm.parseBlock(wire)
 }
 
 // SetPreference implements chain.ChainVM interface
@@ -714,13 +747,65 @@ func (vm *VM) SetPreference(ctx context.Context, id ids.ID) error {
 func (vm *VM) LastAccepted(ctx context.Context) (ids.ID, error) {
 	vm.mu.RLock()
 	defer vm.mu.RUnlock()
-	return vm.lastAcceptedID, nil
+	if vm.lastAccepted == nil {
+		return ids.Empty, ErrNotInitialized
+	}
+	return vm.lastAccepted.ID_, nil
 }
 
-// GetBlockIDAtHeight implements chain.ChainVM interface
+// GetBlockIDAtHeight answers from the height index Accept writes in the same
+// commit as the block itself, so the index cannot name a block the chain did not
+// accept.
 func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
-	// For now, return error - would need height index for full implementation
-	return ids.Empty, errors.New("height index not implemented")
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+	raw, err := vm.db.Get(heightKey(height))
+	if err != nil {
+		return ids.Empty, fmt.Errorf("aivm: height %d: %w", height, err)
+	}
+	return ids.ToID(raw)
+}
+
+// openTip reads back where this chain got to.
+//
+// Only an ABSENT tip means a fresh chain. Reading any other failure that way — a
+// closed database, an unreadable volume, a short read — starts a live chain over
+// at genesis and lets it build height 1 on top of state it cannot see, durably.
+// A chain that cannot read its own tip does not know where it is, and the honest
+// answer is to refuse to open.
+func (vm *VM) openTip(genesis *Block) (*Block, error) {
+	raw, err := vm.db.Get(tipKey)
+	switch {
+	case errors.Is(err, database.ErrNotFound):
+		return genesis, nil
+	case err != nil:
+		return nil, fmt.Errorf("aivm: read tip: %w", err)
+	}
+	// ToID refuses anything that is not an id, which is the whole of what can be
+	// wrong with these bytes — checking the length first and then converting made
+	// the conversion's own error a branch nothing could take.
+	id, err := ids.ToID(raw)
+	if err != nil {
+		return nil, fmt.Errorf("aivm: tip: %w", err)
+	}
+	if id == genesis.ID_ {
+		return genesis, nil
+	}
+	wire, err := vm.db.Get(blockKey(id))
+	if err != nil {
+		return nil, fmt.Errorf("aivm: tip %s: %w", id, err)
+	}
+	blk, err := vm.parseBlock(wire)
+	if err != nil {
+		return nil, err
+	}
+	// The tip was named under this chain id when it was written. A different id
+	// here means the database belongs to another chain, which is not a chain to
+	// resume — it is one to refuse.
+	if blk.ID_ != id {
+		return nil, fmt.Errorf("aivm: stored tip names %s, its bytes name %s", id, blk.ID_)
+	}
+	return blk, nil
 }
 
 // NewHTTPHandler implements chain.ChainVM interface
@@ -755,125 +840,7 @@ func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
 // HealthCheck implements chain.ChainVM interface
 func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
 	return chain.HealthResult{
-		Healthy: vm.running,
+		Healthy: vm.live(),
 		Details: map[string]string{"status": "operational"},
 	}, nil
-}
-
-// =============================================================================
-// Block Methods (implements chain.Block interface)
-// =============================================================================
-
-// computeID computes the block ID from its canonical ZAP wire (ID_ excluded).
-func (blk *Block) computeID() ids.ID {
-	bytes, _ := blk.Marshal()
-	hash := sha256.Sum256(bytes)
-	return ids.ID(hash)
-}
-
-// ID returns the block ID
-func (blk *Block) ID() ids.ID {
-	return blk.ID_
-}
-
-// Parent returns the parent block ID
-func (blk *Block) Parent() ids.ID {
-	return blk.ParentID_
-}
-
-// ParentID returns the parent block ID
-func (blk *Block) ParentID() ids.ID {
-	return blk.ParentID_
-}
-
-// Height returns the block height
-func (blk *Block) Height() uint64 {
-	return blk.Height_
-}
-
-// Timestamp returns the block timestamp
-func (blk *Block) Timestamp() time.Time {
-	return blk.Timestamp_
-}
-
-// Status returns the block status
-func (blk *Block) Status() uint8 {
-	return 0 // Processing
-}
-
-// Verify verifies the block. For A-Chain quorum, this deterministically re-runs
-// the committed C-Chain intents the proposer recorded (under consensus) and
-// checks they reproduce the proposer's receipt_root — so every validator reaches
-// identical engine state from the same committed inputs. A block that records an
-// intent which fails id binding / committedness / replay, or whose imports do
-// not reproduce the recorded receipt_root, is rejected.
-func (blk *Block) Verify(ctx context.Context) error {
-	if blk.vm == nil {
-		return nil
-	}
-	blk.vm.mu.Lock()
-	defer blk.vm.mu.Unlock()
-	if len(blk.ImportedIntents) == 0 && blk.ReceiptRoot == (common.Hash{}) {
-		return nil
-	}
-	// Snapshot the ledger before applying the recorded imports into the staging
-	// layer, so a block that verifies but is later rejected (lost the round) rolls
-	// back both engine state and ledger value via abortEngine.
-	blk.vm.snapshotLedger()
-	return blk.vm.verifyImported(blk.Height_, blk.ImportedIntents, blk.ReceiptRoot)
-}
-
-// Accept accepts the block. This is the SOLE commit point for engine state: the
-// staged engine-state delta (importPending/Settle writes accumulated in vm.qdb)
-// is flushed to the durable DB here, and the ledger snapshot is cleared. A block
-// that is built/verified but never accepted moves NO durable engine state and NO
-// value (see Block.Reject -> abortEngine).
-func (blk *Block) Accept(ctx context.Context) error {
-	blk.vm.mu.Lock()
-	defer blk.vm.mu.Unlock()
-
-	// Commit the staged engine state FIRST. If this fails the block is not made
-	// last-accepted, so consensus surfaces the fault rather than diverging.
-	if err := blk.vm.commitEngine(); err != nil {
-		return err
-	}
-
-	// Store the block bytes (commitEngine already flushed engine slots; the block
-	// key is disjoint from the av/state/ keyspace).
-	bytes, err := blk.Marshal()
-	if err != nil {
-		return err
-	}
-	if err := blk.vm.db.Put(blk.ID_[:], bytes); err != nil {
-		return err
-	}
-
-	// Update last accepted
-	blk.vm.lastAcceptedID = blk.ID_
-	blk.vm.lastAccepted = blk
-
-	// Remove from pending
-	delete(blk.vm.pendingBlocks, blk.ID_)
-
-	return nil
-}
-
-// Reject rejects the block and rolls back any engine-state delta + ledger value
-// it staged during BuildBlock/Verify, so a block that loses the round leaves zero
-// durable side effects (no funds pulled, no intent consumed, no task orphaned).
-func (blk *Block) Reject(ctx context.Context) error {
-	blk.vm.mu.Lock()
-	defer blk.vm.mu.Unlock()
-
-	blk.vm.abortEngine()
-	delete(blk.vm.pendingBlocks, blk.ID_)
-	return nil
-}
-
-// Bytes returns the serialized block
-func (blk *Block) Bytes() []byte {
-	if blk.bytes == nil {
-		blk.bytes, _ = blk.Marshal()
-	}
-	return blk.bytes
 }

@@ -4,17 +4,30 @@
 package aivm
 
 // quorum_vm.go is the VM-side glue that mounts the A-Chain quorum settlement
-// engine onto the ChainVM: a DB-backed QuorumState committed under consensus, a
-// native-token QuorumLedger, and the CONSENSUS-GATED inbound path for C-Chain
-// intents. It keeps all engine wiring in one orthogonal place so vm.go stays a
-// thin ChainVM shell.
+// engine onto the ChainVM: engine state, native-token custody, and the
+// CONSENSUS-GATED inbound path for C-Chain intents. It keeps all engine wiring
+// in one orthogonal place so vm.go stays a thin ChainVM shell.
 //
 // The load-bearing safety invariant lives here: committed C intents are buffered
-// (EnqueueCommittedIntent) but only TURN INTO TASKS inside BuildBlock /
-// Block.Verify (importPending), i.e. under A-Chain consensus. There is no code
-// path from a live/RPC request to createTask — the only caller of
-// ImportCommittedIntent is importPending, and the only callers of importPending
-// are the block build and verify paths.
+// (EnqueueCommittedIntent) but only TURN INTO TASKS inside a block. There is no
+// code path from a live/RPC request to createTask — the only caller of
+// ImportCommittedIntent is pick/replay, and the only callers of those are the
+// block build, verify and accept paths.
+//
+// TWO WRITE PLANES, never braided:
+//
+//   - COMMITTED state (vm.db, read/written through vm.qstate) is what the chain
+//     has agreed. Every read outside a block sees exactly this.
+//
+//   - The VIEW (vm.view, a versiondb over vm.db) is what an ACCEPTING block
+//     writes through. It is empty except between the first write of Block.Accept
+//     and that block's single Commit, so a block's writes can never ride out on
+//     another block's commit — the fault that let Accept(A) publish B's staged
+//     intent and Reject(B) discard A's.
+//
+// Building and verifying write to NEITHER. They run the same transition against
+// an overlay that buffers writes in memory and is then thrown away, so a block
+// that is proposed, or checked and lost, moves no state and no value at all.
 
 import (
 	"github.com/holiman/uint256"
@@ -25,9 +38,8 @@ import (
 
 // dbState adapts a luxfi/database.Database (or any KeyValueReaderWriter) to the
 // engine's QuorumState. Engine slots are 32-byte keccak keys; values are 32-byte
-// words. State written here is part of the VM's DB and commits under consensus
-// when the enclosing block is Accepted. A read miss returns the zero hash, which
-// the engine treats as "unset" — identical semantics to the in-memory MemState.
+// words. A read miss returns the zero hash, which the engine treats as "unset" —
+// identical semantics to the in-memory MemState.
 type dbState struct {
 	db database.KeyValueReaderWriter
 }
@@ -36,8 +48,8 @@ type dbState struct {
 func NewDBState(db database.KeyValueReaderWriter) QuorumState { return &dbState{db: db} }
 
 func (s *dbState) stateKey(slot common.Hash) []byte {
-	// Prefix engine slots so they never collide with block/height keys in the
-	// shared DB.
+	// Prefix engine slots so they never collide with block/height/tip keys in
+	// the shared DB.
 	return append([]byte("av/state/"), slot.Bytes()...)
 }
 
@@ -56,6 +68,34 @@ func (s *dbState) SetState(slot, value common.Hash) {
 	_ = s.db.Put(s.stateKey(slot), value.Bytes())
 }
 
+// overlay is a QuorumState that buffers writes over another one. It is how a
+// transition can be RUN without being APPLIED: the proposer needs the state a
+// block would reach in order to stamp its receipt root, and a validator needs it
+// in order to check that stamp, and neither of them is allowed to change
+// anything. Both use one of these and drop it.
+//
+// It is deliberately at the QuorumState layer rather than the database layer.
+// The engine's whole storage contract is "32-byte slot in, 32-byte word out", so
+// buffering it takes a map and two methods, with no commit path to get wrong and
+// no second versiondb whose Abort someone could forget to call.
+type overlay struct {
+	base  QuorumState
+	dirty map[common.Hash]common.Hash
+}
+
+func newOverlay(base QuorumState) *overlay {
+	return &overlay{base: base, dirty: make(map[common.Hash]common.Hash)}
+}
+
+func (o *overlay) GetState(slot common.Hash) common.Hash {
+	if v, ok := o.dirty[slot]; ok {
+		return v
+	}
+	return o.base.GetState(slot)
+}
+
+func (o *overlay) SetState(slot, value common.Hash) { o.dirty[slot] = value }
+
 // SetCommitVerifier installs the C-Chain committedness proof checker. Until this
 // is set the VM uses a fail-closed verifier that admits nothing, so no boundary
 // intent can create a task. The verifier is the single trust the inbound seam
@@ -67,175 +107,149 @@ func (vm *VM) SetCommitVerifier(ccv CCommitVerifier) {
 }
 
 // QuorumEngine exposes the engine handle (and its state/ledger) for the RPC
-// service and tests. The returned QuorumState commits under consensus.
+// service and tests. The QuorumState returned is COMMITTED state: it shows what
+// the chain has accepted and nothing a block in flight has proposed.
 func (vm *VM) QuorumEngine() (*Engine, QuorumState, QuorumLedger) {
 	return vm.quorum, vm.qstate, vm.qledger
 }
 
-// FundLedger seeds opening native balances onto the VM's committed-state ledger.
-// This is the genesis/deposit seam: the host L1 credits A-Chain accounts (a
-// requester that will fund an inference escrow, an operator that will bond) at
-// chain birth or via a verified cross-chain deposit, BEFORE any task or
-// registration can pull from them. It mutates the same MemLedger that
-// importPending/Settle move value within and that commitEngine/abortEngine
-// gate on Accept/Reject, so funded balances participate in the conservation
-// invariant exactly like deposited value. Guarded by vm.mu. Fail-closed: a
-// credit overflow aborts with no partial seeding.
+// FundLedger seeds opening native balances. This is the genesis/deposit seam:
+// the host L1 credits A-Chain accounts (a requester that will fund an inference
+// escrow, an operator that will bond) at chain birth or via a verified
+// cross-chain deposit, BEFORE any task or registration can pull from them.
+//
+// It goes through Seed, so the credits are durable at once rather than riding
+// out on whichever block commits first. Fail-closed: a credit overflow aborts
+// with no partial seeding.
 func (vm *VM) FundLedger(opening map[common.Address]*uint256.Int) error {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-	l, ok := vm.qledger.(*MemLedger)
-	if !ok {
-		return ErrLedgerNotFundable
-	}
-	for a, v := range opening {
-		if err := l.Credit(a, v); err != nil {
-			return err
+	return vm.Seed(func(_ QuorumState, lg QuorumLedger) error {
+		for a, v := range opening {
+			if err := lg.Credit(a, v); err != nil {
+				return err
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // EnqueueCommittedIntent buffers a C-Chain intent that the boundary transport
 // has delivered with a committedness proof. It does NOT create a task — that
-// happens only under consensus in BuildBlock/Verify via importPending. Safe to
-// call from the transport goroutine; guarded by the VM lock.
+// happens only under consensus, inside a block. Safe to call from the transport
+// goroutine; guarded by the VM lock.
 func (vm *VM) EnqueueCommittedIntent(intent CIntent) {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 	vm.pendingIntents = append(vm.pendingIntents, intent)
 }
 
-// verifyImported re-runs, under consensus (Block.Verify), the exact set of
-// committed intents a proposer recorded in a block — so a follower reaches
-// byte-identical engine state. Each intent must still pass the id binding +
-// committedness proof + anti-replay (idempotent: an already-imported intent is
-// rejected by the seen marker, which is the correct outcome if the proposer
-// already applied it in this same verify pass; followers apply each exactly
-// once). Returns an error if the recorded set does not reproduce the recorded
-// receipt_root. Caller holds vm.mu.
-func (vm *VM) verifyImported(height uint64, recorded []CIntent, wantRoot common.Hash) error {
-	if vm.quorum == nil || vm.qstate == nil || vm.qledger == nil {
-		return nil
+// drop forgets the intents a block carried, once that block is durable. Until
+// then they stay buffered: a proposal that loses the round has consumed nothing,
+// and the next proposer must still be able to carry the same work.
+//
+// Caller holds vm.mu.
+func (vm *VM) drop(carried []CIntent) {
+	if len(carried) == 0 {
+		return
 	}
-	for _, intent := range recorded {
-		// A follower that has not yet applied this intent applies it now; one that
-		// has (seen marker set) gets ErrIntentAlreadyUsed, which is benign here.
-		_, err := vm.quorum.ImportCommittedIntent(vm.qstate, vm.qledger, vm.ccv, intent, height)
-		if err != nil && err != ErrIntentAlreadyUsed {
-			return err
+	gone := make(map[common.Hash]struct{}, len(carried))
+	for _, in := range carried {
+		gone[in.IntentID] = struct{}{}
+	}
+	kept := vm.pendingIntents[:0]
+	for _, in := range vm.pendingIntents {
+		if _, ok := gone[in.IntentID]; !ok {
+			kept = append(kept, in)
 		}
 	}
-	// Same pass the proposer ran, at the same height. Settlement is a function
-	// of the state and the height, so it needs nothing recorded in the block:
-	// the receipt-root comparison below is what checks it.
-	vm.settleDue(height)
-	// The recorded root must equal the one these imports actually produce, with no
-	// exemption for the zero hash. Skipping the comparison when the block claims
-	// zero made the determinism check opt-out: a proposer wrote a zero receipt_root
-	// and followers applied its intents without ever checking that their engine
-	// state agreed. An honest proposer stamps the engine's own root (vm.go:622), and
-	// a block with no folded receipts carries zero on both sides, so an equality
-	// check admits every honest case and only rejects a genuine divergence.
-	if got := vm.quorum.ReceiptRoot(vm.qstate); got != wantRoot {
-		return ErrReceiptRootMismatch
+	vm.pendingIntents = kept
+}
+
+// replay applies the intents a block RECORDED, at that block's height, and
+// returns the receipt root they reach. It is what a validator runs to check a
+// proposer's arithmetic and what Accept runs to make it durable — the same code
+// over different storage, so the two can never disagree about what a block does.
+//
+// Every recorded intent must still import. An intent this node has already
+// consumed reports ErrIntentAlreadyUsed and is benign — the anti-replay marker
+// is exactly the right verdict, and the receipt-root comparison below is what
+// decides whether the resulting state agrees.
+//
+// Caller holds vm.mu.
+func (vm *VM) replay(st QuorumState, lg QuorumLedger, recorded []CIntent, height uint64) (common.Hash, error) {
+	for _, intent := range recorded {
+		_, err := vm.quorum.ImportCommittedIntent(st, lg, vm.ccv, intent, height)
+		if err != nil && err != ErrIntentAlreadyUsed {
+			return common.Hash{}, err
+		}
+	}
+	return vm.settle(st, lg, height), nil
+}
+
+// pick chooses, from the buffered committed intents, the ones that import
+// cleanly at this height, applying each as it goes so the next one sees the
+// state the previous left. This is the PROPOSER's decision about what a block
+// carries; a rejected intent (forged id, failed proof, replay, ineligible pool)
+// is simply left out and no state changed for it.
+//
+// Caller holds vm.mu.
+func (vm *VM) pick(st QuorumState, lg QuorumLedger, height uint64) ([]CIntent, common.Hash) {
+	carried := make([]CIntent, 0, len(vm.pendingIntents))
+	for _, intent := range vm.pendingIntents {
+		if _, err := vm.quorum.ImportCommittedIntent(st, lg, vm.ccv, intent, height); err == nil {
+			carried = append(carried, intent)
+		}
+	}
+	return carried, vm.settle(st, lg, height)
+}
+
+// settle gives a verdict to every task whose reveal window has closed and
+// returns the receipt root that leaves. This is what pays operators: without it
+// a task sits revealed and unsettled forever, and the work the network did for
+// it is never credited to anyone.
+//
+// It is a function of the state and the height alone, so it needs nothing
+// recorded in the block — the receipt root is what checks it.
+func (vm *VM) settle(st QuorumState, lg QuorumLedger, height uint64) common.Hash {
+	vm.quorum.SettleDue(st, lg, height)
+	return vm.quorum.ReceiptRoot(st)
+}
+
+// Seed applies the one engine mutation a chain makes outside consensus: what
+// its genesis allocates. It writes through the view and commits at once, before
+// any block exists, for the same reason Accept commits — left staged, a genesis
+// allocation would ride out on whichever block committed first and vanish with a
+// chain that never accepted one.
+func (vm *VM) Seed(write func(QuorumState, QuorumLedger) error) error {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+	staged := NewDBState(vm.view)
+	if err := write(staged, newStateLedger(staged)); err != nil {
+		vm.view.Abort()
+		return err
+	}
+	if err := vm.view.Commit(); err != nil {
+		vm.view.Abort()
+		return err
 	}
 	return nil
 }
 
-// importPending drains the buffered committed intents into A-Chain tasks under
-// consensus. It is the ONLY caller of the engine's verified inbound seam.
-// Returns the intents that successfully created a task (to be recorded in the
-// block for deterministic re-verification). Caller holds vm.mu.
-func (vm *VM) importPending(height uint64) []CIntent {
-	if vm.quorum == nil || vm.qstate == nil || vm.qledger == nil || len(vm.pendingIntents) == 0 {
-		return nil
-	}
-	imported := make([]CIntent, 0, len(vm.pendingIntents))
-	for _, intent := range vm.pendingIntents {
-		if _, err := vm.quorum.ImportCommittedIntent(vm.qstate, vm.qledger, vm.ccv, intent, height); err == nil {
-			imported = append(imported, intent)
-		}
-		// A rejected intent (forged id, failed proof, replay, ineligible pool) is
-		// simply dropped — it created no task and no state changed (fail-closed).
-	}
-	vm.pendingIntents = vm.pendingIntents[:0]
-	return imported
-}
-
-// settleDue gives a verdict to every task whose reveal window has closed. It
-// runs on both the build and the verify path at the same height over the same
-// state, so both reach the same verdicts; a disagreement about who was paid
-// changes the receipt root, which verifyImported already refuses.
-func (vm *VM) settleDue(height uint64) uint32 {
-	if vm.quorum == nil || vm.qstate == nil || vm.qledger == nil {
-		return 0
-	}
-	return vm.quorum.SettleDue(vm.qstate, vm.qledger, height)
-}
-
-// vmLedger is the engine's QuorumLedger backed by the VM's account balances. For
-// chains that carry native balances in their own state this would read/write
-// that store; here it is the in-memory MemLedger seeded at Initialize, which is
-// sufficient for the engine's conservation guarantees (the canonical custody
-// account is EscrowAccount regardless of backing store).
-type vmLedger = MemLedger
-
-// initQuorum sets up the engine, its DB-backed state, and ledger. Called from
+// initQuorum sets up the engine, its state and its ledger. Called from
 // Initialize. cChainID/aChainID are derived from the deployment (the host
 // chain's id and the configured C-chain id); here we derive stable 32-byte ids
 // from the VM's network id and host chain id so a single-node test/dev instance
 // is self-consistent.
 //
-// Engine state is STAGED in a versiondb layered over vm.db: writes from
-// importPending/Settle (which run in BuildBlock / Verify) accumulate in the
-// version delta and only land in vm.db when commitEngine() is called from
-// Block.Accept. A rejected/discarded block calls abortEngine() to drop the delta.
-// This is what makes "engine state commits under consensus AT Accept" true — a
-// block that is built but never accepted moves NO durable state and NO value.
-func (vm *VM) initQuorum(opening map[common.Address]*uint256.Int) {
+// Custody is engine state, so the ledger is a view over it rather than a second
+// store: value moves through the one staging layer, commits in the one write,
+// and survives a restart with the stake records it belongs to.
+func (vm *VM) initQuorum() {
 	c := chainIDFromString("c-chain")
 	a := chainIDFromString(vm.config.HostChainID)
 	vm.quorum = NewEngine(c, a)
-	vm.qdb = versiondb.New(vm.db)
-	vm.qstate = NewDBState(vm.qdb)
-	vm.qledger = NewMemLedger(opening)
-}
-
-// commitEngine flushes the staged engine-state delta to the durable DB and clears
-// the ledger snapshot. Called from Block.Accept (under vm.mu) — the SOLE commit
-// point for engine state and ledger value. Returns any DB commit error so Accept
-// fails loudly rather than silently losing state.
-func (vm *VM) commitEngine() error {
-	if vm.qdb == nil {
-		return nil
-	}
-	if err := vm.qdb.Commit(); err != nil {
-		return err
-	}
-	vm.qledgerSnap = nil
-	return nil
-}
-
-// abortEngine drops the staged engine-state delta and rolls the ledger back to the
-// last committed snapshot. Called from Block.Reject (and any discard path) so a
-// block that never reaches Accept leaves zero durable side effects.
-func (vm *VM) abortEngine() {
-	if vm.qdb != nil {
-		vm.qdb.Abort()
-	}
-	if l, ok := vm.qledger.(*MemLedger); ok && vm.qledgerSnap != nil {
-		l.Restore(vm.qledgerSnap)
-	}
-}
-
-// snapshotLedger records the ledger's committed balances so abortEngine can roll
-// back to them. Taken at the start of a block-building / verification pass that
-// may move funds, BEFORE any import touches the ledger.
-func (vm *VM) snapshotLedger() {
-	if l, ok := vm.qledger.(*MemLedger); ok && vm.qledgerSnap == nil {
-		vm.qledgerSnap = l.Snapshot()
-	}
+	vm.view = versiondb.New(vm.db)
+	vm.qstate = NewDBState(vm.db)
+	vm.qledger = newStateLedger(vm.qstate)
 }
 
 // chainIDFromString derives a stable 32-byte chain id from a label. Deterministic

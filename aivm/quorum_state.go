@@ -57,7 +57,97 @@ type QuorumLedger interface {
 	GetBalance(a common.Address) *uint256.Int
 	Pull(from common.Address, amount *uint256.Int) error
 	Pay(to common.Address, amount *uint256.Int) error
+
+	// Credit mints into an account. It is the genesis/deposit seam — the host
+	// L1 crediting an A-Chain account at chain birth or via a verified
+	// cross-chain deposit — and the only way value enters. Pull and Pay only
+	// move what Credit put there.
+	Credit(a common.Address, amount *uint256.Int) error
 }
+
+// ---------------------------------------------------------------------------
+// The value arithmetic, once.
+// ---------------------------------------------------------------------------
+
+// balances is where an account's number is kept. It is the ONLY thing the two
+// ledgers below differ in: one keeps them in a map, the other in engine state.
+// Everything that decides whether value may move is written once, against this,
+// so an in-memory ledger and a chain-state ledger cannot drift into different
+// answers about an overdraft.
+type balances interface {
+	get(a common.Address) *uint256.Int
+	set(a common.Address, v *uint256.Int)
+}
+
+// credit mints amount into a. Fail-closed on overflow; no write on error.
+func credit(b balances, a common.Address, amount *uint256.Int) error {
+	nv := new(uint256.Int)
+	if _, over := nv.AddOverflow(b.get(a), amount); over {
+		return ErrCreditOverflow
+	}
+	b.set(a, nv)
+	return nil
+}
+
+// pull debits from by amount and credits EscrowAccount. Fail-closed on
+// insufficient balance or overflow; no write on error.
+func pull(b balances, from common.Address, amount *uint256.Int) error {
+	src := b.get(from)
+	if src.Lt(amount) {
+		return ErrInsufficientFunds
+	}
+	ne := new(uint256.Int)
+	if _, over := ne.AddOverflow(b.get(EscrowAccount), amount); over {
+		return ErrStakeOverflow
+	}
+	b.set(from, new(uint256.Int).Sub(src, amount))
+	b.set(EscrowAccount, ne)
+	return nil
+}
+
+// pay debits EscrowAccount by amount and credits to. Fail-closed on escrow
+// underflow (a hard invariant breach) or recipient overflow.
+func pay(b balances, to common.Address, amount *uint256.Int) error {
+	esc := b.get(EscrowAccount)
+	if esc.Lt(amount) {
+		return ErrEscrowUnderflow
+	}
+	nd := new(uint256.Int)
+	if _, over := nd.AddOverflow(b.get(to), amount); over {
+		return ErrCreditOverflow
+	}
+	b.set(EscrowAccount, new(uint256.Int).Sub(esc, amount))
+	b.set(to, nd)
+	return nil
+}
+
+// stateLedger keeps native balances in engine state. It is what the VM runs on,
+// and it is the reason value now moves the way everything else does: through the
+// block's staging layer, committed in the block's single write, and durable
+// across a restart. Held beside the state instead, a ledger had to be staged,
+// rolled back and committed in step with it — and the two halves were not in
+// step, so a restart came back with the stake records and none of the balances.
+type stateLedger struct{ st QuorumState }
+
+func newStateLedger(st QuorumState) *stateLedger { return &stateLedger{st: st} }
+
+func (l *stateLedger) get(a common.Address) *uint256.Int {
+	return new(uint256.Int).SetBytes(l.st.GetState(slotAddr(nsBalance, a)).Bytes())
+}
+
+func (l *stateLedger) set(a common.Address, v *uint256.Int) {
+	l.st.SetState(slotAddr(nsBalance, a), h32(v))
+}
+
+func (l *stateLedger) GetBalance(a common.Address) *uint256.Int { return l.get(a) }
+
+func (l *stateLedger) Credit(a common.Address, amount *uint256.Int) error {
+	return credit(l, a, amount)
+}
+func (l *stateLedger) Pull(from common.Address, amount *uint256.Int) error {
+	return pull(l, from, amount)
+}
+func (l *stateLedger) Pay(to common.Address, amount *uint256.Int) error { return pay(l, to, amount) }
 
 // ---------------------------------------------------------------------------
 // In-memory substrate (tests + single-process engine; the live VM swaps in a
@@ -97,63 +187,30 @@ func NewMemLedger(opening map[common.Address]*uint256.Int) *MemLedger {
 	return &MemLedger{bal: bal}
 }
 
-// GetBalance returns a copy of the account's balance (zero if unknown).
-func (l *MemLedger) GetBalance(a common.Address) *uint256.Int {
+func (l *MemLedger) get(a common.Address) *uint256.Int {
 	if v, ok := l.bal[a]; ok {
 		return new(uint256.Int).Set(v)
 	}
 	return uint256.NewInt(0)
 }
 
-// Credit mints `amount` into `a`'s balance. This is the genesis/bootstrap seam
-// for native value (the L1's own state credits an A-Chain account at chain birth
-// or via a cross-chain deposit before any task/registration can pull from it).
-// It is the symmetric counterpart of GetBalance/Pull/Pay and the only way the VM
-// seeds opening balances onto a ledger that was constructed empty. Fail-closed on
-// overflow; no state change on error.
+func (l *MemLedger) set(a common.Address, v *uint256.Int) { l.bal[a] = v }
+
+// GetBalance returns a copy of the account's balance (zero if unknown).
+func (l *MemLedger) GetBalance(a common.Address) *uint256.Int { return l.get(a) }
+
+// Credit mints `amount` into `a`'s balance.
 func (l *MemLedger) Credit(a common.Address, amount *uint256.Int) error {
-	cur := l.GetBalance(a)
-	nv := new(uint256.Int)
-	if _, overflow := nv.AddOverflow(cur, amount); overflow {
-		return ErrCreditOverflow
-	}
-	l.bal[a] = nv
-	return nil
+	return credit(l, a, amount)
 }
 
-// Pull debits `from` by amount and credits EscrowAccount. Fail-closed on
-// insufficient balance or overflow; no state change on error.
+// Pull debits `from` by amount and credits EscrowAccount.
 func (l *MemLedger) Pull(from common.Address, amount *uint256.Int) error {
-	src := l.GetBalance(from)
-	if src.Lt(amount) {
-		return ErrInsufficientFunds
-	}
-	esc := l.GetBalance(EscrowAccount)
-	ne := new(uint256.Int)
-	if _, overflow := ne.AddOverflow(esc, amount); overflow {
-		return ErrStakeOverflow
-	}
-	l.bal[from] = new(uint256.Int).Sub(src, amount)
-	l.bal[EscrowAccount] = ne
-	return nil
+	return pull(l, from, amount)
 }
 
-// Pay debits EscrowAccount by amount and credits `to`. Fail-closed on escrow
-// underflow (a hard invariant breach) or recipient overflow.
-func (l *MemLedger) Pay(to common.Address, amount *uint256.Int) error {
-	esc := l.GetBalance(EscrowAccount)
-	if esc.Lt(amount) {
-		return ErrEscrowUnderflow
-	}
-	dst := l.GetBalance(to)
-	nd := new(uint256.Int)
-	if _, overflow := nd.AddOverflow(dst, amount); overflow {
-		return ErrCreditOverflow
-	}
-	l.bal[EscrowAccount] = new(uint256.Int).Sub(esc, amount)
-	l.bal[to] = nd
-	return nil
-}
+// Pay debits EscrowAccount by amount and credits `to`.
+func (l *MemLedger) Pay(to common.Address, amount *uint256.Int) error { return pay(l, to, amount) }
 
 // Total returns the grand-total balance over every account (for the
 // conservation invariant test). Pure read.
@@ -163,29 +220,6 @@ func (l *MemLedger) Total() *uint256.Int {
 		sum.Add(sum, v)
 	}
 	return sum
-}
-
-// Snapshot returns a deep copy of the balance map. Paired with Restore, it lets
-// the VM gate ledger mutations on block Accept: BuildBlock/Verify may move funds
-// while planning a block, and a rejected/discarded block restores the snapshot so
-// no value moves outside consensus. (The engine's QuorumState is staged
-// separately via versiondb; the two are committed/aborted together.)
-func (l *MemLedger) Snapshot() map[common.Address]*uint256.Int {
-	cp := make(map[common.Address]*uint256.Int, len(l.bal))
-	for a, v := range l.bal {
-		cp[a] = new(uint256.Int).Set(v)
-	}
-	return cp
-}
-
-// Restore replaces the balance map with a previously taken Snapshot (deep-copied
-// again so the snapshot stays reusable).
-func (l *MemLedger) Restore(snap map[common.Address]*uint256.Int) {
-	nb := make(map[common.Address]*uint256.Int, len(snap))
-	for a, v := range snap {
-		nb[a] = new(uint256.Int).Set(v)
-	}
-	l.bal = nb
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +234,7 @@ var (
 	nsModelIndex  = []byte("av/mspec.idx")    // per-ModelSpec operator-array length
 	nsModelMember = []byte("av/mspec.mem")    // per-ModelSpec operator-array element
 	nsModelSeen   = []byte("av/mspec.seen")   // per-(ModelSpec,operator) membership flag
+	nsBalance     = []byte("av/bal")          // native account balance (chain custody)
 	nsCredit      = []byte("av/cred")         // operator withdrawable credit ledger
 	nsReqNonce    = []byte("av/req.nonce")    // requester monotonic nonce
 	nsTask        = []byte("av/task")         // task record (status + params) *** also job_id domain

@@ -107,7 +107,7 @@ func TestGenesisJSON(t *testing.T) {
 	require.Equal(g.Timestamp, parsed.Timestamp)
 }
 
-func TestBlockComputeID(t *testing.T) {
+func TestBlockName(t *testing.T) {
 	require := require.New(t)
 
 	blk := &Block{
@@ -115,13 +115,14 @@ func TestBlockComputeID(t *testing.T) {
 		Height_:    1,
 		Timestamp_: time.Unix(1700000000, 0),
 	}
+	require.NoError(blk.name())
+	require.NotEqual(ids.Empty, blk.ID_)
+	require.NotEmpty(blk.bytes)
 
-	id := blk.computeID()
-	require.NotEqual(ids.Empty, id)
-
-	// Same block data → same ID (deterministic).
-	id2 := blk.computeID()
-	require.Equal(id, id2)
+	// Naming is deterministic.
+	id := blk.ID_
+	require.NoError(blk.name())
+	require.Equal(id, blk.ID_)
 
 	// Different height → different ID.
 	blk2 := &Block{
@@ -129,7 +130,8 @@ func TestBlockComputeID(t *testing.T) {
 		Height_:    2,
 		Timestamp_: time.Unix(1700000000, 0),
 	}
-	require.NotEqual(id, blk2.computeID())
+	require.NoError(blk2.name())
+	require.NotEqual(id, blk2.ID_)
 }
 
 func TestBlockInterface(t *testing.T) {
@@ -143,20 +145,28 @@ func TestBlockInterface(t *testing.T) {
 		Height_:    42,
 		Timestamp_: now,
 	}
-	blk.ID_ = blk.computeID()
+	require.NoError(blk.name())
 
 	require.Equal(parentID, blk.Parent())
 	require.Equal(parentID, blk.ParentID())
 	require.Equal(uint64(42), blk.Height())
 	require.Equal(now, blk.Timestamp())
 	require.NotNil(blk.Bytes())
+	require.Equal(uint8(0), blk.Status(), "a block with no chain is not accepted anywhere")
 }
 
-func TestBlockVerify(t *testing.T) {
+// A block with no chain behind it has no parent to sit on, no state to check
+// against and no chain id to be named by. Every question Verify asks of it is
+// unanswerable, and it used to answer "no objection" to all of them — so a
+// hand-built Block satisfied the one gate consensus has.
+func TestADetachedBlockIsRefused(t *testing.T) {
 	require := require.New(t)
+	ctx := context.Background()
 
 	blk := &Block{Height_: 1, Timestamp_: time.Now()}
-	require.NoError(blk.Verify(context.Background()))
+	require.ErrorIs(blk.Verify(ctx), ErrDetachedBlock)
+	require.ErrorIs(blk.Accept(ctx), ErrDetachedBlock)
+	require.ErrorIs(blk.Reject(ctx), ErrDetachedBlock)
 }
 
 func TestVMNotInitialized(t *testing.T) {
@@ -211,12 +221,19 @@ func TestVMHealthCheck(t *testing.T) {
 func TestVMLastAccepted(t *testing.T) {
 	require := require.New(t)
 
-	expectedID := ids.GenerateTestID()
-	vm := &VM{lastAcceptedID: expectedID}
+	// A VM that has not opened a chain has no head to report, and reporting one
+	// anyway is how a caller builds on a block that does not exist.
+	vm := &VM{}
+	_, err := vm.LastAccepted(context.Background())
+	require.ErrorIs(err, ErrNotInitialized)
+
+	tip := &Block{Height_: 7}
+	require.NoError(tip.name())
+	vm.lastAccepted = tip
 
 	id, err := vm.LastAccepted(context.Background())
 	require.NoError(err)
-	require.Equal(expectedID, id)
+	require.Equal(tip.ID_, id)
 }
 
 func TestVMSetState(t *testing.T) {

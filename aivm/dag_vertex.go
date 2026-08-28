@@ -52,26 +52,28 @@ func (v *AIVertex) Verify(ctx context.Context) error {
 	return nil
 }
 
+// Accept records the vertex. It does NOT move the block chain's tip: a vertex is
+// not a block, and writing the vertex id into the tip left the id the VM reported
+// and the block the VM held disagreeing — two owners of one fact, and the one a
+// restart would read back named no block at all.
+//
+// The vertex is stored under its own prefix, disjoint from the block keyspace,
+// so a block read can never decode a vertex.
 func (v *AIVertex) Accept(ctx context.Context) error {
 	v.status = choices.Accepted
 
 	v.vm.mu.Lock()
 	defer v.vm.mu.Unlock()
 
-	b := marshalVertex(v)
-	if err := v.vm.db.Put(v.id[:], b); err != nil {
+	wire, err := marshalVertex(v)
+	if err != nil {
 		return err
 	}
-	v.vm.lastAcceptedID = v.id
-	delete(v.vm.pendingBlocks, v.id)
-	return nil
+	return v.vm.db.Put(vertexKey(v.id), wire)
 }
 
 func (v *AIVertex) Reject(ctx context.Context) error {
 	v.status = choices.Rejected
-	v.vm.mu.Lock()
-	delete(v.vm.pendingBlocks, v.id)
-	v.vm.mu.Unlock()
 	return nil
 }
 
@@ -115,8 +117,17 @@ func (v *AIVertex) ConflictsVertex(other vertex.Vertex) bool {
 // and ["a","bc"] hashed the same bytes — a second vertex that a peer must treat
 // as the first. Each variable-length part is now written with its length ahead
 // of it, which is what makes the encoding injective.
+//
+// The chain id leads, for the reason a block's does: it is not on the wire, so
+// every node names a vertex under ITS OWN chain and a vertex cannot be carried
+// from one A-Chain to another.
 func (v *AIVertex) computeID() ids.ID {
 	h := sha256.New()
+	chainID := ids.Empty
+	if v.vm != nil {
+		chainID = v.vm.chainID
+	}
+	h.Write(chainID[:])
 	binary.Write(h, binary.BigEndian, v.height)
 	binary.Write(h, binary.BigEndian, v.epoch)
 
@@ -180,7 +191,7 @@ func (vm *VM) BuildVertex(ctx context.Context) (vertex.Vertex, error) {
 	v := &AIVertex{
 		height:  parent.Height_ + 1,
 		epoch:   0,
-		parents: []ids.ID{vm.lastAcceptedID},
+		parents: []ids.ID{parent.ID_},
 		txIDs:   txIDs,
 		tasks:   batch,
 		jobIDs:  jobIDs,
@@ -188,7 +199,11 @@ func (vm *VM) BuildVertex(ctx context.Context) (vertex.Vertex, error) {
 		vm:      vm,
 	}
 	v.id = v.computeID()
-	v.bytes = marshalVertex(v)
+	wire, err := marshalVertex(v)
+	if err != nil {
+		return nil, err
+	}
+	v.bytes = wire
 	return v, nil
 }
 

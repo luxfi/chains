@@ -44,7 +44,7 @@ func TestProbe_DefaultVerifierFailClosed(t *testing.T) {
 	for i := 0; i < eligible; i++ {
 		opening[addr(byte(0x10+i))] = new(uint256.Int).Mul(MinProviderBond, uint256.NewInt(3))
 	}
-	v.qledger = NewMemLedger(opening)
+	require.NoError(v.FundLedger(opening))
 	for i := 0; i < eligible; i++ {
 		st2 := v.qstate
 		require.NoError(e.RegisterOperator(st2, v.qledger, addr(byte(0x10+i)),
@@ -126,4 +126,78 @@ func TestProbe_ThresholdEqualsN(t *testing.T) {
 	res, err := e.Settle(st, lg, taskID, 161)
 	require.NoError(err)
 	require.Equal(TaskFailed, res.Status, "unanimity not reached -> Failed")
+}
+
+// Settlement is a function of the state and the height, so running the same pass
+// twice at the same height must be indistinguishable from running it once. If it
+// were not, two nodes that reached a height by different routes — one that ran
+// the pass while building and again while accepting — would disagree about who
+// was paid, and the receipt root would split them.
+func TestASecondSettlePassAtTheSameHeightChangesNothing(t *testing.T) {
+	require := require.New(t)
+
+	e := NewEngine(h(1), h(2))
+	st := NewMemState()
+	reward := uint256.NewInt(1_000_000_000_000_000_000)
+	requester := addr(0xF0)
+	opening := map[common.Address]*uint256.Int{requester: new(uint256.Int).Mul(reward, uint256.NewInt(64))}
+	ops := make([]common.Address, eligible)
+	for i := range ops {
+		ops[i] = addr(byte(0x10 + i))
+		opening[ops[i]] = new(uint256.Int).Mul(MinProviderBond, uint256.NewInt(3))
+	}
+	lg := NewMemLedger(opening)
+	for i, op := range ops {
+		require.NoError(e.RegisterOperator(st, lg, op, new(uint256.Int).Mul(MinProviderBond, uint256.NewInt(2)), modelSpec, h(byte(0x80+i))))
+	}
+	in := mkIntent(e, requester, testN, testThr, uint256.NewInt(1), reward)
+	taskID, err := e.ImportCommittedIntent(st, lg, acceptAll, in, 1)
+	require.NoError(err)
+	sel, err := e.SelectOperators(st, taskID, modelSpec, testN)
+	require.NoError(err)
+	out := h(0x42)
+	for i := 0; i < testThr; i++ {
+		require.NoError(e.CommitResponse(st, taskID, sel[i], opCommit(taskID, sel[i], out, h(7), h(9)), 2))
+		require.NoError(e.RevealResponse(st, taskID, sel[i], out, h(7), h(9), 32))
+	}
+
+	total := lg.Total().String()
+	first := e.SettleDue(st, lg, 62)
+	root := e.ReceiptRoot(st)
+	paid := lg.Total().String()
+
+	second := e.SettleDue(st, lg, 62)
+	require.Equal(uint32(1), first, "the due task should have been settled once")
+	require.Equal(uint32(0), second, "a settled task must not be settled again")
+	require.Equal(root, e.ReceiptRoot(st), "a second pass moved the receipt root")
+	require.Equal(paid, lg.Total().String(), "a second pass moved value")
+	require.Equal(total, paid, "settlement is a transfer, not a mint")
+}
+
+// An error is a statement about what happened. Refusing a withdrawal because the
+// operator has NOT deregistered used to report "operator is unbonding" — the
+// opposite of the truth, and an operator reading it would conclude it had
+// already started its cooldown and simply wait.
+func TestWithdrawSaysWhichWayItRefused(t *testing.T) {
+	require := require.New(t)
+
+	e := NewEngine(h(1), h(2))
+	st := NewMemState()
+	op := addr(1)
+	lg := NewMemLedger(map[common.Address]*uint256.Int{op: new(uint256.Int).Mul(MinProviderBond, uint256.NewInt(3))})
+	require.NoError(e.RegisterOperator(st, lg, op, MinProviderBond, modelSpec, h(1)))
+
+	_, err := e.WithdrawStake(st, lg, op, 100)
+	require.ErrorIs(err, ErrOperatorBonded, "a bonded operator was told it was unbonding")
+
+	require.NoError(e.DeregisterOperator(st, op, 100))
+	_, err = e.WithdrawStake(st, lg, op, 100)
+	require.ErrorIs(err, ErrCooldownActive)
+
+	_, err = e.WithdrawStake(st, lg, addr(2), 100)
+	require.ErrorIs(err, ErrOperatorUnknown)
+
+	stake, err := e.WithdrawStake(st, lg, op, 100+UnbondCooldownBlocks)
+	require.NoError(err)
+	require.Equal(MinProviderBond.String(), stake.String())
 }

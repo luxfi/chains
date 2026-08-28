@@ -323,7 +323,7 @@ func (s *Service) handleMerkleRoot(w http.ResponseWriter, r *http.Request) {
 // handleHealth returns health status
 func (s *Service) handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"healthy": s.vm.running,
+		"healthy": s.vm.live(),
 		"version": Version.String(),
 	})
 }

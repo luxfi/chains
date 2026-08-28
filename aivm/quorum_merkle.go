@@ -125,13 +125,28 @@ func merkleProof(leaves []common.Hash, idx uint32) MerkleProof {
 	return proof
 }
 
+// maxProofDepth bounds the levels a proof may claim. A tree of 2^32 leaves needs
+// 32, and Index is a uint32, so a longer proof indexes nothing — it is only a
+// way to make a verifier do unbounded work on an attacker's say-so.
+const maxProofDepth = 32
+
 // VerifyReceiptProof checks that receiptHash is included under root at the
 // proof's index. It re-applies the leaf hash (leafHash) and folds with the
 // siblings, choosing left/right by the index bit at each level — exactly
 // inverting merkleProof/merkleRoot. Returns true iff the recomputed root equals
 // root. This is the function the A->C boundary (and anyone) uses to verify an
 // exported receipt belongs to the committed receipt_root.
+//
+// The index must be SPENT by the fold: after one halving per sibling nothing may
+// be left of it. The fold reads one bit per level and silently discards the rest,
+// so any index sharing its low bits verified — in a 4-leaf tree, index 4 (and 8,
+// and 12, and every other index congruent mod 4) proved membership at index 0.
+// An index is part of what a proof asserts, and a verifier that ignores most of
+// it is not checking that assertion.
 func VerifyReceiptProof(receiptHash common.Hash, proof MerkleProof, root common.Hash) bool {
+	if len(proof.Siblings) > maxProofDepth {
+		return false
+	}
 	cur := leafHash(receiptHash)
 	idx := proof.Index
 	for _, sib := range proof.Siblings {
@@ -142,5 +157,5 @@ func VerifyReceiptProof(receiptHash common.Hash, proof MerkleProof, root common.
 		}
 		idx /= 2
 	}
-	return cur == root
+	return idx == 0 && cur == root
 }

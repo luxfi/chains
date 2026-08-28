@@ -209,6 +209,31 @@ func (e *Engine) WithdrawStake(st QuorumState, lg QuorumLedger, operator common.
 // ModelSpec, and hold stake >= MinProviderBond. It is the SINGLE source of "who
 // is eligible" — both the margin check and the beacon draw consume it, so they
 // can never disagree about the eligible universe.
+//
+// WHAT A QUORUM OVER THIS SET MEANS. t of n BONDED STAKES agreed — not t of n
+// independent parties. The set is keyed by address, and one operator may hold as
+// many addresses as it cares to fund. Nothing here can tell two addresses of one
+// operator from two operators, and nothing on this chain can either: the four
+// facts it holds about an operator are its address, its bonded stake, the
+// ModelSpec it advertises, and a hash of its endpoint. None of them names a
+// party.
+//
+// The endpoint hash is the closest thing, and it is self-declared and opaque, so
+// refusing duplicates would stop only an operator too lazy to declare a second
+// string — while making this function read as though independence were enforced.
+// A check an adversary steps over in one line is worse than no check, because
+// the reader stops looking.
+//
+// What DOES bound a Sybil is the bond. Every address here has MinProviderBond
+// locked and slashable, so n addresses cost n bonds and carry n exposures: the
+// quorum is as expensive to capture as the stake behind it. That is the real
+// claim, and it is economic.
+//
+// Making it a claim about PARTIES needs an identity this chain does not have —
+// an attestation binding an address to a distinct operator. One exists in this
+// VM (RequireTEEAttestation) and is deliberately optional, because a TEE vendor
+// as the trust root is the assumption the design refuses. Until such an identity
+// is mandatory, "independent" describes the economics, not the operators.
 func eligibleSet(st QuorumState, modelSpecHash common.Hash) []common.Address {
 	total := modelCount(st, modelSpecHash)
 	eligible := make([]common.Address, 0, total)
