@@ -449,8 +449,8 @@ type ListIssuersReply struct {
 
 // ListIssuers lists all issuers
 func (s *Service) ListIssuers(r *http.Request, args *ListIssuersArgs, reply *ListIssuersReply) error {
-	s.vm.mu.RLock()
-	defer s.vm.mu.RUnlock()
+	s.vm.chain.RLock()
+	defer s.vm.chain.RUnlock()
 
 	reply.Issuers = make([]IssuerReply, 0, len(s.vm.issuers))
 
@@ -507,8 +507,8 @@ func (s *Service) Health(r *http.Request, args *HealthArgs, reply *HealthReply) 
 		return err
 	}
 
-	s.vm.mu.RLock()
-	defer s.vm.mu.RUnlock()
+	s.vm.chain.RLock()
+	defer s.vm.chain.RUnlock()
 
 	reply.Healthy = health.Healthy
 	reply.Identities = len(s.vm.identities)

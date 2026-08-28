@@ -4,35 +4,12 @@
 package identityvm
 
 import (
-	"github.com/luxfi/accel"
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/ids"
-	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms"
 )
-
-var _ vms.Factory = (*Factory)(nil)
 
 // VMID is the unique identifier for IdentityVM (I-Chain)
 var VMID = ids.ID{'i', 'd', 'e', 'n', 't', 'i', 't', 'y', 'v', 'm'}
 
-// Factory creates new IdentityVM instances
-type Factory struct{}
-
-// New returns a new instance of the IdentityVM.
-// Allocates a per-VM GPU session at PriorityNormal for future batch
-// credential signature verification.
-func (f *Factory) New(logger log.Logger) (interface{}, error) {
-	sess, err := accel.NewVMSession("identityvm", accel.WithPriority(accel.PriorityNormal))
-	if err != nil {
-		return nil, err
-	}
-	return &VM{
-		accel:         sess,
-		identities:    make(map[ids.ID]*Identity),
-		credentials:   make(map[ids.ID]*Credential),
-		issuers:       make(map[ids.ID]*Issuer),
-		revocations:   make(map[ids.ID]*RevocationEntry),
-		pendingCreds:  make([]*Credential, 0),
-		pendingBlocks: make(map[ids.ID]*Block),
-	}, nil
-}
+// Factory creates new IdentityVM instances.
+type Factory = chain.Factory[VM]

@@ -46,8 +46,6 @@ func TestVMInitialize(t *testing.T) {
 		credentials:   make(map[ids.ID]*Credential),
 		issuers:       make(map[ids.ID]*Issuer),
 		revocations:   make(map[ids.ID]*RevocationEntry),
-		pendingCreds:  make([]*Credential, 0),
-		pendingBlocks: make(map[ids.ID]*Block),
 	}
 
 	genesis := &Genesis{
@@ -619,9 +617,7 @@ func TestBlockWithCredentials(t *testing.T) {
 	require.NoError(err)
 
 	// Pending credentials should be cleared
-	vm.mu.RLock()
-	require.Empty(vm.pendingCreds)
-	vm.mu.RUnlock()
+	require.Zero(vm.pending.Len())
 }
 
 // setupTestVM creates and initializes a test VM
@@ -633,8 +629,6 @@ func setupTestVM(t *testing.T) *VM {
 		credentials:   make(map[ids.ID]*Credential),
 		issuers:       make(map[ids.ID]*Issuer),
 		revocations:   make(map[ids.ID]*RevocationEntry),
-		pendingCreds:  make([]*Credential, 0),
-		pendingBlocks: make(map[ids.ID]*Block),
 	}
 
 	genesis := &Genesis{

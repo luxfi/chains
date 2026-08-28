@@ -11,22 +11,20 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/gorilla/rpc/v2"
 	grjson "github.com/gorilla/rpc/v2/json"
 
-	"github.com/luxfi/accel"
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/consensus/core/choices"
-	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/vms/artifacts"
 	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/runtime"
 	vmcore "github.com/luxfi/vm"
-	"github.com/luxfi/vm/chain"
+	vmchain "github.com/luxfi/vm/chain"
 )
 
 const (
@@ -44,9 +42,8 @@ const (
 )
 
 var (
-	_ chain.ChainVM = (*VM)(nil)
+	_ vmchain.ChainVM = (*VM)(nil)
 
-	lastAcceptedKey  = []byte("lastAccepted")
 	identityPrefix   = []byte("id:")
 	credentialPrefix = []byte("cred:")
 	issuerPrefix     = []byte("issuer:")
@@ -132,41 +129,36 @@ type RevocationEntry struct {
 	Reason       string    `json:"reason"`
 }
 
+// MaxPendingCredentials bounds the queue of credentials waiting for a block.
+// Issuing is open to any authorized issuer, so without a bound the queue is
+// whatever they choose to make it.
+const MaxPendingCredentials = 4096
+
 // VM implements the IdentityVM for decentralized identity
 type VM struct {
 	rt     *runtime.Runtime
 	config Config
 	log    log.Logger
-	db     database.Database
 
-	// Per-VM GPU acceleration session. Reserved for future batch
-	// credential signature verification and DID proof checks.
-	accel *accel.VMSession
+	// chain is the durable state, the blocks in flight and the tip — and the
+	// one lock over all of it, which the record caches below share. Take it
+	// with chain.Lock or chain.RLock.
+	chain *chain.Store
 
-	// State
-	identities    map[ids.ID]*Identity
-	credentials   map[ids.ID]*Credential
-	issuers       map[ids.ID]*Issuer
-	revocations   map[ids.ID]*RevocationEntry
-	pendingCreds  []*Credential
-	pendingBlocks map[ids.ID]*Block
+	// Record caches, under the chain's lock.
+	identities  map[ids.ID]*Identity
+	credentials map[ids.ID]*Credential
+	issuers     map[ids.ID]*Issuer
+	revocations map[ids.ID]*RevocationEntry
 
-	// work tells consensus a block can be built, which is what issuing a
-	// credential produces.
-	work vmcore.Latch
+	// pending holds the credentials waiting for a block, and tells consensus
+	// there is one to build. LOCK ORDER: the chain's lock, then the pool's.
+	pending *chain.Pool[*Credential]
 
-	// Consensus
-	lastAccepted   *Block
-	lastAcceptedID ids.ID
-
-	// Fee policy gating user-submitted mutating RPCs (CreateIdentity,
-	// IssueCredential, RevokeCredential, CreateProof,
-	// RegisterIssuer). FlatPolicy at MinTxFeeFloor; consensus-
-	// internal callers bypass via direct VM methods.
-	feePolicy fee.Policy
-	networkID uint32
-
-	mu sync.RWMutex
+	// fee is what this chain charges to admit a mutating RPC. I-Chain accepts
+	// user-submitted DID and credential calls that produce on-chain effects,
+	// so it declares the floor rather than admitting free work.
+	fee chain.Fee
 
 	// RPC
 	rpcServer *rpc.Server
@@ -178,7 +170,6 @@ func (vm *VM) Initialize(
 	vmInit vmcore.Init,
 ) error {
 	vm.rt = vmInit.Runtime
-	vm.db = vmInit.DB
 
 	if logger, ok := vm.rt.Log.(log.Logger); ok {
 		vm.log = logger
@@ -186,12 +177,15 @@ func (vm *VM) Initialize(
 		return errors.New("invalid logger type")
 	}
 
+	// The caches are rebuilt only here: a block publishes its records after its
+	// writes have committed, so a block that fails leaves them untouched and
+	// there is nothing to roll back.
+	vm.chain = chain.New(vmInit.DB, nil)
 	vm.identities = make(map[ids.ID]*Identity)
 	vm.credentials = make(map[ids.ID]*Credential)
 	vm.issuers = make(map[ids.ID]*Issuer)
 	vm.revocations = make(map[ids.ID]*RevocationEntry)
-	vm.pendingCreds = make([]*Credential, 0)
-	vm.pendingBlocks = make(map[ids.ID]*Block)
+	vm.pending = chain.NewPool(MaxPendingCredentials, func(c *Credential) ids.ID { return c.ID })
 
 	// Parse genesis
 	genesis, err := ParseGenesis(vmInit.Genesis)
@@ -225,19 +219,26 @@ func (vm *VM) Initialize(
 	vm.rpcServer.RegisterCodec(grjson.NewCodec(), "application/json;charset=UTF-8")
 	vm.rpcServer.RegisterService(&Service{vm: vm}, "identity")
 
-	// Pin fee policy. I-Chain accepts user mutating RPCs so attach
-	// the canonical FlatPolicy at MinTxFeeFloor; fee.Validate
-	// refuses zero-fee user-facing chains at boot.
+	// I-Chain accepts user mutating RPCs, so it declares the floor; the node's
+	// boot-time Validate refuses a zero-fee user-facing chain.
+	var networkID uint32
 	if vm.rt != nil {
-		vm.networkID = vm.rt.NetworkID
+		networkID = vm.rt.NetworkID
 	}
-	vm.feePolicy = newFeePolicy(vm.networkID)
-	if err := fee.Validate(vm.feePolicy); err != nil {
+	vm.fee = chain.Floor(networkID)
+	if err := fee.Validate(vm.fee.Policy()); err != nil {
 		return fmt.Errorf("identityvm: fee policy: %w", err)
 	}
 
-	// Load last accepted block
-	if err := vm.loadLastAccepted(); err != nil {
+	// Genesis is at height 0, stamped with the time genesis itself declares.
+	// Reading the wall clock here would give every node a different genesis id
+	// for the same chain, since the id is the hash of the block's own fields.
+	genesisBlock := &Block{
+		BlockTimestamp: genesis.Timestamp,
+		vm:             vm,
+		status:         choices.Accepted,
+	}
+	if _, _, err := vm.chain.Open(genesisBlock, vm.parseBlock); err != nil {
 		return err
 	}
 
@@ -259,42 +260,23 @@ func (vm *VM) Initialize(
 	return nil
 }
 
-// loadLastAccepted loads the last accepted block from the database
-func (vm *VM) loadLastAccepted() error {
-	lastAcceptedBytes, err := vm.db.Get(lastAcceptedKey)
-	if err == database.ErrNotFound {
-		vm.lastAccepted = &Block{
-			BlockHeight:    0,
-			BlockTimestamp: time.Now().Unix(),
-			vm:             vm,
-			status:         choices.Accepted,
-		}
-		vm.lastAcceptedID = vm.lastAccepted.ID()
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-
-	var blockID ids.ID
-	copy(blockID[:], lastAcceptedBytes)
-
-	blockBytes, err := vm.db.Get(blockID[:])
-	if err != nil {
-		return err
-	}
-
+// parseBlock decodes a block belonging to this VM. The store uses it to read
+// back the tip and any accepted block, so there is one decoder rather than one
+// per call site.
+func (vm *VM) parseBlock(raw []byte) (chain.Block, error) {
 	var block Block
-	if err := parseBlock(blockBytes, &block); err != nil {
-		return err
+	if err := parseBlock(raw, &block); err != nil {
+		return nil, err
 	}
-
 	block.vm = vm
+	block.bytes = raw
 	block.status = choices.Accepted
-	vm.lastAccepted = &block
-	vm.lastAcceptedID = blockID
+	return &block, nil
+}
 
-	return nil
+// credentialKey is where a credential is recorded.
+func credentialKey(id ids.ID) []byte {
+	return append(append([]byte(nil), credentialPrefix...), id[:]...)
 }
 
 // SetState implements chain.ChainVM
@@ -333,11 +315,11 @@ func (vm *VM) CreateHandlers(ctx context.Context) (map[string]http.Handler, erro
 }
 
 // HealthCheck implements chain.ChainVM
-func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
+func (vm *VM) HealthCheck(ctx context.Context) (vmchain.HealthResult, error) {
+	vm.chain.RLock()
+	defer vm.chain.RUnlock()
 
-	return chain.HealthResult{
+	return vmchain.HealthResult{
 		Healthy: true,
 		Details: map[string]string{
 			"identities":  fmt.Sprintf("%d", len(vm.identities)),
@@ -353,7 +335,7 @@ func (vm *VM) Version(ctx context.Context) (string, error) {
 }
 
 // Connected implements chain.ChainVM
-func (vm *VM) Connected(ctx context.Context, nodeID ids.NodeID, nodeVersion *chain.VersionInfo) error {
+func (vm *VM) Connected(ctx context.Context, nodeID ids.NodeID, nodeVersion *vmchain.VersionInfo) error {
 	vm.log.Debug("Node connected", log.String("nodeID", nodeID.String()))
 	return nil
 }
@@ -364,36 +346,33 @@ func (vm *VM) Disconnected(ctx context.Context, nodeID ids.NodeID) error {
 	return nil
 }
 
-// BuildBlock implements chain.ChainVM
-func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-
-	// A block with nothing in it says nothing and still has to be voted on.
-	if len(vm.pendingCreds) == 0 {
-		return nil, errNothingToBuild
+// BuildBlock implements chain.ChainVM. Reading the tip and registering the
+// block on it happen in one step, so nothing can be accepted in between and
+// leave the proposal hanging off a parent that is no longer the tip.
+func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
+	built, err := vm.chain.Propose(func(parent ids.ID, height uint64) (chain.Block, error) {
+		// A block with nothing in it says nothing and still has to be voted on.
+		creds := vm.pending.Take(0)
+		if len(creds) == 0 {
+			return nil, errNothingToBuild
+		}
+		return &Block{
+			ParentID_:      parent,
+			BlockHeight:    height + 1,
+			BlockTimestamp: time.Now().Unix(),
+			Credentials:    creds,
+			vm:             vm,
+			status:         choices.Processing,
+		}, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	// Copy pending credentials to avoid slice mutation issues during Accept
-	creds := make([]*Credential, len(vm.pendingCreds))
-	copy(creds, vm.pendingCreds)
-
-	block := &Block{
-		ParentID_:      vm.lastAcceptedID,
-		BlockHeight:    vm.lastAccepted.BlockHeight + 1,
-		BlockTimestamp: time.Now().Unix(),
-		Credentials:    creds,
-		vm:             vm,
-		status:         choices.Processing,
-	}
-
-	vm.pendingBlocks[block.ID()] = block
-
-	return block, nil
+	return built, nil
 }
 
 // ParseBlock implements chain.ChainVM
-func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (chain.Block, error) {
+func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (vmchain.Block, error) {
 	var block Block
 	if err := parseBlock(blockBytes, &block); err != nil {
 		return nil, err
@@ -406,32 +385,8 @@ func (vm *VM) ParseBlock(ctx context.Context, blockBytes []byte) (chain.Block, e
 }
 
 // GetBlock implements chain.ChainVM
-func (vm *VM) GetBlock(ctx context.Context, blockID ids.ID) (chain.Block, error) {
-	vm.mu.RLock()
-	// Check pending blocks (nil-safe for early calls before initialization)
-	if vm.pendingBlocks != nil {
-		if block, ok := vm.pendingBlocks[blockID]; ok {
-			vm.mu.RUnlock()
-			return block, nil
-		}
-	}
-	vm.mu.RUnlock()
-
-	blockBytes, err := vm.db.Get(blockID[:])
-	if err != nil {
-		return nil, err
-	}
-
-	var block Block
-	if err := parseBlock(blockBytes, &block); err != nil {
-		return nil, err
-	}
-
-	block.vm = vm
-	block.bytes = blockBytes
-	block.status = choices.Accepted
-
-	return &block, nil
+func (vm *VM) GetBlock(ctx context.Context, blockID ids.ID) (vmchain.Block, error) {
+	return vm.chain.Block(blockID, vm.parseBlock)
 }
 
 // SetPreference implements chain.ChainVM
@@ -441,17 +396,16 @@ func (vm *VM) SetPreference(ctx context.Context, blockID ids.ID) error {
 
 // LastAccepted implements chain.ChainVM
 func (vm *VM) LastAccepted(ctx context.Context) (ids.ID, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-	return vm.lastAcceptedID, nil
+	id, _ := vm.chain.Tip()
+	return id, nil
 }
 
 // ======== Identity Management ========
 
 // CreateIdentity creates a new decentralized identity
 func (vm *VM) CreateIdentity(publicKey []byte, metadata map[string]string) (*Identity, error) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
+	vm.chain.Lock()
+	defer vm.chain.Unlock()
 
 	// Generate identity ID from public key
 	h := sha256.New()
@@ -477,7 +431,7 @@ func (vm *VM) CreateIdentity(publicKey []byte, metadata map[string]string) (*Ide
 	// Persist (native ZAP wire)
 	identityBytes := marshalIdentity(identity)
 	key := append(identityPrefix, identityID[:]...)
-	if err := vm.db.Put(key, identityBytes); err != nil {
+	if err := vm.chain.Base().Put(key, identityBytes); err != nil {
 		return nil, err
 	}
 
@@ -486,8 +440,8 @@ func (vm *VM) CreateIdentity(publicKey []byte, metadata map[string]string) (*Ide
 
 // GetIdentity returns an identity by ID
 func (vm *VM) GetIdentity(identityID ids.ID) (*Identity, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
+	vm.chain.RLock()
+	defer vm.chain.RUnlock()
 
 	identity, ok := vm.identities[identityID]
 	if !ok {
@@ -498,8 +452,8 @@ func (vm *VM) GetIdentity(identityID ids.ID) (*Identity, error) {
 
 // ResolveIdentity resolves an identity by DID
 func (vm *VM) ResolveIdentity(did string) (*Identity, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
+	vm.chain.RLock()
+	defer vm.chain.RUnlock()
 
 	for _, identity := range vm.identities {
 		if identity.DID == did {
@@ -513,8 +467,8 @@ func (vm *VM) ResolveIdentity(did string) (*Identity, error) {
 
 // IssueCredential issues a new verifiable credential
 func (vm *VM) IssueCredential(issuerID, subjectID ids.ID, credType []string, claims map[string]interface{}, ttl time.Duration) (*Credential, error) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
+	vm.chain.Lock()
+	defer vm.chain.Unlock()
 
 	// Verify issuer exists and is authorized
 	issuer, ok := vm.issuers[issuerID]
@@ -561,18 +515,21 @@ func (vm *VM) IssueCredential(issuerID, subjectID ids.ID, credType []string, cla
 	}
 
 	vm.credentials[credID] = cred
-	vm.pendingCreds = append(vm.pendingCreds, cred)
 
-	// Consensus builds nothing until it is told there is something to build.
-	vm.work.Signal()
+	// Queueing tells consensus there is a block to build; a chain builds
+	// nothing until it is told.
+	if err := vm.pending.Add(cred); err != nil {
+		delete(vm.credentials, credID)
+		return nil, err
+	}
 
 	return cred, nil
 }
 
 // GetCredential returns a credential by ID
 func (vm *VM) GetCredential(credID ids.ID) (*Credential, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
+	vm.chain.RLock()
+	defer vm.chain.RUnlock()
 
 	cred, ok := vm.credentials[credID]
 	if !ok {
@@ -594,8 +551,8 @@ func (vm *VM) GetCredential(credID ids.ID) (*Credential, error) {
 
 // RevokeCredential revokes a credential
 func (vm *VM) RevokeCredential(credID ids.ID, revokerID ids.ID, reason string) error {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
+	vm.chain.Lock()
+	defer vm.chain.Unlock()
 
 	cred, ok := vm.credentials[credID]
 	if !ok {
@@ -621,13 +578,13 @@ func (vm *VM) RevokeCredential(credID ids.ID, revokerID ids.ID, reason string) e
 	// Persist revocation (native ZAP wire)
 	revBytes := marshalRevocation(revocation)
 	key := append(revocationPrefix, credID[:]...)
-	return vm.db.Put(key, revBytes)
+	return vm.chain.Base().Put(key, revBytes)
 }
 
 // VerifyCredential verifies a credential is valid
 func (vm *VM) VerifyCredential(credID ids.ID) (bool, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
+	vm.chain.RLock()
+	defer vm.chain.RUnlock()
 
 	cred, ok := vm.credentials[credID]
 	if !ok {
@@ -663,8 +620,8 @@ func (vm *VM) VerifyCredential(credID ids.ID) (bool, error) {
 
 // CreateCredentialProof creates a CredentialProof artifact
 func (vm *VM) CreateCredentialProof(credID ids.ID, zkProof []byte, selectiveDisclosure []string) (*artifacts.CredentialProof, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
+	vm.chain.RLock()
+	defer vm.chain.RUnlock()
 
 	cred, ok := vm.credentials[credID]
 	if !ok {
@@ -722,15 +679,15 @@ func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, er
 // VM stops. Waiting only on the context would mean BuildBlock is never called
 // and the chain never leaves genesis, however many credentials are issued.
 func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
-	return vm.work.WaitForEvent(ctx)
+	return vm.pending.Wait(ctx)
 }
 
 // ======== Issuer Management ========
 
 // RegisterIssuer registers a new credential issuer
 func (vm *VM) RegisterIssuer(name string, publicKey []byte, types []string, trustLevel int) (*Issuer, error) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
+	vm.chain.Lock()
+	defer vm.chain.Unlock()
 
 	// Generate issuer ID
 	h := sha256.New()
@@ -752,7 +709,7 @@ func (vm *VM) RegisterIssuer(name string, publicKey []byte, types []string, trus
 	// Persist
 	issuerBytes, _ := json.Marshal(issuer)
 	key := append(issuerPrefix, issuerID[:]...)
-	if err := vm.db.Put(key, issuerBytes); err != nil {
+	if err := vm.chain.Base().Put(key, issuerBytes); err != nil {
 		return nil, err
 	}
 
@@ -761,8 +718,8 @@ func (vm *VM) RegisterIssuer(name string, publicKey []byte, types []string, trus
 
 // GetIssuer returns an issuer by ID
 func (vm *VM) GetIssuer(issuerID ids.ID) (*Issuer, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
+	vm.chain.RLock()
+	defer vm.chain.RUnlock()
 
 	issuer, ok := vm.issuers[issuerID]
 	if !ok {
