@@ -358,15 +358,14 @@ func TestProposeBuildsOnTheTipAndTracksWhatItBuilt(t *testing.T) {
 	first := newBlock(1, f.genesis.ID(), 1)
 	require.NoError(t, f.store.Accept(first))
 
-	var sawParent ids.ID
-	var sawHeight uint64
-	built, err := f.store.Propose(func(parent ids.ID, height uint64) (*testBlock, error) {
-		sawParent, sawHeight = parent, height
-		return newBlock(2, parent, height+1), nil
+	var saw *testBlock
+	built, err := f.store.Propose(func(parent *testBlock) (*testBlock, error) {
+		saw = parent
+		return newBlock(2, parent.ID(), parent.Height()+1), nil
 	})
 	require.NoError(t, err)
-	require.Equal(t, first.ID(), sawParent)
-	require.Equal(t, uint64(1), sawHeight)
+	require.Equal(t, first.ID(), saw.ID())
+	require.Equal(t, uint64(1), saw.Height())
 
 	got, err := f.store.Block(built.ID(), f.parse)
 	require.NoError(t, err)
@@ -377,7 +376,7 @@ func TestAProposalThatRefusesTracksNothing(t *testing.T) {
 	f := newFixture(t)
 	nothing := errors.New("nothing to propose")
 
-	built, err := f.store.Propose(func(ids.ID, uint64) (*testBlock, error) { return nil, nothing })
+	built, err := f.store.Propose(func(*testBlock) (*testBlock, error) { return nil, nothing })
 	require.ErrorIs(t, err, nothing)
 	require.Nil(t, built)
 
@@ -502,15 +501,14 @@ func TestAProposalFollowsTheEnginesPreference(t *testing.T) {
 	f.store.Track(two)
 	f.store.Prefer(two.ID())
 
-	var sawParent ids.ID
-	var sawHeight uint64
-	_, err := f.store.Propose(func(parent ids.ID, height uint64) (*testBlock, error) {
-		sawParent, sawHeight = parent, height
-		return newBlock(3, parent, height+1), nil
+	var saw *testBlock
+	_, err := f.store.Propose(func(parent *testBlock) (*testBlock, error) {
+		saw = parent
+		return newBlock(3, parent.ID(), parent.Height()+1), nil
 	})
 	require.NoError(t, err)
-	require.Equal(t, two.ID(), sawParent, "a proposal extends the preferred fork")
-	require.Equal(t, uint64(2), sawHeight)
+	require.Equal(t, two.ID(), saw.ID(), "a proposal extends the preferred fork")
+	require.Equal(t, uint64(2), saw.Height())
 }
 
 func TestAPreferenceTheStoreCannotResolveFallsBackToTheTip(t *testing.T) {
@@ -519,11 +517,11 @@ func TestAPreferenceTheStoreCannotResolveFallsBackToTheTip(t *testing.T) {
 	require.NoError(t, f.store.Accept(one))
 	f.store.Prefer(ids.ID{99})
 
-	var sawParent ids.ID
-	_, err := f.store.Propose(func(parent ids.ID, height uint64) (*testBlock, error) {
-		sawParent = parent
-		return newBlock(3, parent, height+1), nil
+	var saw *testBlock
+	_, err := f.store.Propose(func(parent *testBlock) (*testBlock, error) {
+		saw = parent
+		return newBlock(3, parent.ID(), parent.Height()+1), nil
 	})
 	require.NoError(t, err)
-	require.Equal(t, one.ID(), sawParent)
+	require.Equal(t, one.ID(), saw.ID())
 }

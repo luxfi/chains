@@ -438,14 +438,14 @@ func (vm *VM) rpcGetInfo() (*ThresholdInfo, error) {
 		AuthorizedChains: chains,
 		TotalKeys:        len(keys),
 		SharesHeld:       len(vm.shares),
-		StagedCeremonies: len(vm.inflight),
+		StagedCeremonies: vm.staged.Len(),
 		StateRoot:        "0x" + hex.EncodeToString(root[:]),
 	}, nil
 }
 
 func (vm *VM) rpcGetStats() (*NetworkStats, error) {
 	vm.mu.RLock()
-	staged := len(vm.inflight)
+	staged := vm.staged.Len()
 	vm.mu.RUnlock()
 
 	vm.stats.mu.RLock()

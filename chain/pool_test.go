@@ -21,7 +21,7 @@ func at(n byte) entry { return entry{id: ids.ID{n}} }
 
 func claimOf(e entry) ids.ID { return e.id }
 
-func newTestPool(max int) *Pool[entry] { return NewPool(max, claimOf) }
+func newTestPool(max int) *Pool[entry, ids.ID] { return NewPool(max, claimOf) }
 
 func TestAPoolHandsBackWhatItWasGivenInOrder(t *testing.T) {
 	p := newTestPool(8)

@@ -211,6 +211,55 @@ fails with `library 'resolv' not found` unless the macOS SDK syslibroot is set.
 Run tests with `SDKROOT="$(xcrun --show-sdk-path)" go test ./schain/...`. This
 affects `dexvm` and every other VM here too — it is NOT schain-specific.
 
+## How a block becomes fact: `chain/`
+
+Every chain here advances the same way, so it is written once, in `chain/`.
+A chain package declares what it IS — its transactions, its records, its
+authorization rules — and nothing about how a block lands.
+
+`chain.Store[B]` holds a chain's committed database, the versiondb view every
+block writes through, the blocks in flight, the accepted tip, and the block the
+engine prefers. `Store.Accept` runs the block's `Write`, then puts the block,
+its height entry and the tip pointer, then commits ONCE. Any failure aborts the
+view, rebuilds the chain's caches from committed state, and leaves the tip where
+it was. `Publish` runs only after the commit.
+
+That split is the whole point. `Write` can fail and is discarded whole;
+`Publish` cannot fail and only ever sees durable state. Five chains here used to
+write with individual `db.Put` calls that each returned early, with the status
+and the tip already moved — so a failure left the chain believing a block it had
+only half applied, with no way back. On M-Chain it was worse than a loss: the
+duplicate guards in `PutKey`/`PutCeremony` then refused the records the failed
+block had already written, so that block could never be applied again and the
+chain was wedged at that height.
+
+- **`chain.Block` is not the engine's block interface.** It is `ID`/`Height`/
+  `Bytes`/`Write`/`Publish` and nothing more, because Z-Chain decides in two
+  shapes: a linear block and a DAG vertex with several parents and no timestamp.
+  Both change state the same way. A chain with one shape parameterises the store
+  over its own type (`Store[*Block]`) and never asserts; Z-Chain uses
+  `Store[chain.Block]` and says which it got.
+- **The store's lock is the chain's lock.** In-flight blocks under a second
+  mutex is one map with two owners, which in Go is a fatal throw. A VM's own
+  operational state — B-Chain's signer set, transfers and release plumbing — is
+  NOT the chain's state and keeps its own lock; the order is written where the
+  locks are, and it is always the chain's first.
+- **`Propose` hands over the parent block**, not the tip id, so a build never
+  calls back into the store it is already inside.
+- **`chain.Pool[T,K]`** derives its claim set from its queue and rebuilds it
+  whenever the queue shrinks, so a claim cannot outlive the entry that made it.
+  It carries the latch (see below).
+- **`chain.Floor(networkID)` / `chain.Closed()`** replace each VM's
+  `newFeePolicy`; the zero `chain.Fee` admits nothing, so a chain that forgets
+  to declare one refuses every caller.
+- **`chain.Factory[VM]`** replaces each VM's factory. A factory-built VM holds
+  nothing; `Initialize` does all of it.
+
+On `chain.Store`: identityvm, zkvm, bridgevm, mpcvm. keyvm and fhevm already had
+the discipline in their own code and are the shape it was generalised from;
+schain and quantumvm are partway. graphvm is NOT on it and does not need to be —
+it writes nothing at all, so there is no partial state to have.
+
 ## Sibling repos
 
 See the org-level `LLM.md` at `/Users/a/work/lux/luxfi/LLM.md` for the full inventory of sibling repos and inter-repo dependencies.

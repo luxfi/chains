@@ -8,7 +8,6 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/luxfi/ids"
 	vmcore "github.com/luxfi/vm"
 )
 
@@ -24,12 +23,12 @@ import (
 // LOCK ORDER: a chain takes its Store's lock first and a Pool's second, never
 // the other way round. Accept holds the store lock and drops from the pool
 // inside it, so the reverse order deadlocks.
-type Pool[T any] struct {
+type Pool[T any, K comparable] struct {
 	mu    sync.Mutex
-	claim func(T) ids.ID
+	claim func(T) K
 	max   int
 	queue []T
-	held  map[ids.ID]struct{}
+	held  map[K]struct{}
 	work  vmcore.Latch
 }
 
@@ -46,17 +45,17 @@ var (
 
 // NewPool returns a pool bounded at max entries, where claim says what an
 // entry takes — which is also how it is found again.
-func NewPool[T any](max int, claim func(T) ids.ID) *Pool[T] {
-	return &Pool[T]{
+func NewPool[T any, K comparable](max int, claim func(T) K) *Pool[T, K] {
+	return &Pool[T, K]{
 		claim: claim,
 		max:   max,
-		held:  make(map[ids.ID]struct{}),
+		held:  make(map[K]struct{}),
 	}
 }
 
 // Add queues an entry and tells consensus there is something to build. A chain
 // builds nothing until it is told.
-func (p *Pool[T]) Add(entry T) error {
+func (p *Pool[T, K]) Add(entry T) error {
 	p.mu.Lock()
 	if len(p.queue) >= p.max {
 		p.mu.Unlock()
@@ -79,7 +78,7 @@ func (p *Pool[T]) Add(entry T) error {
 // queued. A block SELECTS from the pool rather than draining it, so an engine
 // that discards a proposal — which it may do without ever rejecting it —
 // cannot take the queue with it. n of zero or less takes everything.
-func (p *Pool[T]) Take(n int) []T {
+func (p *Pool[T, K]) Take(n int) []T {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -90,11 +89,11 @@ func (p *Pool[T]) Take(n int) []T {
 }
 
 // Drop removes accepted entries and rebuilds the claim set from what remains.
-func (p *Pool[T]) Drop(entries []T) {
+func (p *Pool[T, K]) Drop(entries []T) {
 	if len(entries) == 0 {
 		return
 	}
-	gone := make(map[ids.ID]struct{}, len(entries))
+	gone := make(map[K]struct{}, len(entries))
 	for _, e := range entries {
 		gone[p.claim(e)] = struct{}{}
 	}
@@ -109,14 +108,14 @@ func (p *Pool[T]) Drop(entries []T) {
 		}
 	}
 	p.queue = kept
-	p.held = make(map[ids.ID]struct{}, len(kept))
+	p.held = make(map[K]struct{}, len(kept))
 	for _, e := range kept {
 		p.held[p.claim(e)] = struct{}{}
 	}
 }
 
 // Holds reports whether a queued entry already claims c.
-func (p *Pool[T]) Holds(c ids.ID) bool {
+func (p *Pool[T, K]) Holds(c K) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	_, ok := p.held[c]
@@ -124,7 +123,7 @@ func (p *Pool[T]) Holds(c ids.ID) bool {
 }
 
 // Len is how many entries are waiting.
-func (p *Pool[T]) Len() int {
+func (p *Pool[T, K]) Len() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.queue)
@@ -133,6 +132,6 @@ func (p *Pool[T]) Len() int {
 // Wait blocks until there is something to build a block from, or the caller
 // gives up. Waiting on the context alone would mean a chain never leaves
 // genesis however much it is offered.
-func (p *Pool[T]) Wait(ctx context.Context) (vmcore.Message, error) {
+func (p *Pool[T, K]) Wait(ctx context.Context) (vmcore.Message, error) {
 	return p.work.WaitForEvent(ctx)
 }

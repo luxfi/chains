@@ -40,6 +40,7 @@ import (
 
 	"github.com/luxfi/consensus/core/choices"
 	"github.com/luxfi/crypto/secp256k1"
+	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/threshold/pkg/party"
@@ -156,12 +157,13 @@ func (b *Block) Verify(ctx context.Context) error {
 	if vm == nil {
 		return errors.New("mpcvm: block has no VM")
 	}
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-
 	if b.BlockHeight == 0 {
 		return errors.New("mpcvm: genesis block is not verifiable as a transition")
 	}
+
+	// The parent is resolved through the chain's lock, before this takes the
+	// VM's. Holding the VM's across that would take the two in the opposite
+	// order to the one Accept takes them in, which is a deadlock.
 	parent, err := vm.loadBlock(b.ParentID_)
 	if err != nil {
 		return fmt.Errorf("mpcvm: unknown parent %s: %w", b.ParentID_, err)
@@ -175,6 +177,9 @@ func (b *Block) Verify(ctx context.Context) error {
 	if len(b.Operations) == 0 {
 		return errors.New("mpcvm: empty block")
 	}
+
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
 
 	// Fold the operations, checking each against state plus the effects of the
 	// operations before it in this same block, and accumulating the root.
@@ -387,6 +392,18 @@ func verifyGroupSignature(groupPub, digest, sig []byte) error {
 // is accepted but whose state was not written is exactly the divergence the
 // state root exists to catch.
 func (b *Block) Accept(ctx context.Context) error {
+	return b.vm.chain.Accept(b)
+}
+
+// Write folds the block's operations into the registry and the ceremony log,
+// and stages the root they reach.
+//
+// The root check used to run AFTER every key and ceremony had already been
+// written, so refusing here left exactly the disagreeing state it refuses to
+// persist — and the duplicate guards in PutKey and PutCeremony then made that
+// block permanently unacceptable, wedging the chain at that height. Now
+// nothing is durable until the check has passed and the whole block commits.
+func (b *Block) Write(database.Database) error {
 	vm := b.vm
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
@@ -418,42 +435,36 @@ func (b *Block) Accept(ctx context.Context) error {
 		// the block the network accepted.
 		return fmt.Errorf("%w at accept: computed %x, block claims %x", ErrRootMismatch, root[:8], b.StateRoot[:8])
 	}
+	return vm.state.WriteRoot(root)
+}
 
-	raw, err := b.Marshal()
-	if err != nil {
-		return err
-	}
-	if err := vm.state.PutBlock(b.ID(), b.BlockHeight, raw); err != nil {
-		return err
-	}
-	if err := vm.state.SetLastAccepted(b.ID(), root); err != nil {
-		return err
-	}
-
+// Publish makes the block's root current and releases the ceremonies it
+// carried. It runs after the commit, so the root this node reports is one that
+// is on disk and a ceremony leaves the staging queue only once the block
+// recording it is durable.
+func (b *Block) Publish() {
 	b.status = choices.Accepted
-	vm.lastAcceptedID = b.ID()
-	delete(vm.pendingBlocks, b.ID())
-	for _, op := range b.Operations {
-		delete(vm.inflight, op.CeremonyID)
-	}
 
-	vm.log.Info("accepted M-Chain block",
+	b.vm.mu.Lock()
+	b.vm.state.HoldRoot(b.StateRoot)
+	b.vm.mu.Unlock()
+
+	b.vm.staged.Drop(b.Operations)
+
+	b.vm.log.Info("accepted M-Chain block",
 		log.Stringer("blockID", b.ID()),
 		log.Uint64("height", b.BlockHeight),
 		log.Int("operations", len(b.Operations)),
-		log.String("stateRoot", fmt.Sprintf("%x", root[:8])),
+		log.String("stateRoot", fmt.Sprintf("%x", b.StateRoot[:8])),
 	)
-	return nil
 }
 
 // Reject drops a block. State was never touched, so there is nothing to undo.
 func (b *Block) Reject(ctx context.Context) error {
 	b.status = choices.Rejected
-	b.vm.mu.Lock()
-	defer b.vm.mu.Unlock()
-	delete(b.vm.pendingBlocks, b.ID())
-	// The ceremonies stay in flight: rejection means this block did not land,
-	// not that the ceremony was invalid, so the result may be re-proposed.
+	b.vm.chain.Drop(b.ID())
+	// The ceremonies stay staged: rejection means this block did not land, not
+	// that the ceremony was invalid, so the result may be re-proposed.
 	b.vm.log.Info("rejected M-Chain block", log.Stringer("blockID", b.ID()))
 	return nil
 }
