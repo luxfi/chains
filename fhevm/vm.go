@@ -765,7 +765,7 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		vm:           vm,
 	}
 	blk.id = blk.computeID()
-	vm.pendingBlocks[blk.id] = blk
+	vm.trackVerified(blk)
 	return blk, nil
 }
 
@@ -829,6 +829,30 @@ func (vm *VM) getBlockLocked(blockID ids.ID) (*Block, error) {
 		return nil, fmt.Errorf("fhevm: block %s: %w", blockID, err)
 	}
 	return parseBlock(vm, b)
+}
+
+// trackVerified makes a block findable by id while it is in flight, so a child
+// can resolve it as a parent. Both the block we build and a block we verify
+// from a peer go through here — tracking only our own left a follower able to
+// verify b1 and unable to verify b2.
+//
+// It also prunes, because nothing else will: the engine may drop a block it
+// never accepts and never rejects, so a tracker that only ever grew would leak
+// exactly the way an unreleased mempool claim did. Anything at or below the
+// last accepted height is already decided or orphaned, which bounds this to the
+// blocks actually in flight above it.
+//
+// Caller holds stateLock for writing.
+func (vm *VM) trackVerified(b *Block) {
+	if b.height <= vm.height {
+		return
+	}
+	for id, blk := range vm.pendingBlocks {
+		if blk.height <= vm.height {
+			delete(vm.pendingBlocks, id)
+		}
+	}
+	vm.pendingBlocks[b.id] = b
 }
 
 // ---- ChainVM lifecycle / misc ----

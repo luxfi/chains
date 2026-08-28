@@ -101,15 +101,34 @@ func (b *Block) Verify(ctx context.Context) error {
 			ErrInvalidBlock, len(b.transactions), MaxBlockTxs)
 	}
 
-	b.vm.stateLock.RLock()
-	defer b.vm.stateLock.RUnlock()
+	if err := func() error {
+		b.vm.stateLock.RLock()
+		defer b.vm.stateLock.RUnlock()
 
-	batch := newBatch(b.vm)
-	for _, tx := range b.transactions {
-		if err := batch.admit(tx); err != nil {
-			return err
+		batch := newBatch(b.vm)
+		for _, tx := range b.transactions {
+			if err := batch.admit(tx); err != nil {
+				return err
+			}
 		}
+		return nil
+	}(); err != nil {
+		return err
 	}
+
+	// A block that verifies is one the engine may build on, so it has to be
+	// findable by id — including one parsed from a peer rather than built here.
+	// Tracking only self-built blocks meant a follower verified b1 and then
+	// failed b2 with "verify parent: not found", which is the ordinary shape
+	// whenever more than one block is in flight.
+	//
+	// The read lock above cannot be upgraded, so the checks finish under it and
+	// the registration takes the write lock on its own. pendingBlocks keeps ONE
+	// owner — reaching it under a second mutex is the bug this VM already has a
+	// test against.
+	b.vm.stateLock.Lock()
+	b.vm.trackVerified(b)
+	b.vm.stateLock.Unlock()
 	return nil
 }
 
