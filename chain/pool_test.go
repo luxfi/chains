@@ -50,8 +50,6 @@ func TestASecondClaimOnQueuedWorkIsRefused(t *testing.T) {
 	require.NoError(t, p.Add(at(1)))
 	require.ErrorIs(t, p.Add(at(1)), ErrHeld)
 	require.Equal(t, 1, p.Len())
-	require.True(t, p.Holds(ids.ID{1}))
-	require.False(t, p.Holds(ids.ID{2}))
 }
 
 func TestAFullPoolRefusesRatherThanGrows(t *testing.T) {
@@ -74,9 +72,8 @@ func TestAClaimDoesNotOutliveItsEntry(t *testing.T) {
 	p.Drop([]entry{at(1)})
 
 	require.Equal(t, []entry{at(2)}, p.Take(0))
-	require.False(t, p.Holds(ids.ID{1}), "the dropped entry holds nothing")
-	require.True(t, p.Holds(ids.ID{2}), "the one still queued does")
-	require.NoError(t, p.Add(at(1)), "and its claim can be made again")
+	require.NoError(t, p.Add(at(1)), "the dropped entry's claim can be made again")
+	require.ErrorIs(t, p.Add(at(2)), ErrHeld, "the one still queued still holds its own")
 }
 
 func TestDroppingNothingChangesNothing(t *testing.T) {
@@ -84,7 +81,7 @@ func TestDroppingNothingChangesNothing(t *testing.T) {
 	require.NoError(t, p.Add(at(1)))
 	p.Drop(nil)
 	require.Equal(t, 1, p.Len())
-	require.True(t, p.Holds(ids.ID{1}))
+	require.ErrorIs(t, p.Add(at(1)), ErrHeld)
 }
 
 func TestDroppingWhatWasNeverQueuedLeavesTheRestAlone(t *testing.T) {
@@ -92,7 +89,7 @@ func TestDroppingWhatWasNeverQueuedLeavesTheRestAlone(t *testing.T) {
 	require.NoError(t, p.Add(at(1)))
 	p.Drop([]entry{at(9)})
 	require.Equal(t, []entry{at(1)}, p.Take(0))
-	require.True(t, p.Holds(ids.ID{1}))
+	require.ErrorIs(t, p.Add(at(1)), ErrHeld)
 }
 
 func TestAddingTellsConsensusThereIsSomethingToBuild(t *testing.T) {
@@ -128,7 +125,6 @@ func TestConcurrentUseOfAPoolDoesNotRace(t *testing.T) {
 				default:
 					p.Take(4)
 					p.Len()
-					p.Holds(ids.ID{1})
 				}
 			}
 		}()

@@ -180,7 +180,9 @@ type VM struct {
 
 	// Fee policy. M-Chain is service-only (committee-driven, no
 	// user mempool) so this is the NoUserTxPolicy sentinel.
-	feePolicy fee.Policy
+	// fee is what this chain charges to admit a user transaction, which is
+	// nothing: M-Chain takes none.
+	fee chain.Fee
 
 	// mu guards State and the VM's own maps. State is deliberately not safe for
 	// concurrent use — a state machine with its own locking invites callers to
@@ -238,8 +240,8 @@ func (vm *VM) Initialize(
 	// Pin fee policy. M-Chain is service-only (committee-driven, no
 	// user mempool) so attach the NoUserTxPolicy sentinel.
 	// fee.Validate passes for the sentinel even with zero MinTxFee.
-	vm.feePolicy = newFeePolicy()
-	if err := fee.Validate(vm.feePolicy); err != nil {
+	vm.fee = chain.Closed()
+	if err := fee.Validate(vm.fee.Policy()); err != nil {
 		return fmt.Errorf("mpcvm: fee policy: %w", err)
 	}
 
