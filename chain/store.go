@@ -321,10 +321,20 @@ func (s *Store[B]) Open(genesis B, parse func([]byte) (B, error)) (B, bool, erro
 
 	var nothing B
 
+	// Only a tip that is ABSENT means a fresh chain. Reading any other failure
+	// that way — a closed database, an unreadable volume, a short read — starts
+	// a live chain over at genesis and lets it build height 1 on top of state
+	// it cannot see, durably. A chain that cannot read its own tip does not
+	// know where it is, and the honest answer is to refuse to open.
 	raw, err := s.view.Get(tipKey)
-	if err != nil || len(raw) != ids.IDLen {
+	switch {
+	case errors.Is(err, database.ErrNotFound):
 		s.tip, s.height, s.last = genesis.ID(), genesis.Height(), genesis
 		return genesis, true, nil
+	case err != nil:
+		return nothing, false, fmt.Errorf("chain: read tip: %w", err)
+	case len(raw) != ids.IDLen:
+		return nothing, false, fmt.Errorf("chain: tip is %d bytes, want %d", len(raw), ids.IDLen)
 	}
 
 	id, err := ids.ToID(raw)
