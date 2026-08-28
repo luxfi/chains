@@ -165,27 +165,27 @@ func TestAuthenticate(t *testing.T) {
 	k := newTestKey(t)
 	other := newTestKey(t)
 
-	require.NoError(t, registerTx(t, k, testScheme, digestOf("auth"), 1).authenticate())
+	require.NoError(t, registerTx(t, k, testScheme, digestOf("auth"), 1).authenticate(testChainID))
 
 	unsigned := registerTx(t, k, testScheme, digestOf("auth"), 1)
 	unsigned.Auth, unsigned.Sig = nil, nil
-	require.ErrorIs(t, unsigned.authenticate(), ErrUnsignedTx)
+	require.ErrorIs(t, unsigned.authenticate(testChainID), ErrUnsignedTx)
 
 	tampered := registerTx(t, k, testScheme, digestOf("auth"), 1)
 	tampered.Nonce = 7
-	require.ErrorIs(t, tampered.authenticate(), ErrBadSignature)
+	require.ErrorIs(t, tampered.authenticate(testChainID), ErrBadSignature)
 
 	// Signed by `other` but claiming k's address: the address is derived from
 	// the attached public key, so the two cannot be made to agree.
 	impersonating := registerTx(t, k, testScheme, digestOf("auth"), 1)
 	other.sign(t, impersonating)
-	require.ErrorIs(t, impersonating.authenticate(), ErrPayerMismatch)
+	require.ErrorIs(t, impersonating.authenticate(testChainID), ErrPayerMismatch)
 
 	// Auth bytes that are not a public key at all.
 	garbage := registerTx(t, k, testScheme, digestOf("auth"), 1)
 	garbage.Auth = []byte("garbage")
 	garbage.Payer = addressOf(garbage.Auth)
-	require.Error(t, garbage.authenticate())
+	require.Error(t, garbage.authenticate(testChainID))
 }
 
 // TestAddressDerivationIsStable proves a payer's address and a committee
@@ -343,4 +343,275 @@ func TestTransactionIDIsContentHash(t *testing.T) {
 
 	other := registerTx(t, k, testScheme, digestOf("id"), 2)
 	require.NotEqual(t, first, other.ID())
+}
+
+// TestSyntacticVerifyRefusesEveryMalformedPayload walks each operation's payload
+// rules. They are the checks that run on an UNAUTHENTICATED transaction, so
+// each one is a refusal that costs nothing — and each is a field an attacker
+// chooses, which is why none of them may be optional.
+func TestSyntacticVerifyRefusesEveryMalformedPayload(t *testing.T) {
+	digest := digestOf("subject")
+	handle := deriveHandle(digest, testScheme)
+	sound := RegisterPayload{Digest: digest, Type: 4, Level: 3, Size: 4096}
+
+	for name, tc := range map[string]struct {
+		tx   *Transaction
+		want error
+	}{
+		"register: undecodable": {
+			&Transaction{Type: TxRegisterCiphertext, Scheme: testScheme, Nonce: 1, Subject: handle,
+				Payload: []byte("{not json")}, ErrInvalidPayload},
+		"register: no digest": {
+			&Transaction{Type: TxRegisterCiphertext, Scheme: testScheme, Nonce: 1,
+				Subject: deriveHandle([32]byte{}, testScheme),
+				Payload: mustJSON(nil, RegisterPayload{Type: 4, Level: 3, Size: 4096})}, ErrInvalidPayload},
+		"register: zero size": {
+			&Transaction{Type: TxRegisterCiphertext, Scheme: testScheme, Nonce: 1, Subject: handle,
+				Payload: mustJSON(nil, RegisterPayload{Digest: digest, Type: 4, Level: 3})}, ErrInvalidPayload},
+		"register: size beyond anything servable": {
+			&Transaction{Type: TxRegisterCiphertext, Scheme: testScheme, Nonce: 1, Subject: handle,
+				Payload: mustJSON(nil, RegisterPayload{Digest: digest, Type: 4, Level: 3, Size: MaxCiphertextSize + 1})}, ErrInvalidPayload},
+		"register: negative level": {
+			&Transaction{Type: TxRegisterCiphertext, Scheme: testScheme, Nonce: 1, Subject: handle,
+				Payload: mustJSON(nil, RegisterPayload{Digest: digest, Type: 4, Level: -1, Size: 4096})}, ErrInvalidPayload},
+		"register: subject is not the handle": {
+			&Transaction{Type: TxRegisterCiphertext, Scheme: testScheme, Nonce: 1, Subject: [32]byte{9},
+				Payload: mustJSON(nil, sound)}, ErrHandleMismatch},
+
+		"grant: undecodable": {
+			&Transaction{Type: TxGrantPermit, Nonce: 1, Payload: []byte("{")}, ErrInvalidPayload},
+		"grant: confers nothing": {
+			&Transaction{Type: TxGrantPermit, Nonce: 1,
+				Payload: mustJSON(nil, GrantPayload{Operations: 0})}, ErrInvalidPayload},
+		"grant: unknown capability bits": {
+			&Transaction{Type: TxGrantPermit, Nonce: 1,
+				Payload: mustJSON(nil, GrantPayload{Operations: 1 << 31})}, ErrInvalidPayload},
+		"grant: negative expiry": {
+			&Transaction{Type: TxGrantPermit, Nonce: 1,
+				Payload: mustJSON(nil, GrantPayload{Operations: fhe.PermitOpDecrypt, Expiry: -1})}, ErrInvalidPayload},
+
+		"revoke: undecodable": {
+			&Transaction{Type: TxRevokePermit, Nonce: 1, Payload: []byte("[]")}, ErrInvalidPayload},
+
+		"request: undecodable": {
+			&Transaction{Type: TxRequestDecrypt, Scheme: testScheme, Nonce: 1, Payload: []byte("{")}, ErrInvalidPayload},
+		"request: names no permit": {
+			&Transaction{Type: TxRequestDecrypt, Scheme: testScheme, Nonce: 1,
+				Payload: mustJSON(nil, RequestPayload{})}, ErrInvalidPayload},
+		"request: negative expiry": {
+			&Transaction{Type: TxRequestDecrypt, Scheme: testScheme, Nonce: 1,
+				Payload: mustJSON(nil, RequestPayload{PermitID: [32]byte{1}, Expiry: -1})}, ErrInvalidPayload},
+
+		"fulfill: undecodable": {
+			&Transaction{Type: TxFulfillDecrypt, Nonce: 1, Payload: []byte("{")}, ErrInvalidPayload},
+		"fulfill: no result": {
+			&Transaction{Type: TxFulfillDecrypt, Nonce: 1,
+				Payload: mustJSON(nil, FulfillPayload{})}, ErrInvalidPayload},
+
+		"advance: undecodable": {
+			&Transaction{Type: TxAdvanceEpoch, Nonce: 1, Payload: []byte("{")}, ErrInvalidPayload},
+
+		"a nonce below the first one": {
+			&Transaction{Type: TxRevokePermit, Nonce: 0,
+				Payload: mustJSON(nil, RevokePayload{})}, ErrBadNonce},
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.ErrorIs(t, tc.tx.SyntacticVerify(), tc.want)
+		})
+	}
+
+	// The control: the well-formed shapes all pass.
+	require.NoError(t, (&Transaction{Type: TxRegisterCiphertext, Scheme: testScheme, Nonce: 1,
+		Subject: handle, Payload: mustJSON(nil, sound)}).SyntacticVerify())
+	require.NoError(t, (&Transaction{Type: TxRevokePermit, Nonce: 1,
+		Payload: mustJSON(nil, RevokePayload{})}).SyntacticVerify())
+}
+
+// TestCommitteeOrderIsPartOfTheValue proves a committee's members must arrive
+// in canonical order and without repeats. Members hash the SET to vote on it,
+// so two orderings of the same members would be two different proposals and the
+// committee could never agree with itself.
+func TestCommitteeOrderIsPartOfTheValue(t *testing.T) {
+	c, _ := newCommittee(t, 3)
+
+	shuffled := []fhe.CommitteeMember{c[2], c[0], c[1]}
+	require.ErrorIs(t, ValidateCommittee(shuffled, 2, []byte("pk")), ErrInvalidCommittee)
+
+	repeated := []fhe.CommitteeMember{c[0], c[0], c[1]}
+	require.ErrorIs(t, ValidateCommittee(repeated, 2, []byte("pk")), ErrInvalidCommittee,
+		"one seat twice is not two seats")
+
+	require.NoError(t, ValidateCommittee(c, 2, []byte("pk")), "the control")
+}
+
+// TestApplyFailsClosedOnWhatItCannotWrite proves every effect reports a failed
+// write instead of returning success. These are the errors that abort a block
+// whole: a validator that cannot write cannot proceed, and a transaction that
+// silently did not apply would leave two validators holding different state.
+func TestApplyFailsClosedOnWhatItCannotWrite(t *testing.T) {
+	owner, grantee := newTestKey(t), newTestKey(t)
+	vm, _, members := newDecryptVM(t, 3, 2, owner, grantee)
+	handle, permitID := seedPermit(t, vm, owner, grantee, fhe.PermitOpDecrypt, 0)
+	acceptOne(t, vm, requestTx(t, grantee, testScheme, handle, permitID, 0, 1))
+	requestID := deriveRequestID(handle, grantee.addr, 1)
+	next, _ := newCommittee(t, 3)
+	now := vm.clock.Time().Unix()
+
+	require.NoError(t, vm.versdb.Close())
+	for name, apply := range map[string]func() error{
+		"register": func() error { return registerTx(t, owner, testScheme, digestOf("w"), 9).applyRegister(vm, now) },
+		"grant": func() error {
+			return grantTx(t, owner, handle, grantee.addr, fhe.PermitOpDecrypt, 0, 9).applyGrant(vm, now)
+		},
+		"revoke":  func() error { return revokeTx(t, owner, permitID, 9).applyRevoke(vm) },
+		"request": func() error { return requestTx(t, grantee, testScheme, handle, permitID, 0, 9).applyRequest(vm, now) },
+		"fulfill": func() error { return fulfillTx(t, members[0], requestID, digestOf("r"), 9).applyFulfill(vm, now) },
+		"advance": func() error { return advanceTx(t, members[0], 1, next, 2, []byte("pk"), 9).applyAdvance(vm, now) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Error(t, apply())
+		})
+	}
+}
+
+// TestApplyRefusesAPayloadItCannotDecode proves each effect re-derives its
+// arguments from the payload and fails closed rather than applying a zero
+// value. SyntacticVerify has already accepted the payload by the time a block
+// carries it, so this is the check behind the check — but a check that only
+// ever runs behind another is one nobody can show still works, so it is shown
+// here directly.
+func TestApplyRefusesAPayloadItCannotDecode(t *testing.T) {
+	owner, grantee := newTestKey(t), newTestKey(t)
+	vm, _, members := newDecryptVM(t, 3, 2, owner, grantee)
+	handle, permitID := seedPermit(t, vm, owner, grantee, fhe.PermitOpDecrypt, 0)
+	acceptOne(t, vm, requestTx(t, grantee, testScheme, handle, permitID, 0, 1))
+	requestID := deriveRequestID(handle, grantee.addr, 1)
+	now := vm.clock.Time().Unix()
+
+	junk := func(typ uint8, subject [32]byte) *Transaction {
+		return &Transaction{Type: typ, Scheme: testScheme, Payer: owner.addr, Subject: subject,
+			Nonce: 9, Payload: []byte("{not json")}
+	}
+	require.Error(t, junk(TxRegisterCiphertext, handle).applyRegister(vm, now))
+	require.Error(t, junk(TxGrantPermit, handle).applyGrant(vm, now))
+	require.Error(t, junk(TxRequestDecrypt, handle).applyRequest(vm, now))
+	require.Error(t, junk(TxFulfillDecrypt, requestID).applyFulfill(vm, now))
+	require.Error(t, junk(TxAdvanceEpoch, [32]byte{}).applyAdvance(vm, now))
+
+	// And each effect that names a record refuses when the record is not there.
+	missing := [32]byte{0xaa}
+	require.ErrorIs(t, revokeTx(t, owner, missing, 9).applyRevoke(vm), ErrPermitNotFound)
+	require.ErrorIs(t, fulfillTx(t, members[0], missing, digestOf("r"), 9).applyFulfill(vm, now), ErrRequestNotFound)
+
+	// A fulfilment whose epoch has been forgotten is refused rather than tallied
+	// against a threshold nobody can name.
+	rec, ok := vm.Decrypt(requestID)
+	require.True(t, ok)
+	rec.Epoch = 99
+	vm.stateLock.Lock()
+	require.NoError(t, vm.putDecrypt(&DecryptRecord{DecryptRequest: rec.DecryptRequest, PermitID: rec.PermitID}))
+	vm.stateLock.Unlock()
+	require.ErrorIs(t, fulfillTx(t, members[0], requestID, digestOf("r"), 9).applyFulfill(vm, now), ErrEpochNotFound)
+}
+
+// TestAnUnknownOperationIsRefused proves authorization fails closed on an
+// operation it does not know, rather than falling through to an effect.
+//
+// Apply has the same default and it is UNREACHABLE: checkAuth runs first and
+// refuses every type the switch below does not name, so nothing reaches it. It
+// stays because the switch assigns err per case — without the default an
+// unknown type would leave err nil and Apply would report the transaction
+// APPLIED, which is the one answer that must never be given by accident.
+func TestAnUnknownOperationIsRefused(t *testing.T) {
+	k := newTestKey(t)
+	committee, _ := newCommittee(t, 1)
+	vm := newTestVM(t, fundAll(k), committee, 1)
+
+	vm.stateLock.Lock()
+	defer vm.stateLock.Unlock()
+	alien := &Transaction{Type: 99, Payer: k.addr, Nonce: 1}
+	require.ErrorIs(t, alien.checkAuth(vm, 0), ErrInvalidTxType)
+
+	applied, err := alien.Apply(vm, 0)
+	require.NoError(t, err, "an unknown operation reverts; it does not halt the block")
+	require.False(t, applied)
+}
+
+// TestCheckAuthRefusesWhatItCannotResolve covers the authorization decisions
+// that turn on a record being there. Each is a refusal rather than a default:
+// authorization that fell through when it could not find what it was asked
+// about would grant on ignorance.
+func TestCheckAuthRefusesWhatItCannotResolve(t *testing.T) {
+	owner, grantee := newTestKey(t), newTestKey(t)
+	vm, _, members := newDecryptVM(t, 3, 2, owner, grantee)
+	handle, permitID := seedPermit(t, vm, owner, grantee, fhe.PermitOpDecrypt, 0)
+	acceptOne(t, vm, requestTx(t, grantee, testScheme, handle, permitID, 0, 1))
+	requestID := deriveRequestID(handle, grantee.addr, 1)
+	now := vm.clock.Time().Unix()
+
+	vm.stateLock.RLock()
+	defer vm.stateLock.RUnlock()
+
+	// A request whose payload does not decode cannot be authorized against a
+	// permit it does not name.
+	malformed := &Transaction{Type: TxRequestDecrypt, Scheme: testScheme, Payer: grantee.addr,
+		Subject: handle, Nonce: 2, Payload: []byte("{not json")}
+	require.ErrorIs(t, malformed.checkAuth(vm, now), ErrInvalidPayload)
+
+	// So does an epoch proposal.
+	badAdvance := &Transaction{Type: TxAdvanceEpoch, Payer: members[0].addr, Nonce: 2,
+		Payload: []byte("{not json")}
+	require.ErrorIs(t, badAdvance.checkAuth(vm, now), ErrInvalidPayload)
+
+	// A fulfilment for an epoch the chain has forgotten names no committee, so
+	// there is nobody it could be authorized as.
+	rec, ok := vm.decrypts[requestID]
+	require.True(t, ok)
+	held := rec.Epoch
+	rec.Epoch = 99
+	require.ErrorIs(t,
+		fulfillTx(t, members[0], requestID, digestOf("r"), 1).checkAuth(vm, now), ErrEpochNotFound)
+	rec.Epoch = held
+}
+
+// TestAdvanceReportsAWriteItCannotMake proves the epoch rotation reports a
+// failed write at either of the two records it must put down — the epoch it
+// closes and the epoch it opens. A rotation that half-happened would leave the
+// chain with no sitting committee.
+func TestAdvanceReportsAWriteItCannotMake(t *testing.T) {
+	vm, _, members := newDecryptVM(t, 3, 1) // one vote decides
+	next, _ := newCommittee(t, 3)
+	now := vm.clock.Time().Unix()
+
+	require.NoError(t, vm.versdb.Close())
+	require.Error(t, advanceTx(t, members[0], 1, next, 2, []byte("pk"), 1).applyAdvance(vm, now),
+		"a rotation that cannot be written did not happen")
+}
+
+// TestFulfilmentNeedsThePermitThatAskedForIt proves a committee cannot answer a
+// request whose authorizing permit is no longer there. The permit is what makes
+// the ask legitimate, so a request that outlived it authorizes nothing —
+// otherwise a deleted grant would still deliver a plaintext to a callback.
+func TestFulfilmentNeedsThePermitThatAskedForIt(t *testing.T) {
+	owner, grantee := newTestKey(t), newTestKey(t)
+	vm, _, members := newDecryptVM(t, 3, 2, owner, grantee)
+	handle, permitID := seedPermit(t, vm, owner, grantee, fhe.PermitOpDecrypt, 0)
+	acceptOne(t, vm, requestTx(t, grantee, testScheme, handle, permitID, 0, 1))
+	requestID := deriveRequestID(handle, grantee.addr, 1)
+	now := vm.clock.Time().Unix()
+
+	fulfil := fulfillTx(t, members[0], requestID, digestOf("r"), 1)
+
+	vm.stateLock.RLock()
+	require.NoError(t, fulfil.checkAuth(vm, now), "the control: with the permit there, it is authorized")
+	vm.stateLock.RUnlock()
+
+	// Point the request at a permit nothing granted.
+	vm.stateLock.Lock()
+	vm.decrypts[requestID].PermitID = [32]byte{0xab}
+	vm.stateLock.Unlock()
+
+	vm.stateLock.RLock()
+	defer vm.stateLock.RUnlock()
+	require.ErrorIs(t, fulfil.checkAuth(vm, now), ErrPermitNotFound)
 }

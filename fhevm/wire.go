@@ -23,24 +23,33 @@ import (
 //
 // SECURITY — the signing/authentication architecture:
 //
-//   - SigningBytes() is the deterministic preimage the payer SIGNS. It is one
-//     zap object binding every semantically-meaningful field (Type, Payer,
-//     Subject, GasLimit, Nonce, Scheme, Payload) and EXCLUDING Auth/Sig.
-//     Because Payer is bound here and authenticate() requires Payer ==
+//   - content() is one zap object binding every semantically-meaningful field
+//     (Type, Payer, Subject, GasLimit, Nonce, Scheme, Payload) and EXCLUDING
+//     Auth/Sig. Because Payer is bound here and authenticate() requires Payer ==
 //     addressOf(Auth), an attacker cannot swap in a different public key. And
 //     because Subject is bound here — and SyntacticVerify requires it to equal
 //     what the payload derives — the signature covers the OBJECT acted on, not
 //     merely the arguments that produce it.
 //
-//   - Bytes() is SigningBytes() ‖ sigObject, where sigObject carries Auth+Sig.
-//     The signed bytes are therefore a genuine byte-prefix of the full wire (the
-//     node's proposervm signed-block idiom). ID() = sha256(Bytes()).
+//   - SigningBytes(chain) is the deterministic preimage the payer SIGNS: the
+//     content, bound to the ONE chain it is meant for. The chain id does not
+//     travel — each side supplies its own — so a transaction signed for the
+//     testnet F-Chain cannot authenticate on the mainnet one. Without that
+//     binding a captured transaction replays verbatim onto every other F-Chain,
+//     where the same payer address exists (an address is the hash of a public
+//     key), burning its balance there for an operation it never asked for.
 //
-//   - authenticate() re-derives SigningBytes() from the parsed fields and
+//   - Bytes() is content() ‖ sigObject, where sigObject carries Auth+Sig, and
+//     ID() = sha256(Bytes()). What is authenticated is still exactly what is
+//     transmitted: the preimage is a pure function of the chain and the
+//     transmitted content prefix, and ParseTransaction accepts only input that
+//     is byte-identical to what those fields re-serialize to.
+//
+//   - authenticate(chain) re-derives the preimage from the parsed fields and
 //     verifies the signature against it; a deterministic zap marshal guarantees
-//     the re-derived preimage equals the signed prefix.
+//     the re-derived preimage equals the signed one.
 
-// ---- Transaction signing object (the SIGNED preimage; excludes Auth/Sig) ----
+// ---- Transaction content object (the semantic fields; excludes Auth/Sig) ----
 //
 //	Type     u8    @ 0
 //	Payer    20B   @ 1
@@ -70,10 +79,15 @@ const (
 	sgSize = 16
 )
 
-// SigningBytes is the deterministic encoding the payer signs. It binds every
-// semantically meaningful field — including Payer and Subject — but excludes
-// Auth and Sig.
-func (tx *Transaction) SigningBytes() []byte {
+// txDomain separates a transaction preimage from every other thing this chain
+// hashes, so no other digest can ever be mistaken for a payer's signature over
+// a transaction.
+const txDomain = "fhevm/tx/"
+
+// content is the deterministic encoding of the transaction's semantic fields —
+// including Payer and Subject — excluding Auth and Sig. It is the leading
+// message of the wire encoding.
+func (tx *Transaction) content() []byte {
 	b := zap.NewBuilder(zap.HeaderSize + txSize + len(tx.Scheme) + len(tx.Payload) + 64)
 	ob := b.StartObject(txSize)
 	ob.SetUint8(txType, tx.Type)
@@ -87,11 +101,22 @@ func (tx *Transaction) SigningBytes() []byte {
 	return b.Finish()
 }
 
-// Bytes is the full wire encoding: the signing object followed by an appended
-// zap object carrying Auth and Sig. The signing prefix is byte-identical to
-// SigningBytes(), so the payer's signature covers exactly Bytes()[:zapLen].
+// SigningBytes is the preimage the payer signs: the transaction's content bound
+// to the chain it is meant for. Clients build it with the chain id they are
+// transacting on; a node verifies with its own, so the two agree only on the
+// chain the payer chose.
+func (tx *Transaction) SigningBytes(chain ids.ID) []byte {
+	c := tx.content()
+	out := make([]byte, 0, len(txDomain)+len(chain)+len(c))
+	out = append(out, txDomain...)
+	out = append(out, chain[:]...)
+	return append(out, c...)
+}
+
+// Bytes is the full wire encoding: the content object followed by an appended
+// zap object carrying Auth and Sig.
 func (tx *Transaction) Bytes() []byte {
-	signing := tx.SigningBytes()
+	signing := tx.content()
 
 	sb := zap.NewBuilder(zap.HeaderSize + sgSize + len(tx.Auth) + len(tx.Sig) + 32)
 	so := sb.StartObject(sgSize)
@@ -192,7 +217,20 @@ func (b *Block) Bytes() []byte {
 	return bld.Finish()
 }
 
+// MaxBlockSize bounds a block on the wire. Without it a peer decides how much
+// this node parses, hashes and allocates before anything about the block has
+// been checked: an 8 MB message carrying 1,524 transactions parsed to
+// completion, because MaxBlockTxs was applied by Verify and Verify runs after
+// the parse. Both bounds belong here, at the first byte, and neither implies
+// the other — this one bounds the bytes read, MaxBlockTxs bounds the signatures
+// verified, and a small block can still declare a great many tiny transactions.
+const MaxBlockSize = 2 << 20 // 2 MiB
+
 func parseBlock(vm *VM, data []byte) (*Block, error) {
+	if len(data) > MaxBlockSize {
+		return nil, fmt.Errorf("fhevm: %w: block is %d bytes, over %d",
+			ErrInvalidPayload, len(data), MaxBlockSize)
+	}
 	msg, err := zap.Parse(data)
 	if err != nil {
 		return nil, err
@@ -207,6 +245,10 @@ func parseBlock(vm *VM, data []byte) (*Block, error) {
 	b.timestamp = time.Unix(o.Int64(blkTime), 0)
 
 	lens := readU32List(o, blkTxLens)
+	if len(lens) > MaxBlockTxs {
+		return nil, fmt.Errorf("fhevm: %w: block declares %d transactions, over %d",
+			ErrInvalidPayload, len(lens), MaxBlockTxs)
+	}
 	blob := o.Bytes(blkTxBlob)
 	b.transactions = make([]*Transaction, 0, len(lens))
 	pos := 0
@@ -221,17 +263,13 @@ func parseBlock(vm *VM, data []byte) (*Block, error) {
 		b.transactions = append(b.transactions, tx)
 		pos += int(l)
 	}
-	// The lengths must account for the whole blob. Without this, bytes no length
-	// covers ride along unread: the fields decode identically, the id is
-	// computed from the transactions rather than the bytes, and a block has as
-	// many encodings as an attacker cares to make.
-	if pos != len(blob) {
-		return nil, fmt.Errorf("fhevm: %w: %d unread bytes in the tx blob",
-			ErrInvalidPayload, len(blob)-pos)
-	}
-	// And the whole encoding must be the one this block serializes to, the same
-	// rule ParseTransaction applies — so the claim in this file's header holds
-	// for a block as well as for a transaction.
+	// The whole encoding must be the one this block serializes to, the same rule
+	// ParseTransaction applies — so the claim in this file's header holds for a
+	// block as well as for a transaction. Bytes that no length covers are refused
+	// by it too, and not separately: a blob with unread bytes re-serializes
+	// SHORTER than it arrived, so the comparison below fails. That is measured,
+	// not assumed — deleting the separate check left every test green, which is
+	// what makes it a special case of this one rather than a second rule.
 	b.id = b.computeID()
 	if !bytes.Equal(data, b.Bytes()) {
 		return nil, fmt.Errorf("fhevm: %w: non-canonical block encoding", ErrInvalidPayload)
@@ -280,3 +318,15 @@ func appendBytes(b []byte) []byte {
 	}
 	return append([]byte(nil), b...)
 }
+
+// emptyBlockSize is the wire cost of a block carrying no transactions: the zap
+// header, the root object, and an empty length list.
+var emptyBlockSize = len((&Block{}).Bytes())
+
+// txEntry is what one transaction costs a block BEYOND its own bytes: four for
+// its entry in the length list, and up to four more of zap's eight-byte
+// alignment. It is an upper bound by construction, which is the direction that
+// matters — BuildBlock adds it per selected transaction, so its running total
+// can never come in under the block it describes and a proposer cannot select
+// its way past a size its own Verify refuses. wire_test.go pins the relation.
+const txEntry = 8

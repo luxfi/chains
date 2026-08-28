@@ -19,7 +19,6 @@ import (
 
 	"github.com/luxfi/chains/mpcvm/fhe"
 	"github.com/luxfi/database/memdb"
-	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/runtime"
 	vmcore "github.com/luxfi/vm"
@@ -79,12 +78,17 @@ func dump(t *testing.T, vm *VM) string {
 
 // replayNode builds a node from bytes identical to every other node's, so that
 // any difference in the result comes from applying the block and nothing else.
-func replayNode(t *testing.T, genesis []byte, chainID ids.ID) *VM {
+// That includes the chain id: these nodes are validators of ONE chain, as
+// production's are, and the id is not a parameter because there is nothing for
+// a caller to vary. A harness that handed each node its own would be describing
+// a shape that does not exist, and would excuse the binding it should be
+// checking.
+func replayNode(t *testing.T, genesis []byte) *VM {
 	t.Helper()
 	logger := log.NewNoOpLogger()
 	vm := &VM{}
 	require.NoError(t, vm.Initialize(context.Background(), vmcore.Init{
-		Runtime:  &runtime.Runtime{ChainID: chainID, NetworkID: 96369, Log: logger},
+		Runtime:  &runtime.Runtime{ChainID: testChainID, NetworkID: 96369, Log: logger},
 		DB:       memdb.New(),
 		ToEngine: make(chan vmcore.Message, 8),
 		Log:      logger,
@@ -106,11 +110,9 @@ func TestReplayIsByteIdentical(t *testing.T) {
 		Committee: committee, Threshold: 2, PublicKey: []byte("network-fhe-public-key"),
 	})
 	require.NoError(t, err)
-	chainID := ids.GenerateTestID()
-
 	// The producer runs the whole lifecycle, so the blocks exercise every
 	// operation and every record type.
-	producer := replayNode(t, genesis, chainID)
+	producer := replayNode(t, genesis)
 	producer.clock.Set(timeAt(1_700_000_100))
 
 	handle, permitID := seedPermit(t, producer, owner, grantee, fhe.PermitOpDecrypt, 0)
@@ -139,9 +141,9 @@ func TestReplayIsByteIdentical(t *testing.T) {
 
 	// Two fresh nodes replay it. Their clocks differ from the producer's and
 	// from each other's, because chain time must come from the block.
-	a := replayNode(t, genesis, chainID)
+	a := replayNode(t, genesis)
 	a.clock.Set(timeAt(1_900_000_000))
-	b := replayNode(t, genesis, chainID)
+	b := replayNode(t, genesis)
 	b.clock.Set(timeAt(2_100_000_000))
 
 	for _, node := range []*VM{a, b} {
@@ -182,14 +184,12 @@ func TestReplayIsIndependentOfWallClock(t *testing.T) {
 		Committee: committee, Threshold: 1, PublicKey: []byte("pk"),
 	})
 	require.NoError(t, err)
-	chainID := ids.GenerateTestID()
-
-	producer := replayNode(t, genesis, chainID)
+	producer := replayNode(t, genesis)
 	producer.clock.Set(timeAt(1_700_000_500))
 	acceptOne(t, producer, registerTx(t, k, testScheme, digestOf("stamped"), 1))
 	raw := producer.lastBlock.Bytes()
 
-	follower := replayNode(t, genesis, chainID)
+	follower := replayNode(t, genesis)
 	follower.clock.Set(timeAt(1_700_090_000)) // a day later
 	blk, err := follower.ParseBlock(context.Background(), raw)
 	require.NoError(t, err)

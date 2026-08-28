@@ -98,6 +98,12 @@ var (
 	errNoParentBlock = errors.New("fhevm: no parent block")
 	errClockBehind   = errors.New("fhevm: local clock trails the chain tip by more than the skew allowance")
 
+	// ErrNotOnTip refuses a block that does not extend the chain: one whose
+	// parent is neither the accepted tip nor a block verified above it. Such a
+	// block is well formed and still unusable — accepting one rewinds the chain
+	// to its parent's height.
+	ErrNotOnTip = errors.New("fhevm: block does not extend the accepted tip")
+
 	ErrInvalidBlock     = errors.New("fhevm: malformed block")
 	ErrMempoolFull      = errors.New("fhevm: mempool is full")
 	ErrInvalidTxType    = errors.New("fhevm: invalid transaction type")
@@ -272,6 +278,12 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 	if cfg.NetworkID != 0 {
 		vm.networkID = cfg.NetworkID
 	}
+	// Every signature this chain accepts and every block id it computes is bound
+	// to this value, so a chain with no identity would share both with every
+	// other chain that also had none. There is no default for it.
+	if vm.chainID == ids.Empty {
+		return fmt.Errorf("fhevm: %w: no chain id", ErrInvalidBlock)
+	}
 
 	vm.ledger = fee.NewLedger(vm.versdb)
 	vm.feePolicy = newFeePolicy(vm.networkID)
@@ -397,18 +409,52 @@ func (vm *VM) loadStateLocked() error {
 	if err := loadInto(vm, EpochPrefix, vm.epochs, func(r *EpochRecord) uint64 { return r.Epoch }); err != nil {
 		return err
 	}
-	if b, err := vm.state.Get(currentEpochKey); err == nil && len(b) == 8 {
-		vm.epoch = binary.BigEndian.Uint64(b)
+	epoch, err := vm.read(currentEpochKey, 8)
+	if err != nil {
+		return err
+	}
+	if epoch != nil {
+		vm.epoch = binary.BigEndian.Uint64(epoch)
 	}
 
-	if b, err := vm.state.Get(lastAcceptedKey); err == nil && len(b) == 32 {
-		copy(vm.lastAccepted[:], b)
-		if blk, err := vm.getBlockLocked(vm.lastAccepted); err == nil {
-			vm.lastBlock = blk
-			vm.height = blk.height
+	tip, err := vm.read(lastAcceptedKey, 32)
+	if err != nil {
+		return err
+	}
+	if tip != nil {
+		vm.lastAccepted = ids.ID(tip)
+		blk, err := vm.getBlockLocked(vm.lastAccepted)
+		if err != nil {
+			return fmt.Errorf("fhevm: last accepted block %s: %w", vm.lastAccepted, err)
 		}
+		vm.lastBlock = blk
+		vm.height = blk.height
 	}
 	return nil
+}
+
+// read returns the value at key, or nil if the key is ABSENT. Anything else is
+// an error, because a read that failed is not a read that found nothing.
+//
+// Conflating the two is how a live chain reads as a fresh one: a transient
+// failure on the last-accepted pointer left the tip at genesis and the height at
+// zero with Initialize returning nil, and the node went on to build height 1
+// over a chain already at height 2 — durably, over the height index, with
+// nothing in any log to say so. The same conflation on the epoch pointer seats
+// the wrong committee, and on a nonce it reopens the replay window that nonce
+// exists to close.
+func (vm *VM) read(key []byte, width int) ([]byte, error) {
+	b, err := vm.state.Get(key)
+	switch {
+	case errors.Is(err, database.ErrNotFound):
+		return nil, nil
+	case err != nil:
+		return nil, err
+	case len(b) != width:
+		return nil, fmt.Errorf("fhevm: %w: %q is %d bytes, not %d",
+			ErrInvalidPayload, key, len(b), width)
+	}
+	return b, nil
 }
 
 // loadInto reads every JSON record under prefix into dst, keyed by key(record).
@@ -520,15 +566,17 @@ func writeRecord[R any](vm *VM, prefix string, id [32]byte, rec *R) error {
 	return vm.state.Put(append([]byte(prefix), id[:]...), data)
 }
 
-// nonceOf returns the payer's last-used nonce (0 if the account has never
-// transacted). The next valid nonce is nonceOf(payer)+1. Caller holds a lock.
-func (vm *VM) nonceOf(payer fee.Account) uint64 {
-	key := append(append([]byte{}, noncePrefix...), payer[:]...)
-	b, err := vm.state.Get(key)
-	if err != nil || len(b) != 8 {
-		return 0
+// nonceOf returns the payer's last-used nonce. An account that has never
+// transacted has nonce 0; a read that FAILED is an error, not a zero, because a
+// zero here says "this payer has spent nothing" and lets every transaction it
+// ever signed through again. The next valid nonce is nonceOf(payer)+1. Caller
+// holds a lock.
+func (vm *VM) nonceOf(payer fee.Account) (uint64, error) {
+	b, err := vm.read(append(append([]byte{}, noncePrefix...), payer[:]...), 8)
+	if err != nil || b == nil {
+		return 0, err
 	}
-	return binary.BigEndian.Uint64(b)
+	return binary.BigEndian.Uint64(b), nil
 }
 
 // setNonce records the payer's last-used nonce (writes to the versiondb, so it
@@ -650,7 +698,7 @@ func (vm *VM) SubmitTx(tx *Transaction) (ids.ID, error) {
 	if err := tx.SyntacticVerify(); err != nil {
 		return ids.Empty, err
 	}
-	if err := tx.authenticate(); err != nil {
+	if err := tx.authenticate(vm.chainID); err != nil {
 		return ids.Empty, err
 	}
 	feeAmt, err := FeeFor(tx)
@@ -668,7 +716,11 @@ func (vm *VM) SubmitTx(tx *Transaction) (ids.ID, error) {
 	}
 	// The replay/order guard runs BEFORE authorization, so a replayed
 	// transaction is reported as replayed whatever else is true of it.
-	want := vm.nonceOf(tx.Payer) + 1
+	committed, err := vm.nonceOf(tx.Payer)
+	if err != nil {
+		return ids.Empty, err
+	}
+	want := committed + 1
 	if q, ok := vm.queued[tx.Payer]; ok && q >= want {
 		want = q + 1
 	}
@@ -742,16 +794,26 @@ func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
 		return nil, errNoPendingTxs
 	}
 
+	// Selection stops at whichever bound comes first: the transaction count a
+	// block may carry, or the bytes it may occupy on the wire. Stopping only on
+	// the count would let 1024 ordinary transactions — each carrying an ML-DSA-65
+	// key and signature — build a 5 MB block that this node's own parser refuses.
 	batch := newBatch(vm)
 	picked := make([]*Transaction, 0, len(queued))
+	size := emptyBlockSize
 	for _, tx := range queued {
 		if len(picked) == MaxBlockTxs {
+			break
+		}
+		grown := size + len(tx.Bytes()) + txEntry
+		if grown > MaxBlockSize {
 			break
 		}
 		if err := batch.admit(tx); err != nil {
 			continue
 		}
 		picked = append(picked, tx)
+		size = grown
 	}
 	if len(picked) == 0 {
 		return nil, errNoPendingTxs
@@ -831,6 +893,24 @@ func (vm *VM) getBlockLocked(blockID ids.ID) (*Block, error) {
 	return parseBlock(vm, b)
 }
 
+// onTip reports whether a block whose parent is parentID extends the chain: the
+// parent is the accepted tip, or a block that verified above it and is still in
+// flight. trackVerified admits nothing at or below the accepted height and
+// Verify admits nothing whose own parent failed this test, so every block in
+// flight descends from the tip and the two cases are the whole of it.
+//
+// Caller holds stateLock.
+func (vm *VM) onTip(parentID ids.ID) error {
+	if parentID == vm.lastAccepted {
+		return nil
+	}
+	if _, ok := vm.pendingBlocks[parentID]; ok {
+		return nil
+	}
+	return fmt.Errorf("fhevm: %w: parent %s is neither the tip %s nor in flight",
+		ErrNotOnTip, parentID, vm.lastAccepted)
+}
+
 // trackVerified makes a block findable by id while it is in flight, so a child
 // can resolve it as a parent. Both the block we build and a block we verify
 // from a peer go through here — tracking only our own left a follower able to
@@ -890,9 +970,6 @@ func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
 	}
 	mux := http.NewServeMux()
 	for path, h := range handlers {
-		if path == "" {
-			path = "/"
-		}
 		mux.Handle(path, h)
 	}
 	return mux, nil
@@ -929,8 +1006,15 @@ func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
 	committee := len(epoch.Committee)
 	threshold := epoch.Threshold
 	height := vm.height
-	burned, _ := vm.ledger.Burned()
+	burned, err := vm.ledger.Burned()
 	vm.stateLock.RUnlock()
+
+	// A ledger this node cannot read is not a ledger reporting zero burned. The
+	// number would be indistinguishable from a chain that has never settled a
+	// fee, which is the one reading an operator would take as fine.
+	if err != nil {
+		return chain.HealthResult{}, err
+	}
 
 	return chain.HealthResult{
 		// A committee is what makes F answerable: with none seated, decryptions

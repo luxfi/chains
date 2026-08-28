@@ -54,7 +54,7 @@ func (b *batch) admit(tx *Transaction) error {
 	if err := tx.SyntacticVerify(); err != nil {
 		return err
 	}
-	if err := tx.authenticate(); err != nil {
+	if err := tx.authenticate(b.vm.chainID); err != nil {
 		return err
 	}
 
@@ -62,7 +62,11 @@ func (b *batch) admit(tx *Transaction) error {
 	// one, counting the transactions already taken from it in this block.
 	want, seen := b.nonce[tx.Payer]
 	if !seen {
-		want = b.vm.nonceOf(tx.Payer) + 1
+		committed, err := b.vm.nonceOf(tx.Payer)
+		if err != nil {
+			return err
+		}
+		want = committed + 1
 	}
 	if tx.Nonce != want {
 		return ErrBadNonce

@@ -26,8 +26,14 @@ type Block struct {
 	vm           *VM
 }
 
+// computeID names the block by its content AND by the chain it belongs to. The
+// chain id does not travel — a peer supplies its own — so the same bytes name
+// different blocks on different chains, and chain B cannot resolve chain A's
+// parent. Without it every F-Chain with the same genesis timestamp shared one
+// genesis id, and a block built on one was accepted verbatim by the others.
 func (b *Block) computeID() ids.ID {
 	h := sha256.New()
+	h.Write(b.vm.chainID[:])
 	h.Write(b.parentID[:])
 	var u8 [8]byte
 	binary.BigEndian.PutUint64(u8[:], b.height)
@@ -100,10 +106,25 @@ func (b *Block) Verify(ctx context.Context) error {
 		return fmt.Errorf("fhevm: %w: %d transactions exceeds %d",
 			ErrInvalidBlock, len(b.transactions), MaxBlockTxs)
 	}
+	// A block this node built in memory is held to the same size a block off the
+	// wire is held to, so a proposer cannot produce one its own peers refuse to
+	// parse.
+	if n := len(b.Bytes()); n > MaxBlockSize {
+		return fmt.Errorf("fhevm: %w: %d bytes exceeds %d", ErrInvalidBlock, n, MaxBlockSize)
+	}
 
 	if err := func() error {
 		b.vm.stateLock.RLock()
 		defer b.vm.stateLock.RUnlock()
+
+		// The parent must be one this chain can still build on: the accepted tip,
+		// or a block verified above it and not yet decided. Height alone is not
+		// that check — a block whose parent is an OLD accepted block satisfies
+		// height == parent+1 perfectly well, and accepting it rewinds the chain
+		// and leaves the height index naming an orphan as canonical.
+		if err := b.vm.onTip(b.parentID); err != nil {
+			return err
+		}
 
 		batch := newBatch(b.vm)
 		for _, tx := range b.transactions {
@@ -143,6 +164,17 @@ func (b *Block) Accept(ctx context.Context) error {
 
 	b.vm.stateLock.Lock()
 	defer b.vm.stateLock.Unlock()
+
+	// A block extends the tip or it is not accepted. Verify reached the same
+	// verdict earlier, against the tip AT THAT TIME; between the two the chain
+	// moves, and it is this hold of the lock that decides. Without it Accept
+	// writes the height index, the last-accepted pointer and the in-memory height
+	// for a block on an abandoned branch — the chain rewinds, and every peer
+	// bootstrapping from the index is served an orphan as canonical.
+	if b.parentID != b.vm.lastAccepted {
+		return fmt.Errorf("fhevm: %w: parent %s is not the accepted tip %s",
+			ErrNotOnTip, b.parentID, b.vm.lastAccepted)
+	}
 
 	if err := b.settleAndApply(now); err != nil {
 		b.abort()
@@ -208,7 +240,11 @@ func (b *Block) settleAndApply(now int64) error {
 	for _, tx := range b.transactions {
 		// Replay/order guard: nonce must be exactly the payer's next. Reads the
 		// versiondb so earlier txs in this same block (buffered) are seen.
-		if tx.Nonce != b.vm.nonceOf(tx.Payer)+1 {
+		committed, err := b.vm.nonceOf(tx.Payer)
+		if err != nil {
+			return err
+		}
+		if tx.Nonce != committed+1 {
 			return ErrBadNonce
 		}
 		gasUsed, err := GasFor(tx)
