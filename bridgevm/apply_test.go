@@ -169,3 +169,23 @@ func TestAnAcceptedBlockIsDurableAndReleased(t *testing.T) {
 	require.False(t, fresh)
 	require.Equal(t, blk.ID(), at.ID())
 }
+
+// TestTheHeightIndexNamesOnlyAcceptedBlocks pins the index to the commit that
+// wrote it.
+func TestTheHeightIndexNamesOnlyAcceptedBlocks(t *testing.T) {
+	vm, db, _ := vmWithTransfer(t)
+
+	blk, err := vm.BuildBlock(context.Background())
+	require.NoError(t, err)
+
+	db.refuse = true
+	require.ErrorIs(t, blk.Accept(context.Background()), errRefused)
+	_, err = vm.GetBlockIDAtHeight(context.Background(), 1)
+	require.Error(t, err, "a block that did not commit has no height entry")
+
+	db.refuse = false
+	require.NoError(t, blk.Accept(context.Background()))
+	at, err := vm.GetBlockIDAtHeight(context.Background(), 1)
+	require.NoError(t, err)
+	require.Equal(t, blk.ID(), at)
+}

@@ -221,6 +221,33 @@ func TestAnAcceptedBlockIsDurableAndVisible(t *testing.T) {
 	require.Equal(t, blk.ID(), got.ID())
 }
 
+// TestTheHeightIndexNamesOnlyAcceptedBlocks pins the index to the commit that
+// wrote it: it is written with the block, so it cannot name one the chain did
+// not accept.
+func TestTheHeightIndexNamesOnlyAcceptedBlocks(t *testing.T) {
+	vm, db := newRefusingVM(t)
+	defer vm.Shutdown(context.Background())
+
+	subject, _ := vm.CreateIdentity([]byte("subject"), nil)
+	issuer, _ := vm.RegisterIssuer("issuer", []byte("issuer-key"), []string{"T"}, 1)
+	_, err := vm.IssueCredential(issuer.ID, subject.ID, []string{"T"}, nil, time.Hour)
+	require.NoError(t, err)
+
+	doomed, err := vm.BuildBlock(context.Background())
+	require.NoError(t, err)
+	db.refuse = true
+	require.ErrorIs(t, doomed.Accept(context.Background()), errRefused)
+
+	_, err = vm.GetBlockIDAtHeight(context.Background(), 1)
+	require.Error(t, err, "a block that did not commit has no height entry")
+
+	db.refuse = false
+	require.NoError(t, doomed.Accept(context.Background()))
+	at, err := vm.GetBlockIDAtHeight(context.Background(), 1)
+	require.NoError(t, err)
+	require.Equal(t, doomed.ID(), at)
+}
+
 // tipKeyForTest names the store's tip pointer. The test asserts on the key the
 // store actually writes rather than on one it hopes matches.
 func tipKeyForTest() []byte { return []byte("chain/tip") }

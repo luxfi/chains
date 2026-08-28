@@ -204,3 +204,28 @@ func TestGenesisIsDurableWithoutABlock(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, has, "a genesis allocation is durable before any block exists")
 }
+
+// TestTheHeightIndexNamesOnlyAcceptedBlocks pins the index to the commit that
+// wrote it.
+func TestTheHeightIndexNamesOnlyAcceptedBlocks(t *testing.T) {
+	vmImpl, db := newRefusingVM(t)
+	defer vmImpl.Shutdown(context.Background())
+
+	tx := spendTx(nullifier(11))
+	acceptProofs(vmImpl, tx)
+	require.NoError(t, vmImpl.mempool.AddTransaction(tx))
+
+	blk, err := vmImpl.BuildBlock(context.Background())
+	require.NoError(t, err)
+
+	db.refuse = true
+	require.ErrorIs(t, blk.Accept(context.Background()), errRefused)
+	_, err = vmImpl.GetBlockIDAtHeight(context.Background(), 1)
+	require.Error(t, err, "a block that did not commit has no height entry")
+
+	db.refuse = false
+	require.NoError(t, blk.Accept(context.Background()))
+	at, err := vmImpl.GetBlockIDAtHeight(context.Background(), 1)
+	require.NoError(t, err)
+	require.Equal(t, blk.ID(), at)
+}
