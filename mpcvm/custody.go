@@ -22,8 +22,13 @@ package mpcvm
 // The committee is the chain's own validator set (Committee below). Joining the
 // signing ring is joining the validator set — there is no allowlist, no
 // operator registry, and no key ceremony gated on an admin. A new validator
-// participates in every key generated after it joins, and is reshared into
-// existing keys by the resharing path.
+// participates in every key generated after it joins.
+//
+// It does NOT join keys that already exist: there is no resharing ceremony, and
+// a key's participant set is fixed at the DKG that created it. That is a real
+// limit — a custody key survives only while K of its original N remain — and it
+// is stated rather than implied, because a registry with a ReplaceKey and prose
+// about "the resharing path" reads as though the ceremony exists.
 //
 // # Why this is the fix for off-chain signer clusters
 //
@@ -42,10 +47,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"time"
 
-	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
+	"github.com/luxfi/threshold/pkg/math/curve"
 	"github.com/luxfi/threshold/pkg/party"
 	"github.com/luxfi/threshold/pkg/quorum"
 	cmpconfig "github.com/luxfi/threshold/protocols/cmp/config"
@@ -101,8 +105,20 @@ func (h *heldShare) marshal() ([]byte, error) {
 }
 
 // parseHeldShare reads a node-private share back.
+//
+// The curve comes from the key's protocol, and it is not optional: the stored
+// encoding holds curve points as bare bytes, so the decoder has to be told
+// which curve to decode them on. It used to be handed nil, which the library
+// refuses outright — so parseHeldShare could not succeed for ANY input, and
+// every validator that actually held a share failed to start, with
+// Initialize returning "load key shares: config must be initialized using
+// EmptyConfig". A node that holds no share restarts fine, which is why the
+// path that fails is the one only real committee members take.
 func parseHeldShare(kind string, raw []byte) (*heldShare, error) {
-	cfg := cmpconfig.EmptyConfig(nil)
+	if kind != KindCGGMP21 {
+		return nil, fmt.Errorf("mpcvm: share for unknown protocol %q", kind)
+	}
+	cfg := cmpconfig.EmptyConfig(curve.Secp256k1{})
 	if err := cfg.UnmarshalBinary(raw); err != nil {
 		return nil, fmt.Errorf("mpcvm: share for kind %s: %w", kind, err)
 	}
@@ -318,7 +334,6 @@ func (vm *VM) runKeygen(ctx context.Context, keyID string, policy quorum.Policy,
 		Artifact:        pop,
 		Signers:         participants,
 		Key:             rec,
-		Timestamp:       time.Now().Unix(),
 	}
 	vm.stage(op)
 
@@ -400,7 +415,6 @@ func (vm *VM) runSign(ctx context.Context, keyID string, digest []byte, requesti
 		Digest:          append([]byte(nil), digest...),
 		Artifact:        sig,
 		Signers:         signers,
-		Timestamp:       time.Now().Unix(),
 	}
 	vm.stage(op)
 
@@ -471,14 +485,7 @@ func (vm *VM) runCMPKeygen(
 // inbound gossip for that ceremony finds it. release tears it down.
 func (vm *VM) ceremonyRouter(ctx context.Context, cid string, parties []party.ID) (MessageRouter, func(), error) {
 	if vm.sender == nil {
-		// Single-process operation with no p2p. The in-process mesh is the same
-		// MessageRouter boundary, so the executor path under test is the path
-		// that runs in production; only the wire underneath differs.
-		if vm.localMesh == nil {
-			return nil, nil, errors.New("mpcvm: no warp sender and no local mesh; cross-validator ceremonies unavailable")
-		}
-		mesh := vm.localMesh
-		return mesh.routerFor(cid, vm.partyID), func() { mesh.release(cid) }, nil
+		return nil, nil, errors.New("mpcvm: no warp sender; cross-validator ceremonies unavailable")
 	}
 	nodes, peers, err := resolveCommittee(parties)
 	if err != nil {
@@ -558,7 +565,3 @@ func containsParty(ps []party.ID, want party.ID) bool {
 	}
 	return false
 }
-
-// netID is the network (subnet) this chain validates. M-Chain runs on the
-// primary network, so its committee is the primary validator set.
-var _ = ids.Empty

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/luxfi/crypto/bls"
+	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 )
@@ -697,6 +698,15 @@ func (lm *LifecycleManager) completeDKGLocked() (*deferredCallback, error) {
 	lm.currentDKG.Status = DKGCompleted
 	lm.currentDKG.CompletedAt = time.Now().Unix()
 
+	// A transition waiting on this ceremony can now be finalized. This is the
+	// only place that advances it: shouldFinalizeTransition finalizes only from
+	// TransitionFinalizingPhase, so without this the transition stays in
+	// TransitionDKGPhase forever, currentTransition never clears, and
+	// shouldStartTransition then refuses every later epoch as well.
+	if lm.currentTransition != nil && lm.currentTransition.Status == TransitionDKGPhase {
+		lm.currentTransition.Status = TransitionFinalizingPhase
+	}
+
 	lm.logger.Info("DKG ceremony completed",
 		"epoch", lm.currentDKG.Epoch,
 		"public_key_len", len(publicKey))
@@ -817,10 +827,14 @@ func (lm *LifecycleManager) startTransitionLocked() error {
 		participants[i] = m.NodeID
 	}
 
-	// Start DKG for new epoch
+	// Start DKG for new epoch. A committee too small for the configured
+	// threshold falls back to the smallest quorum above two thirds, the same
+	// rule DefaultThreshold encodes: 2*100/3+1 is 67, the configured default.
+	// Without the +1 the fallback is 2*n/3, which is 66 of 100 -- and 2 of 4,
+	// half the committee.
 	threshold := lm.config.DefaultThreshold
 	if threshold > len(participants) {
-		threshold = (len(participants) * 2) / 3 // 2/3 majority
+		threshold = (len(participants)*2)/3 + 1
 	}
 
 	return lm.startDKGLocked(newEpoch, participants, threshold)
@@ -999,41 +1013,55 @@ func (lm *LifecycleManager) SetSlashCallback(onSlash func(nodeID ids.NodeID, rea
 	lm.onSlash = onSlash
 }
 
-// loadState loads persisted lifecycle state
+// loadState restores a ceremony or a transition that was in flight when the
+// process last stopped.
+//
+// A record that is absent means there was nothing in flight. Anything else --
+// an unreadable database, bytes that do not decode -- is reported, because
+// continuing leaves the manager with no ceremony and no transition, which is
+// indistinguishable from a clean start: the epoch the committee was halfway
+// through would simply never finish, and nothing would say so.
 func (lm *LifecycleManager) loadState() error {
 	if lm.registry == nil || lm.registry.db == nil {
 		return nil
 	}
 
-	// Load any active DKG state
 	currentEpoch := lm.registry.GetCurrentEpoch()
-	dkgKey := append([]byte("lifecycle:dkg:"), encodeUint64(currentEpoch)...)
-	if dkgData, err := lm.registry.db.Get(dkgKey); err == nil && len(dkgData) > 0 {
+
+	dkgData, err := lm.registry.db.Get(append([]byte("lifecycle:dkg:"), encodeUint64(currentEpoch)...))
+	if err != nil && !errors.Is(err, database.ErrNotFound) {
+		return fmt.Errorf("read DKG state: %w", err)
+	}
+	if len(dkgData) > 0 {
 		var dkg DKGState
-		if err := json.Unmarshal(dkgData, &dkg); err == nil {
-			// Only restore if DKG is still in progress
-			if dkg.Status != DKGCompleted && dkg.Status != DKGFailed && dkg.Status != DKGAborted {
-				lm.currentDKG = &dkg
-				lm.logger.Info("Restored DKG state from database",
-					"epoch", dkg.Epoch,
-					"status", dkg.Status.String())
-			}
+		if err := json.Unmarshal(dkgData, &dkg); err != nil {
+			return fmt.Errorf("decode DKG state: %w", err)
+		}
+		// Only restore if DKG is still in progress
+		if dkg.Status != DKGCompleted && dkg.Status != DKGFailed && dkg.Status != DKGAborted {
+			lm.currentDKG = &dkg
+			lm.logger.Info("Restored DKG state from database",
+				"epoch", dkg.Epoch,
+				"status", dkg.Status.String())
 		}
 	}
 
-	// Load any active transition state
-	transitionKey := append([]byte("lifecycle:transition:"), encodeUint64(currentEpoch+1)...)
-	if transitionData, err := lm.registry.db.Get(transitionKey); err == nil && len(transitionData) > 0 {
+	transitionData, err := lm.registry.db.Get(append([]byte("lifecycle:transition:"), encodeUint64(currentEpoch+1)...))
+	if err != nil && !errors.Is(err, database.ErrNotFound) {
+		return fmt.Errorf("read transition state: %w", err)
+	}
+	if len(transitionData) > 0 {
 		var transition TransitionState
-		if err := json.Unmarshal(transitionData, &transition); err == nil {
-			// Only restore if transition is still in progress
-			if transition.Status != TransitionCompleted && transition.Status != TransitionFailed {
-				lm.currentTransition = &transition
-				lm.logger.Info("Restored transition state from database",
-					"fromEpoch", transition.FromEpoch,
-					"toEpoch", transition.ToEpoch,
-					"status", transition.Status.String())
-			}
+		if err := json.Unmarshal(transitionData, &transition); err != nil {
+			return fmt.Errorf("decode transition state: %w", err)
+		}
+		// Only restore if transition is still in progress
+		if transition.Status != TransitionCompleted && transition.Status != TransitionFailed {
+			lm.currentTransition = &transition
+			lm.logger.Info("Restored transition state from database",
+				"fromEpoch", transition.FromEpoch,
+				"toEpoch", transition.ToEpoch,
+				"status", transition.Status.String())
 		}
 	}
 

@@ -569,7 +569,11 @@ func ParseFHEKeyRotationV1(data []byte) (*FHEKeyRotationV1, error) {
 // Payload Dispatcher
 // =====================
 
-// ParsePayload parses any FHE Warp payload and returns the type and data
+// ParsePayload parses any FHE Warp payload and returns the type and data.
+// On any error the payload is a true nil. Handing back the typed pointer
+// alongside the error boxes a nil *FHEDecryptResultV1 into a non-nil
+// interface, and a caller testing `if payload != nil` then admits a payload
+// that failed to parse.
 func ParsePayload(data []byte) (uint8, interface{}, error) {
 	if len(data) < 2 {
 		return 0, nil, ErrPayloadTooShort
@@ -594,16 +598,28 @@ func ParsePayload(data []byte) (uint8, interface{}, error) {
 		return payloadType, req, nil
 	case PayloadTypeFHEDecryptResultV1:
 		res, err := ParseFHEDecryptResultV1(data)
-		return payloadType, res, err
+		if err != nil {
+			return payloadType, nil, err
+		}
+		return payloadType, res, nil
 	case PayloadTypeFHEReencryptRequestV1:
 		req, err := ParseFHEReencryptRequestV1(data)
-		return payloadType, req, err
+		if err != nil {
+			return payloadType, nil, err
+		}
+		return payloadType, req, nil
 	case PayloadTypeFHETaskResultV1:
 		res, err := ParseFHETaskResultV1(data)
-		return payloadType, res, err
+		if err != nil {
+			return payloadType, nil, err
+		}
+		return payloadType, res, nil
 	case PayloadTypeFHEKeyRotationV1:
 		rot, err := ParseFHEKeyRotationV1(data)
-		return payloadType, rot, err
+		if err != nil {
+			return payloadType, nil, err
+		}
+		return payloadType, rot, nil
 	default:
 		return payloadType, nil, ErrInvalidPayloadType
 	}

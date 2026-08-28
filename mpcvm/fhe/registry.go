@@ -508,11 +508,19 @@ func (r *Registry) GetCurrentEpoch() uint64 {
 	return r.epoch
 }
 
-// GetCommittee returns the committee for the current epoch
+// GetCommittee returns the committee for the current epoch.
+// Only a missing epoch record means "no committee yet"; any other failure is
+// returned. Reporting a read failure as an empty committee hands the lifecycle
+// manager a zero-member set that reads as a legitimate answer -- it would
+// register every new member at index 0, weigh the committee at zero, and open
+// a DKG with no participants.
 func (r *Registry) GetCommittee() ([]CommitteeMember, error) {
 	info, err := r.GetEpoch(r.GetCurrentEpoch())
+	if errors.Is(err, database.ErrNotFound) {
+		return []CommitteeMember{}, nil
+	}
 	if err != nil {
-		return []CommitteeMember{}, nil // Return empty slice if no epoch configured
+		return nil, err
 	}
 	return info.Committee, nil
 }
@@ -527,12 +535,18 @@ func (r *Registry) AddCommitteeMember(member *CommitteeMember) error {
 	data, err := r.db.Get(key)
 
 	var info EpochInfo
-	if err == nil {
+	switch {
+	case err == nil:
 		if err := json.Unmarshal(data, &info); err != nil {
 			return fmt.Errorf("failed to unmarshal epoch info: %w", err)
 		}
-	} else {
+	case errors.Is(err, database.ErrNotFound):
 		info = EpochInfo{Epoch: epoch, Status: EpochActive, Threshold: 67}
+	default:
+		// Starting from a blank EpochInfo here would write the new member into
+		// an epoch record holding only that member, dropping the committee the
+		// read failed to return.
+		return fmt.Errorf("failed to read epoch info: %w", err)
 	}
 
 	// Check if member already exists
@@ -574,8 +588,13 @@ func (r *Registry) RemoveCommitteeMember(nodeID ids.NodeID) error {
 	epoch := r.epoch
 	key := append(epochPrefix, encodeUint64(epoch)...)
 	data, err := r.db.Get(key)
-	if err != nil {
+	if errors.Is(err, database.ErrNotFound) {
 		return nil // No epoch, nothing to remove
+	}
+	if err != nil {
+		// Returning nil here reports "removed" for a member still in the
+		// committee -- SlashMember reads that as a completed eviction.
+		return fmt.Errorf("failed to read epoch info: %w", err)
 	}
 
 	var info EpochInfo

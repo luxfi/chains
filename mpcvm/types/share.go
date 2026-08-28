@@ -64,7 +64,7 @@ func (s Share) PayloadFrom(arena []byte) ([]byte, error) {
 		return nil, fmt.Errorf("share: payload [%d..%d] out of arena (%d)",
 			s.PayloadOffset, end, len(arena))
 	}
-	return arena[s.PayloadOffset : s.PayloadOffset+s.PayloadLen], nil
+	return arena[uint64(s.PayloadOffset):end], nil
 }
 
 // Validate checks the envelope-level invariants. Payload validation

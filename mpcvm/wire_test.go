@@ -40,7 +40,6 @@ func sampleKeyRecord() *KeyRecord {
 		Participants:   []party.ID{"p1", "p2", "p3"},
 		GroupPublicKey: pub,
 		Address:        addr,
-		Generation:     5,
 		CreatedHeight:  42,
 	}
 }
@@ -63,10 +62,8 @@ func TestWireRoundTrip_Operation_Sign(t *testing.T) {
 		Digest:          make([]byte, 32),
 		Artifact:        sampleSignature(),
 		Signers:         []party.ID{"p1", "p2"},
-		Timestamp:       1_700_000_000,
 	}
-	b, err := marshalOperation(op)
-	require.NoError(err)
+	b := marshalOperation(op)
 	msg, err := zap.Parse(b)
 	require.NoError(err)
 	got, err := readOperation(msg.Root())
@@ -90,10 +87,8 @@ func TestWireRoundTrip_Operation_Keygen(t *testing.T) {
 		Artifact:        sampleSignature(),
 		Signers:         rec.Participants,
 		Key:             rec,
-		Timestamp:       1_700_000_001,
 	}
-	b, err := marshalOperation(op)
-	require.NoError(err)
+	b := marshalOperation(op)
 	msg, err := zap.Parse(b)
 	require.NoError(err)
 	got, err := readOperation(msg.Root())
@@ -120,17 +115,16 @@ func TestWireRoundTrip_Block(t *testing.T) {
 			{
 				Type: OpTypeKeygen, CeremonyID: "c1", KeyID: rec.KeyID,
 				Digest: commit[:], Artifact: sampleSignature(),
-				Signers: rec.Participants, Key: rec, Timestamp: 1,
+				Signers: rec.Participants, Key: rec,
 			},
 			{
 				Type: OpTypeSign, CeremonyID: "c2", KeyID: rec.KeyID,
 				Digest: make([]byte, 32), Artifact: sampleSignature(),
-				Signers: []party.ID{"p1", "p2"}, Timestamp: 2,
+				Signers: []party.ID{"p1", "p2"},
 			},
 		},
 	}
-	b, err := blk.Marshal()
-	require.NoError(err)
+	b := blk.Marshal()
 	var got Block
 	require.NoError(parseBlockBytes(b, &got))
 	require.Equal(blk.ParentID_, got.ParentID_)
@@ -144,8 +138,7 @@ func TestWireRoundTrip_Block(t *testing.T) {
 
 	// empty-operations block: Operations stays nil
 	empty := &Block{ParentID_: ids.ID{5}, BlockHeight: 1}
-	eb, err := empty.Marshal()
-	require.NoError(err)
+	eb := empty.Marshal()
 	var egot Block
 	require.NoError(parseBlockBytes(eb, &egot))
 	require.Nil(egot.Operations)
@@ -160,8 +153,7 @@ func TestWireRoundTrip_KeyRecord(t *testing.T) {
 	rec := sampleKeyRecord()
 	require.NoError(rec.Validate())
 
-	b, err := marshalKeyRecord(rec)
-	require.NoError(err)
+	b := marshalKeyRecord(rec)
 	got, err := parseKeyRecord(b)
 	require.NoError(err)
 	require.Equal(rec, got)
@@ -184,8 +176,7 @@ func TestWireRoundTrip_CeremonyRecord(t *testing.T) {
 		RequestingChain: "B-Chain",
 		Height:          99,
 	}
-	b, err := marshalCeremonyRecord(c)
-	require.NoError(err)
+	b := marshalCeremonyRecord(c)
 	got, err := parseCeremonyRecord(b)
 	require.NoError(err)
 	require.Equal(c, got)
@@ -200,8 +191,7 @@ func TestWireRoundTrip_CrossChainMPCRequest(t *testing.T) {
 		Type: "sign", RequestingChain: "B-Chain", KeyID: "key-1",
 		KeyType: "secp256k1", MessageHash: []byte("h"), MessageType: "eth_sign",
 	}
-	b, err := r.Marshal()
-	require.NoError(err)
+	b := r.Marshal()
 	var got CrossChainMPCRequest
 	require.NoError(parseCrossChainMPCRequest(b, &got))
 	require.Equal(r, &got)

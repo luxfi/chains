@@ -36,6 +36,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luxfi/chains/ownership"
 	"github.com/luxfi/database/memdb"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
@@ -290,13 +291,13 @@ func TestBridgeCustody_KeygenSignAndRecordOverGossip(t *testing.T) {
 	var recip [20]byte
 	copy(recip[:], []byte("recipient-0xabc0123"))
 	req := BridgeReleaseRequest{
-		KeyID:           keyID,
-		SrcChainID:      200201, // Zoo EVM
-		DstChainID:      97368,  // Lux testnet M-Chain route
-		Asset:           asset,
-		Amount:          1_000_000,
-		Recipient:       recip,
-		Nonce:           7,
+		KeyID:      keyID,
+		SrcChainID: 200201, // Zoo EVM
+		DstChainID: 97368,  // Lux testnet M-Chain route
+		Asset:      asset,
+		Amount:     1_000_000,
+		Recipient:  recip,
+		Nonce:      7,
 	}
 
 	// Every validator is asked; only the policy's K-subset signs. With a 3-of-5
@@ -504,13 +505,13 @@ func TestBridgeCustody_ThreeOfFive(t *testing.T) {
 	var recip [20]byte
 	copy(recip[:], []byte("recipient-3of5"))
 	req := BridgeReleaseRequest{
-		KeyID:           keyID,
-		SrcChainID:      200201,
-		DstChainID:      97368,
-		Asset:           asset,
-		Amount:          4_200_000,
-		Recipient:       recip,
-		Nonce:           11,
+		KeyID:      keyID,
+		SrcChainID: 200201,
+		DstChainID: 97368,
+		Asset:      asset,
+		Amount:     4_200_000,
+		Recipient:  recip,
+		Nonce:      11,
 	}
 
 	// Every validator is asked; the ones outside this task's quorum decline with
@@ -563,4 +564,111 @@ func TestBridgeCustody_ThreeOfFive(t *testing.T) {
 
 	t.Logf("3-of-5 custody: key %s addr 0x%x | %d of %d validators signed, %d declined | signature verifies | state root %x",
 		keyID, rec.Address, len(signed), n, declined, vms[0].StateRoot())
+}
+
+// =============================================================================
+// The attestation domains, over the same real ceremony path
+// =============================================================================
+
+// Every attestation M-Chain issues is produced by the SAME ceremony, over a
+// domain-bound payload, and verified against the SAME registry.
+//
+// The four domains differ only in how they compute their subject and their
+// commitment — which is the only thing that actually differs between an oracle
+// commit, a session completion, an epoch beacon and an ownership claim. This
+// runs all four through a real 2-of-3 committee over the real gossip transport,
+// so what is being held is that the shared path works for each of them, not
+// that four separate paths happen to agree.
+func TestEveryAttestationDomainRunsTheOneCeremonyPath(t *testing.T) {
+	const n = 3
+	const keyID = "attesting-custody"
+	policy := quorum.MustNew(2, 3)
+
+	nodes := make([]ids.NodeID, n)
+	for i := range nodes {
+		nodes[i] = ids.GenerateTestNodeID()
+	}
+	vs := committeeState(nodes)
+
+	fab := newMemFabric()
+	vms := make([]*VM, n)
+	for i, nid := range nodes {
+		vms[i] = newFabricVM(t, fab, nid, vs)
+	}
+
+	ctx, cancel := ceremonyContext(t)
+	defer cancel()
+
+	runOnAll(t, ctx, vms, func(ctx context.Context, vm *VM) (*Operation, error) {
+		return vm.StartKeygenWithPolicy(ctx, keyID, policy, authenticated(vm, "B-Chain"))
+	})
+	commitBlock(t, ctx, vms[0], vms)
+
+	var subject, root [32]byte
+	copy(subject[:], []byte("request-0x01"))
+	copy(root[:], []byte("commitment-root"))
+
+	// Each domain, asked of every validator; only the task's quorum signs.
+	for name, ask := range map[string]func(context.Context, *VM) (*QuantumAttestation, error){
+		"oracle write": func(c context.Context, vm *VM) (*QuantumAttestation, error) {
+			return vm.AttestOracleCommit(c, authenticated(vm, "B-Chain"), keyID, subject, 0, root, 11)
+		},
+		"oracle read": func(c context.Context, vm *VM) (*QuantumAttestation, error) {
+			return vm.AttestOracleCommit(c, authenticated(vm, "B-Chain"), keyID, subject, 1, root, 12)
+		},
+		"session complete": func(c context.Context, vm *VM) (*QuantumAttestation, error) {
+			return vm.AttestSessionComplete(c, authenticated(vm, "B-Chain"), keyID, subject, root, root, root, 13)
+		},
+		"epoch beacon": func(c context.Context, vm *VM) (*QuantumAttestation, error) {
+			return vm.AttestEpochBeacon(c, authenticated(vm, "B-Chain"), keyID, 14, root)
+		},
+	} {
+		signed, declined := runOnQuorum(t, ctx, vms, ask)
+		require.Lenf(t, signed, policy.K, "%s: exactly K validators sign", name)
+		require.Equalf(t, policy.N-policy.K, declined, "%s: the rest decline", name)
+
+		att := signed[0]
+		for _, a := range signed {
+			require.Equalf(t, att.Signature, a.Signature, "%s: all honest signers derive one signature", name)
+			require.Equalf(t, att.AttestationID, a.AttestationID, "%s: and one attestation id", name)
+		}
+		require.Equalf(t, policy, att.Policy, "%s: the attestation carries the key's own policy", name)
+		require.Lenf(t, att.Signers, policy.K, "%s", name)
+		require.NotEmptyf(t, att.CeremonyID, "%s: the attestation names the ceremony that produced it", name)
+
+		// Every validator verifies it, including the ones that did not sign.
+		for i, vm := range vms {
+			require.NoErrorf(t, vm.VerifyAttestation(att), "%s: validator %d rejected it", name, i)
+		}
+	}
+
+	// Two attestations over the same payload by different quorums are
+	// distinguishable, because the id binds the ceremony that signed it.
+	first, _ := runOnQuorum(t, ctx, vms, func(c context.Context, vm *VM) (*QuantumAttestation, error) {
+		return vm.AttestOracleCommit(c, authenticated(vm, "B-Chain"), keyID, subject, 0, root, 21)
+	})
+	second, _ := runOnQuorum(t, ctx, vms, func(c context.Context, vm *VM) (*QuantumAttestation, error) {
+		return vm.AttestOracleCommit(c, authenticated(vm, "B-Chain"), keyID, subject, 0, root, 22)
+	})
+	require.NotEqual(t, first[0].AttestationID, second[0].AttestationID)
+
+	// And an ownership claim rides the same path, returning the portable form a
+	// verifier consumes with no callback to M.
+	claim := ownership.Claim{Chain: 1, Token: 7, Block: 31}
+	copy(claim.Node[:], []byte("node-0x0123456789abc"))
+	owned, declined := runOnQuorum(t, ctx, vms, func(c context.Context, vm *VM) (*ownership.Attestation, error) {
+		return vm.AttestNFTOwnership(c, authenticated(vm, "B-Chain"), keyID, claim)
+	})
+	require.Len(t, owned, policy.K)
+	require.Equal(t, policy.N-policy.K, declined)
+	require.Equal(t, policy.K, owned[0].Quorum)
+	require.Equal(t, policy.K, owned[0].Signers)
+	require.Equal(t, claim.Block, owned[0].Epoch,
+		"the claim's block is the epoch, so equivocation means two facts about one node at one block")
+	require.NoError(t, owned[0].Authorizes(claim.Node))
+
+	// A node may not borrow a peer's entitlement.
+	var other [20]byte
+	copy(other[:], []byte("someone-else-0x9876"))
+	require.Error(t, owned[0].Authorizes(other))
 }

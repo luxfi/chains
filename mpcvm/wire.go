@@ -33,11 +33,16 @@ import (
 //	ReqChain   bytes @ 24
 //	Digest     bytes @ 32
 //	Artifact   bytes @ 40
-//	Timestamp  i64   @ 48
-//	SignerLens list  @ 56
-//	SignerBlob bytes @ 64
-//	KeyPresent u8    @ 72   (1 iff a KeyRecord follows — keygen operations)
-//	KeyBlob    bytes @ 80   (marshalled KeyRecord)
+//	SignerLens list  @ 48
+//	SignerBlob bytes @ 56
+//	KeyPresent u8    @ 64   (1 iff a KeyRecord follows — keygen operations)
+//	KeyBlob    bytes @ 72   (marshalled KeyRecord)
+//
+// There is no timestamp field. An operation used to carry one; nothing read it,
+// nothing checked it, and it was not in the operation's state-root digest — so
+// it was a byte-range any relay could rewrite to produce a DIFFERENT, equally
+// valid block from the same transition. A field that changes the block id and
+// changes nothing else is malleability with no upside.
 const (
 	opType       = 0
 	opCeremony   = 8
@@ -45,22 +50,18 @@ const (
 	opReqChn     = 24
 	opDigest     = 32
 	opArtifact   = 40
-	opTS         = 48
-	opSignerLens = 56
-	opSignerBlob = 64
-	opKeyPresent = 72
-	opKeyBlob    = 80
-	opSize       = 88
+	opSignerLens = 48
+	opSignerBlob = 56
+	opKeyPresent = 64
+	opKeyBlob    = 72
+	opSize       = 80
 )
 
-func marshalOperation(op *Operation) ([]byte, error) {
+func marshalOperation(op *Operation) []byte {
 	signerLens, signerBlob := packStrings(partyIDsToStrings(op.Signers))
 	var keyBlob []byte
 	if op.Key != nil {
-		var err error
-		if keyBlob, err = marshalKeyRecord(op.Key); err != nil {
-			return nil, err
-		}
+		keyBlob = marshalKeyRecord(op.Key)
 	}
 	b := zap.NewBuilder(zap.HeaderSize + opSize + len(op.Type) + len(op.CeremonyID) +
 		len(op.KeyID) + len(op.RequestingChain) + len(op.Digest) + len(op.Artifact) +
@@ -74,16 +75,19 @@ func marshalOperation(op *Operation) ([]byte, error) {
 	ob.SetBytes(opReqChn, []byte(op.RequestingChain))
 	ob.SetBytes(opDigest, op.Digest)
 	ob.SetBytes(opArtifact, op.Artifact)
-	ob.SetInt64(opTS, op.Timestamp)
 	ob.SetList(opSignerLens, signerLensOff, len(signerLens))
 	ob.SetBytes(opSignerBlob, signerBlob)
 	ob.SetUint8(opKeyPresent, boolByte(op.Key != nil))
 	ob.SetBytes(opKeyBlob, keyBlob)
 	ob.FinishAsRoot()
-	return b.Finish(), nil
+	return b.Finish()
 }
 
 func readOperation(o zap.Object) (*Operation, error) {
+	signers, err := unpackStrings(readU32List(o, opSignerLens), o.Bytes(opSignerBlob))
+	if err != nil {
+		return nil, fmt.Errorf("mpcvm operation: signers: %w", err)
+	}
 	op := &Operation{
 		Type:            string(o.Bytes(opType)),
 		CeremonyID:      string(o.Bytes(opCeremony)),
@@ -91,8 +95,7 @@ func readOperation(o zap.Object) (*Operation, error) {
 		RequestingChain: string(o.Bytes(opReqChn)),
 		Digest:          appendBytes(o.Bytes(opDigest)),
 		Artifact:        appendBytes(o.Bytes(opArtifact)),
-		Timestamp:       o.Int64(opTS),
-		Signers:         stringsToPartyIDs(unpackStrings(readU32List(o, opSignerLens), o.Bytes(opSignerBlob))),
+		Signers:         stringsToPartyIDs(signers),
 	}
 	if o.Uint8(opKeyPresent) != 0 {
 		rec, err := parseKeyRecord(o.Bytes(opKeyBlob))
@@ -123,14 +126,16 @@ const (
 )
 
 // Marshal encodes the block (excluding the derived ID_) to canonical wire.
-func (b *Block) Marshal() ([]byte, error) {
+//
+// Encoding cannot fail. A builder writes into a buffer it sized itself, so
+// there is no input for which this returns half a block — which is why it
+// returns bytes rather than bytes and an error nobody could produce and every
+// caller discarded.
+func (b *Block) Marshal() []byte {
 	var opBlob []byte
 	opLens := make([]uint32, 0, len(b.Operations))
 	for _, op := range b.Operations {
-		ob, err := marshalOperation(op)
-		if err != nil {
-			return nil, err
-		}
+		ob := marshalOperation(op)
 		opLens = append(opLens, uint32(len(ob)))
 		opBlob = append(opBlob, ob...)
 	}
@@ -145,10 +150,15 @@ func (b *Block) Marshal() ([]byte, error) {
 	ob.SetList(blkOpLens, opLensOff, len(opLens))
 	ob.SetBytes(blkOpBlob, opBlob)
 	ob.FinishAsRoot()
-	return bld.Finish(), nil
+	return bld.Finish()
 }
 
 func parseBlockBytes(data []byte, blk *Block) error {
+	// Refuse the size before decoding it. Everything below allocates in
+	// proportion to what the bytes claim, and a peer chooses the bytes.
+	if len(data) > maxBlockBytes {
+		return fmt.Errorf("mpcvm block: %d bytes, at most %d", len(data), maxBlockBytes)
+	}
 	msg, err := zap.Parse(data)
 	if err != nil {
 		return err
@@ -157,12 +167,23 @@ func parseBlockBytes(data []byte, blk *Block) error {
 		return fmt.Errorf("mpcvm block: trailing bytes")
 	}
 	o := msg.Root()
-	copy(blk.ParentID_[:], o.BytesFixedSlice(blkParent, 32))
+	parent := o.BytesFixedSlice(blkParent, 32)
+	root := o.BytesFixedSlice(blkRoot, 32)
+	// copy() into a fixed array zero-fills whatever the source did not cover,
+	// so a truncated object would decode to a block naming a DIFFERENT parent
+	// and a different post-state instead of failing.
+	if len(parent) != 32 || len(root) != 32 {
+		return fmt.Errorf("mpcvm block: header is truncated")
+	}
+	copy(blk.ParentID_[:], parent)
 	blk.BlockHeight = o.Uint64(blkHeight)
 	blk.BlockTimestamp = o.Int64(blkTime)
-	copy(blk.StateRoot[:], o.BytesFixedSlice(blkRoot, 32))
+	copy(blk.StateRoot[:], root)
 
 	opLens := readU32List(o, blkOpLens)
+	if len(opLens) > maxOpsPerBlock {
+		return fmt.Errorf("mpcvm block: %d operations, at most %d", len(opLens), maxOpsPerBlock)
+	}
 	if len(opLens) == 0 {
 		blk.Operations = nil
 		return nil
@@ -185,6 +206,13 @@ func parseBlockBytes(data []byte, blk *Block) error {
 		blk.Operations = append(blk.Operations, op)
 		pos += int(l)
 	}
+	// Past the CONTENT, not past the declared size: bytes after the last
+	// operation sit inside the object and would otherwise be accepted and
+	// silently dropped, so one transition would have unboundedly many
+	// encodings on the wire.
+	if pos != len(opBlob) {
+		return fmt.Errorf("mpcvm block: %d bytes after the last operation", len(opBlob)-pos)
+	}
 	return nil
 }
 
@@ -206,7 +234,7 @@ const (
 	ccSize    = 48
 )
 
-func (r *CrossChainMPCRequest) Marshal() ([]byte, error) {
+func (r *CrossChainMPCRequest) Marshal() []byte {
 	b := zap.NewBuilder(zap.HeaderSize + ccSize + len(r.Type) + len(r.RequestingChain) +
 		len(r.KeyID) + len(r.KeyType) + len(r.MessageHash) + len(r.MessageType) + 64)
 	ob := b.StartObject(ccSize)
@@ -217,7 +245,7 @@ func (r *CrossChainMPCRequest) Marshal() ([]byte, error) {
 	ob.SetBytes(ccMsgHash, r.MessageHash)
 	ob.SetBytes(ccMsgType, []byte(r.MessageType))
 	ob.FinishAsRoot()
-	return b.Finish(), nil
+	return b.Finish()
 }
 
 func parseCrossChainMPCRequest(data []byte, r *CrossChainMPCRequest) error {
@@ -268,7 +296,7 @@ const (
 	krSize      = 80
 )
 
-func marshalKeyRecord(r *KeyRecord) ([]byte, error) {
+func marshalKeyRecord(r *KeyRecord) []byte {
 	partyLens, partyBlob := packStrings(partyIDsToStrings(r.Participants))
 	bld := zap.NewBuilder(zap.HeaderSize + krSize + len(r.KeyID) + len(r.Kind) +
 		len(r.GroupPublicKey) + len(r.Address) + len(partyBlob) + 4*len(partyLens) + 128)
@@ -286,7 +314,7 @@ func marshalKeyRecord(r *KeyRecord) ([]byte, error) {
 	ob.SetList(krPartyLens, partyLensOff, len(partyLens))
 	ob.SetBytes(krPartyBlob, partyBlob)
 	ob.FinishAsRoot()
-	return bld.Finish(), nil
+	return bld.Finish()
 }
 
 func parseKeyRecord(data []byte) (*KeyRecord, error) {
@@ -298,6 +326,10 @@ func parseKeyRecord(data []byte) (*KeyRecord, error) {
 		return nil, fmt.Errorf("mpcvm key record: trailing bytes")
 	}
 	o := msg.Root()
+	parties, err := unpackStrings(readU32List(o, krPartyLens), o.Bytes(krPartyBlob))
+	if err != nil {
+		return nil, fmt.Errorf("mpcvm key record: participants: %w", err)
+	}
 	return &KeyRecord{
 		KeyID:          string(o.Bytes(krKeyID)),
 		Kind:           string(o.Bytes(krKind)),
@@ -306,7 +338,7 @@ func parseKeyRecord(data []byte) (*KeyRecord, error) {
 		Address:        appendBytes(o.Bytes(krAddr)),
 		Generation:     o.Uint64(krGen),
 		CreatedHeight:  o.Uint64(krCreatedHt),
-		Participants:   stringsToPartyIDs(unpackStrings(readU32List(o, krPartyLens), o.Bytes(krPartyBlob))),
+		Participants:   stringsToPartyIDs(parties),
 	}, nil
 }
 
@@ -334,7 +366,7 @@ const (
 	crSize       = 72
 )
 
-func marshalCeremonyRecord(c *CeremonyRecord) ([]byte, error) {
+func marshalCeremonyRecord(c *CeremonyRecord) []byte {
 	signerLens, signerBlob := packStrings(partyIDsToStrings(c.Signers))
 	bld := zap.NewBuilder(zap.HeaderSize + crSize + len(c.ID) + len(c.Kind) + len(c.KeyID) +
 		len(c.Digest) + len(c.Artifact) + len(c.RequestingChain) + len(signerBlob) + 4*len(signerLens) + 128)
@@ -351,7 +383,7 @@ func marshalCeremonyRecord(c *CeremonyRecord) ([]byte, error) {
 	ob.SetList(crSignerLens, signerLensOff, len(signerLens))
 	ob.SetBytes(crSignerBlob, signerBlob)
 	ob.FinishAsRoot()
-	return bld.Finish(), nil
+	return bld.Finish()
 }
 
 func parseCeremonyRecord(data []byte) (*CeremonyRecord, error) {
@@ -363,6 +395,10 @@ func parseCeremonyRecord(data []byte) (*CeremonyRecord, error) {
 		return nil, fmt.Errorf("mpcvm ceremony record: trailing bytes")
 	}
 	o := msg.Root()
+	signers, err := unpackStrings(readU32List(o, crSignerLens), o.Bytes(crSignerBlob))
+	if err != nil {
+		return nil, fmt.Errorf("mpcvm ceremony record: signers: %w", err)
+	}
 	return &CeremonyRecord{
 		ID:              string(o.Bytes(crID)),
 		Kind:            string(o.Bytes(crKind)),
@@ -371,7 +407,7 @@ func parseCeremonyRecord(data []byte) (*CeremonyRecord, error) {
 		Artifact:        appendBytes(o.Bytes(crArtifact)),
 		RequestingChain: string(o.Bytes(crReqChain)),
 		Height:          o.Uint64(crHeight),
-		Signers:         stringsToPartyIDs(unpackStrings(readU32List(o, crSignerLens), o.Bytes(crSignerBlob))),
+		Signers:         stringsToPartyIDs(signers),
 	}, nil
 }
 
@@ -415,20 +451,29 @@ func packStrings(ss []string) ([]uint32, []byte) {
 }
 
 // unpackStrings re-splits blob by lens. Returns nil (not empty) for no entries.
-func unpackStrings(lens []uint32, blob []byte) []string {
+//
+// A blob that does not cover exactly what the lengths declare is an error, not
+// a short answer. It used to stop at the first overrun and return what it had,
+// so a crafted encoding declaring five signers with room for three decoded to
+// three signers with no error anywhere — a party set quietly smaller than the
+// one on the wire, which is the shape every threshold check downstream trusts.
+func unpackStrings(lens []uint32, blob []byte) ([]string, error) {
 	if len(lens) == 0 {
-		return nil
+		return nil, nil
 	}
 	out := make([]string, 0, len(lens))
 	pos := 0
-	for _, l := range lens {
+	for i, l := range lens {
 		if pos+int(l) > len(blob) {
-			break
+			return nil, fmt.Errorf("entry %d wants %d bytes, %d remain", i, l, len(blob)-pos)
 		}
 		out = append(out, string(blob[pos:pos+int(l)]))
 		pos += int(l)
 	}
-	return out
+	if pos != len(blob) {
+		return nil, fmt.Errorf("%d bytes after the last entry", len(blob)-pos)
+	}
+	return out, nil
 }
 
 func partyIDsToStrings(ids []party.ID) []string {

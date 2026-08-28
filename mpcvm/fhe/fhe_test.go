@@ -1,5 +1,3 @@
-//go:build cgo
-
 // Copyright (C) 2019-2025, Lux Industries Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
@@ -650,10 +648,10 @@ func TestContributeShareAlreadyComplete(t *testing.T) {
 	require := require.New(t)
 
 	logger := log.Noop()
-	// Use very low threshold for easier testing
+	// Smallest quorum the constructor accepts, so two shares finish the session.
 	params, _ := ckks.NewParametersFromLiteral(ckks.ExampleParameters128BitLogN14LogQP438)
 	config := ThresholdConfig{
-		Threshold:    1,
+		Threshold:    2,
 		TotalParties: 2,
 		CKKSParams:   params,
 		LogBound:     128,
@@ -684,18 +682,21 @@ func TestContributeShareAlreadyComplete(t *testing.T) {
 	err = integration.InitiateDecryption(sessionID, requestID, ctBytes)
 	require.NoError(err)
 
-	// Generate a share
-	shareBytes, err := integration.GenerateShare(sessionID)
+	// Two shares reach the threshold of 2
+	first, err := integration.GenerateShare(sessionID)
 	require.NoError(err)
+	complete, err := integration.ContributeShare(sessionID, ids.GenerateTestNodeID(), first)
+	require.NoError(err)
+	require.False(complete)
 
-	// Contribute share - threshold is 1 so this should complete
-	nodeID := ids.GenerateTestNodeID()
-	complete, err := integration.ContributeShare(sessionID, nodeID, shareBytes)
+	second, err := integration.GenerateShare(sessionID)
+	require.NoError(err)
+	complete, err = integration.ContributeShare(sessionID, ids.GenerateTestNodeID(), second)
 	require.NoError(err)
 	require.True(complete)
 
 	// Try to contribute again - should return true (already complete)
-	complete, err = integration.ContributeShare(sessionID, ids.GenerateTestNodeID(), shareBytes)
+	complete, err = integration.ContributeShare(sessionID, ids.GenerateTestNodeID(), second)
 	require.NoError(err)
 	require.True(complete)
 }

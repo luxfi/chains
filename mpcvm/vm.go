@@ -79,21 +79,27 @@ type ThresholdConfig struct {
 	// place (quorum.Policy.Degree) at the keygen boundary.
 	Policy quorum.Policy `json:"policy"`
 
-	// Session Configuration
-	SessionTimeout      time.Duration `json:"sessionTimeout"`      // Max wall-clock for one ceremony
-	MaxActiveSessions   int           `json:"maxActiveSessions"`   // Max concurrent ceremonies
-	MaxSessionsPerChain int           `json:"maxSessionsPerChain"` // Max concurrent ceremonies per requesting chain
-	MaxOpsPerBlock      int           `json:"maxOpsPerBlock"`      // Max operations in one block
+	// SessionTimeout is the wall clock one ceremony gets before it is abandoned.
+	//
+	// It is the only session knob. There were three more — a global concurrency
+	// cap, a per-chain concurrency cap and a per-block operation cap — and not
+	// one of them was ever read. The last was the dangerous one: a block-size
+	// bound is a consensus rule, and had it been read where it looks like it
+	// belongs, two validators configured differently would have reached
+	// opposite verdicts on the same block. It is a constant now
+	// (maxOpsPerBlock), where an operator cannot move it.
+	SessionTimeout time.Duration `json:"sessionTimeout"`
 
-	// Quota Configuration (daily limits)
-	DailySigningQuota map[string]uint64 `json:"dailySigningQuota"` // ChainID -> daily signing limit
+	// DailySigningQuota overrides a chain's own DailySigningLimit, by chain
+	// name. It is per-node rate limiting, not consensus: refusing to START a
+	// ceremony is local, and a ceremony that completes is verified by everyone
+	// on its own evidence.
+	DailySigningQuota map[string]uint64 `json:"dailySigningQuota"`
 
-	// Authorized Chains that can request MPC services
+	// AuthorizedChains is the custody permission table, keyed by the operator's
+	// label for a chain. Authorization binds to the entry's ChainID; see
+	// caller.go.
 	AuthorizedChains map[string]*ChainPermissions `json:"authorizedChains"`
-
-	// Key Management
-	KeyRotationPeriod time.Duration `json:"keyRotationPeriod"` // How often to rotate keys
-	MaxKeyAge         time.Duration `json:"maxKeyAge"`         // Maximum age of a key before forced rotation
 }
 
 // ChainPermissions defines what a chain can do with MPC services
@@ -166,10 +172,6 @@ type VM struct {
 	// produces a block the others can verify. LOCK ORDER: the chain's lock,
 	// then the pool's.
 	staged *chain.Pool[*Operation, string]
-
-	// localMesh is the in-process ceremony transport used when the VM has no
-	// p2p sender (single-process dev and tests). Nil on a networked node.
-	localMesh *localMesh
 
 	// Quota Tracking
 	dailySigningCount map[string]uint64 // ChainID -> count today
@@ -304,6 +306,21 @@ func (vm *VM) Initialize(
 		return fmt.Errorf("mpcvm: open chain state: %w", err)
 	}
 	if fresh {
+		// "Fresh" is a claim about the tip pointer, and the store reports it on
+		// ANY failure to read that pointer — a missing one and an unreadable one
+		// look the same from here. So it is checked against the thing it implies
+		// rather than believed: an empty chain has applied no operations, and
+		// the root of a chain that has applied none is exactly its genesis root.
+		//
+		// Without this, one transient read fault at boot re-installs genesis
+		// over a live custody registry, durably, and Initialize returns nil.
+		// Refusing to start is the only safe answer: the operator can look at
+		// the disk, and a node that will not start loses no funds.
+		if root != genesisRoot(vm.rt.ChainID) {
+			return fmt.Errorf("mpcvm: refusing to install genesis over applied state: "+
+				"the chain has no tip but its root is %x, not the genesis root %x",
+				root[:8], genesisRoot(vm.rt.ChainID))
+		}
 		// NewState seeded the genesis root through the view; commit it, so a
 		// node that accepts no block still comes back to the same root.
 		if err := vm.chain.Seed(func(database.Database) error { return nil }); err != nil {
@@ -415,15 +432,10 @@ func (vm *VM) parseConfig(configBytes []byte) error {
 			//
 			// Degree 2: two parties may be corrupt or offline. 2K > N holds, so the
 			// quorum is unique — two disjoint quorums cannot both sign.
-			Policy:              quorum.MustNew(3, 5),
-			SessionTimeout:      5 * time.Minute,
-			MaxActiveSessions:   100,
-			MaxSessionsPerChain: 10,
-			MaxOpsPerBlock:      64,
-			KeyRotationPeriod:   30 * 24 * time.Hour,
-			MaxKeyAge:           90 * 24 * time.Hour,
-			DailySigningQuota:   make(map[string]uint64),
-			AuthorizedChains:    make(map[string]*ChainPermissions),
+			Policy:            quorum.MustNew(3, 5),
+			SessionTimeout:    5 * time.Minute,
+			DailySigningQuota: make(map[string]uint64),
+			AuthorizedChains:  make(map[string]*ChainPermissions),
 		}
 
 		// Default authorized chains (all internal Lux chains)
@@ -491,9 +503,6 @@ func (vm *VM) parseConfig(configBytes []byte) error {
 	if !vm.config.Policy.Valid() {
 		return fmt.Errorf("%w: %q is not a deployable policy (want the form \"3-of-5\")",
 			ErrInvalidThreshold, vm.config.Policy)
-	}
-	if vm.config.MaxOpsPerBlock <= 0 {
-		vm.config.MaxOpsPerBlock = 64
 	}
 	return nil
 }
@@ -666,11 +675,6 @@ func (vm *VM) checkQuotaReset() {
 // BuildBlock implements the chain.ChainVM interface
 func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
 	built, err := vm.chain.Propose(func(parent *Block) (*Block, error) {
-		staged := vm.staged.Take(vm.config.MaxOpsPerBlock)
-		if len(staged) == 0 {
-			return nil, errors.New("mpcvm: no completed ceremonies to include")
-		}
-
 		// Only include operations that still verify against current state. A
 		// ceremony can be staged and then invalidated by a block that landed first
 		// (the same key registered, the same ceremony recorded); proposing it
@@ -679,6 +683,25 @@ func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
 		defer vm.mu.RUnlock()
 
 		root := vm.state.Root()
+
+		// Build only on state this node has applied. The engine's preferred
+		// block may be one still in flight, and every check below — the
+		// registry, the ceremony log, the accumulated root — reads applied
+		// state. A block built on an unapplied parent therefore claims a root
+		// that skips the parent's operations: it VERIFIES on every peer, wins
+		// consensus, and then fails at Accept once the parent lands, which for
+		// a decided block halts the chain. Refusing to build is a wait; the
+		// ceremonies stay staged and the next proposal carries them.
+		if parent.StateRoot != root {
+			return nil, fmt.Errorf("%w: %s leaves root %x, this node is at %x",
+				ErrStaleParent, parent.ID(), parent.StateRoot[:8], root[:8])
+		}
+
+		staged := vm.staged.Take(maxOpsPerBlock)
+		if len(staged) == 0 {
+			return nil, errors.New("mpcvm: no completed ceremonies to include")
+		}
+
 		pending := make(map[string]*KeyRecord, len(staged))
 		operations := make([]*Operation, 0, len(staged))
 		var invalid []*Operation
@@ -868,11 +891,29 @@ func (vm *VM) RequestFailed(ctx context.Context, nodeID ids.NodeID, requestID ui
 // the ceremony's router. Messages that arrive before our own router for that
 // ceremony is registered are buffered and drained on register, so no round-one
 // broadcast is lost to a start-order race.
+//
+// It is also where a ceremony message becomes attributable. The threshold
+// library carries the sender in the message body and does not authenticate it —
+// it is written for an authenticated channel and expects its transport to
+// supply that. This is the transport. The p2p layer authenticated nodeID, and
+// party.ID IS the NodeID string on this chain, so a message whose From names a
+// different party is one peer speaking as another. Delivering it would let any
+// node that can reach this method inject rounds as any committee member:
+// enough to abort every custody ceremony on demand, and enough to make the
+// protocol's identifiable abort name an honest validator for it.
 func (vm *VM) Gossip(ctx context.Context, nodeID ids.NodeID, msg []byte) error {
 	sessionID, ceremonyMsg, err := unmarshalEnvelope(msg)
 	if err != nil {
 		// Not an MPC ceremony envelope (or corrupt) — ignore, never fault
 		// consensus on a peer's malformed gossip.
+		return nil
+	}
+	if ceremonyMsg.From != party.ID(nodeID.String()) {
+		vm.log.Warn("dropping ceremony message sent under another party's name",
+			log.String("sender", nodeID.String()),
+			log.String("claimed", string(ceremonyMsg.From)),
+			log.String("ceremony", sessionID),
+		)
 		return nil
 	}
 	vm.deliverCeremonyMessage(sessionID, ceremonyMsg)
@@ -1310,17 +1351,46 @@ func (vm *VM) VerifyAttestation(a *QuantumAttestation) error {
 	if _, ok := domainSeparators[a.Domain]; !ok {
 		return fmt.Errorf("mpcvm: unknown attestation domain %q", a.Domain)
 	}
-	// K signers, not K-1: a set the size of the polynomial degree cannot
-	// produce a signature, so a claim that it did is a wrong-degree key.
-	if len(a.Signers) < a.Policy.K {
-		return fmt.Errorf("%w: %d signers for policy %s", ErrQuorumTooSmall, len(a.Signers), a.Policy)
-	}
-	pubKey, err := vm.PublicKey(a.KeyID)
+	// The registry decides the quorum, not the attestation.
+	//
+	// This used to compare len(a.Signers) against a.Policy — two fields of the
+	// same attacker-supplied document — so it held for every attestation ever
+	// written, including one declaring 1-of-1 with one signer. A quorum check
+	// against the checked party's own claim is not a check. Reading the key's
+	// record is: the policy a key was generated under is consensus state, and
+	// an attestation that misdeclares it is refused before its signature is
+	// even considered.
+	rec, err := vm.Key(a.KeyID)
 	if err != nil {
 		return err
 	}
+	if a.Policy != rec.Policy {
+		return fmt.Errorf("%w: attestation declares policy %s, key %s is %s",
+			ErrInvalidOperation, a.Policy, a.KeyID, rec.Policy)
+	}
+	// K signers, not K-1: a set the size of the polynomial degree cannot
+	// produce a signature, so a claim that it did is a wrong-degree key.
+	if len(a.Signers) < rec.Policy.K {
+		return fmt.Errorf("%w: %d signers for policy %s", ErrQuorumTooSmall, len(a.Signers), rec.Policy)
+	}
+	// Canonical and real: without this, one signer repeated K times, or under K
+	// spellings, or K names that hold no share of this key, all count as a
+	// quorum. Block.verifySign holds the same three rules on the same set, so
+	// an attestation cannot pass here under a rule a block would have refused.
+	if !sortedUnique(a.Signers) {
+		return fmt.Errorf("%w: signer set is not canonical (sorted+unique)", ErrInvalidOperation)
+	}
+	members := make(map[party.ID]struct{}, len(rec.Participants))
+	for _, p := range rec.Participants {
+		members[p] = struct{}{}
+	}
+	for _, s := range a.Signers {
+		if _, ok := members[s]; !ok {
+			return fmt.Errorf("%w: %s is not a participant of key %s", ErrInvalidOperation, s, rec.KeyID)
+		}
+	}
 	payload := ComputeAttestationPayload(a.Domain, a.SubjectID, a.CommitmentRoot, a.Epoch)
-	if err := verifyGroupSignature(pubKey, payload[:], a.Signature); err != nil {
+	if err := verifyGroupSignature(rec.GroupPublicKey, payload[:], a.Signature); err != nil {
 		return fmt.Errorf("%w: %w", ErrBadArtifact, err)
 	}
 	return nil

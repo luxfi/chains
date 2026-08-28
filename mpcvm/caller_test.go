@@ -92,9 +92,9 @@ func TestCaller_PayloadCannotNameItself(t *testing.T) {
 func TestUnboundLabelIsNotCounted(t *testing.T) {
 	real := ids.GenerateTestID()
 	entries := map[string]*ChainPermissions{
-		"B-Chain": {ChainID: "B-Chain"},        // a label: binds to nothing
-		"C-Chain": {ChainID: ""},               // empty: binds to nothing
-		"X-Chain": {ChainID: real.String()},    // an actual chain id
+		"B-Chain": {ChainID: "B-Chain"},     // a label: binds to nothing
+		"C-Chain": {ChainID: ""},            // empty: binds to nothing
+		"X-Chain": {ChainID: real.String()}, // an actual chain id
 	}
 	bound := 0
 	for _, p := range entries {

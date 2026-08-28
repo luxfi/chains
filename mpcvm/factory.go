@@ -5,7 +5,6 @@ package mpcvm
 
 import (
 	"github.com/luxfi/constants"
-	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/node/vms"
 )
@@ -27,10 +26,17 @@ var _ vms.Factory = (*Factory)(nil)
 // node/node/vms.go all say mpcvm.
 var VMID = constants.MPCVMID
 
-// Assert at compile time that the alias really is the shared constant, so a
-// future edit cannot silently reintroduce a private literal.
-var _ = map[bool]struct{}{VMID == ids.ID{'m', 'p', 'c', 'v', 'm'}: {}}
-
+// The value is held by TestVMID_Bytes and TestVMID_IsCanonicalAndStable, which
+// compare it to the literal bytes and to the CB58 the plugin binary is named
+// after.
+//
+// It used to also carry `var _ = map[bool]struct{}{VMID == ids.ID{...}: {}}`,
+// labelled a compile-time assertion. It is not one: a map literal with a
+// single non-constant key compiles whatever the key evaluates to — only a
+// DUPLICATE constant key is a compile error. So it held for every possible
+// value of VMID, including a wrong one, while reading as proof. A check that
+// cannot fail is worse than no check, because it stops anyone writing the one
+// that can.
 // Factory creates M-Chain VM instances.
 type Factory struct{}
 

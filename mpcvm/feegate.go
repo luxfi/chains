@@ -7,13 +7,18 @@ import (
 	"github.com/luxfi/node/vms/types/fee"
 )
 
-// gateUserTx refuses every caller — M-Chain accepts no user txs. It is a
-// committee-driven service VM: keygen and signing requests come from validators
-// through consensus, not a user mempool. Any service entry that exposes itself
-// as user-callable MUST route through this gate, so the refusal is explicit
-// rather than a path nobody happened to write.
-func (vm *VM) gateUserTx() error { return vm.fee.Admit(0) }
+// Fee is what M-Chain charges to admit a user transaction, which is nothing,
+// because it admits none: it is a committee-driven service VM, and keygen and
+// signing requests reach it from validators through consensus rather than from
+// a mempool. Initialize pins the closed sentinel and the node's boot-time
+// nodefee.Validate reads it back through here.
+//
+// There was also a gateUserTx() wrapper, described as the gate every
+// user-callable entry MUST route through. Nothing routed through it, because
+// M-Chain has no user-callable entry — a refusal nobody can reach is a
+// statement, and this is where the statement belongs.
+func (vm *VM) Fee() fee.Policy { return vm.fee.Policy() }
 
-// FeePolicy exposes the chain's declared fee policy for diagnostics and the
-// boot-time Validate gate.
-func (vm *VM) FeePolicy() fee.Policy { return vm.fee.Policy() }
+// AdmitUserTx is the refusal itself, so "M-Chain takes no user transactions"
+// is a value that can be exercised rather than a comment.
+func (vm *VM) AdmitUserTx(paid uint64) error { return vm.fee.Admit(paid) }
