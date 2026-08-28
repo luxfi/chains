@@ -100,9 +100,18 @@ const (
 // canonical wire. blockID = sha256(this).
 func (blk *Block) Marshal() ([]byte, error) {
 	intentLens, intentBlob := packObjs(blk.ImportedIntents, marshalCIntent)
-	taskLens, taskBlob := packJSON(blk.Tasks)
-	resLens, resBlob := packJSON(blk.Results)
-	pregLens, pregBlob := packJSON(blk.ProviderRegs)
+	taskLens, taskBlob, err := packJSON(blk.Tasks)
+	if err != nil {
+		return nil, fmt.Errorf("aivm block: tasks: %w", err)
+	}
+	resLens, resBlob, err := packJSON(blk.Results)
+	if err != nil {
+		return nil, fmt.Errorf("aivm block: results: %w", err)
+	}
+	pregLens, pregBlob, err := packJSON(blk.ProviderRegs)
+	if err != nil {
+		return nil, fmt.Errorf("aivm block: provider registrations: %w", err)
+	}
 
 	b := zap.NewBuilder(zap.HeaderSize + blkSize + len(intentBlob) + len(taskBlob) +
 		len(resBlob) + len(pregBlob) +
@@ -271,12 +280,18 @@ const (
 
 // marshalVertex encodes the vertex's structural + payload fields (excluding the
 // derived id, the local status, and the runtime vm/bytes fields).
-func marshalVertex(v *AIVertex) []byte {
+func marshalVertex(v *AIVertex) ([]byte, error) {
 	parents := concatIDs(v.parents)
 	txIDs := concatIDs(v.txIDs)
 	jobLens, jobBlob := packStrings(v.jobIDs)
-	taskLens, taskBlob := packJSON(v.tasks)
-	resLens, resBlob := packJSON(v.results)
+	taskLens, taskBlob, err := packJSON(v.tasks)
+	if err != nil {
+		return nil, fmt.Errorf("aivm vertex: tasks: %w", err)
+	}
+	resLens, resBlob, err := packJSON(v.results)
+	if err != nil {
+		return nil, fmt.Errorf("aivm vertex: results: %w", err)
+	}
 
 	b := zap.NewBuilder(zap.HeaderSize + vxSize + len(parents) + len(txIDs) +
 		len(jobBlob) + len(taskBlob) + len(resBlob) +
@@ -298,7 +313,7 @@ func marshalVertex(v *AIVertex) []byte {
 	ob.SetList(vxResLens, resLensOff, len(resLens))
 	ob.SetBytes(vxResBlob, resBlob)
 	ob.FinishAsRoot()
-	return b.Finish()
+	return b.Finish(), nil
 }
 
 // parseVertex fills the wire fields of v. The caller sets the derived id and the
@@ -317,9 +332,15 @@ func parseVertex(data []byte, v *AIVertex) error {
 	}
 	v.height = o.Uint64(vxHeight)
 	v.epoch = o.Uint32(vxEpoch)
-	v.parents = splitIDs(o.Bytes(vxParents))
-	v.txIDs = splitIDs(o.Bytes(vxTxIDs))
-	v.jobIDs = unpackStrings(readU32List(o, vxJobLens), o.Bytes(vxJobBlob))
+	if v.parents, err = splitIDs(o.Bytes(vxParents), "parent list"); err != nil {
+		return err
+	}
+	if v.txIDs, err = splitIDs(o.Bytes(vxTxIDs), "tx list"); err != nil {
+		return err
+	}
+	if v.jobIDs, err = unpackStrings(readU32List(o, vxJobLens), o.Bytes(vxJobBlob)); err != nil {
+		return err
+	}
 	if v.tasks, err = unpackJSON[*aicore.Task](readU32List(o, vxTaskLens), o.Bytes(vxTaskBlob)); err != nil {
 		return err
 	}
@@ -375,58 +396,83 @@ func packObjs[T any](items []T, marshal func(T) []byte) (lens []uint32, blob []b
 	return lens, blob
 }
 
-// unpackObjs re-splits a packed blob by lengths and parses each sub-object.
-func unpackObjs[T any](lens []uint32, blob []byte, parse func([]byte) (T, error)) ([]T, error) {
-	if len(lens) == 0 {
-		return nil, nil
-	}
-	out := make([]T, 0, len(lens))
+// span walks the declared lengths over a packed blob, handing each element's
+// slice to visit, and requires the lengths to account for the blob EXACTLY.
+//
+// The exactness is the point. A decoder that stops when the lengths run out
+// ignores whatever follows, so two different buffers decode to the same value —
+// and since a block is named by its own canonical re-encoding, the padded one is
+// stored and served under the canonical one's id. Four stray bytes appended to an
+// intent blob were read as a well-formed block.
+func span(lens []uint32, blob []byte, what string, visit func(i int, elem []byte) error) error {
 	pos := 0
 	for i, l := range lens {
 		if pos+int(l) > len(blob) {
-			return nil, fmt.Errorf("aivm: packed obj %d out of bounds", i)
+			return fmt.Errorf("aivm: %s %d runs %d bytes past the blob", what, i, pos+int(l)-len(blob))
 		}
-		v, err := parse(blob[pos : pos+int(l)])
+		if err := visit(i, blob[pos:pos+int(l)]); err != nil {
+			return err
+		}
+		pos += int(l)
+	}
+	if pos != len(blob) {
+		return fmt.Errorf("aivm: %d bytes past the last %s", len(blob)-pos, what)
+	}
+	return nil
+}
+
+// unpackObjs re-splits a packed blob by lengths and parses each sub-object.
+func unpackObjs[T any](lens []uint32, blob []byte, parse func([]byte) (T, error)) ([]T, error) {
+	out := make([]T, 0, len(lens))
+	err := span(lens, blob, "packed object", func(_ int, elem []byte) error {
+		v, err := parse(elem)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		out = append(out, v)
-		pos += int(l)
+		return nil
+	})
+	if err != nil || len(out) == 0 {
+		return nil, err
 	}
 	return out, nil
 }
 
 // packJSON marshals each item to canonical JSON and returns (lengths, concat
 // blob). Used only for irreducibly-dynamic payloads (see file header).
-func packJSON[T any](items []T) (lens []uint32, blob []byte) {
+//
+// A marshal failure is REPORTED. Dropping it wrote a zero-length element, so an
+// item the encoder could not represent silently became no item at all — and the
+// block's id, computed over that encoding, was the id of a block missing work
+// its author believed it carried.
+func packJSON[T any](items []T) (lens []uint32, blob []byte, err error) {
 	if len(items) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	lens = make([]uint32, len(items))
 	for i, it := range items {
-		m, _ := json.Marshal(it)
+		m, err := json.Marshal(it)
+		if err != nil {
+			return nil, nil, fmt.Errorf("element %d: %w", i, err)
+		}
 		lens[i] = uint32(len(m))
 		blob = append(blob, m...)
 	}
-	return lens, blob
+	return lens, blob, nil
 }
 
 func unpackJSON[T any](lens []uint32, blob []byte) ([]T, error) {
-	if len(lens) == 0 {
-		return nil, nil
-	}
 	out := make([]T, 0, len(lens))
-	pos := 0
-	for i, l := range lens {
-		if pos+int(l) > len(blob) {
-			return nil, fmt.Errorf("aivm: json sub-blob %d out of bounds", i)
-		}
+	err := span(lens, blob, "json element", func(_ int, elem []byte) error {
 		var v T
-		if err := json.Unmarshal(blob[pos:pos+int(l)], &v); err != nil {
-			return nil, err
+		if err := json.Unmarshal(elem, &v); err != nil {
+			return err
 		}
 		out = append(out, v)
-		pos += int(l)
+		return nil
+	})
+	if err != nil || len(out) == 0 {
+		return nil, err
 	}
 	return out, nil
 }
@@ -444,20 +490,16 @@ func packStrings(ss []string) ([]uint32, []byte) {
 	return lens, blob
 }
 
-func unpackStrings(lens []uint32, blob []byte) []string {
-	if len(lens) == 0 {
-		return nil
-	}
+func unpackStrings(lens []uint32, blob []byte) ([]string, error) {
 	out := make([]string, 0, len(lens))
-	pos := 0
-	for _, l := range lens {
-		if pos+int(l) > len(blob) {
-			break
-		}
-		out = append(out, string(blob[pos:pos+int(l)]))
-		pos += int(l)
+	err := span(lens, blob, "string", func(_ int, elem []byte) error {
+		out = append(out, string(elem))
+		return nil
+	})
+	if err != nil || len(out) == 0 {
+		return nil, err
 	}
-	return out
+	return out, nil
 }
 
 func concatIDs(list []ids.ID) []byte {
@@ -471,14 +513,20 @@ func concatIDs(list []ids.ID) []byte {
 	return out
 }
 
-func splitIDs(blob []byte) []ids.ID {
+// splitIDs re-splits a concatenation of 32-byte ids, and refuses a length that
+// is not a whole number of them. Rounding down discarded a short tail, so a
+// buffer with bytes the decoder never read still decoded.
+func splitIDs(blob []byte, what string) ([]ids.ID, error) {
+	if len(blob)%32 != 0 {
+		return nil, fmt.Errorf("aivm: %s is %d bytes, not a multiple of 32", what, len(blob))
+	}
 	n := len(blob) / 32
 	if n == 0 {
-		return nil
+		return nil, nil
 	}
 	out := make([]ids.ID, n)
 	for i := 0; i < n; i++ {
 		copy(out[i][:], blob[i*32:(i+1)*32])
 	}
-	return out
+	return out, nil
 }

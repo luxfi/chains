@@ -56,13 +56,11 @@ func newAIVMForConsensus(t *testing.T) (*VM, common.Address, []common.Address) {
 		ops[i] = addr(byte(0x10 + i))
 		opening[ops[i]] = new(uint256.Int).Mul(MinProviderBond, uint256.NewInt(3))
 	}
-	v.qledger = NewMemLedger(opening)
+	require.NoError(t, v.FundLedger(opening))
 	for i, op := range ops {
 		stake := new(uint256.Int).Mul(MinProviderBond, uint256.NewInt(2))
 		require.NoError(t, e.RegisterOperator(st, v.qledger, op, stake, modelSpec, h(byte(0x80+i))))
 	}
-	// Commit the seed so registrations are durable (survive abortEngine).
-	require.NoError(t, v.commitEngine())
 	return v, reqr, ops
 }
 
@@ -153,12 +151,11 @@ func TestRegression_DefaultVerifierFailClosed(t *testing.T) {
 	for i := 0; i < eligible; i++ {
 		opening[addr(byte(0x10+i))] = new(uint256.Int).Mul(MinProviderBond, uint256.NewInt(3))
 	}
-	v.qledger = NewMemLedger(opening)
+	require.NoError(v.FundLedger(opening))
 	for i := 0; i < eligible; i++ {
 		require.NoError(e.RegisterOperator(v.qstate, v.qledger, addr(byte(0x10+i)),
 			new(uint256.Int).Mul(MinProviderBond, uint256.NewInt(2)), modelSpec, h(byte(0x80+i))))
 	}
-	require.NoError(v.commitEngine())
 	intent := mkIntent(e, reqr, testN, testThr, uint256.NewInt(1), reward)
 	v.EnqueueCommittedIntent(intent)
 	blk, err := v.BuildBlock(context.Background())

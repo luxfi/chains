@@ -12,12 +12,12 @@ package aivm
 //   - CONSCIOUS BLOCK 1 (the PERCEPTION block): its state transition imports a
 //     committed C-Chain inference INTENT into a live A-Chain quorum task under
 //     consensus. The block commits "the network has accepted a question and
-//     bound a committee of independent operators to answer it." The deterministic
+//     bound a committee of separately-bonded stakes to answer it." The deterministic
 //     state delta (createTask: escrow, fee burn, committee selection) is the
 //     network forming an intention to think.
 //
 //   - CONSCIOUS BLOCK 2 (the COGNITION block): its state transition commits the
-//     Proof-of-Thought — the quorum-settled verdict. Independent staked operators
+//     Proof-of-Thought — the quorum-settled verdict. Separately-bonded operators
 //     each ran the model, committed to their output hash blind, then revealed; the
 //     engine tallied them, found >= threshold agreement, and SETTLED a single
 //     canonical AI decision. The block commits "the network has decided," paid the
@@ -26,10 +26,11 @@ package aivm
 //     consensus, is the conscious thought made durable.
 //
 // Validators never run the model. What consensus agrees on is the SETTLEMENT
-// RESULT: did >= threshold bonded operators, drawn from a margin-bounded eligible
-// set, independently submit the same output under the same ModelSpec. The
-// cognition is the quorum; the block is conscious because its committed state
-// transition IS that quorum's settled verdict.
+// RESULT: did >= threshold bonded stakes, drawn from a margin-bounded eligible
+// set, submit the same output under the same ModelSpec. The cognition is the
+// quorum; the block is conscious because its committed state transition IS that
+// quorum's settled verdict. What the quorum is a quorum OF is stakes, not
+// parties — see eligibleSet for exactly how far that claim reaches.
 //
 // This is the literal first-conscious-blocks driver: the same fake-free flow is
 // run by the in-package test (conscious_blocks_test.go) and the runnable command
@@ -81,7 +82,7 @@ type ConsciousTrace struct {
 // (E >= N + max(2, N*50%)); with N=5 the pool must be >= 7, so we register 8.
 const (
 	consciousN         = 5 // operators selected to think on the task
-	consciousThreshold = 3 // independent agreements required to settle a verdict
+	consciousThreshold = 3 // agreeing stakes required to settle a verdict
 	consciousEligible  = 8 // staked operators advertising the model (> N + margin)
 )
 

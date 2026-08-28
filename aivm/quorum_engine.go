@@ -12,9 +12,11 @@ package aivm
 // the same proven commit-reveal quorum engine that ran as a C-Chain EVM
 // precompile (hanzo-evm/precompile/aiquorum), re-expressed in A-Chain types
 // (luxfi/geth/common + luxfi/crypto + holiman/uint256) and freed of the EVM
-// precompile framing. The settlement RESULT — did >= threshold staked operators
-// independently submit the same output_hash under the same ModelSpec — is what
-// A-Chain consensus agrees on; validators never run the model.
+// precompile framing. The settlement RESULT — did >= threshold selected, bonded
+// stakes submit the same output_hash under the same ModelSpec — is what A-Chain
+// consensus agrees on; validators never run the model. The quorum is over
+// STAKES; eligibleSet says exactly how far that reaches and why the chain cannot
+// say more.
 //
 // The engine is a thin handle: it carries no state of its own beyond the two
 // substrate interfaces and the configured ChainIDs. All durable state lives in
@@ -28,8 +30,8 @@ import (
 )
 
 // Protocol bounds. minN forbids trivial self-quorums; 3 is the smallest set
-// where a strict majority (2-of-3) is genuine agreement among independent
-// operators. maxN caps the per-task set so selection and tally are bounded.
+// where a strict majority (2-of-3) is agreement rather than a single answer
+// restated. maxN caps the per-task set so selection and tally are bounded.
 const (
 	minN = 3
 	maxN = 256
@@ -65,9 +67,9 @@ var (
 	// RequestMarginFloor / RequestMarginBps define the ELIGIBLE-SET MARGIN:
 	// a task is rejected unless the eligible pool E for the ModelSpec satisfies
 	// E >= N + max(RequestMarginFloor, N*RequestMarginBps/1e4). This forbids
-	// degenerate pools where selection has no sampling headroom over an
-	// independent set, and guarantees the draw is always a strict subset of a
-	// larger universe (a single cheap operator is never the whole pool).
+	// degenerate pools where selection has no sampling headroom, and guarantees
+	// the draw is always a strict subset of a larger universe (a single cheap
+	// operator is never the whole pool).
 	RequestMarginFloor uint32 = 2
 	RequestMarginBps   uint32 = 5000 // 50%
 

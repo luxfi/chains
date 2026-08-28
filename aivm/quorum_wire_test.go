@@ -159,3 +159,52 @@ func TestMerkleProofRoundTrip(t *testing.T) {
 	require.Equal(r1, r2)
 	require.NotEqual(r1, rootOverAddrs([]common.Address{addr(3), addr(2), addr(1)}), "order matters")
 }
+
+// The fold reads one bit of the index per level and silently discards the rest,
+// so every index sharing its low bits verified: in a four-leaf tree, index 4
+// proved membership at index 0. An index is part of what a proof asserts, and a
+// verifier that ignores most of it is not checking that assertion.
+func TestAProofIndexMustBeSpentByTheFold(t *testing.T) {
+	require := require.New(t)
+
+	raw := []common.Hash{h(1), h(2), h(3), h(4)}
+	leaves := make([]common.Hash, len(raw))
+	for i, x := range raw {
+		leaves[i] = leafHash(x)
+	}
+	root := merkleRoot(leaves)
+
+	honest := merkleProof(leaves, 0)
+	require.True(VerifyReceiptProof(raw[0], honest, root))
+
+	// Same siblings, an out-of-range index whose low bits match. Every multiple
+	// of the tree width used to pass.
+	width := uint32(1) << uint(len(honest.Siblings))
+	for _, k := range []uint32{1, 2, 3, 1 << 20} {
+		forged := MerkleProof{Index: honest.Index + k*width, Siblings: honest.Siblings}
+		require.False(VerifyReceiptProof(raw[0], forged, root),
+			"index %d verified in a %d-leaf tree", forged.Index, len(raw))
+	}
+
+	// A proof claiming more levels than a uint32 index can address is refused
+	// outright — even one whose arithmetic checks out. No tree this chain builds
+	// has that many levels, so such a proof is not a membership claim about any
+	// of them; it is a way to make a verifier fold for as long as the sender
+	// likes.
+	fold := func(levels int) (MerkleProof, common.Hash) {
+		p := MerkleProof{Index: 0, Siblings: make([]common.Hash, levels)}
+		cur := leafHash(raw[0])
+		for range p.Siblings {
+			cur = merkleNode(cur, common.Hash{})
+		}
+		return p, cur
+	}
+	atLimit, limitRoot := fold(maxProofDepth)
+	require.True(VerifyReceiptProof(raw[0], atLimit, limitRoot), "a proof at the limit still verifies")
+	past, pastRoot := fold(maxProofDepth + 1)
+	require.False(VerifyReceiptProof(raw[0], past, pastRoot),
+		"a proof one level past the limit verified on its own arithmetic")
+
+	// A single-leaf tree is the one honest zero-sibling case, and it still works.
+	require.True(VerifyReceiptProof(raw[0], MerkleProof{}, leafHash(raw[0])))
+}

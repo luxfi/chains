@@ -135,13 +135,14 @@ func autoLoadBackend() *GPUBackend {
 	activeBackendOnce.Do(func() {
 		for _, c := range platformCandidates() {
 			for _, path := range candidatePaths(c) {
+				// openGPUBackend returns a backend only when the handle opened
+				// AND all six launchers resolved, so a nil error here already
+				// means IsAvailable. Re-testing it read as care and was a branch
+				// no input could take — and a branch nothing can reach is a
+				// branch nothing can check.
 				b, err := openGPUBackend(c.kind, path)
 				if err != nil {
 					continue // try the next candidate path
-				}
-				if !b.IsAvailable() {
-					b.Close()
-					continue
 				}
 				activeBackend = b
 				return

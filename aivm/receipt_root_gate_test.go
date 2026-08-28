@@ -41,7 +41,6 @@ func TestVerifyRejectsBlockClaimingZeroReceiptRoot(t *testing.T) {
 	}
 	_, err = e.Settle(st, lg, taskID, 161)
 	require.NoError(err)
-	require.NoError(v.commitEngine())
 
 	root := e.ReceiptRoot(st)
 	require.NotEqual(common.Hash{}, root, "a settled receipt must move the root")
