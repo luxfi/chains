@@ -66,6 +66,7 @@ type Store[B Block] struct {
 	reload func() error
 
 	flight    map[ids.ID]B
+	last      B // the accepted tip, kept so a proposal never re-reads it
 	tip       ids.ID
 	height    uint64
 	preferred ids.ID
@@ -118,7 +119,7 @@ func (s *Store[B]) Base() database.Database { return s.base }
 //
 // The block's own effects become visible last, after the commit, so there is
 // no window in which the chain has advanced past state that is not on disk.
-func (s *Store[B]) Accept(b Block) error {
+func (s *Store[B]) Accept(b B) error {
 	s.Lock()
 	defer s.Unlock()
 
@@ -143,7 +144,7 @@ func (s *Store[B]) Accept(b Block) error {
 		return s.undo(fmt.Errorf("chain: commit block %s: %w", id, err))
 	}
 
-	s.tip, s.height = id, b.Height()
+	s.tip, s.height, s.last = id, b.Height(), b
 	delete(s.flight, id)
 	s.prune()
 	b.Publish()
@@ -188,6 +189,8 @@ func (s *Store[B]) Seed(write func(database.Database) error) error {
 // tip until the engine says otherwise, and a preference the store no longer
 // holds — pruned, or never tracked — falls back to the tip rather than naming
 // a parent nothing can resolve.
+//
+//nolint:unused // Prefer is the ChainVM SetPreference surface.
 func (s *Store[B]) Prefer(id ids.ID) {
 	s.Lock()
 	defer s.Unlock()
@@ -201,16 +204,16 @@ func (s *Store[B]) Prefer(id ids.ID) {
 //
 // A build with nothing to propose says so with an error, and nothing is
 // tracked.
-func (s *Store[B]) Propose(build func(parent ids.ID, height uint64) (B, error)) (B, error) {
+func (s *Store[B]) Propose(build func(parent B) (B, error)) (B, error) {
 	s.Lock()
 	defer s.Unlock()
 
-	parent, height := s.tip, s.height
+	parent := s.last
 	if b, ok := s.flight[s.preferred]; ok {
-		parent, height = b.ID(), b.Height()
+		parent = b
 	}
 
-	b, err := build(parent, height)
+	b, err := build(parent)
 	if err != nil {
 		var nothing B
 		return nothing, err
@@ -286,6 +289,9 @@ func (s *Store[B]) Block(id ids.ID, parse func([]byte) (B, error)) (B, error) {
 	if b, ok := s.flight[id]; ok {
 		return b, nil
 	}
+	if id == s.tip {
+		return s.last, nil
+	}
 	raw, err := s.view.Get(blockKey(id))
 	if err != nil {
 		var nothing B
@@ -319,7 +325,7 @@ func (s *Store[B]) Open(genesis B, parse func([]byte) (B, error)) (B, bool, erro
 
 	raw, err := s.view.Get(tipKey)
 	if err != nil || len(raw) != ids.IDLen {
-		s.tip, s.height = genesis.ID(), genesis.Height()
+		s.tip, s.height, s.last = genesis.ID(), genesis.Height(), genesis
 		return genesis, true, nil
 	}
 
@@ -328,7 +334,7 @@ func (s *Store[B]) Open(genesis B, parse func([]byte) (B, error)) (B, bool, erro
 		return nothing, false, err
 	}
 	if id == genesis.ID() {
-		s.tip, s.height = id, genesis.Height()
+		s.tip, s.height, s.last = id, genesis.Height(), genesis
 		return genesis, false, nil
 	}
 
@@ -340,7 +346,7 @@ func (s *Store[B]) Open(genesis B, parse func([]byte) (B, error)) (B, bool, erro
 	if err != nil {
 		return nothing, false, err
 	}
-	s.tip, s.height = id, b.Height()
+	s.tip, s.height, s.last = id, b.Height(), b
 	return b, false, nil
 }
 

@@ -492,34 +492,10 @@ func (vm *VM) ceremonyRouter(ctx context.Context, cid string, parties []party.ID
 
 // stage queues a completed operation for inclusion in the next block and wakes
 // the block builder. Staging is idempotent on ceremony id: a ceremony that
-// completes twice (a re-proposal after a rejected block) stages once.
+// completes twice (a re-proposal after a rejected block) stages once, which is
+// what the pool's claim set already refuses.
 func (vm *VM) stage(op *Operation) {
-	vm.mu.Lock()
-	if _, dup := vm.inflight[op.CeremonyID]; dup {
-		vm.mu.Unlock()
-		return
-	}
-	vm.inflight[op.CeremonyID] = op
-	vm.order = append(vm.order, op.CeremonyID)
-	vm.mu.Unlock()
-
-	// Tell the engine there is work.
-	vm.work.Signal()
-}
-
-// drain returns the staged operations in staging order, ready for a block.
-// Caller holds vm.mu.
-func (vm *VM) drain(limit int) []*Operation {
-	out := make([]*Operation, 0, min(limit, len(vm.order)))
-	for _, cid := range vm.order {
-		if len(out) == limit {
-			break
-		}
-		if op, ok := vm.inflight[cid]; ok {
-			out = append(out, op)
-		}
-	}
-	return out
+	_ = vm.staged.Add(op)
 }
 
 // quorumFor selects the K participants that sign a given task.

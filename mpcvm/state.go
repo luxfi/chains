@@ -63,10 +63,7 @@ import (
 var (
 	prefixKeyRecord = []byte("c/key/")      // replicated: custody key registry
 	prefixCeremony  = []byte("c/ceremony/") // replicated: ceremony log
-	prefixBlock     = []byte("c/block/")    // replicated: accepted blocks
-	prefixHeight    = []byte("c/height/")   // replicated: height -> block id
 	keyRoot         = []byte("c/root")      // replicated: current state root
-	keyLastAccepted = []byte("n/lastAccepted")
 	prefixShare     = []byte("n/share/") // NODE-PRIVATE: this party's key share
 )
 
@@ -453,64 +450,30 @@ func (s *State) HasShare(keyID string) (bool, error) {
 // Chain pointers
 // -----------------------------------------------------------------------------
 
-// PutBlock persists an accepted block and its height index entry.
-func (s *State) PutBlock(id ids.ID, height uint64, raw []byte) error {
-	if err := s.db.Put(append(append([]byte(nil), prefixBlock...), id[:]...), raw); err != nil {
-		return err
-	}
-	return s.db.Put(heightKey(height), id[:])
+// WriteRoot stages the root a block reaches. It is staged, not landed: the
+// block, its height entry, the tip pointer and every record the block wrote all
+// commit together or not at all, so a root can never name a state the chain
+// does not have.
+func (s *State) WriteRoot(root [32]byte) error {
+	return s.db.Put(keyRoot, root[:])
 }
 
-// GetBlock reads a persisted block's bytes.
-func (s *State) GetBlock(id ids.ID) ([]byte, error) {
-	return s.db.Get(append(append([]byte(nil), prefixBlock...), id[:]...))
-}
+// HoldRoot makes a committed root current. It runs after the commit, so the
+// root this node reports is always one that is on disk.
+func (s *State) HoldRoot(root [32]byte) { s.root = root }
 
-// BlockIDAtHeight resolves a height to its accepted block id. This is the
-// height index the engine relies on across restarts, so it is persisted rather
-// than held in a map that empties on reboot.
-func (s *State) BlockIDAtHeight(height uint64) (ids.ID, error) {
-	b, err := s.db.Get(heightKey(height))
+// ReadRoot puts the committed root back, discarding an advance that belonged
+// to a block whose writes were discarded.
+func (s *State) ReadRoot() error {
+	stored, err := s.db.Get(keyRoot)
 	if err != nil {
-		return ids.Empty, err
-	}
-	return ids.ToID(b)
-}
-
-// SetLastAccepted records the accepted tip and the root that came with it, in
-// that order: the root is durable before the tip that claims it, so a crash
-// between the two leaves a tip whose root is already stored rather than a tip
-// pointing at a root that was never written.
-func (s *State) SetLastAccepted(id ids.ID, root [32]byte) error {
-	if err := s.db.Put(keyRoot, root[:]); err != nil {
 		return err
 	}
-	if err := s.db.Put(keyLastAccepted, id[:]); err != nil {
-		return err
+	if len(stored) != 32 {
+		return fmt.Errorf("mpcvm: stored root is %d bytes, want 32", len(stored))
 	}
-	s.root = root
+	copy(s.root[:], stored)
 	return nil
-}
-
-// LastAccepted returns the persisted accepted tip. found is false on a fresh
-// database, which is the caller's signal to install genesis.
-func (s *State) LastAccepted() (id ids.ID, found bool, err error) {
-	b, err := s.db.Get(keyLastAccepted)
-	if errors.Is(err, database.ErrNotFound) {
-		return ids.Empty, false, nil
-	}
-	if err != nil {
-		return ids.Empty, false, err
-	}
-	id, err = ids.ToID(b)
-	return id, err == nil, err
-}
-
-func heightKey(h uint64) []byte {
-	k := make([]byte, len(prefixHeight)+8)
-	copy(k, prefixHeight)
-	binary.BigEndian.PutUint64(k[len(prefixHeight):], h)
-	return k
 }
 
 // -----------------------------------------------------------------------------

@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/constants"
 	luxcrypto "github.com/luxfi/crypto"
 	"github.com/luxfi/crypto/secp256k1"
@@ -37,12 +38,18 @@ import (
 	"github.com/luxfi/threshold/pkg/protocol"
 	"github.com/luxfi/threshold/pkg/quorum"
 	vmcore "github.com/luxfi/vm"
-	"github.com/luxfi/vm/chain"
+	vmchain "github.com/luxfi/vm/chain"
 	"github.com/luxfi/warp"
 )
 
+// maxStagedCeremonies bounds the queue of completed ceremonies waiting for a
+// block. Staging is driven by ceremonies this node took part in, so the bound
+// is generous, but a queue with no bound at all is whatever a long outage makes
+// it.
+const maxStagedCeremonies = 4096
+
 var (
-	_ chain.ChainVM = (*VM)(nil)
+	_ vmchain.ChainVM = (*VM)(nil)
 
 	Version = &version.Semantic{
 		Major: 1,
@@ -137,10 +144,16 @@ type VM struct {
 	netID   ids.ID     // network whose validator set forms the committee
 	pool    *pool.Pool // worker pool for MPC operations
 
+	// chain is the durable state, the blocks in flight and the tip, under the
+	// one lock the rest of the VM shares. State writes through its view, so a
+	// key registration and the block that made it land together or not at all.
+	chain        *chain.Store[*Block]
+	genesisBlock *Block
+
 	// state is the persisted, replicated chain state: the custody-key registry,
-	// the ceremony log, the block store and the state root. It is the authority
-	// on what M-Chain knows — there is no second in-memory copy that could
-	// disagree with it or vanish on restart.
+	// the ceremony log and the state root. It is the authority on what M-Chain
+	// knows — there is no second in-memory copy that could disagree with it or
+	// vanish on restart.
 	state *State
 
 	// shares is this node's secret key material, keyed by key id. Loaded from
@@ -148,12 +161,11 @@ type VM struct {
 	// root; another validator legitimately holds different bytes.
 	shares map[string]*heldShare
 
-	// Completed ceremonies awaiting inclusion in a block, and their staging
-	// order. Every participant stages the same operations, so whichever node
-	// proposes produces a block the others can verify.
-	inflight map[string]*Operation
-	order    []string
-	work     vmcore.Latch
+	// Completed ceremonies awaiting inclusion in a block, in staging order.
+	// Every participant stages the same operations, so whichever node proposes
+	// produces a block the others can verify. LOCK ORDER: the chain's lock,
+	// then the pool's.
+	staged *chain.Pool[*Operation, string]
 
 	// localMesh is the in-process ceremony transport used when the VM has no
 	// p2p sender (single-process dev and tests). Nil on a networked node.
@@ -163,11 +175,6 @@ type VM struct {
 	dailySigningCount map[string]uint64 // ChainID -> count today
 	quotaResetTime    time.Time         // When to reset quotas
 
-	// Block Management
-	preferred      ids.ID
-	lastAcceptedID ids.ID
-	pendingBlocks  map[ids.ID]*Block
-
 	// Network Stats
 	stats *vmStats
 
@@ -175,6 +182,15 @@ type VM struct {
 	// user mempool) so this is the NoUserTxPolicy sentinel.
 	feePolicy fee.Policy
 
+	// mu guards State and the VM's own maps. State is deliberately not safe for
+	// concurrent use — a state machine with its own locking invites callers to
+	// interleave reads and writes across a transition and observe a half-applied
+	// block — so this is the lock that stands in for it.
+	//
+	// LOCK ORDER, without exception: the chain's lock, then this one. Accept
+	// holds the chain's and reaches State inside it, so any path holding this
+	// one while resolving a block would deadlock. Verify resolves its parent
+	// before taking this lock for that reason.
 	mu sync.RWMutex
 }
 
@@ -207,9 +223,9 @@ func (vm *VM) Initialize(
 	}
 
 	// Initialize maps
-	vm.pendingBlocks = make(map[ids.ID]*Block)
 	vm.shares = make(map[string]*heldShare)
-	vm.inflight = make(map[string]*Operation)
+	vm.staged = chain.NewPool(maxStagedCeremonies,
+		func(op *Operation) string { return op.CeremonyID })
 	vm.sessionRouters = make(map[string]*gossipRouter)
 	vm.pendingBySession = make(map[string][]*protocol.Message)
 	vm.dailySigningCount = make(map[string]uint64)
@@ -255,8 +271,11 @@ func (vm *VM) Initialize(
 		vm.config.Policy = genesis.Policy
 	}
 
-	// Open persisted state, resuming whatever this node already knows.
-	state, err := NewState(vm.db, vm.rt.ChainID)
+	// Open persisted state, resuming whatever this node already knows. State
+	// writes through the chain's view, so a key registration and the block that
+	// made it commit together or not at all.
+	vm.chain = chain.New[*Block](vm.db, vm.reloadRoot)
+	state, err := NewState(vm.chain.View(), vm.rt.ChainID)
 	if err != nil {
 		return err
 	}
@@ -267,46 +286,35 @@ func (vm *VM) Initialize(
 	// comes back at the height it left, not at zero. Recomputing genesis
 	// unconditionally would discard every accepted block and re-run history
 	// from an empty registry.
-	tip, found, err := vm.state.LastAccepted()
-	if err != nil {
-		return fmt.Errorf("mpcvm: read accepted tip: %w", err)
-	}
 	root := vm.state.Root()
-	if found {
-		blk, err := vm.loadBlock(tip)
-		if err != nil {
-			return fmt.Errorf("mpcvm: accepted tip %s is not readable: %w", tip, err)
+	genesisBlock := &Block{
+		BlockHeight:    0,
+		BlockTimestamp: genesis.Timestamp,
+		ParentID_:      ids.Empty,
+		StateRoot:      root,
+		vm:             vm,
+	}
+	genesisBlock.ID_ = genesisBlock.computeID()
+	vm.genesisBlock = genesisBlock
+
+	at, fresh, err := vm.chain.Open(genesisBlock, vm.parseBlock)
+	if err != nil {
+		return fmt.Errorf("mpcvm: open chain state: %w", err)
+	}
+	if fresh {
+		// NewState seeded the genesis root through the view; commit it, so a
+		// node that accepts no block still comes back to the same root.
+		if err := vm.chain.Seed(func(database.Database) error { return nil }); err != nil {
+			return err
 		}
-		vm.lastAcceptedID = tip
-		vm.preferred = tip
-		vm.log.Info("M-Chain resumed",
-			log.Stringer("tip", tip),
-			log.Uint64("height", blk.BlockHeight),
+		vm.log.Info("M-Chain genesis installed",
+			log.Stringer("blockID", genesisBlock.ID()),
 			log.String("stateRoot", fmt.Sprintf("%x", root[:8])),
 		)
 	} else {
-		genesisBlock := &Block{
-			BlockHeight:    0,
-			BlockTimestamp: genesis.Timestamp,
-			ParentID_:      ids.Empty,
-			StateRoot:      root,
-			vm:             vm,
-		}
-		genesisBlock.ID_ = genesisBlock.computeID()
-		raw, err := genesisBlock.Marshal()
-		if err != nil {
-			return err
-		}
-		if err := vm.state.PutBlock(genesisBlock.ID(), 0, raw); err != nil {
-			return fmt.Errorf("mpcvm: store genesis block: %w", err)
-		}
-		if err := vm.state.SetLastAccepted(genesisBlock.ID(), root); err != nil {
-			return err
-		}
-		vm.lastAcceptedID = genesisBlock.ID()
-		vm.preferred = genesisBlock.ID()
-		vm.log.Info("M-Chain genesis installed",
-			log.Stringer("blockID", genesisBlock.ID()),
+		vm.log.Info("M-Chain resumed",
+			log.Stringer("tip", at.ID()),
+			log.Uint64("height", at.Height()),
 			log.String("stateRoot", fmt.Sprintf("%x", root[:8])),
 		)
 	}
@@ -654,121 +662,118 @@ func (vm *VM) checkQuotaReset() {
 }
 
 // BuildBlock implements the chain.ChainVM interface
-func (vm *VM) BuildBlock(ctx context.Context) (chain.Block, error) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
+func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
+	built, err := vm.chain.Propose(func(parent *Block) (*Block, error) {
+		staged := vm.staged.Take(vm.config.MaxOpsPerBlock)
+		if len(staged) == 0 {
+			return nil, errors.New("mpcvm: no completed ceremonies to include")
+		}
 
-	parentID := vm.preferred
-	if parentID == ids.Empty {
-		parentID = vm.lastAcceptedID
-	}
-	parent, err := vm.loadBlock(parentID)
+		// Only include operations that still verify against current state. A
+		// ceremony can be staged and then invalidated by a block that landed first
+		// (the same key registered, the same ceremony recorded); proposing it
+		// anyway would build a block every peer rejects.
+		vm.mu.RLock()
+		defer vm.mu.RUnlock()
+
+		root := vm.state.Root()
+		pending := make(map[string]*KeyRecord, len(staged))
+		operations := make([]*Operation, 0, len(staged))
+		var invalid []*Operation
+		for _, op := range staged {
+			if err := vm.verifyOperation(op, pending); err != nil {
+				vm.log.Debug("dropping staged ceremony",
+					log.String("ceremony", op.CeremonyID),
+					log.String("reason", err.Error()),
+				)
+				invalid = append(invalid, op)
+				continue
+			}
+			if op.Type == OpTypeKeygen {
+				pending[op.Key.KeyID] = op.Key
+			}
+			operations = append(operations, op)
+			root = advance(root, op.digest())
+		}
+		vm.staged.Drop(invalid)
+		if len(operations) == 0 {
+			return nil, errors.New("mpcvm: no completed ceremonies to include")
+		}
+
+		// The block timestamp never precedes its parent's; Verify enforces the
+		// same bound, so a clock that ran backwards must not produce an
+		// unverifiable block on the proposer's own machine.
+		ts := time.Now().Unix()
+		if ts < parent.BlockTimestamp {
+			ts = parent.BlockTimestamp
+		}
+
+		blk := &Block{
+			ParentID_:      parent.ID(),
+			BlockHeight:    parent.Height() + 1,
+			BlockTimestamp: ts,
+			StateRoot:      root,
+			Operations:     operations,
+			vm:             vm,
+		}
+		blk.ID_ = blk.computeID()
+
+		vm.log.Info("built M-Chain block",
+			log.Stringer("blockID", blk.ID()),
+			log.Uint64("height", blk.BlockHeight),
+			log.Int("operations", len(operations)),
+			log.String("stateRoot", fmt.Sprintf("%x", root[:8])),
+		)
+		return blk, nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("mpcvm: parent %s: %w", parentID, err)
+		return nil, err
 	}
-
-	staged := vm.drain(vm.config.MaxOpsPerBlock)
-	if len(staged) == 0 {
-		return nil, errors.New("mpcvm: no completed ceremonies to include")
-	}
-
-	// Only include operations that still verify against current state. A
-	// ceremony can be staged and then invalidated by a block that landed first
-	// (the same key registered, the same ceremony recorded); proposing it
-	// anyway would build a block every peer rejects.
-	root := vm.state.Root()
-	pending := make(map[string]*KeyRecord, len(staged))
-	operations := make([]*Operation, 0, len(staged))
-	for _, op := range staged {
-		if err := vm.verifyOperation(op, pending); err != nil {
-			vm.log.Debug("dropping staged ceremony",
-				log.String("ceremony", op.CeremonyID),
-				log.String("reason", err.Error()),
-			)
-			delete(vm.inflight, op.CeremonyID)
-			continue
-		}
-		if op.Type == OpTypeKeygen {
-			pending[op.Key.KeyID] = op.Key
-		}
-		operations = append(operations, op)
-		root = advance(root, op.digest())
-	}
-	vm.order = retainOrder(vm.order, vm.inflight)
-	if len(operations) == 0 {
-		return nil, errors.New("mpcvm: no completed ceremonies to include")
-	}
-
-	// The block timestamp never precedes its parent's; Verify enforces the same
-	// bound, so a clock that ran backwards must not produce an unverifiable
-	// block on the proposer's own machine.
-	ts := time.Now().Unix()
-	if ts < parent.BlockTimestamp {
-		ts = parent.BlockTimestamp
-	}
-
-	blk := &Block{
-		ParentID_:      parentID,
-		BlockHeight:    parent.BlockHeight + 1,
-		BlockTimestamp: ts,
-		StateRoot:      root,
-		Operations:     operations,
-		vm:             vm,
-	}
-	blk.ID_ = blk.computeID()
-	vm.pendingBlocks[blk.ID()] = blk
-
-	vm.log.Info("built M-Chain block",
-		log.Stringer("blockID", blk.ID()),
-		log.Uint64("height", blk.BlockHeight),
-		log.Int("operations", len(operations)),
-		log.String("stateRoot", fmt.Sprintf("%x", root[:8])),
-	)
-	return blk, nil
-}
-
-// retainOrder drops staging-order entries whose operation is gone, so the slice
-// cannot grow without bound across a long-running node.
-func retainOrder(order []string, live map[string]*Operation) []string {
-	out := order[:0]
-	for _, cid := range order {
-		if _, ok := live[cid]; ok {
-			out = append(out, cid)
-		}
-	}
-	return out
+	return built, nil
 }
 
 // GetBlock implements the chain.ChainVM interface
-func (vm *VM) GetBlock(ctx context.Context, id ids.ID) (chain.Block, error) {
+func (vm *VM) GetBlock(ctx context.Context, id ids.ID) (vmchain.Block, error) {
 	vm.mu.RLock()
 	defer vm.mu.RUnlock()
 	return vm.loadBlock(id)
 }
 
 // ParseBlock implements the chain.ChainVM interface
-func (vm *VM) ParseBlock(ctx context.Context, bytes []byte) (chain.Block, error) {
+func (vm *VM) ParseBlock(ctx context.Context, bytes []byte) (vmchain.Block, error) {
+	return vm.parseBlock(bytes)
+}
+
+// parseBlock decodes a block belonging to this VM. The store reads accepted
+// blocks back through it, so there is one decoder rather than one per caller.
+func (vm *VM) parseBlock(raw []byte) (*Block, error) {
 	blk := &Block{vm: vm}
-	if err := parseBlockBytes(bytes, blk); err != nil {
+	if err := parseBlockBytes(raw, blk); err != nil {
 		return nil, err
 	}
 	blk.ID_ = blk.computeID()
 	return blk, nil
 }
 
-// SetPreference implements the chain.ChainVM interface
-func (vm *VM) SetPreference(ctx context.Context, id ids.ID) error {
+// reloadRoot puts the committed state root back after a block's writes have
+// been discarded, so the root this node reports is one that is on disk. It runs
+// inside Accept, under the chain's lock, and takes the VM's in that order.
+func (vm *VM) reloadRoot() error {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
-	vm.preferred = id
+	return vm.state.ReadRoot()
+}
+
+// SetPreference implements the chain.ChainVM interface
+func (vm *VM) SetPreference(ctx context.Context, id ids.ID) error {
+	vm.chain.Prefer(id)
 	return nil
 }
 
 // LastAccepted implements the chain.ChainVM interface
 func (vm *VM) LastAccepted(ctx context.Context) (ids.ID, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-	return vm.lastAcceptedID, nil
+	id, _ := vm.chain.Tip()
+	return id, nil
 }
 
 // CreateHandlers implements the common.VM interface
@@ -788,21 +793,21 @@ func (vm *VM) CreateHandlers(ctx context.Context) (map[string]http.Handler, erro
 // gating health on key material would take healthy nodes out of rotation for
 // doing their job correctly. What a share-less node cannot do — contribute a
 // partial signature — is visible in sharesHeld.
-func (vm *VM) HealthCheck(ctx context.Context) (chain.HealthResult, error) {
+func (vm *VM) HealthCheck(ctx context.Context) (vmchain.HealthResult, error) {
 	vm.mu.RLock()
 	defer vm.mu.RUnlock()
 
 	keys, err := vm.state.Keys()
 	if err != nil {
-		return chain.HealthResult{}, fmt.Errorf("mpcvm: read custody registry: %w", err)
+		return vmchain.HealthResult{}, fmt.Errorf("mpcvm: read custody registry: %w", err)
 	}
 	root := vm.state.Root()
-	return chain.HealthResult{
+	return vmchain.HealthResult{
 		Healthy: true,
 		Details: map[string]string{
 			"custodyKeys":      fmt.Sprintf("%d", len(keys)),
 			"sharesHeld":       fmt.Sprintf("%d", len(vm.shares)),
-			"stagedCeremonies": fmt.Sprintf("%d", len(vm.inflight)),
+			"stagedCeremonies": fmt.Sprintf("%d", vm.staged.Len()),
 			"stateRoot":        hex.EncodeToString(root[:]),
 		},
 	}, nil
@@ -830,7 +835,7 @@ func (vm *VM) CreateStaticHandlers(ctx context.Context) (map[string]http.Handler
 }
 
 // Connected implements the common.VM interface
-func (vm *VM) Connected(ctx context.Context, nodeID ids.NodeID, nodeVersion *chain.VersionInfo) error {
+func (vm *VM) Connected(ctx context.Context, nodeID ids.NodeID, nodeVersion *vmchain.VersionInfo) error {
 	return nil
 }
 
@@ -925,9 +930,7 @@ func (vm *VM) CrossChainRequestFailed(ctx context.Context, chainID ids.ID, reque
 // index is persisted, so it survives a restart — a purely in-memory height map
 // answers "not found" for every accepted block after a reboot.
 func (vm *VM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-	return vm.state.BlockIDAtHeight(height)
+	return vm.chain.IDAtHeight(height)
 }
 
 // SetState implements the common.VM interface
@@ -948,28 +951,19 @@ func (vm *VM) NewHTTPHandler(ctx context.Context) (http.Handler, error) {
 // completed ceremony never reaches a block unless some other chain happened to
 // wake the builder.
 func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
-	return vm.work.WaitForEvent(ctx)
+	return vm.staged.Wait(ctx)
 }
 
 // Helper methods
 
-// loadBlock reads a block from the pending set or from persisted state. Both
-// Verify and BuildBlock resolve parents through here, so an accepted ancestor
-// is found after a restart rather than only while it happens to be in memory.
+// loadBlock reads a block in flight or one read back from committed state, so
+// an accepted ancestor is found after a restart rather than only while it
+// happens to be in memory.
 func (vm *VM) loadBlock(id ids.ID) (*Block, error) {
-	if blk, ok := vm.pendingBlocks[id]; ok {
-		return blk, nil
+	if vm.genesisBlock != nil && id == vm.genesisBlock.ID() {
+		return vm.genesisBlock, nil
 	}
-	raw, err := vm.state.GetBlock(id)
-	if err != nil {
-		return nil, err
-	}
-	blk := &Block{vm: vm}
-	if err := parseBlockBytes(raw, blk); err != nil {
-		return nil, err
-	}
-	blk.ID_ = id
-	return blk, nil
+	return vm.chain.Block(id, vm.parseBlock)
 }
 
 // handleHealth serves the same result HealthCheck reports to the engine. One
