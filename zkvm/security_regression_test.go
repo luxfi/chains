@@ -324,7 +324,7 @@ func newTestProofVerifier(t *testing.T) *ProofVerifier {
 	config := ZConfig{
 		ProofCacheSize: 100,
 	}
-	pv, err := NewProofVerifier(config, [32]byte{}, log.NoLog{})
+	pv, err := NewProofVerifier(config, testBind, log.NoLog{})
 	if err != nil {
 		t.Fatalf("NewProofVerifier: %v", err)
 	}

@@ -4,6 +4,7 @@
 package zkvm
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -260,14 +261,22 @@ func (vm *VM) Initialize(
 	}
 	vm.genesisBlock.ID_ = vm.genesisBlock.computeID()
 
-	_, fresh, err := vm.chain.Open(vm.genesisBlock, func(raw []byte) (chain.Block, error) { return vm.parseBlock(raw) })
-	if err != nil {
+	if _, _, err := vm.chain.Open(vm.genesisBlock, func(raw []byte) (chain.Block, error) { return vm.parseBlock(raw) }); err != nil {
 		return err
 	}
-	if fresh {
-		// The genesis allocation is the one mutation outside a block, and it is
-		// committed on its own: staged, it would ride on whichever block landed
-		// first and vanish from a chain that never accepted one.
+
+	// The genesis allocation is the one mutation outside a block, and it is
+	// committed on its own: staged, it would ride on whichever block landed
+	// first and vanish from a chain that never accepted one.
+	//
+	// Whether it has already been applied is asked of the STATE, not of the
+	// store: the store records a tip when it accepts a block, and seeding is
+	// not accepting one, so a chain that has seeded and not yet built reports
+	// itself fresh on every boot. Answering that with a second allocation ends
+	// in "UTXO already exists" — a node that cannot restart until it produces
+	// a block. Finalize is the last thing the allocation does, so a committed
+	// root that is no longer the empty one is the allocation itself saying so.
+	if bytes.Equal(vm.root.Get(), make([]byte, 32)) {
 		if err := vm.chain.Seed(func(database.Database) error {
 			return vm.processGenesisTransactions(genesis)
 		}); err != nil {

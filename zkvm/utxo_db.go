@@ -75,15 +75,7 @@ func (udb *UTXODB) AddUTXO(utxo *UTXO) error {
 		return errors.New("UTXO already exists")
 	}
 
-	// Serialize UTXO
-	utxoBytes, err := utxo.Marshal()
-	if err != nil {
-		return err
-	}
-
-	// Store in database
-	key := makeUTXOKey(utxo.Commitment)
-	if err := udb.db.Put(key, utxoBytes); err != nil {
+	if err := udb.db.Put(makeUTXOKey(utxo.Commitment), utxo.Marshal()); err != nil {
 		return err
 	}
 

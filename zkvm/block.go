@@ -285,20 +285,12 @@ func (b *Block) Reject(ctx context.Context) error {
 	return nil
 }
 
-// Bytes returns the block bytes
+// Bytes returns the block's canonical encoding, computed once.
 func (b *Block) Bytes() []byte {
-	if b.bytes != nil {
-		return b.bytes
+	if b.bytes == nil {
+		b.bytes = b.Marshal()
 	}
-
-	bytes, err := b.Marshal()
-	if err != nil {
-		// Log error and return nil
-		return nil
-	}
-
-	b.bytes = bytes
-	return bytes
+	return b.bytes
 }
 
 // Genesis represents genesis data

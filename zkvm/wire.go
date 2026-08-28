@@ -261,7 +261,7 @@ func parseZKProof(data []byte) (*ZKProof, error) {
 
 const utxoSize = 68
 
-func (u *UTXO) Marshal() ([]byte, error) {
+func (u *UTXO) Marshal() []byte {
 	b := zap.NewBuilder(zap.HeaderSize + utxoSize + len(u.Commitment) + len(u.Ciphertext) + len(u.EphemeralPK) + 64)
 	ob := b.StartObject(utxoSize)
 	ob.SetBytesFixed(0, u.TxID[:])
@@ -271,7 +271,7 @@ func (u *UTXO) Marshal() ([]byte, error) {
 	ob.SetBytes(52, u.Ciphertext)
 	ob.SetBytes(60, u.EphemeralPK)
 	ob.FinishAsRoot()
-	return b.Finish(), nil
+	return b.Finish()
 }
 
 func parseUTXO(data []byte, u *UTXO) error {
@@ -300,7 +300,7 @@ func parseUTXO(data []byte, u *UTXO) error {
 // transaction other than the one the proof was verified for.
 const txSize = 98
 
-func (tx *Transaction) Marshal() ([]byte, error) {
+func (tx *Transaction) Marshal() []byte {
 	tinLens, tinBlob := packObjs(tx.TransparentInputs, marshalTransparentInput)
 	toutLens, toutBlob := packObjs(tx.TransparentOutputs, marshalTransparentOutput)
 	nullLens, nullBlob := packBytesList(tx.Nullifiers)
@@ -331,7 +331,7 @@ func (tx *Transaction) Marshal() ([]byte, error) {
 	ob.SetBytes(82, proof)
 	ob.SetBytes(90, tx.Memo)
 	ob.FinishAsRoot()
-	return b.Finish(), nil
+	return b.Finish()
 }
 
 func parseTransaction(data []byte) (*Transaction, error) {
@@ -372,8 +372,8 @@ func parseTransaction(data []byte) (*Transaction, error) {
 //	TxBlob bytes@56, StateRoot bytes@64, BlockProof bytes@72
 const blkSize = 80
 
-func (b *Block) Marshal() ([]byte, error) {
-	txLens, txBlob := packObjs(b.Txs, func(t *Transaction) []byte { m, _ := t.Marshal(); return m })
+func (b *Block) Marshal() []byte {
+	txLens, txBlob := packObjs(b.Txs, (*Transaction).Marshal)
 	proof := marshalZKProof(b.BlockProof)
 	bld := zap.NewBuilder(zap.HeaderSize + blkSize + len(txBlob) + len(b.StateRoot) + len(proof) + 4*len(txLens) + 256)
 	txOff := writeU32List(bld, txLens)
@@ -386,7 +386,7 @@ func (b *Block) Marshal() ([]byte, error) {
 	ob.SetBytes(64, b.StateRoot)
 	ob.SetBytes(72, proof)
 	ob.FinishAsRoot()
-	return bld.Finish(), nil
+	return bld.Finish()
 }
 
 func parseBlockBytes(data []byte, blk *Block) error {

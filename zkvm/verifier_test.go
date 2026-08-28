@@ -78,7 +78,7 @@ func keyedVerifier(t *testing.T, keys map[string][]byte) *ProofVerifier {
 	pv, err := NewProofVerifier(ZConfig{
 		ProofCacheSize: 16,
 		VerifyingKeys:  keys,
-	}, [32]byte{}, log.NoLog{})
+	}, testBind, log.NoLog{})
 	if err != nil {
 		t.Fatalf("NewProofVerifier: %v", err)
 	}
@@ -392,8 +392,13 @@ func TestWitnessMustMatchWhatTheKeysCircuitTakes(t *testing.T) {
 	}
 }
 
-// testBind is the chain binding a test verifier is built with: the zero bind,
-// which is what NewProofVerifier(cfg, [32]byte{}, …) carries. Every proof's
-// public inputs lead with it, so a proof made for one chain does not verify on
-// another.
-var testBind [32]byte
+// testBind is the chain binding every test verifier is built with. It is not
+// the zero value, so "the chain this proof was made for" is distinguishable
+// from "no chain at all" — a zero bind would make every wrong-chain case look
+// right. Every proof's public inputs lead with it.
+var testBind = [32]byte{
+	0x5A, 0xC1, 0x00, 0xDE, 0xAD, 0xBE, 0xEF, 0x11,
+	0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+	0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x02,
+	0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+}

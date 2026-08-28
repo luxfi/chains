@@ -16,15 +16,21 @@ import (
 	"github.com/luxfi/ids"
 )
 
-// spendTx builds a shielded transfer that spends the given nullifiers.
+// spendTx builds a transaction spending the given notes. Its output commitment
+// is derived from what it spends, so two different spends create two different
+// outputs — which is what the set the chain keeps requires of them.
 func spendTx(nullifiers ...[]byte) *Transaction {
+	commitment := sha256.New()
+	for _, n := range nullifiers {
+		commitment.Write(n)
+	}
 	tx := &Transaction{
 		Type:       TransactionTypeTransfer,
 		Version:    1,
 		Nullifiers: nullifiers,
 		Outputs: []*ShieldedOutput{
 			{
-				Commitment:      make([]byte, 32),
+				Commitment:      commitment.Sum(nil),
 				EncryptedNote:   make([]byte, 32),
 				EphemeralPubKey: make([]byte, 32),
 				OutputProof:     make([]byte, 32),

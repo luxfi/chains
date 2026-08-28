@@ -275,7 +275,7 @@ func (v *Vertex) serialize() []byte {
 	binary.BigEndian.PutUint32(b4, uint32(len(v.txs)))
 	buf = append(buf, b4...)
 	for _, tx := range v.txs {
-		txBytes, _ := tx.Marshal()
+		txBytes := tx.Marshal()
 		binary.BigEndian.PutUint32(b4, uint32(len(txBytes)))
 		buf = append(buf, b4...)
 		buf = append(buf, txBytes...)
