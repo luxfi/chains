@@ -389,6 +389,14 @@ func (vm *VM) parseBlock(raw []byte) (*Block, error) {
 
 // GetBlock retrieves a block by ID
 func (vm *VM) GetBlock(ctx context.Context, blkID ids.ID) (vmchain.Block, error) {
+	return vm.block(blkID)
+}
+
+// block resolves a block id to a block. It is the ONE place this chain decides
+// that a decision it made is a block: a vertex is a decision too, and asking
+// for one by block id is answered as a miss rather than with something the
+// caller cannot use.
+func (vm *VM) block(blkID ids.ID) (*Block, error) {
 	if blkID == vm.genesisBlock.ID() {
 		return vm.genesisBlock, nil
 	}
@@ -396,9 +404,6 @@ func (vm *VM) GetBlock(ctx context.Context, blkID ids.ID) (vmchain.Block, error)
 	if err != nil {
 		return nil, err
 	}
-	// A vertex is a decision this chain makes but not a block the engine can
-	// take, so asking for one by block id is answered as a miss rather than
-	// with something the caller cannot use.
 	blk, ok := decided.(*Block)
 	if !ok {
 		return nil, fmt.Errorf("%w: %s is not a block", chain.ErrNoBlock, blkID)
@@ -426,9 +431,7 @@ func (vm *VM) SetState(ctx context.Context, state uint32) error {
 
 // Shutdown shuts down the VM
 func (vm *VM) Shutdown(ctx context.Context) error {
-	if !vm.log.IsZero() {
-		vm.log.Info("Shutting down ZK UTXO VM")
-	}
+	vm.log.Info("Shutting down ZK UTXO VM")
 
 	if vm.utxoDB != nil {
 		vm.utxoDB.Close()

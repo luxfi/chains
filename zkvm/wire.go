@@ -369,13 +369,12 @@ func parseTransaction(data []byte) (*Transaction, error) {
 // ================= Block =================
 //
 //	ParentID 32B@0, Height u64@32, Timestamp i64@40, TxLens list@48,
-//	TxBlob bytes@56, StateRoot bytes@64, BlockProof bytes@72
-const blkSize = 80
+//	TxBlob bytes@56, StateRoot bytes@64
+const blkSize = 72
 
 func (b *Block) Marshal() []byte {
 	txLens, txBlob := packObjs(b.Txs, (*Transaction).Marshal)
-	proof := marshalZKProof(b.BlockProof)
-	bld := zap.NewBuilder(zap.HeaderSize + blkSize + len(txBlob) + len(b.StateRoot) + len(proof) + 4*len(txLens) + 256)
+	bld := zap.NewBuilder(zap.HeaderSize + blkSize + len(txBlob) + len(b.StateRoot) + 4*len(txLens) + 256)
 	txOff := writeU32List(bld, txLens)
 	ob := bld.StartObject(blkSize)
 	ob.SetBytesFixed(0, b.ParentID_[:])
@@ -384,7 +383,6 @@ func (b *Block) Marshal() []byte {
 	ob.SetList(48, txOff, len(txLens))
 	ob.SetBytes(56, txBlob)
 	ob.SetBytes(64, b.StateRoot)
-	ob.SetBytes(72, proof)
 	ob.FinishAsRoot()
 	return bld.Finish()
 }
@@ -398,11 +396,6 @@ func parseBlockBytes(data []byte, blk *Block) error {
 	blk.BlockHeight = o.Uint64(32)
 	blk.BlockTimestamp = o.Int64(40)
 	blk.StateRoot = cp(o.Bytes(64))
-	if blk.Txs, err = unpackObjs(readU32List(o, 48), o.Bytes(56), parseTransaction); err != nil {
-		return err
-	}
-	if blk.BlockProof, err = parseZKProof(o.Bytes(72)); err != nil {
-		return err
-	}
-	return nil
+	blk.Txs, err = unpackObjs(readU32List(o, 48), o.Bytes(56), parseTransaction)
+	return err
 }

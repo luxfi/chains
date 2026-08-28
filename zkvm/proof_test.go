@@ -137,49 +137,6 @@ func TestASatisfyingProofIsAcceptedAndRemembered(t *testing.T) {
 	require.Greater(t, hits, before)
 }
 
-// A block proof asks the same question of every transaction in the block —
-// there is one verification path, so a block of one and a block of many reach
-// the same verdict on the same proof.
-func TestBlockProofVerifiesEveryTransaction(t *testing.T) {
-	nullifier := make([]byte, 32)
-	nullifier[0] = 0xA1
-	commitment := make([]byte, 32)
-	commitment[0] = 0xC1
-
-	witness := []fr.Element{field(testBind[:]), field(nullifier), field(commitment)}
-	key, frame := satisfying(t, witness)
-	pv := keyedVerifier(t, map[string][]byte{string(TransactionTypeTransfer): key})
-
-	good := &Transaction{
-		Type:       TransactionTypeTransfer,
-		Version:    1,
-		Nullifiers: [][]byte{nullifier},
-		Outputs:    []*ShieldedOutput{{Commitment: commitment}},
-		Proof: &ZKProof{
-			ProofType:    "groth16",
-			ProofData:    frame,
-			PublicInputs: [][]byte{testBind[:], nullifier, commitment},
-		},
-	}
-	good.ID = good.ComputeID()
-
-	// A block with no aggregate proof asks nothing.
-	require.NoError(t, pv.VerifyBlockProof(&Block{}))
-
-	require.NoError(t, pv.VerifyBlockProof(&Block{
-		BlockProof: &ZKProof{ProofType: "groth16"},
-		Txs:        []*Transaction{good, good},
-	}))
-
-	bad := *good
-	bad.Proof = &ZKProof{ProofType: "groth16", ProofData: groth16Frame(), PublicInputs: good.Proof.PublicInputs}
-	bad.ID = bad.ComputeID()
-	require.Error(t, pv.VerifyBlockProof(&Block{
-		BlockProof: &ZKProof{ProofType: "groth16"},
-		Txs:        []*Transaction{good, &bad},
-	}))
-}
-
 func TestProofRefusals(t *testing.T) {
 	pv := keyedVerifier(t, map[string][]byte{string(TransactionTypeTransfer): groth16Key(4)})
 
@@ -192,6 +149,12 @@ func TestProofRefusals(t *testing.T) {
 		}
 	}
 	require.ErrorContains(t, pv.VerifyTransactionProof(tx("bulletproofs", nil)), "not yet implemented")
+
+	// PLONK's verification equation was never written. Decoding a proof
+	// carefully in order to refuse it is not a verifier, so the refusal is all
+	// this path does and all it says.
+	require.ErrorIs(t, pv.VerifyTransactionProof(tx("plonk", make([]byte, 736))), errPLONKIncomplete)
+	require.ErrorIs(t, pv.VerifyTransactionProof(tx("plonk", nil)), errPLONKIncomplete)
 	require.ErrorContains(t, pv.VerifyTransactionProof(tx("nonsense", nil)), "unsupported proof type")
 	require.ErrorContains(t, pv.VerifyTransactionProof(tx("groth16", make([]byte, 10))), "invalid proof data length")
 
@@ -243,32 +206,6 @@ func TestPublicInputsBindTheTransaction(t *testing.T) {
 			require.ErrorContains(t, pv.VerifyTransactionProof(tx(tt.inputs)), tt.want)
 		})
 	}
-}
-
-// A PLONK proof is refused for the reason it is refused: the verification
-// equation is not implemented, so nothing structurally well-formed is ever
-// accepted. Its public inputs are checked first, like every other system's.
-func TestPLONKRefusals(t *testing.T) {
-	pv := keyedVerifier(t, map[string][]byte{string(TransactionTypeTransfer): plonkKey()})
-
-	nullifier := make([]byte, 32)
-	tx := &Transaction{
-		Type:       TransactionTypeTransfer,
-		Nullifiers: [][]byte{nullifier},
-		Proof: &ZKProof{
-			ProofType:    "plonk",
-			ProofData:    plonkFrame(),
-			PublicInputs: [][]byte{testBind[:], nullifier},
-		},
-	}
-	require.ErrorIs(t, pv.VerifyTransactionProof(tx), errPLONKIncomplete)
-
-	tx.Proof.PublicInputs = [][]byte{make([]byte, 32)}
-	require.ErrorContains(t, pv.VerifyTransactionProof(tx), "chain binding")
-
-	tx.Proof.PublicInputs = [][]byte{testBind[:], nullifier}
-	tx.Proof.ProofData = make([]byte, 10)
-	require.ErrorContains(t, pv.VerifyTransactionProof(tx), "invalid PLONK proof data length")
 }
 
 // A verifying key that does not decode is not a key, and the failure names
