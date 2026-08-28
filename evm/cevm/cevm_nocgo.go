@@ -12,13 +12,14 @@ import "fmt"
 // No library linked, so there is no ABI to report.
 const ABIVersion uint32 = 0
 
-// AutoDetect returns CPUSequential when built without CGo.
+// AutoDetect returns CPUSequential: with no library there is no lane to detect.
 func AutoDetect() Backend { return CPUSequential }
 
-// AvailableBackends returns CPUSequential only when built without CGo.
+// AvailableBackends returns CPUSequential alone — the only lane a build with no
+// library has, and it cannot execute either.
 func AvailableBackends() []Backend { return []Backend{CPUSequential} }
 
-// BackendName uses the local Go-side string when CGo is off.
+// BackendName uses the local Go-side string; there is no library to ask.
 func BackendName(b Backend) string { return b.String() }
 
 // LibraryABIVersion returns the Go-side constant when there's no library.
@@ -32,7 +33,7 @@ func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *Bl
 	}
 	_ = ctx
 	_ = state
-	return nil, fmt.Errorf("cevm: native EVM not linked, cannot execute transactions (rebuild with CGO_ENABLED=1 -tags=lux_cevm_native)")
+	return nil, fmt.Errorf("cevm: cannot execute %d transactions: %w", len(txs), ErrNotLinked)
 }
 
 // HealthProbeResult mirrors the cgo build's struct so consumers see the same
@@ -61,12 +62,17 @@ type HealthReport struct {
 	ExecTime     float64
 }
 
-// Health returns a single non-OK report indicating CGo is disabled.
+// Health returns a single non-OK report naming the reason nothing can execute.
+//
+// The reason used to read "built without CGo", which is wrong on the default
+// build: cgo is on, and what is missing is the lux_cevm_native tag and the
+// luxcpp bundle behind it. An operator reading it went and checked
+// CGO_ENABLED, which was already 1.
 func Health() []HealthReport {
 	return []HealthReport{{
 		Backend: CPUSequential,
 		Name:    CPUSequential.String(),
 		OK:      false,
-		Err:     fmt.Errorf("cevm: built without CGo, no backends executable"),
+		Err:     ErrNotLinked,
 	}}
 }

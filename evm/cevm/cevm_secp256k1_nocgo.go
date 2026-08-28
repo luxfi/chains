@@ -25,5 +25,5 @@ func BatchRecoverSenders(txs types.Transactions, signer types.Signer) ([]common.
 		return nil, nil
 	}
 	_ = signer
-	return nil, fmt.Errorf("cevm: BatchRecoverSenders requires CGO_ENABLED=1 -tags=lux_cevm_native (libsecp256k1_cpu)")
+	return nil, fmt.Errorf("cevm: BatchRecoverSenders needs libsecp256k1_cpu: %w", ErrNotLinked)
 }
