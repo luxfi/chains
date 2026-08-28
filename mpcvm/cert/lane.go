@@ -49,9 +49,6 @@ const (
 type LaneRegistry struct {
 	owner    Owner
 	verifier map[types.CertLane]LaneVerifier
-	// aliases lets the host wire legacy-lane-id → modern-lane during
-	// the LP-134 grace window. Empty after the grace epoch closes.
-	aliases map[types.CertLane]types.CertLane
 }
 
 // NewRegistry constructs a registry owned by the given chain.
@@ -59,7 +56,6 @@ func NewRegistry(owner Owner) *LaneRegistry {
 	return &LaneRegistry{
 		owner:    owner,
 		verifier: make(map[types.CertLane]LaneVerifier),
-		aliases:  make(map[types.CertLane]types.CertLane),
 	}
 }
 
@@ -90,29 +86,10 @@ func (r *LaneRegistry) Register(v LaneVerifier) error {
 	return nil
 }
 
-// RegisterLegacyAlias maps a legacy LP-5013 T-Chain lane to the
-// modern M/F lane during the grace window. After the window closes,
-// the host calls ClearAliases() and any legacy share is rejected.
-func (r *LaneRegistry) RegisterLegacyAlias(legacy, modern types.CertLane) error {
-	if _, ok := r.verifier[modern]; !ok {
-		return fmt.Errorf("registry: cannot alias to unregistered lane %d", modern)
-	}
-	r.aliases[legacy] = modern
-	return nil
-}
-
-// ClearAliases removes all legacy aliases. Called by the host at the
-// end of the grace epoch.
-func (r *LaneRegistry) ClearAliases() {
-	r.aliases = make(map[types.CertLane]types.CertLane)
-}
-
-// Verifier resolves a lane (including grace-window aliases) to its
-// verifier. Returns an error if no verifier is registered.
+// Verifier resolves a lane to its verifier. Returns an error if no verifier
+// is registered — a lane this chain does not own has none, which is how
+// Register's ownership rule keeps holding at dispatch time.
 func (r *LaneRegistry) Verifier(lane types.CertLane) (LaneVerifier, error) {
-	if alias, ok := r.aliases[lane]; ok {
-		lane = alias
-	}
 	v, ok := r.verifier[lane]
 	if !ok {
 		return nil, fmt.Errorf("registry: no verifier for lane %d", lane)
