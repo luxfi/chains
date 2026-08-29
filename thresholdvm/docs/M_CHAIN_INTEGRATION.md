@@ -1,7 +1,7 @@
 # M-Chain Integration
 
 This document describes how `chains/mchain/` plugs into the
-`thresholdvm` substrate when running in **MPC mode** (per LP-134).
+`thresholdvm` substrate when running in **MPC mode** (per LP-1340).
 The same substrate, running in FHE mode, serves F-Chain — see
 `F_CHAIN_INTEGRATION.md` for that side. The legacy "T-Chain" name is
 retained only for `teleportvm` (LP-6332), which is unrelated.
@@ -15,9 +15,9 @@ retained only for `teleportvm` (LP-6332), which is unrelated.
      reg.Register(cggmp21Verifier{...})         // LaneMChainCGGMP21
      reg.Register(frostVerifier{...})           // LaneMChainFROST
      reg.Register(ringtailGenVerifier{...})     // LaneMChainRingtailGen
-4. During the LP-134 grace epoch, M-Chain wires legacy aliases:
+4. During the LP-1340 grace epoch, M-Chain wires legacy aliases:
      reg.RegisterLegacyAlias(LaneTChainSign, LaneMChainCGGMP21)
-     // ... per the LP-134 deprecation table.
+     // ... per the LP-1340 deprecation table.
 5. M-Chain implements runtime.MChainAdapter and hands itself to the
    substrate's ceremony driver.
 6. M-Chain begins accepting blocks. Each ceremony round is an entry
@@ -86,7 +86,7 @@ into the F-Chain handoff envelope (see
 
 ## Migration from T-Chain
 
-LP-5013's T-Chain hosted both MPC and FHE. After the LP-134
+LP-5013's T-Chain hosted both MPC and FHE. After the LP-1340
 activation epoch:
 
 - All T-Chain MPC ceremonies move to M-Chain unchanged. Same

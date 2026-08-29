@@ -2,7 +2,7 @@
 
 **ThresholdVM is a Go library, not a chain.**
 
-Per LP-134 (Lux Chain Topology), the legacy T-Chain custody monolith is
+Per LP-1340 (Lux Chain Topology), the legacy T-Chain custody monolith is
 split into two operational chains, both served by this substrate:
 
 - `thresholdvm` in **MPC mode → M-Chain** — bridge custody for external
@@ -58,7 +58,7 @@ The legacy "T-Chain" name is retained **only** for `teleportvm`
 
 ## Why split
 
-LP-134 deprecates LP-5013 ("T-Chain MPC Custody"). T-Chain previously
+LP-1340 deprecates LP-5013 ("T-Chain MPC Custody"). T-Chain previously
 mixed MPC ceremonies and FHE compute under one validator set, one
 ceremony root, one block cadence. Sign-oriented (sub-second, latency
 critical) and compute-oriented (multi-second, throughput critical)
@@ -114,9 +114,9 @@ date target the legacy T-Chain layout.
 | LP | Topic |
 |---|---|
 | LP-019 | Threshold MPC for Bridge Signing (M-Chain protocols) |
-| LP-013 | FHE on GPU (F-Chain compute) |
+| LP-4655 | FHE on GPU (F-Chain compute) |
 | LP-076 | Universal Threshold Cryptography Framework |
-| LP-134 | Lux Chain Topology — defines the M/F split |
+| LP-1340 | Lux Chain Topology — defines the M/F split |
 | LP-132 | QuasarGPU Execution Adapter — lane verifiers run here |
 | LP-020 | Quasar Consensus 3.0 — certificate_subject binding |
 

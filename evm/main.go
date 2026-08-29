@@ -29,8 +29,8 @@ import (
 	_ "github.com/luxfi/precompile/mldsa"  // 0x012202 ML-DSA   (FIPS 204 — Module-LWE signature)
 	_ "github.com/luxfi/precompile/slhdsa" // 0x012203 SLH-DSA  (FIPS 205 — hash-based signature)
 	_ "github.com/luxfi/precompile/pulsar" // 0x012204 Pulsar   (Module-LWE threshold FIPS 204)
-	_ "github.com/luxfi/precompile/p3q"    // 0x012205 P3Q      (strict-PQ STARK / FRI / cSHAKE256)
-	_ "github.com/luxfi/precompile/corona" // 0x012206 Corona   (Ring-LWE threshold)
+	_ "github.com/luxfi/precompile/p3q"    // 0x012205 P3Q      (unified PQ threshold-sig verifier family)
+	_ "github.com/luxfi/precompile/corona" // 0x012206 Corona   (Module-LWE threshold)
 	_ "github.com/luxfi/precompile/xwing"  // 0x2221   X-Wing hybrid KEM (X25519+ML-KEM)
 
 	// ── Hashing / ZK Curves ─────────────────────────────

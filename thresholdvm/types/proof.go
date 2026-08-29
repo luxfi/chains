@@ -5,7 +5,7 @@ package types
 
 // Proof is the verification artifact emitted at ceremony Finalize. It
 // is consumed by Quasar 3.0's cert pipeline (LP-020) and bound into
-// certificate_subject (LP-134).
+// certificate_subject (LP-1340).
 //
 // The substrate defines the envelope; the per-protocol payload (the
 // actual signature, group public key, FHE key, etc.) is opaque bytes

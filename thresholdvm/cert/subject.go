@@ -9,7 +9,7 @@ import (
 )
 
 // Roots is the set of upstream roots a Quasar 3.0 certificate_subject
-// binds, mirroring the QuasarRoundDescriptor in LP-134.
+// binds, mirroring the QuasarRoundDescriptor in LP-1340.
 //
 // All seven roots are required, including both MChain and FChain —
 // this is the structural property that makes cross-chain replay
@@ -31,11 +31,11 @@ type Roots struct {
 
 // BindSubject computes certificate_subject = H(... all roots ...).
 // The hash domain is sha256 with a 1-byte version tag (0x01 for
-// LP-134 v3.1) so future descriptor extensions can change the input
+// LP-1340 v3.1) so future descriptor extensions can change the input
 // set without colliding.
 func BindSubject(r Roots) [32]byte {
 	h := sha256.New()
-	h.Write([]byte{0x01}) // LP-134 v3.1 descriptor version
+	h.Write([]byte{0x01}) // LP-1340 v3.1 descriptor version
 	h.Write(r.ParentBlock[:])
 	h.Write(r.StateRoot[:])
 	h.Write(r.ExecRoot[:])
@@ -62,7 +62,7 @@ func VerifySubject(claimed [32]byte, r Roots) error {
 }
 
 // RequireBothChains reports an error if either MChainCeremony or
-// FChainFHE is zero — the LP-134 invariant that every round binds
+// FChainFHE is zero — the LP-1340 invariant that every round binds
 // **both** chain roots, even on rounds where one chain does not
 // finalize a ceremony (the unchanged root from the previous round
 // satisfies the binding).

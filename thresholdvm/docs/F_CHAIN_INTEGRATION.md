@@ -11,7 +11,7 @@ ThresholdVM substrate.
 3. F-Chain registers each protocol verifier:
      reg.Register(tfheVerifier{...})            // LaneFChainTFHE
      reg.Register(bootstrapVerifier{...})       // LaneFChainBootstrap
-4. During the LP-134 grace epoch, F-Chain wires legacy aliases:
+4. During the LP-1340 grace epoch, F-Chain wires legacy aliases:
      reg.RegisterLegacyAlias(LaneTChainFHE, LaneFChainTFHE)
 5. F-Chain implements runtime.FChainAdapter.
 6. F-Chain begins accepting blocks.
@@ -93,7 +93,7 @@ attestation ceremony:
 LP-5013's T-Chain hosted FHE compute under a different chain ID.
 The migration path is:
 
-- All FHE compute moves to F-Chain unchanged. Kernels (LP-013)
+- All FHE compute moves to F-Chain unchanged. Kernels (LP-4655)
   port across — they were never tied to T-Chain semantics.
 - During the grace epoch, F-Chain accepts legacy `LaneTChainFHE`
   shares via `RegisterLegacyAlias` and dispatches them to
