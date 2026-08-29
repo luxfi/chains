@@ -38,7 +38,7 @@ var mockLiquidityTokens = []string{
 // negative half of the never-mix-Liquidity boundary (the positive ChainVerifier gate
 // proves real on-chain existence; this refuses a forbidden BRAND regardless).
 var forbiddenUniverseLabels = []string{
-	"liquid",   // catches "Liquid EVM" / "Liquid DEX" / "Liquidity" (all contain "liquid")
+	"liquid",  // catches "Liquid EVM" / "Liquid DEX" / "Liquidity" (all contain "liquid")
 	"partner", // upstream poison-lineage org
 }
 

@@ -68,9 +68,9 @@ func TestParseConsensusMode_RejectsUnknown(t *testing.T) {
 		t.Fatal("unknown consensus mode token must be rejected")
 	}
 	for tok, want := range map[string]ConsensusMode{
-		"QUORUM_FINALITY":         ConsensusModeQuorumFinality,
+		"QUORUM_FINALITY":          ConsensusModeQuorumFinality,
 		"HONEST_VALIDATOR_LABELED": ConsensusModeHonestValidatorLabeled,
-		"":                        ConsensusModeUnset,
+		"":                         ConsensusModeUnset,
 	} {
 		got, err := ParseConsensusMode(tok)
 		if err != nil || got != want {
