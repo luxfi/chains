@@ -34,7 +34,7 @@ type BlockSigs struct {
 // Like a supermassive black hole, it pulls all blocks to quantum finality
 // using dual BLS+Corona threshold signatures:
 // - BLS threshold signatures (classical security, fast path)
-// - Corona threshold signatures (post-quantum, Ring-LWE based)
+// - Corona threshold signatures (post-quantum, Module-LWE based)
 //
 // Blocks are NOT considered produced without BOTH thresholds being met.
 type Quasar struct {
@@ -430,7 +430,7 @@ func (q *Quasar) AddValidator(validatorID string, weight uint64) error {
 
 // NTTForwardCorona transforms Corona polynomial coefficients to NTT domain
 // using GPU acceleration when available. This enables O(n log n) polynomial
-// multiplication in the Ring-LWE scheme used by Corona threshold signatures.
+// multiplication in the Module-LWE scheme used by Corona threshold signatures.
 func (q *Quasar) NTTForwardCorona(coefficients []uint64) ([]uint64, error) {
 	params := accellattice.NTTParams{
 		N:       256,     // Ring dimension for Corona (X^256 + 1)

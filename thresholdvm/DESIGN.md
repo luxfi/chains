@@ -1,7 +1,7 @@
 # ThresholdVM Design
 
 > Status: Final for Quasar 3.0 activation (2025-12-25)
-> Supersedes the T-Chain monolith (LP-5013), per LP-134
+> Supersedes the T-Chain monolith (LP-5013), per LP-1340
 
 ## 1. Position in the topology
 
@@ -137,7 +137,7 @@ type LaneRegistry interface {
 
 ## 6. Certificate-subject binding
 
-LP-134 extends `QuasarRoundDescriptor`:
+LP-1340 extends `QuasarRoundDescriptor`:
 
 ```cpp
 uint8_t mchain_ceremony_root[32];
@@ -226,7 +226,7 @@ or boot-time failure, not a silent semantic bug.
 
 ## 11. References
 
-Per LP-134 (Lux Chain Topology), the legacy T-Chain monolith is split into
+Per LP-1340 (Lux Chain Topology), the legacy T-Chain monolith is split into
 two operational chains served by this same `thresholdvm` substrate:
 
 - `thresholdvm` in **MPC mode → M-Chain** (CGGMP21, FROST, Ringtail-gen).
@@ -238,11 +238,11 @@ The standalone `teleportvm` (LP-6332) is unrelated and retains its own
 | LP | Topic |
 |---|---|
 | LP-019 | Threshold MPC for Bridge Signing (M-Chain protocols) |
-| LP-013 | FHE on GPU (F-Chain compute) |
+| LP-4655 | FHE on GPU (F-Chain compute) |
 | LP-076 | Universal Threshold Cryptography Framework |
 | LP-077 | Linear Secret Sharing (resharing) |
 | LP-132 | QuasarGPU Execution Adapter |
-| LP-134 | Lux Chain Topology — defines the M/F-Chain split |
+| LP-1340 | Lux Chain Topology — defines the M/F-Chain split |
 | LP-020 | Quasar Consensus 3.0 |
 | LP-6332 | teleportvm cross-chain message bus (separate "T-Chain") |
-| LP-5013 | T-Chain MPC Custody (deprecated, superseded by LP-134) |
+| LP-5013 | T-Chain MPC Custody (deprecated, superseded by LP-1340) |

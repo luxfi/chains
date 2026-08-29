@@ -31,7 +31,7 @@ shared by both chains.
 ## Status
 
 - Substrate ships with Quasar 3.0 activation on **2025-12-25**.
-- LP-5013 (T-Chain) is **deprecated** by LP-134.
+- LP-5013 (T-Chain) is **deprecated** by LP-1340.
 - Cert-lane enums `MChainCGGMP21=5`, `MChainFROST=6`,
   `MChainRingtailGen=7`, `FChainTFHE=8`, `FChainBootstrap=9`. Never
   reorder; appends only.

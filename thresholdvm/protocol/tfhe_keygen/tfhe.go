@@ -38,7 +38,7 @@ type Producer interface {
 // into fchain_fhe_root.
 type Consumer interface {
 	// Ingest verifies the upstream proof and installs the bootstrap
-	// key for use by F-Chain's FHE compute pipeline (LP-013).
+	// key for use by F-Chain's FHE compute pipeline (LP-4655).
 	Ingest(ctx context.Context, mchainSubject [32]byte, proof types.Proof) error
 	// VerifyHandoff is the per-share verifier on F-Chain's
 	// LaneFChainBootstrap. It validates that a F-Chain bootstrap

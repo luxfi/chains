@@ -50,7 +50,7 @@ type LaneRegistry struct {
 	owner    Owner
 	verifier map[types.CertLane]LaneVerifier
 	// aliases lets the host wire legacy-lane-id → modern-lane during
-	// the LP-134 grace window. Empty after the grace epoch closes.
+	// the LP-1340 grace window. Empty after the grace epoch closes.
 	aliases map[types.CertLane]types.CertLane
 }
 

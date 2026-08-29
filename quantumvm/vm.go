@@ -211,7 +211,7 @@ func (vm *VM) Initialize(ctx context.Context, init luxvm.Init) error {
 	vm.log.Info("║ QVM INITIALIZED with Quasar PQ-BFT Consensus                    ║")
 	vm.log.Info("───────────────────────────────────────────────────────────────────")
 	vm.log.Info("║ Quantum Signatures: ML-DSA (NIST PQC)", log.Bool("enabled", vm.Config.QuantumStampEnabled))
-	vm.log.Info("║ Corona Threshold: Ring-LWE PQ", log.Bool("enabled", vm.Config.CoronaEnabled))
+	vm.log.Info("║ Corona Threshold: Module-LWE PQ", log.Bool("enabled", vm.Config.CoronaEnabled))
 	vm.log.Info("║ BLS Threshold: Classical fast path", log.Bool("enabled", true))
 	vm.log.Info("║ Quasar Hybrid: BLS + Corona dual signing", log.Bool("enabled", true))
 	vm.log.Info("║ Parallel TX Processing:", log.Int("maxParallel", vm.Config.MaxParallelTxs))

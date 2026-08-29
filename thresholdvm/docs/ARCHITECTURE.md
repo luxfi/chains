@@ -112,8 +112,8 @@ with a deterministic wrapping.
 | LP | Topic |
 |---|---|
 | LP-019 | Threshold MPC |
-| LP-013 | FHE on GPU |
+| LP-4655 | FHE on GPU |
 | LP-076 | Universal Threshold Cryptography |
 | LP-132 | QuasarGPU Execution Adapter |
-| LP-134 | Lux Chain Topology |
+| LP-1340 | Lux Chain Topology |
 | LP-020 | Quasar Consensus 3.0 |
