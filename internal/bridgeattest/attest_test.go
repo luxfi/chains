@@ -152,8 +152,8 @@ func TestAttestationMustNameTheKeyWeTrust(t *testing.T) {
 	bt := katTransfer(t)
 	digest := bt.Digest()
 
-	custody, _ := secp256k1.NewPrivateKey()   // the key B-Chain is configured with
-	attacker, _ := secp256k1.NewPrivateKey()  // a key the attacker just made
+	custody, _ := secp256k1.NewPrivateKey()  // the key B-Chain is configured with
+	attacker, _ := secp256k1.NewPrivateKey() // a key the attacker just made
 
 	// A perfectly self-consistent attestation: real transfer, real digest, a
 	// signature that verifies — under the attacker's own key, which it helpfully
