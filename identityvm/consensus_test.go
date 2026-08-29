@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/consensus/core/choices"
 	"github.com/luxfi/database/memdb"
 	"github.com/luxfi/ids"
@@ -341,7 +342,7 @@ func TestBlockMustExtendTheTip(t *testing.T) {
 		vm:             h.VM,
 	}
 	require.Error(t, sibling.Verify(ctx))
-	require.ErrorIs(t, sibling.Accept(ctx), ErrNotOnTip)
+	require.ErrorIs(t, sibling.Accept(ctx), chain.ErrNotOnTip)
 
 	// A block whose parent IS resolvable and beneath the tip. Its height
 	// follows its parent's perfectly well, which is the whole point: accepting
@@ -356,8 +357,8 @@ func TestBlockMustExtendTheTip(t *testing.T) {
 		Identities:     []*Identity{h.identity(t, newParty(t), nil)},
 		vm:             h.VM,
 	}
-	require.ErrorIs(t, rewind.Verify(ctx), ErrNotOnTip)
-	require.ErrorIs(t, rewind.Accept(ctx), ErrNotOnTip)
+	require.ErrorIs(t, rewind.Verify(ctx), chain.ErrNotOnTip)
+	require.ErrorIs(t, rewind.Accept(ctx), chain.ErrNotOnTip)
 
 	at1, err := h.GetBlockIDAtHeight(ctx, 1)
 	require.NoError(t, err)
@@ -382,8 +383,106 @@ func TestAcceptRecheckesTheTip(t *testing.T) {
 	// A competitor verifies against the same tip and is accepted first.
 	h.accept(t, &Change{Identity: h.identity(t, newParty(t), nil)})
 
-	require.ErrorIs(t, loser.Accept(ctx), ErrNotOnTip)
+	require.ErrorIs(t, loser.Accept(ctx), chain.ErrNotOnTip)
 	require.Equal(t, uint8(choices.Unknown), loser.Status())
+}
+
+// A block at height 0 is genesis, and genesis is given rather than accepted.
+// Verify does not stop a second one: it asks only that a block at height 0
+// name no parent, and skips every parent check for it. Accept used to skip the
+// tip check for it too — height 0 was exempt — so a peer could hand a live
+// chain a second beginning carrying records of its choosing, and the tip and
+// the height both went back to the start. The store exempts nothing: a block
+// naming no parent does not extend a tip, whatever its height says.
+func TestASecondGenesisCannotRewindTheChain(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+
+	first := h.accept(t, &Change{Identity: h.identity(t, newParty(t), nil)})
+	tip, height := h.chain.Tip()
+	require.EqualValues(t, 1, height)
+
+	usurper := &Block{
+		ParentID_:      ids.Empty,
+		BlockHeight:    0,
+		BlockTimestamp: time.Now().Unix(),
+		Identities:     []*Identity{h.identity(t, newParty(t), nil)},
+		vm:             h.VM,
+	}
+	require.NoError(t, usurper.Verify(ctx), "Verify lets this through; the store is what refuses it")
+	require.ErrorIs(t, usurper.Accept(ctx), chain.ErrNotOnTip)
+
+	stillTip, stillHeight := h.chain.Tip()
+	require.Equal(t, tip, stillTip, "the chain did not go back to a beginning")
+	require.Equal(t, first.ID(), stillTip)
+	require.Equal(t, height, stillHeight)
+	_, err := h.Identity(usurper.Identities[0].ID)
+	require.Error(t, err, "and it applied nothing")
+}
+
+// Two siblings accepted at once, on one store. Neither is sequenced behind the
+// other by the test: the tip each is judged against is whatever the store holds
+// when it lets that one in. Reading the tip before asking for the lock is what
+// this refuses — that reading is stale by the time the commit runs.
+func TestTwoAcceptsAtOnceLeaveOneChain(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	genesisID, _ := h.chain.Tip()
+
+	sibling := func() *Block {
+		b := &Block{
+			ParentID_:      genesisID,
+			BlockHeight:    1,
+			BlockTimestamp: time.Now().Unix(),
+			Identities:     []*Identity{h.identity(t, newParty(t), nil)},
+			vm:             h.VM,
+		}
+		require.NoError(t, b.Verify(ctx))
+		return b
+	}
+	a, b := sibling(), sibling()
+	require.NotEqual(t, a.ID(), b.ID())
+
+	won, lost := race(t, a.Accept, b.Accept)
+	require.NoError(t, won)
+	require.ErrorIs(t, lost, chain.ErrNotOnTip)
+
+	tip, height := h.chain.Tip()
+	require.EqualValues(t, 1, height, "one block landed, not two")
+	require.Contains(t, []ids.ID{a.ID(), b.ID()}, tip)
+	at1, err := h.GetBlockIDAtHeight(ctx, 1)
+	require.NoError(t, err)
+	require.Equal(t, tip, at1, "and the height index names it")
+
+	// The refused block's identity reached neither disk nor memory.
+	refused := a
+	if tip == a.ID() {
+		refused = b
+	}
+	_, err = h.Identity(refused.Identities[0].ID)
+	require.Error(t, err)
+}
+
+// race runs two accepts at the same time and returns them as the one that
+// landed and the one that did not. Both failing, or both landing, is reported
+// as such rather than hidden: the caller holds one of each.
+func race(t *testing.T, accept ...func(context.Context) error) (won, lost error) {
+	t.Helper()
+	errs := make(chan error, len(accept))
+	start := make(chan struct{})
+	for _, a := range accept {
+		go func(a func(context.Context) error) {
+			<-start
+			errs <- a(context.Background())
+		}(a)
+	}
+	close(start)
+
+	won, lost = <-errs, <-errs
+	if won != nil {
+		won, lost = lost, won
+	}
+	return won, lost
 }
 
 func TestBlockVerifyRefusals(t *testing.T) {
