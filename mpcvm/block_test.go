@@ -16,6 +16,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/consensus/core/choices"
 	luxcrypto "github.com/luxfi/crypto"
 	"github.com/luxfi/threshold/pkg/math/curve"
@@ -79,6 +80,95 @@ func TestABlockOnAnUnappliedParentIsRefused(t *testing.T) {
 	require.NoError(t, first.Accept(ctx()))
 	after := blockOver(t, vm, key.signOpOver(t, digestOf(2)))
 	require.NoError(t, after.Verify(ctx()))
+}
+
+// The tip moves between Verify and Accept — a sibling accepted first is
+// exactly that window — so Accept asks again, under the lock that commits.
+//
+// This chain used to answer the question sideways. Write recomputes the root
+// from applied state and refuses a mismatch, and because this chain refuses an
+// empty block its root strictly advances, so a moved tip showed up there as a
+// root that no longer matched. That is a true statement about STATE and it is
+// kept; it is not a statement about LINEAGE, and reading it as one costs the
+// distinction the moment a block that changes nothing is admissible. The tip
+// is now asked about directly, and the sibling is refused before a single
+// operation is folded.
+func TestAcceptRechecksTheTip(t *testing.T) {
+	vm := newVM(t)
+	key := newCustody(t, "vault", quorum.MustNew(3, 5), 9)
+	key.register(t, vm)
+
+	// Two siblings on one parent, both checked against the tip they share.
+	first := blockOver(t, vm, key.signOpOver(t, digestOf(1)))
+	second := blockOver(t, vm, key.signOpOver(t, digestOf(2)))
+	require.NotEqual(t, first.ID(), second.ID())
+	require.Equal(t, first.ParentID_, second.ParentID_)
+	require.NoError(t, first.Verify(ctx()))
+	require.NoError(t, second.Verify(ctx()))
+
+	require.NoError(t, first.Accept(ctx()))
+	require.ErrorIs(t, second.Accept(ctx()), chain.ErrNotOnTip)
+
+	tip, height := vm.chain.Tip()
+	require.Equal(t, first.ID(), tip, "the chain did not rewind")
+	require.EqualValues(t, first.BlockHeight, height)
+	_, err := vm.state.GetCeremony(second.Operations[0].CeremonyID)
+	require.Error(t, err, "and the refused block recorded nothing")
+}
+
+// Two siblings accepted at once. Neither is sequenced behind the other here:
+// the tip each is judged against is whatever the store holds when it lets that
+// one in, so one lands and the other cannot.
+func TestTwoAcceptsAtOnceLeaveOneChain(t *testing.T) {
+	vm := newVM(t)
+	key := newCustody(t, "vault", quorum.MustNew(3, 5), 10)
+	key.register(t, vm)
+
+	a := blockOver(t, vm, key.signOpOver(t, digestOf(1)))
+	b := blockOver(t, vm, key.signOpOver(t, digestOf(2)))
+	require.NoError(t, a.Verify(ctx()))
+	require.NoError(t, b.Verify(ctx()), "both check out against the tip they share")
+
+	won, lost := race(t, a.Accept, b.Accept)
+	require.NoError(t, won)
+	require.ErrorIs(t, lost, chain.ErrNotOnTip)
+
+	tip, height := vm.chain.Tip()
+	require.EqualValues(t, a.BlockHeight, height, "one block landed, not two")
+
+	// Exactly the winner's ceremony is on record, and the root is the one that
+	// winner declared.
+	landed, refused := a, b
+	if tip == b.ID() {
+		landed, refused = b, a
+	}
+	_, err := vm.state.GetCeremony(landed.Operations[0].CeremonyID)
+	require.NoError(t, err)
+	_, err = vm.state.GetCeremony(refused.Operations[0].CeremonyID)
+	require.Error(t, err)
+	require.Equal(t, landed.StateRoot, vm.state.Root())
+}
+
+// race runs two accepts at the same time and returns them as the one that
+// landed and the one that did not. Both failing, or both landing, is reported
+// as such rather than hidden: the caller holds one of each.
+func race(t *testing.T, accept ...func(context.Context) error) (won, lost error) {
+	t.Helper()
+	errs := make(chan error, len(accept))
+	start := make(chan struct{})
+	for _, a := range accept {
+		go func(a func(context.Context) error) {
+			<-start
+			errs <- a(context.Background())
+		}(a)
+	}
+	close(start)
+
+	won, lost = <-errs, <-errs
+	if won != nil {
+		won, lost = lost, won
+	}
+	return won, lost
 }
 
 // The builder holds the same rule, so this node never proposes a block its own

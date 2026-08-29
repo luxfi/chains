@@ -23,13 +23,7 @@ var _ chain.Block = (*Block)(nil)
 // stamped.
 const maxClockSkew = 60 // seconds
 
-var (
-	errInvalidBlock = errors.New("identityvm: invalid block")
-
-	// ErrNotOnTip refuses a block that does not extend the chain: one whose
-	// parent is neither the accepted tip nor a block verified above it.
-	ErrNotOnTip = errors.New("identityvm: block does not extend the accepted tip")
-)
+var errInvalidBlock = errors.New("identityvm: invalid block")
 
 // Block carries every state change this chain makes.
 //
@@ -140,7 +134,7 @@ func (b *Block) Verify(ctx context.Context) error {
 		tip, tipHeight := b.vm.chain.Tip()
 		if parent.ID() != tip && parent.BlockHeight <= tipHeight {
 			return fmt.Errorf("%w: parent %s at height %d is beneath the tip at %d",
-				ErrNotOnTip, parent.ID(), parent.BlockHeight, tipHeight)
+				chain.ErrNotOnTip, parent.ID(), parent.BlockHeight, tipHeight)
 		}
 		if b.BlockHeight != parent.BlockHeight+1 {
 			return fmt.Errorf("%w: height %d does not follow parent %d",
@@ -161,18 +155,12 @@ func (b *Block) Verify(ctx context.Context) error {
 // Accept applies the block. The store commits everything below in one batch,
 // so a record that cannot be written takes the whole block with it rather than
 // leaving the chain holding half of one.
-func (b *Block) Accept(ctx context.Context) error {
-	// A block extends the tip or it is not accepted. Verify reached the same
-	// verdict earlier, against the tip AT THAT TIME; the tip moves between the
-	// two, and a block whose parent has since been buried would otherwise
-	// write the height index and the tip pointer for an abandoned branch.
-	tip, _ := b.vm.chain.Tip()
-	if b.BlockHeight > 0 && b.ParentID_ != tip {
-		return fmt.Errorf("%w: %s extends %s, which is not the tip %s",
-			ErrNotOnTip, b.ID(), b.ParentID_, tip)
-	}
-	return b.vm.chain.Accept(b)
-}
+//
+// It also decides, under that same lock, whether this block still extends the
+// tip — which is why nothing is asked here. Asking here read the tip, released
+// it, and only then asked for the lock, so a tip that moved in between was
+// answered with a reading taken before it moved.
+func (b *Block) Accept(ctx context.Context) error { return b.vm.chain.Accept(b) }
 
 // Write records every change the block makes. All four kinds land here: the
 // identities and revocations used to be applied in memory only, so a restart

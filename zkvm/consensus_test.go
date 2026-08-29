@@ -12,7 +12,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/consensus/core/choices"
+	"github.com/luxfi/database"
 	"github.com/luxfi/database/memdb"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
@@ -28,8 +30,16 @@ func newVM(t *testing.T) *VM {
 
 func newVMOn(t *testing.T, chainID ids.ID, networkID uint32) *VM {
 	t.Helper()
+	vm := bootOn(t, memdb.New(), chainID, networkID, &Genesis{Timestamp: 1607144400})
+	t.Cleanup(func() { _ = vm.Shutdown(context.Background()) })
+	return vm
+}
 
-	genesis, err := json.Marshal(&Genesis{Timestamp: 1607144400})
+// bootOn brings a Z-Chain up over db exactly as the node does.
+func bootOn(t *testing.T, db database.Database, chainID ids.ID, networkID uint32, genesis *Genesis) *VM {
+	t.Helper()
+
+	raw, err := json.Marshal(genesis)
 	require.NoError(t, err)
 
 	// A NON-strict chain: acceptProofs seeds the verified-proof cache, and the
@@ -42,14 +52,50 @@ func newVMOn(t *testing.T, chainID ids.ID, networkID uint32) *VM {
 	vm := &VM{}
 	require.NoError(t, vm.Initialize(context.Background(), vmcore.Init{
 		Runtime:  &runtime.Runtime{ChainID: chainID, NetworkID: networkID, Log: log.NoLog{}},
-		DB:       memdb.New(),
-		Genesis:  genesis,
+		DB:       db,
+		Genesis:  raw,
 		Config:   config,
 		ToEngine: make(chan vmcore.Message, 1),
 		Log:      log.NoLog{},
 	}))
-	t.Cleanup(func() { _ = vm.Shutdown(context.Background()) })
 	return vm
+}
+
+// A chain that allocated its genesis and has not yet accepted a block must
+// come back knowing it allocated. Seeding used to record no tip, so Open — for
+// which a missing tip IS a fresh chain — reported this node fresh on every
+// boot and asked for the allocation again. The UTXO set refuses a duplicate,
+// so the second start failed: a node that could not restart until it produced
+// a block, which it could not do without starting.
+//
+// The chain is held constant and only the node varies. A fresh chain id per
+// boot would make a restart look like a different chain, and this test would
+// pass for the wrong reason.
+func TestARestartBeforeTheFirstBlockDoesNotAllocateAgain(t *testing.T) {
+	db, chainID := memdb.New(), ids.GenerateTestID()
+	allocation := spendTx(nullifier(200))
+	genesis := &Genesis{Timestamp: 1607144400, InitialTxs: []*Transaction{allocation}}
+
+	first := bootOn(t, db, chainID, 1, genesis)
+	held, err := first.utxoDB.GetUTXO(allocation.Outputs[0].Commitment)
+	require.NoError(t, err, "the allocation is in the set")
+	root := first.root.Get()
+
+	// A second VM over the same database is the restart. The first is left
+	// open rather than shut down: Shutdown closes the base database, which the
+	// node owns and a real restart re-opens, and closing it here would take the
+	// disk out from under the node coming up.
+	second := bootOn(t, db, chainID, 1, genesis)
+	t.Cleanup(func() { _ = second.Shutdown(context.Background()) })
+
+	again, err := second.utxoDB.GetUTXO(allocation.Outputs[0].Commitment)
+	require.NoError(t, err, "and it is still there, once")
+	require.Equal(t, held.Commitment, again.Commitment)
+	require.Equal(t, root, second.root.Get(), "the allocation was not re-run")
+
+	tip, height := second.chain.Tip()
+	require.Equal(t, second.genesisBlock.ID(), tip, "the chain is still sitting on genesis")
+	require.Zero(t, height)
 }
 
 // build assembles one block from the pool and returns it, having made its
@@ -143,7 +189,7 @@ func TestBlockMustExtendTheTip(t *testing.T) {
 	acceptProofs(vm, sibling.Txs...)
 	sibling.StateRoot = vm.computeStateRoot(sibling.Txs)
 
-	require.ErrorIs(t, sibling.Verify(ctx), ErrNotOnTip)
+	require.ErrorIs(t, sibling.Verify(ctx), chain.ErrNotOnTip)
 
 	// The tip did not move, and the height index still names the block the
 	// chain accepted.
@@ -175,12 +221,79 @@ func TestAcceptRecheckesTheTip(t *testing.T) {
 	require.NoError(t, winner.Accept(ctx))
 
 	// The block that verified against the old tip is refused, not written.
-	require.ErrorIs(t, first.Accept(ctx), ErrNotOnTip)
+	require.ErrorIs(t, first.Accept(ctx), chain.ErrNotOnTip)
 
 	tip, _ := vm.chain.Tip()
 	require.Equal(t, winner.ID(), tip)
 	require.False(t, spentOf(t, vm.nullifierDB, nullifier(1)),
 		"a block that was not accepted spent nothing")
+}
+
+// One store, two shapes, one tip, accepted at once. A vertex is not a block —
+// it has several parents and no timestamp — but it changes state the same way
+// and through the same store, which keeps a single tip for both. Neither is
+// sequenced behind the other here: the tip each is judged against is whatever
+// the store holds when it lets that one in.
+func TestABlockAndAVertexRaceForOneTip(t *testing.T) {
+	ctx := context.Background()
+	vm := newVM(t)
+
+	// The vertex, assembled the way the DAG engine assembles one.
+	vtx := spendTx(nullifier(1))
+	acceptProofs(vm, vtx)
+	require.NoError(t, vm.mempool.AddTransaction(vtx))
+	built, err := vm.BuildVertex(ctx)
+	require.NoError(t, err)
+	v := built.(*Vertex)
+
+	// A block on the same parent, spending a different note.
+	btx := spendTx(nullifier(2))
+	acceptProofs(vm, btx)
+	b := &Block{
+		ParentID_:      vm.genesisBlock.ID(),
+		BlockHeight:    1,
+		BlockTimestamp: time.Now().Unix(),
+		Txs:            []*Transaction{btx},
+		vm:             vm,
+	}
+	b.StateRoot = vm.computeStateRoot(b.Txs)
+
+	require.NoError(t, v.Verify(ctx))
+	require.NoError(t, b.Verify(ctx), "both check out against the tip they share")
+
+	won, lost := race(t, v.Accept, b.Accept)
+	require.NoError(t, won)
+	require.ErrorIs(t, lost, chain.ErrNotOnTip)
+
+	tip, height := vm.chain.Tip()
+	require.EqualValues(t, 1, height, "one of them landed, not both")
+	require.Contains(t, []ids.ID{v.ID(), b.ID()}, tip)
+	require.Equal(t, tip == v.ID(), spentOf(t, vm.nullifierDB, nullifier(1)),
+		"the vertex's note is spent exactly when the vertex is the tip")
+	require.Equal(t, tip == b.ID(), spentOf(t, vm.nullifierDB, nullifier(2)),
+		"and the block's exactly when the block is")
+}
+
+// race runs two accepts at the same time and returns them as the one that
+// landed and the one that did not. Both failing, or both landing, is reported
+// as such rather than hidden: the caller holds one of each.
+func race(t *testing.T, accept ...func(context.Context) error) (won, lost error) {
+	t.Helper()
+	errs := make(chan error, len(accept))
+	start := make(chan struct{})
+	for _, a := range accept {
+		go func(a func(context.Context) error) {
+			<-start
+			errs <- a(context.Background())
+		}(a)
+	}
+	close(start)
+
+	won, lost = <-errs, <-errs
+	if won != nil {
+		won, lost = lost, won
+	}
+	return won, lost
 }
 
 func TestBlockVerifyRefusals(t *testing.T) {
@@ -481,11 +594,19 @@ func TestVertexRefusals(t *testing.T) {
 	t.Run("parents that do not name the tip", func(t *testing.T) {
 		v := *valid
 		v.parents = []ids.ID{ids.GenerateTestID()}
-		require.ErrorIs(t, v.Verify(ctx), ErrNotOnTip)
-		require.ErrorIs(t, v.Accept(ctx), ErrNotOnTip)
+		require.ErrorIs(t, v.Verify(ctx), chain.ErrNotOnTip)
+		require.ErrorIs(t, v.Accept(ctx), chain.ErrNotOnTip)
 
 		v.parents = nil
-		require.ErrorIs(t, v.Verify(ctx), ErrNotOnTip)
+		require.ErrorIs(t, v.Verify(ctx), chain.ErrNotOnTip)
+		require.ErrorIs(t, v.Accept(ctx), chain.ErrNotOnTip)
+
+		// A vertex naming SEVERAL parents extends no single block, and the
+		// store keeps one tip. Naming the tip among them is not naming it.
+		tip, _ := vm.chain.Tip()
+		v.parents = []ids.ID{tip, ids.GenerateTestID()}
+		require.ErrorIs(t, v.Verify(ctx), chain.ErrNotOnTip)
+		require.ErrorIs(t, v.Accept(ctx), chain.ErrNotOnTip)
 	})
 
 	t.Run("a height that does not follow the tip", func(t *testing.T) {

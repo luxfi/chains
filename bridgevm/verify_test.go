@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/chains/internal/bridgeattest"
 	"github.com/luxfi/database/memdb"
 	"github.com/luxfi/ids"
@@ -263,9 +264,83 @@ func TestAcceptOnlyExtendsTheTip(t *testing.T) {
 	one := buildAndAccept(t, vm)
 
 	sibling := blockOn(t, vm, vm.genesisBlock, now(), requestFor(2, 100))
-	require.ErrorContains(t, sibling.Accept(context.Background()), "not the tip")
+	require.ErrorIs(t, sibling.Accept(context.Background()), chain.ErrNotOnTip)
 	tip, _ := vm.chain.Tip()
 	require.Equal(t, one.ID(), tip)
+}
+
+// Two siblings accepted at once, on one store. Neither is sequenced behind the
+// other by the test: the tip each is judged against is whatever the store holds
+// when it lets that one in, so one lands and the other cannot. Reading the tip
+// before asking for the lock is what this refuses — that reading is stale by
+// the time the commit runs, and the loser would write the height index and the
+// tip pointer for a branch the chain abandoned.
+func TestTwoAcceptsAtOnceLeaveOneChain(t *testing.T) {
+	ctx := context.Background()
+	vm := boot(t)
+	at := now()
+
+	a := blockOn(t, vm, vm.genesisBlock, at, requestFor(1, 100))
+	b := blockOn(t, vm, vm.genesisBlock, at, requestFor(2, 100))
+	require.NotEqual(t, a.ID(), b.ID())
+	require.NoError(t, a.Verify(ctx))
+	require.NoError(t, b.Verify(ctx), "both check out against the tip they share")
+
+	won, lost := race(t, a.Accept, b.Accept)
+	require.NoError(t, won)
+	require.ErrorIs(t, lost, chain.ErrNotOnTip)
+
+	tip, height := vm.chain.Tip()
+	require.EqualValues(t, 1, height, "one block landed, not two")
+	require.Contains(t, []ids.ID{a.ID(), b.ID()}, tip)
+	at1, err := vm.GetBlockIDAtHeight(ctx, 1)
+	require.NoError(t, err)
+	require.Equal(t, tip, at1, "and the height index names it")
+}
+
+// A restart before the first block. This chain allocates nothing at genesis,
+// so it seeds nothing and stays fresh until a block lands — and it is the
+// SEEDING that a chain has to remember across a boot. A chain with an
+// allocation that forgot it re-ran the allocation and could not start; this
+// one has none to re-run, which is why it shares the Open shape without
+// sharing that failure. What it does have is the guard below it: fresh over a
+// database holding settled transfers is a read fault, not a new chain.
+func TestARestartBeforeTheFirstBlockComesUp(t *testing.T) {
+	db := memdb.New()
+	first := bootOn(t, db, testConfig())
+	second := bootOn(t, db, testConfig())
+
+	require.Equal(t, first.genesisBlock.ID(), second.genesisBlock.ID(),
+		"one chain, two nodes of it")
+	tip, height := second.chain.Tip()
+	require.Equal(t, second.genesisBlock.ID(), tip, "still sitting on genesis")
+	require.Zero(t, height)
+
+	// And it can do what a node that restarted is for.
+	pend(second, requestFor(1, 100))
+	require.EqualValues(t, 1, buildAndAccept(t, second).BlockHeight)
+}
+
+// race runs two accepts at the same time and returns them as the one that
+// landed and the one that did not. Both failing, or both landing, is reported
+// as such rather than hidden: the caller holds one of each.
+func race(t *testing.T, accept ...func(context.Context) error) (won, lost error) {
+	t.Helper()
+	errs := make(chan error, len(accept))
+	start := make(chan struct{})
+	for _, a := range accept {
+		go func(a func(context.Context) error) {
+			<-start
+			errs <- a(context.Background())
+		}(a)
+	}
+	close(start)
+
+	won, lost = <-errs, <-errs
+	if won != nil {
+		won, lost = lost, won
+	}
+	return won, lost
 }
 
 // Genesis is given, not verified. A second one is a peer handing this chain a
