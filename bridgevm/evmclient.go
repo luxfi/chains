@@ -168,13 +168,26 @@ func newEVMChainClient(ctx context.Context, cfg ExternalChainConfig, gasKey *ecd
 		clients = append(clients, c)
 	}
 
-	// Refuse a mismatched network: the primary endpoint must report cfg.ChainID.
-	got, err := clients[0].ChainID(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("bridgevm: chain %q: eth_chainId: %w", cfg.Name, err)
-	}
-	if got.Cmp(chainID) != 0 {
-		return nil, fmt.Errorf("bridgevm: chain %q: endpoint reports chainId %s, config says %s", cfg.Name, got, chainID)
+	// Refuse a mismatched network — every endpoint, not just the first. Reads go
+	// to the primary, but a signed release is broadcast to all of them
+	// (broadcastRelease, and RPCEndpoints says so on its own field), so an
+	// endpoint nobody asked what chain it was on still received a signed
+	// transaction.
+	//
+	// What this establishes is that each endpoint answers with the chain id we
+	// configured. It does not establish that they are the same chain: a fork
+	// reports the id of the chain it left, so a forked endpoint passes here.
+	// Telling those apart takes a commitment to the genesis rather than to the
+	// id — vms/platformvm/adopt.Record.Identity is that commitment, and it is
+	// not consulted from this path yet.
+	for i, c := range clients {
+		got, err := c.ChainID(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("bridgevm: chain %q: endpoint %q: eth_chainId: %w", cfg.Name, cfg.RPCEndpoints[i], err)
+		}
+		if got.Cmp(chainID) != 0 {
+			return nil, fmt.Errorf("bridgevm: chain %q: endpoint %q reports chainId %s, config says %s", cfg.Name, cfg.RPCEndpoints[i], got, chainID)
+		}
 	}
 
 	gasAddr := common.BytesToAddress(crypto.PubkeyToAddress(gasKey.PublicKey).Bytes())
