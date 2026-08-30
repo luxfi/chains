@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/rpc/v2"
+	"github.com/luxfi/chains/internal/codec"
 	"github.com/luxfi/chains/quantumvm/config"
 	"github.com/luxfi/chains/quantumvm/quantum"
 	consensuschain "github.com/luxfi/consensus/engine/chain"
@@ -23,7 +24,6 @@ import (
 	"github.com/luxfi/log"
 	"github.com/luxfi/metric"
 	"github.com/luxfi/node/cache"
-	"github.com/luxfi/node/utils/json"
 	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/timer/mockable"
 	"github.com/luxfi/version"
@@ -508,8 +508,8 @@ func (vm *VM) initializeHTTPHandlers() error {
 
 	// Register QVM service
 	service := &Service{vm: vm}
-	vm.rpcServer.RegisterCodec(json.NewCodec(), "application/json")
-	vm.rpcServer.RegisterCodec(json.NewCodec(), "application/json;charset=UTF-8")
+	vm.rpcServer.RegisterCodec(codec.New(), "application/json")
+	vm.rpcServer.RegisterCodec(codec.New(), "application/json;charset=UTF-8")
 	return vm.rpcServer.RegisterService(service, "quantumvm")
 }
 
