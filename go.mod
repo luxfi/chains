@@ -258,3 +258,7 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+// v1.7.36 serves the zkvm routes flat, so a caller of /rpc, /privacy or
+// /proof receives 404. v1.7.37 restores the grouped handlers.
+retract v1.7.36
