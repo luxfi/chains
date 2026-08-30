@@ -82,9 +82,11 @@ func platformCandidates() []backendCandidate {
 //   - LUX_GPU_PLUGIN_DIR/build/metal-only/backends/<subdir>/<filename>
 //   - LUX_GPU_PLUGIN_DIR/build/vulkan-m1/backends/<subdir>/<filename>
 //   - LUXCPP_PREFIX/lib/<filename>
-//   - bare filename (DT_RUNPATH / DT_RPATH / system search)
 //
-// Bare last so an explicit env override always wins.
+// Every entry is somewhere an operator named. There is deliberately no bare
+// filename: with one the dynamic loader searches its own default path, and a
+// GPU plugin replaces aivm's state transitions wholesale, so a library found
+// rather than named would be deciding consensus state.
 func candidatePaths(c backendCandidate) []string {
 	var paths []string
 	if dir := os.Getenv("LUX_GPU_PLUGIN_DIR"); dir != "" {
@@ -107,9 +109,6 @@ func candidatePaths(c backendCandidate) []string {
 	if dir := os.Getenv("LUXCPP_PREFIX"); dir != "" {
 		paths = append(paths, filepath.Join(dir, "lib", c.filename))
 	}
-	// Bare name — fall back to the loader's default search (DT_RPATH on Linux,
-	// @rpath on darwin, LD_LIBRARY_PATH / DYLD_LIBRARY_PATH set by user).
-	paths = append(paths, c.filename)
 	return paths
 }
 

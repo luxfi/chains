@@ -34,9 +34,12 @@ package aivm
 #cgo darwin LDFLAGS: -ldl
 #cgo linux  LDFLAGS: -ldl
 
+#cgo CFLAGS: -I${SRCDIR}/../internal/luxgpu/include
+
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 // Six host-launcher trampolines — invoked by Go via cgo. The function
 // pointer is opaque (void*); the cgo bridge casts it to the expected
@@ -134,6 +137,27 @@ static int call_aivm_inference(void* fn, const void* weights, const void* ops,
 static int call_aivm_proof_verify(void* fn, const void* ops, void* results,
                                    uint32_t op_count) {
     return ((aivm_proof_verify_fn)fn)(ops, results, op_count, NULL);
+}
+
+#include "lux/gpu/backend_plugin.h"
+
+// aivm_plugin_trusted resolves lux_gpu_backend_init in an already-dlopen'd
+// library, runs it, and checks the two cookies the plugin header requires a
+// loader to check: abi_version must be the one this build was compiled
+// against, and vtbl_size must be our sizeof. Without it, dlsym'ing a launcher
+// by name trusts a library nothing has identified — the name is the only thing
+// being matched, and a name is not a contract. quantumvm already does this.
+//
+//   0 trusted | 1 no init symbol | 2 init false | 3 abi | 4 vtbl_size
+static int aivm_plugin_trusted(void* h) {
+    void* sym = dlsym(h, LUX_GPU_BACKEND_INIT_SYMBOL);
+    if (sym == NULL) return 1;
+    lux_gpu_backend_desc desc;
+    memset(&desc, 0, sizeof desc);
+    if (!((lux_gpu_backend_init_fn)sym)(&desc)) return 2;
+    if (desc.abi_version != LUX_GPU_BACKEND_ABI_VERSION) return 3;
+    if (desc.vtbl_size != (uint32_t)sizeof(lux_gpu_backend_vtbl)) return 4;
+    return 0;
 }
 
 // dlopen / dlsym wrappers — kept here so backend.go can stay pure Go.
@@ -506,6 +530,14 @@ func openGPUBackend(kind BackendKind, path string) (*GPUBackend, error) {
 	handle := C.lux_dlopen(cpath)
 	if handle == nil {
 		return nil, fmt.Errorf("aivm: dlopen(%s): %s", path, C.GoString(C.lux_dlerror()))
+	}
+
+	// Identify the library before trusting any symbol in it.
+	if rc := C.aivm_plugin_trusted(handle); rc != 0 {
+		C.lux_dlclose(handle)
+		return nil, fmt.Errorf(
+			"aivm: %s is not a lux GPU plugin this build can use (check %d)",
+			path, int(rc))
 	}
 
 	backendName := kind.String() // cuda / hip / metal / vulkan / webgpu

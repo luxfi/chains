@@ -38,6 +38,8 @@ package bridgevm
 /*
 #cgo LDFLAGS: -ldl
 
+#cgo CFLAGS: -I${SRCDIR}/../internal/luxgpu/include
+
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -122,6 +124,34 @@ static int call_transition(void* fn,
                                     (void*)0);
 }
 
+#include "lux/gpu/backend_plugin.h"
+
+// bvm_plugin_trusted resolves lux_gpu_backend_init in an already-dlopen'd
+// library, runs it, and checks the two cookies the plugin header requires a
+// loader to check: abi_version must be the one this build was compiled
+// against, and vtbl_size must be our sizeof. Without this, dlsym'ing a
+// launcher by name trusts a library nothing has identified — the name is the
+// only thing being matched, and a name is not a contract.
+//
+// quantumvm already does exactly this; bridgevm, aivm and mpcvm dlsym'd
+// blind. One way, and this is it.
+//
+//   0 — trusted
+//   1 — no lux_gpu_backend_init (not one of our plugins)
+//   2 — init returned false
+//   3 — abi_version mismatch
+//   4 — vtbl_size mismatch
+static int bvm_plugin_trusted(void* h) {
+    void* sym = dlsym(h, LUX_GPU_BACKEND_INIT_SYMBOL);
+    if (sym == NULL) return 1;
+    lux_gpu_backend_desc desc;
+    memset(&desc, 0, sizeof desc);
+    if (!((lux_gpu_backend_init_fn)sym)(&desc)) return 2;
+    if (desc.abi_version != LUX_GPU_BACKEND_ABI_VERSION) return 3;
+    if (desc.vtbl_size != (uint32_t)sizeof(lux_gpu_backend_vtbl)) return 4;
+    return 0;
+}
+
 // dl helpers — wrap dlopen / dlsym / dlerror so the Go side doesn't have to
 // deal with the C string lifetimes.
 
@@ -198,11 +228,6 @@ func probePlugin() {
 			setActiveBackend(bk)
 			return
 		}
-		// Bare-name fallback — let the dynamic loader use its default path.
-		if tryLoad(bk, dsoBareName(bk)) {
-			setActiveBackend(bk)
-			return
-		}
 	}
 }
 
@@ -225,11 +250,12 @@ func candidatePluginPaths(bk Backend) []string {
 		paths = append(paths, filepath.Join(prefix, "lib", name))
 	}
 
-	// 4) CWD — last resort before falling back to the loader default.
-	if cwd, err := os.Getwd(); err == nil {
-		paths = append(paths, filepath.Join(cwd, name))
-	}
-
+	// Deliberately no CWD entry and no bare-name fallback. A GPU plugin
+	// replaces bridgevm's state transitions wholesale, so where it comes from
+	// has to be something an operator said, not something the loader found:
+	// with a bare name the dynamic loader searches its default path, and with
+	// CWD the working directory of whoever started the node decides which
+	// code computes consensus state. Both are named above or nothing loads.
 	return paths
 }
 
@@ -271,6 +297,11 @@ func tryLoad(bk Backend, path string) bool {
 
 	h := C.dl_open(cpath)
 	if h == nil {
+		return false
+	}
+
+	// Identify the library before trusting any symbol in it.
+	if rc := C.bvm_plugin_trusted(h); rc != 0 {
 		return false
 	}
 
