@@ -49,6 +49,8 @@ package mpcvm
 #cgo darwin LDFLAGS: -ldl
 #cgo linux  LDFLAGS: -ldl
 
+#cgo CFLAGS: -I${SRCDIR}/../internal/luxgpu/include
+
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -190,6 +192,27 @@ static void* lux_dlsym(void* handle, const char* name) {
 // if every candidate fails. The dlopen mode is RTLD_NOW|RTLD_LOCAL: NOW so
 // any missing symbol fails fast at load time, LOCAL so the plugin's
 // internal symbols don't pollute the global namespace.
+#include "lux/gpu/backend_plugin.h"
+
+// mpcvm_plugin_trusted resolves lux_gpu_backend_init in an already-dlopen'd
+// library, runs it, and checks the two cookies the plugin header requires a
+// loader to check: abi_version must be the one this build was compiled
+// against, and vtbl_size must be our sizeof. Without it, dlsym'ing a launcher
+// by name trusts a library nothing has identified — the name is the only thing
+// being matched, and a name is not a contract. quantumvm already does this.
+//
+//   0 trusted | 1 no init symbol | 2 init false | 3 abi | 4 vtbl_size
+static int mpcvm_plugin_trusted(void* h) {
+    void* sym = dlsym(h, LUX_GPU_BACKEND_INIT_SYMBOL);
+    if (sym == NULL) return 1;
+    lux_gpu_backend_desc desc;
+    memset(&desc, 0, sizeof desc);
+    if (!((lux_gpu_backend_init_fn)sym)(&desc)) return 2;
+    if (desc.abi_version != LUX_GPU_BACKEND_ABI_VERSION) return 3;
+    if (desc.vtbl_size != (uint32_t)sizeof(lux_gpu_backend_vtbl)) return 4;
+    return 0;
+}
+
 static void* lux_dlopen_first(const char* a, const char* b, const char* c) {
     void* h = NULL;
     if (a && *a) { h = dlopen(a, RTLD_NOW|RTLD_LOCAL); if (h) return h; }
@@ -787,6 +810,11 @@ func tryLoadPlugin(kind GPUBackendKind, candidates ...string) *GPUBackend {
 
 	h := C.lux_dlopen_first(ca, cb, cc)
 	if h == nil {
+		return nil
+	}
+
+	// Identify the library before trusting any symbol in it.
+	if rc := C.mpcvm_plugin_trusted(h); rc != 0 {
 		return nil
 	}
 

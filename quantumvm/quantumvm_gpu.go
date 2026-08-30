@@ -318,12 +318,15 @@ func init() {
 func tryProbe() (*gpuBackend, bool) {
 	dir := os.Getenv(pluginEnv)
 	for _, p := range probeOrder {
+		if dir == "" {
+			// No bare-name attempt: with one the dynamic loader searches its
+			// own default path, so a library found rather than named would be
+			// running Q-Chain verification. The cookies below identify a
+			// plugin; they do not say where it should have come from.
+			continue
+		}
 		for _, bn := range pluginBasenames(p.name) {
-			path := bn
-			if dir != "" {
-				path = filepath.Join(dir, bn)
-			}
-			b, err := openPlugin(p.kind, path)
+			b, err := openPlugin(p.kind, filepath.Join(dir, bn))
 			if err == nil {
 				return b, true
 			}
