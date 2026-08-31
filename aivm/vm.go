@@ -447,7 +447,7 @@ func (vm *VM) Shutdown(ctx context.Context) error {
 //
 // The node mounts each KEY as a route and delivers the request on the path it
 // arrived on, so a handler that dispatches on r.URL.Path never matches: it is
-// asked for /v1/bc/<chainID>/rpc and looks for /stats. A flat map of endpoints to
+// asked for /v1/chain/<chainID>/rpc and looks for /stats. A flat map of endpoints to
 // handlers that answer AT their mount is the simplest shape that works, and it is
 // what this VM uses.
 //
