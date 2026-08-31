@@ -89,7 +89,7 @@ resolves a `CreateChainTx`'s vmID. `TestVMID_IsCanonicalAndStable` pins it.
 - M-Chain is in the genesis chain set of every network
   (`genesis/configs/*/mchain.json`), policy `3-of-5` on
   mainnet/testnet/devnet and `2-of-3` on localnet.
-- Proven: boots on luxd as a genesis chain and serves `/v1/bc/m-chain/rpc`;
+- Proven: boots on luxd as a genesis chain and serves `/v1/chain/m-chain/rpc`;
   `TestBridgeCustody_ThreeOfFive` runs a real 5-validator CGGMP21 DKG at
   degree 2 with a genuine 3-of-5 signature verified and recorded on-chain.
 - **Not** yet proven: a DKG across five separate luxd OS processes over real
