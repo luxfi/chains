@@ -18,7 +18,7 @@ type Service struct {
 
 // Routes returns one handler per endpoint.
 //
-// The node mounts each key under /v1/bc/<chainID> and matches that full path
+// The node mounts each key under /v1/chain/<chainID> and matches that full path
 // EXACTLY, then hands the handler the request with the path it arrived on. A
 // handler therefore never sees a path it can dispatch on, and no path below a
 // mount is routable at all. The key IS the route — the same shape bridgevm and

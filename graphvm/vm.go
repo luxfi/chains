@@ -156,7 +156,7 @@ func (vm *VM) Version(context.Context) (string, error) {
 
 // CreateHandlers implements the common.VM interface.
 //
-// The node mounts each key under /v1/bc/<chainID> and matches that full path
+// The node mounts each key under /v1/chain/<chainID> and matches that full path
 // EXACTLY, then hands the handler the request with the path it arrived on. A
 // handler that dispatches on r.URL.Path therefore never recognizes anything.
 // The key IS the route; one handler per key.

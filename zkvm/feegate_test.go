@@ -93,7 +93,7 @@ func TestZKVM_HTTP_SendTransaction_FeePolicy(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		req := httptest.NewRequest(http.MethodPost, "/v1/bc/z/sendTransaction", bytes.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, "/v1/chain/z/sendTransaction", bytes.NewReader(body))
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, req)
 		return w
@@ -142,7 +142,7 @@ func TestZKVM_HTTP_SendTransaction_FeePolicy(t *testing.T) {
 	}
 
 	// A method the endpoint does not serve is refused, not silently accepted.
-	req := httptest.NewRequest(http.MethodGet, "/v1/bc/z/sendTransaction", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/chain/z/sendTransaction", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusMethodNotAllowed {
