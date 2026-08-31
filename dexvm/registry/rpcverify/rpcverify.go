@@ -42,8 +42,8 @@ type Verifier struct {
 }
 
 // New dials the C-Chain EVM RPC and records the node API base for P/X queries.
-// evmRPC is the full C-Chain RPC URL (…/v1/chain/C/rpc); apiBase is the node root
-// (…) used to reach /ext/P and /v1/chain/X. nativeDecimals is the C-Chain native
+// evmRPC is the full C-Chain RPC URL (…/v1/bc/C/rpc); apiBase is the node root
+// (…) used to reach /ext/P and /v1/bc/X. nativeDecimals is the C-Chain native
 // coin's decimals (18 for LUX).
 func New(ctx context.Context, evmRPC, apiBase string, nativeDecimals uint8) (*Verifier, error) {
 	ec, err := ethclient.DialContext(ctx, evmRPC)
@@ -128,7 +128,7 @@ func (v *Verifier) VerifyUTXOAsset(_ uint32, _ ids.ID, assetID ids.ID) (uint8, e
 		} `json:"result"`
 		Error *rpcError `json:"error"`
 	}
-	if err := v.jsonRPC(ctx, "/v1/chain/X", "avm.getAssetDescription",
+	if err := v.jsonRPC(ctx, "/v1/bc/X", "avm.getAssetDescription",
 		map[string]any{"assetID": assetID.String()}, &out); err != nil {
 		return 0, err
 	}

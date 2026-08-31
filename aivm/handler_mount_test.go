@@ -10,14 +10,14 @@ import (
 	"testing"
 )
 
-// The node mounts each CreateHandlers key at /v1/chain/<chainID>+key and matches
+// The node mounts each CreateHandlers key at /v1/bc/<chainID>+key and matches
 // that path EXACTLY, then hands the handler the request on the path it arrived
 // on. So a handler that dispatches on r.URL.Path is unreachable: no request can
 // ever carry the bare path it looks for, and no path below the mount is routed
 // at all. This asserts the only property that makes an endpoint reachable —
 // the handler answers at the path the node delivers.
 func TestHandlersAnswerAtTheMountedPath(t *testing.T) {
-	const base = "/v1/chain/2NXHomv4gbu8i6JTqALHvcbdeb8gb8r7jzbxqXvqZRd1UzorhF"
+	const base = "/v1/bc/2NXHomv4gbu8i6JTqALHvcbdeb8gb8r7jzbxqXvqZRd1UzorhF"
 
 	handlers, err := (&VM{}).CreateHandlers(context.Background())
 	if err != nil {

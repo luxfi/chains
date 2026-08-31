@@ -22,7 +22,7 @@
 //
 //	dex-assets-validate \
 //	  -manifest dexvm/registry/manifests/assets.mainnet.json \
-//	  -evm-rpc  https://api.lux.network/v1/chain/C/rpc \
+//	  -evm-rpc  https://api.lux.network/v1/bc/C/rpc \
 //	  -api-base https://api.lux.network \
 //	  [-native-decimals 18]
 package main
@@ -42,8 +42,8 @@ import (
 func main() {
 	var (
 		manifestPath = flag.String("manifest", "", "path to the per-network asset manifest JSON")
-		evmRPC       = flag.String("evm-rpc", "", "C-Chain EVM RPC URL (…/v1/chain/C/rpc)")
-		apiBase      = flag.String("api-base", "", "node API base (… root; used for /ext/P and /v1/chain/X)")
+		evmRPC       = flag.String("evm-rpc", "", "C-Chain EVM RPC URL (…/v1/bc/C/rpc)")
+		apiBase      = flag.String("api-base", "", "node API base (… root; used for /ext/P and /v1/bc/X)")
 		nativeDec    = flag.Uint("native-decimals", 18, "C-Chain native coin decimals")
 		timeout      = flag.Duration("timeout", 2*time.Minute, "overall validation timeout")
 	)

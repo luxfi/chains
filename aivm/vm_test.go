@@ -276,7 +276,7 @@ func TestVMCreateHandlers(t *testing.T) {
 	handlers, err := vm.CreateHandlers(context.Background())
 	require.NoError(err)
 
-	// Each key is a route the node mounts under /v1/chain/<chainID>, so the set of
+	// Each key is a route the node mounts under /v1/bc/<chainID>, so the set of
 	// keys IS the chain's public surface. Collapsing them behind one key hides
 	// every endpoint but the one named.
 	keys := make([]string, 0, len(handlers))
