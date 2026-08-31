@@ -74,15 +74,15 @@ jobs:
         include:
           - net: mainnet
             manifest: dexvm/registry/manifests/assets.mainnet.json
-            evm_rpc: https://api.lux.network/v1/chain/C/rpc
+            evm_rpc: https://api.lux.network/v1/bc/C/rpc
             api_base: https://api.lux.network
           - net: testnet
             manifest: dexvm/registry/manifests/assets.testnet.json
-            evm_rpc: https://api.lux-test.network/v1/chain/C/rpc
+            evm_rpc: https://api.lux-test.network/v1/bc/C/rpc
             api_base: https://api.lux-test.network
           - net: devnet
             manifest: dexvm/registry/manifests/assets.devnet.json
-            evm_rpc: https://api.lux-dev.network/v1/chain/C/rpc
+            evm_rpc: https://api.lux-dev.network/v1/bc/C/rpc
             api_base: https://api.lux-dev.network
     steps:
       - uses: actions/checkout@v4

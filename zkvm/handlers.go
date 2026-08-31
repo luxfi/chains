@@ -17,7 +17,7 @@ var (
 	errNoNullifier        = errors.New("nullifier required")
 )
 
-// The node mounts each CreateHandlers key under /v1/chain/<chainID> and matches
+// The node mounts each CreateHandlers key under /v1/bc/<chainID> and matches
 // that full path EXACTLY, then hands the handler the request with the path it
 // arrived on. A mux behind one key therefore serves nothing: it dispatches on
 // r.URL.Path, which is the mounted path and never the route it registered. The
