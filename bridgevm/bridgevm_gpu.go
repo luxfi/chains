@@ -46,7 +46,6 @@ package bridgevm
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <string.h>
 
 // Trampolines — we cannot call function pointers from Go directly through cgo.
 // The trampoline takes the function pointer (resolved via dlsym from Go) and
