@@ -258,3 +258,9 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+// v1.7.37 branched from a commit before v1.7.36 and carries a higher number
+// than the release it does not contain: 38 commits are missing, among them the
+// fix that stops a store reading any failed tip read as a fresh chain. A module
+// resolving "the newest patch" took a tree without it.
+retract v1.7.37
