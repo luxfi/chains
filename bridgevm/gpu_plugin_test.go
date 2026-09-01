@@ -104,8 +104,44 @@ int lux_cuda_bridgevm_transition(
 }
 `
 
-// buildStub compiles src into dir/name and returns its path.
+// stubIdentity is what makes a compiled stub a plugin probePlugin will trust:
+// the init symbol the header requires, answering with the ABI version and
+// vtable size this build was compiled against. A stub built without it exports
+// launcher names and nothing else, which is precisely the library the loader
+// must refuse — see TestALibraryThatOnlyExportsTheNames.
+const stubIdentity = `
+#include <stdbool.h>
+#include <stdint.h>
+#include "lux/gpu/backend_plugin.h"
+
+bool lux_gpu_backend_init(lux_gpu_backend_desc* out) {
+    out->abi_version     = LUX_GPU_BACKEND_ABI_VERSION;
+    out->vtbl_size       = (uint32_t)sizeof(lux_gpu_backend_vtbl);
+    out->backend_name    = "cuda";
+    out->backend_version = "0.0.0-mirror";
+    out->capabilities    = 0;
+    out->vtbl            = 0;
+    return true;
+}
+`
+
+// pluginInclude is where the plugin header lives, relative to this package.
+const pluginInclude = "-I../internal/luxgpu/include"
+
+// buildStub compiles src into dir/name as an identified plugin.
 func buildStub(t *testing.T, dir, name, src string) string {
+	t.Helper()
+	return compileStub(t, dir, name, src+stubIdentity)
+}
+
+// buildStubUnidentified compiles src with no init symbol, so the result
+// exports the launcher names and says nothing about what it is.
+func buildStubUnidentified(t *testing.T, dir, name, src string) string {
+	t.Helper()
+	return compileStub(t, dir, name, src)
+}
+
+func compileStub(t *testing.T, dir, name, src string) string {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(dir, 0o755))
 	csrc := filepath.Join(t.TempDir(), name+".c")
@@ -116,7 +152,7 @@ func buildStub(t *testing.T, dir, name, src string) string {
 	if cc == "" {
 		cc = "cc"
 	}
-	cmd := exec.Command(cc, "-shared", "-fPIC", "-o", out, csrc)
+	cmd := exec.Command(cc, pluginInclude, "-shared", "-fPIC", "-o", out, csrc)
 	combined, err := cmd.CombinedOutput()
 	require.NoError(t, err, "compiling the stub launcher: %s", combined)
 	return out
@@ -274,6 +310,26 @@ func TestNoPluginMeansNoBackend(t *testing.T) {
 }
 
 // The search list is what the documented one says it is, in order.
+// A library exporting the five launcher names and nothing else is what an
+// attacker plants. It is refused before a single launcher is resolved: the
+// name was the only thing being matched, and a name is not a contract.
+func TestALibraryThatOnlyExportsTheNames(t *testing.T) {
+	root := t.TempDir()
+	buildStubUnidentified(t, root, dsoBareName(BackendCUDA), stubLauncherSource)
+	loadStub(t, root)
+
+	require.Equal(t, BackendNone, AutoBackend(),
+		"an unidentified library is not a backend, however many names it exports")
+	require.Nil(t, pluginHandle)
+
+	// The identified build at the same path opens, so the refusal above is the
+	// identity check and not a broken stub.
+	named := t.TempDir()
+	buildStub(t, named, dsoBareName(BackendCUDA), stubLauncherSource)
+	loadStub(t, named)
+	require.Equal(t, BackendCUDA, AutoBackend())
+}
+
 func TestThePluginSearchList(t *testing.T) {
 	t.Setenv("LUX_GPU_PLUGIN_DIR", "/plugins")
 	t.Setenv("LUXCPP_PREFIX", "/opt/lux")
@@ -286,17 +342,18 @@ func TestThePluginSearchList(t *testing.T) {
 		filepath.Join("/plugins", "cuda", name),
 		filepath.Join("/opt/lux", "lib", "lux-gpu", name),
 		filepath.Join("/opt/lux", "lib", name),
-		filepath.Join(cwd, name),
 	}, candidatePluginPaths(BackendCUDA))
+	require.NotContains(t, candidatePluginPaths(BackendCUDA), filepath.Join(cwd, name),
+		"the working directory of whoever started the node does not choose the plugin")
 
+	// Neither variable set means no plugin, not a plugin from wherever the
+	// loader happens to find one.
 	t.Setenv("LUX_GPU_PLUGIN_DIR", "")
 	t.Setenv("LUXCPP_PREFIX", "")
-	require.Equal(t, []string{filepath.Join(cwd, name)}, candidatePluginPaths(BackendCUDA))
+	require.Empty(t, candidatePluginPaths(BackendCUDA))
 
-	// An absolute path that is not there is skipped without a dlopen; a bare
-	// name is left to the loader's own search.
+	// An absolute path that is not there is skipped without a dlopen.
 	require.False(t, plausiblePath("/no/such/plugin.so"))
-	require.True(t, plausiblePath(name))
 	require.True(t, plausiblePath(cwd))
 }
 

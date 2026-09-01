@@ -114,9 +114,33 @@ int lux_cuda_mpcvm_compose_root(
 }
 `
 
+// stubIdentity is what makes a compiled stub a plugin tryLoadPlugin will
+// trust: the init symbol the header requires, answering with the ABI version
+// and vtable size this build was compiled against. A stub built without it
+// exports the four launcher names and nothing else, which is precisely the
+// library the loader must refuse — see TestALibraryThatOnlyExportsTheNames.
+const stubIdentity = `
+#include <stdbool.h>
+#include "lux/gpu/backend_plugin.h"
+
+bool lux_gpu_backend_init(lux_gpu_backend_desc* out) {
+    out->abi_version     = LUX_GPU_BACKEND_ABI_VERSION;
+    out->vtbl_size       = (uint32_t)sizeof(lux_gpu_backend_vtbl);
+    out->backend_name    = "cuda";
+    out->backend_version = "0.0.0-mirror";
+    out->capabilities    = 0;
+    out->vtbl            = 0;
+    return true;
+}
+`
+
+// pluginInclude is where the plugin header lives, relative to this package.
+const pluginInclude = "-I../internal/luxgpu/include"
+
 var (
 	stubOnce sync.Once
 	stubPath string
+	stubAnon string
 	stubErr  error
 )
 
@@ -130,20 +154,58 @@ func stubPlugin(t *testing.T) string {
 			stubErr = err
 			return
 		}
-		src := filepath.Join(dir, "stub.c")
-		if err := os.WriteFile(src, []byte(stubSource), 0o600); err != nil {
-			stubErr = err
-			return
+		// Two builds from one mirror: one that identifies itself, and one that
+		// exports the launcher names and nothing else.
+		for name, identity := range map[string]string{
+			"named": stubIdentity,
+			"anon":  "",
+		} {
+			src := filepath.Join(dir, "stub_"+name+".c")
+			if err := os.WriteFile(src, []byte(stubSource+identity), 0o600); err != nil {
+				stubErr = err
+				return
+			}
+			out := filepath.Join(dir, name, "libluxgpu_backend_cuda.so")
+			if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+				stubErr = err
+				return
+			}
+			if combined, err := exec.Command(compiler(), pluginInclude, "-shared", "-fPIC", "-o", out, src).CombinedOutput(); err != nil {
+				stubErr = fmt.Errorf("%s: %w: %s", compiler(), err, combined)
+				return
+			}
+			if name == "anon" {
+				stubAnon = out
+			} else {
+				stubPath = out
+			}
 		}
-		out := filepath.Join(dir, "libluxgpu_backend_cuda.so")
-		if combined, err := exec.Command(compiler(), "-shared", "-fPIC", "-o", out, src).CombinedOutput(); err != nil {
-			stubErr = fmt.Errorf("%s: %w: %s", compiler(), err, combined)
-			return
-		}
-		stubPath = out
 	})
 	require.NoError(t, stubErr)
 	return stubPath
+}
+
+// stubUnidentified is the same mirror without the init symbol.
+func stubUnidentified(t *testing.T) string {
+	t.Helper()
+	stubPlugin(t)
+	return stubAnon
+}
+
+// A library exporting the four launcher names and nothing else is what an
+// attacker plants. It is refused before a single launcher is resolved: the
+// name was the only thing being matched, and a name is not a contract.
+func TestALibraryThatOnlyExportsTheNames(t *testing.T) {
+	anon := stubUnidentified(t)
+	require.FileExists(t, anon, "the stub is built; it just does not identify itself")
+	require.Nil(t, tryLoadPlugin(GPUBackendCUDA, anon),
+		"an unidentified library is not a backend")
+
+	// The identified build opens, so the refusal above is the identity check
+	// and not a broken stub.
+	b := tryLoadPlugin(GPUBackendCUDA, stubPlugin(t))
+	require.NotNil(t, b)
+	require.True(t, b.IsAvailable())
 }
 
 func compiler() string {
@@ -217,7 +279,9 @@ func TestEveryBackendHasCandidateFilenames(t *testing.T) {
 		require.NotEmptyf(t, got, "%s has no candidate filenames", kind)
 		require.Containsf(t, got[0], "/opt/luxcpp/lib/", "%s must try the install path first", kind)
 		require.Truef(t, hasPrefixDir(got, "/build/plugins"), "%s must try the build tree", kind)
-		require.Containsf(t, got, filepath.Base(got[0]), "%s must fall back to the bare leaf name", kind)
+		require.NotContainsf(t, got, filepath.Base(got[0]),
+			"%s must not offer a bare leaf: the loader would search its own path, "+
+				"and a GPU plugin mints threshold-signing custody", kind)
 		require.NotEmptyf(t, kind.String(), "%s has no launcher prefix", kind)
 	}
 	require.Empty(t, candidatesFor(GPUBackendNone))
@@ -229,9 +293,10 @@ func TestEveryBackendHasCandidateFilenames(t *testing.T) {
 	t.Setenv("HOME", "/home/somebody")
 	require.Contains(t, candidatesFor(GPUBackendCUDA)[0], "/home/somebody/work/luxcpp/install/lib/")
 
-	// With neither, only the bare leaves remain.
+	// With neither, nothing remains. Every candidate came from somewhere an
+	// operator named, so when nobody named anywhere there is nowhere to look.
 	t.Setenv("HOME", "")
-	require.Equal(t, backendDylibLeaves(GPUBackendCUDA), candidatesFor(GPUBackendCUDA))
+	require.Empty(t, candidatesFor(GPUBackendCUDA))
 }
 
 // -----------------------------------------------------------------------------
