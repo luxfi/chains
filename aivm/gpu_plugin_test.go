@@ -107,6 +107,29 @@ const stubPreamble = `
 #include <stdint.h>
 `
 
+// stubIdentity is what makes a compiled stub a plugin openGPUBackend will
+// trust: the init symbol the header requires, answering with the ABI version
+// and vtable size this build was compiled against. A stub built without it
+// exports the six launcher names and nothing else, which is precisely the
+// library the loader must refuse — see TestALibraryThatOnlyExportsTheNames.
+const stubIdentity = `
+#include <stdbool.h>
+#include "lux/gpu/backend_plugin.h"
+
+bool lux_gpu_backend_init(lux_gpu_backend_desc* out) {
+    out->abi_version     = LUX_GPU_BACKEND_ABI_VERSION;
+    out->vtbl_size       = (uint32_t)sizeof(lux_gpu_backend_vtbl);
+    out->backend_name    = "cuda";
+    out->backend_version = "0.0.0-mirror";
+    out->capabilities    = 0;
+    out->vtbl            = 0;
+    return true;
+}
+`
+
+// pluginInclude is where the plugin header lives, relative to this package.
+const pluginInclude = "-I../internal/luxgpu/include"
+
 var (
 	stubOnce sync.Once
 	stubDir  string
@@ -124,24 +147,35 @@ func stubPlugins(t *testing.T) string {
 			stubErr = err
 			return
 		}
+		// k=0..6 identify themselves; "anon" exports the complete launcher set
+		// and no identity, so it stands in for a library planted by someone
+		// who knows the names.
+		builds := map[string]string{"anon": ""}
 		for k := 0; k <= len(launchers); k++ {
-			body := stubPreamble + strings.Join(launchers[:k], "\n")
+			builds[fmt.Sprintf("k%d", k)] = stubIdentity
+		}
+		for name, identity := range builds {
+			k := len(launchers)
+			if name != "anon" {
+				fmt.Sscanf(name, "k%d", &k)
+			}
+			body := stubPreamble + identity + strings.Join(launchers[:k], "\n")
 			// rc_desc is only referenced by the first four launchers; keep the
 			// compiler quiet when it is defined and unused.
 			if k > 0 {
 				body = strings.Replace(body, "static int rc_desc", "static int __attribute__((unused)) rc_desc", 1)
 			}
-			src := filepath.Join(dir, fmt.Sprintf("stub%d.c", k))
+			src := filepath.Join(dir, "stub_"+name+".c")
 			if err := os.WriteFile(src, []byte(body), 0o600); err != nil {
 				stubErr = err
 				return
 			}
-			out := filepath.Join(dir, fmt.Sprintf("k%d", k), "libluxgpu_backend_cuda.so")
+			out := filepath.Join(dir, name, "libluxgpu_backend_cuda.so")
 			if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 				stubErr = err
 				return
 			}
-			if msg, err := exec.Command(compiler(), "-shared", "-fPIC", "-o", out, src).CombinedOutput(); err != nil {
+			if msg, err := exec.Command(compiler(), pluginInclude, "-shared", "-fPIC", "-o", out, src).CombinedOutput(); err != nil {
 				stubErr = fmt.Errorf("%s: %w: %s", compiler(), err, msg)
 				return
 			}
@@ -224,15 +258,18 @@ func TestTheProbeListCoversEveryBackend(t *testing.T) {
 	require.Len(kinds, 5, "each candidate names a distinct backend")
 }
 
-func TestAnExplicitPluginDirWinsOverTheLoaderSearch(t *testing.T) {
+func TestOnlyANamedPlaceIsSearched(t *testing.T) {
 	require := require.New(t)
 	c := backendCandidate{kind: AvailableCUDA, filename: "libluxgpu_backend_cuda.so", subdir: "cuda"}
 
-	// With nothing set, the bare filename is all there is: the loader's own
-	// search, and nothing that could override it.
+	// With neither variable set there is nowhere to look, and that is the
+	// answer. A bare filename here would hand the choice to the dynamic
+	// loader's own search path — LD_LIBRARY_PATH, DT_RUNPATH, the system cache
+	// — and a GPU plugin computes aivm's state transitions, so a library found
+	// rather than named would be deciding consensus state.
 	t.Setenv("LUX_GPU_PLUGIN_DIR", "")
 	t.Setenv("LUXCPP_PREFIX", "")
-	require.Equal([]string{c.filename}, candidatePaths(c))
+	require.Empty(candidatePaths(c), "nothing named, nothing searched")
 
 	t.Setenv("LUX_GPU_PLUGIN_DIR", "/plugins")
 	t.Setenv("LUXCPP_PREFIX", "/opt/luxcpp")
@@ -244,9 +281,33 @@ func TestAnExplicitPluginDirWinsOverTheLoaderSearch(t *testing.T) {
 		"/plugins/build/metal-only/backends/cuda/libluxgpu_backend_cuda.so",
 		"/plugins/build/vulkan-m1/backends/cuda/libluxgpu_backend_cuda.so",
 		"/opt/luxcpp/lib/libluxgpu_backend_cuda.so",
-		"libluxgpu_backend_cuda.so",
 	}, paths)
-	require.Equal(c.filename, paths[len(paths)-1], "the bare name is probed last, so an override always wins")
+	for _, p := range paths {
+		require.True(filepath.IsAbs(p),
+			"every candidate descends from a directory an operator named: %s", p)
+	}
+}
+
+// A library exporting the six launcher names and nothing else is what an
+// attacker plants. It is refused before a single launcher is resolved, because
+// the name was the only thing being matched and a name is not a contract.
+func TestALibraryThatOnlyExportsTheNames(t *testing.T) {
+	require := require.New(t)
+
+	anon := filepath.Join(stubPlugins(t), "anon", "libluxgpu_backend_cuda.so")
+	require.FileExists(anon, "the stub is built; it just does not identify itself")
+
+	b, err := openGPUBackend(AvailableCUDA, anon)
+	require.Error(err, "an unidentified library is not a backend")
+	require.Nil(b)
+	require.Contains(err.Error(), "not a lux GPU plugin this build can use")
+
+	// The identified build at the same path shape opens, so the refusal above
+	// is the identity check and not a broken stub.
+	full, err := openGPUBackend(AvailableCUDA, stubAt(t, len(launchers)))
+	require.NoError(err)
+	require.NotNil(full)
+	require.NoError(full.Close())
 }
 
 // -----------------------------------------------------------------------------
