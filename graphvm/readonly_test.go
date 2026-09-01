@@ -170,11 +170,11 @@ func TestInitializeRefusesBadConfig(t *testing.T) {
 }
 
 // post drives a handler at the path the node mounts it on: the node matches
-// /v1/bc/<chainID>+key EXACTLY and then hands the handler the full path, so a
+// /v1/chain/<chainID>+key EXACTLY and then hands the handler the full path, so a
 // handler that dispatches on r.URL.Path answers nothing.
 func post(t *testing.T, h http.Handler, auth, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	r := httptest.NewRequest(http.MethodPost, "/v1/bc/chain/graphql", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/v1/chain/chain/graphql", strings.NewReader(body))
 	if auth != "" {
 		r.Header.Set("Authorization", auth)
 	}
