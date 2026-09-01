@@ -27,6 +27,13 @@ type testBlock struct {
 	failAfter int // records to write before failing; -1 never fails
 	published int
 	raw       []byte
+
+	// enter runs from ID, which the store calls first under its lock, so it
+	// runs exactly when this block is admitted and not before.
+	enter func()
+	// stall runs from Write, so it holds the store's lock open for as long as
+	// it blocks — which is how a test puts a second Accept behind this one.
+	stall func()
 }
 
 func newBlock(id byte, parent ids.ID, height uint64, records ...string) *testBlock {
@@ -43,13 +50,29 @@ func newBlock(id byte, parent ids.ID, height uint64, records ...string) *testBlo
 	return b
 }
 
+// newGenesis is the block a chain starts from. Its id is deliberately not the
+// zero id: a real genesis id is a hash, and a fixture whose genesis id IS
+// ids.Empty cannot tell a chain sitting on genesis from a store that never
+// opened, which is a difference the store has to act on.
+func newGenesis() *testBlock { return newBlock(255, ids.Empty, 0) }
+
 var errWriteRefused = errors.New("write refused")
 
-func (b *testBlock) ID() ids.ID     { return b.id }
+func (b *testBlock) Parent() ids.ID { return b.parent }
 func (b *testBlock) Height() uint64 { return b.height }
 func (b *testBlock) Bytes() []byte  { return b.raw }
 
+func (b *testBlock) ID() ids.ID {
+	if b.enter != nil {
+		b.enter()
+	}
+	return b.id
+}
+
 func (b *testBlock) Write(db database.Database) error {
+	if b.stall != nil {
+		b.stall()
+	}
 	for i, r := range b.records {
 		if b.failAfter >= 0 && i == b.failAfter {
 			return errWriteRefused
@@ -104,7 +127,7 @@ func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	f := &fixture{base: &refusingDB{Database: memdb.New()}}
 	f.store = New[*testBlock](f.base, func() error { f.reloads++; return nil })
-	f.genesis = newBlock(0, ids.Empty, 0)
+	f.genesis = newGenesis()
 	_, fresh, err := f.store.Open(f.genesis, f.parse)
 	require.NoError(t, err)
 	require.True(t, fresh)
@@ -215,6 +238,87 @@ func TestAFailedCommitLeavesNothingAndDoesNotAdvance(t *testing.T) {
 	require.True(t, f.committed(t, []byte("delta")))
 }
 
+// ---- what a block has to extend ----
+
+// A block extends the tip or it is not accepted, and the tip it is judged
+// against is the one at the commit. Verify reached its verdict against an
+// earlier one.
+func TestAcceptRefusesABlockThatDoesNotExtendTheTip(t *testing.T) {
+	f := newFixture(t)
+	first := newBlock(1, f.genesis.ID(), 1, "alpha")
+	require.NoError(t, f.store.Accept(first))
+
+	// A sibling: everything about it is impeccable except the parent, which
+	// was the tip when it was built and is not the tip now.
+	sibling := newBlock(2, f.genesis.ID(), 1, "beta")
+	require.ErrorIs(t, f.store.Accept(sibling), ErrNotOnTip)
+
+	require.False(t, f.committed(t, []byte("beta")), "a refused block writes nothing")
+	require.False(t, f.committed(t, blockKey(sibling.ID())))
+	require.Zero(t, sibling.published)
+	require.Zero(t, f.reloads, "nothing was staged, so there is nothing to roll back")
+
+	tip, height := f.store.Tip()
+	require.Equal(t, first.ID(), tip, "the chain did not rewind")
+	require.Equal(t, uint64(1), height)
+	at1, err := f.store.IDAtHeight(1)
+	require.NoError(t, err)
+	require.Equal(t, first.ID(), at1, "and the height index still names what was accepted")
+}
+
+// A store that never opened knows no tip. A block naming no parent matches
+// that emptiness exactly, so comparing parent to tip and nothing else would
+// let one install itself as the beginning of a chain that has none.
+func TestAcceptRefusesAStoreThatNeverOpened(t *testing.T) {
+	store := New[*testBlock](memdb.New(), nil)
+	require.ErrorIs(t, store.Accept(newBlock(1, ids.Empty, 1, "alpha")), ErrNotOpen)
+}
+
+// The tip moves DURING an accept, not between two of them. The second block is
+// admitted to the lock only once the first has committed under it, and the tip
+// it is then judged against is the one the first left — which is the whole
+// reason the check lives here: a caller that asks before calling releases its
+// reading, and the store reopens exactly this window.
+//
+// Nothing here is sequenced by hand. The first block holds the lock open from
+// inside its own Write while the second is set going, and the second records
+// what it saw at the moment the store let it in.
+func TestATipThatMovesDuringAnAcceptIsCaughtUnderTheLock(t *testing.T) {
+	f := newFixture(t)
+	held, release := make(chan struct{}), make(chan struct{})
+
+	mover := newBlock(1, f.genesis.ID(), 1, "alpha")
+	mover.stall = func() { close(held); <-release }
+
+	// Both name genesis: two siblings that verified against the same tip.
+	victim := newBlock(2, f.genesis.ID(), 1, "beta")
+	var moverPublishedWhenAdmitted int
+	victim.enter = func() { moverPublishedWhenAdmitted = mover.published }
+
+	moved := make(chan error, 1)
+	go func() { moved <- f.store.Accept(mover) }()
+	<-held // the mover is inside the lock and has committed nothing
+
+	refused := make(chan error, 1)
+	go func() { refused <- f.store.Accept(victim) }()
+
+	close(release)
+	require.NoError(t, <-moved)
+	require.ErrorIs(t, <-refused, ErrNotOnTip)
+	require.Equal(t, 1, moverPublishedWhenAdmitted,
+		"the victim was let into the lock only after the mover had committed and published, "+
+			"so the tip it was judged against is the one the mover left")
+
+	tip, height := f.store.Tip()
+	require.Equal(t, mover.ID(), tip, "the chain did not rewind")
+	require.Equal(t, uint64(1), height)
+	at1, err := f.store.IDAtHeight(1)
+	require.NoError(t, err)
+	require.Equal(t, mover.ID(), at1, "and the height index names the block that was accepted")
+	require.False(t, f.committed(t, []byte("beta")))
+	require.Zero(t, victim.published)
+}
+
 func TestABlockWithNoEncodingIsRefusedWhole(t *testing.T) {
 	f := newFixture(t)
 	b := newBlock(1, f.genesis.ID(), 1, "alpha")
@@ -230,7 +334,7 @@ func TestAReloadFailureIsReportedBesideItsCause(t *testing.T) {
 	base := &refusingDB{Database: memdb.New()}
 	broken := errors.New("caches unreadable")
 	store := New[*testBlock](base, func() error { return broken })
-	genesis := newBlock(0, ids.Empty, 0)
+	genesis := newGenesis()
 	_, _, err := store.Open(genesis, func([]byte) (*testBlock, error) { return nil, nil })
 	require.NoError(t, err)
 
@@ -270,6 +374,47 @@ func TestSeedIsDurableBeforeAnyBlock(t *testing.T) {
 	require.True(t, f.committed(t, []byte("allocation")))
 }
 
+// Seeding is what makes a chain no longer fresh, so the tip goes in the same
+// commit as the allocation. Without it a chain that had allocated and not yet
+// accepted a block reported itself fresh on every boot and allocated again —
+// a duplicate its own state refuses, leaving a node that cannot restart until
+// it produces a block it cannot produce.
+func TestSeedRecordsTheTipSoTheNextBootIsNotFresh(t *testing.T) {
+	f := newFixture(t)
+	require.NoError(t, f.store.Seed(func(db database.Database) error {
+		return db.Put([]byte("allocation"), []byte{1})
+	}))
+	require.True(t, f.committed(t, tipKey))
+
+	// A second store over the same database is a restart.
+	restarted := New[*testBlock](f.base, nil)
+	at, fresh, err := restarted.Open(f.genesis, f.parse)
+	require.NoError(t, err)
+	require.False(t, fresh, "this chain has allocated its genesis")
+	require.Equal(t, f.genesis.ID(), at.ID(), "and is still sitting on it")
+
+	tip, height := restarted.Tip()
+	require.Equal(t, f.genesis.ID(), tip)
+	require.Zero(t, height)
+}
+
+// A store that never opened has no genesis to seed, and seeding one anyway
+// would write the zero id over the tip the chain has yet to record.
+func TestSeedRefusesAStoreThatNeverOpened(t *testing.T) {
+	base := memdb.New()
+	store := New[*testBlock](base, nil)
+	require.ErrorIs(t, store.Seed(func(db database.Database) error {
+		return db.Put([]byte("allocation"), []byte{1})
+	}), ErrNotOpen)
+
+	recorded, err := base.Has(tipKey)
+	require.NoError(t, err)
+	require.False(t, recorded, "and nothing was written")
+	allocated, err := base.Has([]byte("allocation"))
+	require.NoError(t, err)
+	require.False(t, allocated)
+}
+
 func TestASeedThatFailsLeavesNothing(t *testing.T) {
 	f := newFixture(t)
 	refused := errors.New("allocation refused")
@@ -283,6 +428,14 @@ func TestASeedThatFailsLeavesNothing(t *testing.T) {
 	require.ErrorIs(t, err, refused)
 	require.False(t, f.committed(t, []byte("partial")))
 	require.Equal(t, 1, f.reloads)
+
+	// The tip is part of that nothing: a chain still owed its allocation must
+	// come back fresh and be asked for it again.
+	require.False(t, f.committed(t, tipKey))
+	restarted := New[*testBlock](f.base, nil)
+	_, fresh, err := restarted.Open(f.genesis, f.parse)
+	require.NoError(t, err)
+	require.True(t, fresh)
 
 	// And what it staged does not ride along on the first block.
 	require.NoError(t, f.store.Accept(newBlock(1, f.genesis.ID(), 1, "alpha")))
@@ -438,7 +591,7 @@ func TestOpenResumesFromTheRecordedTip(t *testing.T) {
 
 func TestOpenOnAnEmptyStoreStartsAtGenesisAndSaysSo(t *testing.T) {
 	store := New[*testBlock](memdb.New(), nil)
-	genesis := newBlock(0, ids.Empty, 0)
+	genesis := newGenesis()
 	at, fresh, err := store.Open(genesis, func([]byte) (*testBlock, error) { return nil, errors.New("unreachable") })
 	require.NoError(t, err)
 	require.True(t, fresh)

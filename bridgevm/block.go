@@ -91,14 +91,12 @@ func (b *Block) computeID() ids.ID {
 // broadcasts on an external chain — and only then write the block. A write
 // that failed left every one of those done and the block missing, including a
 // release already in flight for a transfer no block records.
-func (b *Block) Accept(ctx context.Context) error {
-	tip, _ := b.vm.chain.Tip()
-	if b.ParentID_ != tip {
-		return fmt.Errorf("%w: %s extends %s, which is not the tip %s",
-			errInvalidBlock, b.ID(), b.ParentID_, tip)
-	}
-	return b.vm.chain.Accept(b)
-}
+//
+// Whether this block still extends the tip is the store's to decide, under the
+// lock that commits. Asking here read the tip, released it, and only then
+// asked for the lock — so a tip that moved in between was answered with a
+// reading taken before it moved.
+func (b *Block) Accept(ctx context.Context) error { return b.vm.chain.Accept(b) }
 
 // Write stages what this block settles: the transfers, and the day's running
 // total per destination. Both land in the same commit as the block itself, so

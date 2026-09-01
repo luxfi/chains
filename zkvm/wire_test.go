@@ -22,8 +22,7 @@ func TestWireRoundTrip_UTXO(t *testing.T) {
 		Ciphertext:  []byte("cipher"),
 		EphemeralPK: []byte("epk"),
 	}
-	b, err := u.Marshal()
-	require.NoError(err)
+	b := u.Marshal()
 	var got UTXO
 	require.NoError(parseUTXO(b, &got))
 	require.Equal(*u, got)
@@ -51,8 +50,7 @@ func TestWireRoundTrip_Transaction(t *testing.T) {
 		Proof: &ZKProof{ProofType: "groth16", ProofData: []byte("pd"), PublicInputs: [][]byte{[]byte("pi1"), []byte("pi2")}},
 		Memo:  []byte("memo"),
 	}
-	b, err := tx.Marshal()
-	require.NoError(err)
+	b := tx.Marshal()
 	got, err := parseTransaction(b)
 	require.NoError(err)
 
@@ -66,8 +64,7 @@ func TestWireRoundTrip_Transaction(t *testing.T) {
 	// Whatever id the sender puts on the value, the wire carries none, so the
 	// bytes and the parsed identity are the same either way.
 	tx.ID = ids.ID{0xFF}
-	forged, err := tx.Marshal()
-	require.NoError(err)
+	forged := tx.Marshal()
 	require.Equal(b, forged, "the id must not reach the wire")
 
 	// Canonical: one transaction has one byte string, so bytes appended to a
@@ -151,10 +148,8 @@ func TestWireRoundTrip_Block(t *testing.T) {
 		BlockTimestamp: 1_700_000_000,
 		Txs:            []*Transaction{tx},
 		StateRoot:      []byte("root"),
-		BlockProof:     &ZKProof{ProofType: "plonk", ProofData: []byte("bp")},
 	}
-	b, err := blk.Marshal()
-	require.NoError(err)
+	b := blk.Marshal()
 	var got Block
 	require.NoError(parseBlockBytes(b, &got))
 	require.Equal(blk.ParentID_, got.ParentID_)
@@ -163,5 +158,4 @@ func TestWireRoundTrip_Block(t *testing.T) {
 	require.Equal(blk.StateRoot, got.StateRoot)
 	require.Len(got.Txs, 1)
 	require.Equal(tx.ComputeID(), got.Txs[0].ID, "a nested transaction's id is derived from its content too")
-	require.Equal(blk.BlockProof, got.BlockProof)
 }

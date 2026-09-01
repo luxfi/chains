@@ -31,8 +31,11 @@ type Block struct {
 	Txs            []*Transaction `json:"transactions"`
 	StateRoot      []byte         `json:"stateRoot"` // Merkle tree root of UTXO set
 
-	// Aggregated proof for the block (optional)
-	BlockProof *ZKProof `json:"blockProof,omitempty"`
+	// There is no aggregate block proof. What stood here was carried on the
+	// wire, hashed into the id, and "verified" by re-verifying the very
+	// transactions Verify had already verified one line above — a second
+	// implementation of a check, standing where a reader would take an
+	// aggregate guarantee to be.
 
 	// Cached values
 	ID_    ids.ID
@@ -74,12 +77,6 @@ func (b *Block) computeID() ids.ID {
 
 	// Include state root
 	h.Write(b.StateRoot)
-
-	// Include block proof if present
-	if b.BlockProof != nil {
-		h.Write([]byte(b.BlockProof.ProofType))
-		h.Write(b.BlockProof.ProofData)
-	}
 
 	return ids.ID(h.Sum(nil))
 }
@@ -150,23 +147,11 @@ func (b *Block) Verify(ctx context.Context) error {
 		}
 	}
 
-	// Verify block proof if present
-	if b.BlockProof != nil {
-		if err := b.vm.proofVerifier.VerifyBlockProof(b); err != nil {
-			return err
-		}
-	}
-
 	// Verify against parent
 	if b.BlockHeight > 0 {
-		parent, err := b.vm.GetBlock(ctx, b.ParentID_)
+		parentBlock, err := b.vm.block(b.ParentID_)
 		if err != nil {
 			return err
-		}
-
-		parentBlock, ok := parent.(*Block)
-		if !ok {
-			return errors.New("invalid parent block type")
 		}
 
 		// The parent must be one this chain can still build on: the accepted
@@ -178,7 +163,7 @@ func (b *Block) Verify(ctx context.Context) error {
 		tip, tipHeight := b.vm.chain.Tip()
 		if parentBlock.ID() != tip && parentBlock.BlockHeight <= tipHeight {
 			return fmt.Errorf("%w: parent %s at height %d is beneath the tip at %d",
-				ErrNotOnTip, parentBlock.ID(), parentBlock.BlockHeight, tipHeight)
+				chain.ErrNotOnTip, parentBlock.ID(), parentBlock.BlockHeight, tipHeight)
 		}
 
 		if b.BlockHeight != parentBlock.BlockHeight+1 {
@@ -212,18 +197,11 @@ func (b *Block) Verify(ctx context.Context) error {
 // early. A failure partway left some notes spent and some outputs created,
 // under a tip the chain had already advanced — a shielded pool half applied,
 // with no way back and no way to apply the block again.
-func (b *Block) Accept(ctx context.Context) error {
-	// A block extends the tip or it is not accepted. Verify reached the same
-	// verdict earlier, against the tip AT THAT TIME; the tip moves between the
-	// two, and a block whose parent has since been buried would otherwise write
-	// the height index and the tip pointer for an abandoned branch.
-	tip, _ := b.vm.chain.Tip()
-	if b.ParentID_ != tip {
-		return fmt.Errorf("%w: %s extends %s, which is not the tip %s",
-			ErrNotOnTip, b.ID(), b.ParentID_, tip)
-	}
-	return b.vm.chain.Accept(b)
-}
+// Whether it still extends the tip is the store's to decide, under the lock
+// that commits. Asking here read the tip, released it, and only then asked for
+// the lock, so a tip that moved in between was answered with a reading taken
+// before it moved.
+func (b *Block) Accept(ctx context.Context) error { return b.vm.chain.Accept(b) }
 
 // Write records the block's spends and its outputs, and advances the committed
 // state root. The three stores were built over this same view at Initialize,
@@ -285,20 +263,12 @@ func (b *Block) Reject(ctx context.Context) error {
 	return nil
 }
 
-// Bytes returns the block bytes
+// Bytes returns the block's canonical encoding, computed once.
 func (b *Block) Bytes() []byte {
-	if b.bytes != nil {
-		return b.bytes
+	if b.bytes == nil {
+		b.bytes = b.Marshal()
 	}
-
-	bytes, err := b.Marshal()
-	if err != nil {
-		// Log error and return nil
-		return nil
-	}
-
-	b.bytes = bytes
-	return bytes
+	return b.bytes
 }
 
 // Genesis represents genesis data
@@ -370,10 +340,6 @@ var (
 	errInvalidHeight    = errors.New("invalid block height")
 	errInvalidTimestamp = errors.New("invalid block timestamp")
 	errInvalidStateRoot = errors.New("invalid state root")
-
-	// ErrNotOnTip refuses a block that does not extend the chain: one whose
-	// parent is neither the accepted tip nor a block verified above it.
-	ErrNotOnTip = errors.New("zkvm: block does not extend the accepted tip")
 
 	// errDuplicateNullifier — the same nullifier appears twice inside one block or
 	// vertex, i.e. one shielded note spent twice. Fail closed.

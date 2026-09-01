@@ -43,8 +43,7 @@ func TestUTXOCountIsReadOffTheRecords(t *testing.T) {
 	db := memdb.New()
 	utxo := &UTXO{TxID: ids.ID{1}, Commitment: []byte("orphan"), Height: 1}
 
-	record, err := utxo.Marshal()
-	require.NoError(t, err)
+	record := utxo.Marshal()
 	require.NoError(t, db.Put(makeUTXOKey(utxo.Commitment), record))
 
 	udb, err := NewUTXODB(db, log.NoLog{})
@@ -131,8 +130,7 @@ func TestUTXOReadDoesNotWriteTheSet(t *testing.T) {
 func TestForeignRecordIsNotAUTXO(t *testing.T) {
 	db := memdb.New()
 
-	record, err := (&UTXO{TxID: ids.ID{1}, Commitment: []byte("orphan"), Height: 1}).Marshal()
-	require.NoError(t, err)
+	record := (&UTXO{TxID: ids.ID{1}, Commitment: []byte("orphan"), Height: 1}).Marshal()
 	foreign := ids.ID{utxoPrefix, 1}
 	require.NoError(t, db.Put(foreign[:], record))
 

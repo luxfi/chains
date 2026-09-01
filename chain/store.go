@@ -37,8 +37,16 @@ import (
 // timestamp and do not. Both change state the same way, and this is that way.
 type Block interface {
 	ID() ids.ID
-	Height() uint64
 	Bytes() []byte
+
+	// Parent and Height are the block's place in the sequence, and it takes
+	// both. Height alone is not a place: a block whose parent is an old
+	// accepted block satisfies height == parent+1 perfectly well, and a chain
+	// that admits it rewinds. Accept compares Parent against the tip, so a
+	// block that reports one it does not extend is a block that reports the
+	// wrong parent to consensus as well.
+	Parent() ids.ID
+	Height() uint64
 
 	// Write stages every durable change the block makes, through the view it
 	// is given and nothing else. Writing anywhere else escapes the rollback.
@@ -84,6 +92,16 @@ var (
 // ErrNoBlock reports that no block is known by that id or at that height.
 var ErrNoBlock = errors.New("chain: no such block")
 
+// ErrNotOnTip refuses a block that does not extend the chain. It is the one
+// name for that refusal: a chain that spells it itself gives the same fact two
+// names, and a caller then has two things to match on.
+var ErrNotOnTip = errors.New("chain: block does not extend the accepted tip")
+
+// ErrNotOpen reports a store that has not opened. It knows no tip, so it
+// cannot say what a block would extend or what a seed would start, and
+// answering either from an empty tip writes the zero id over the chain's own.
+var ErrNotOpen = errors.New("chain: store has not opened")
+
 // New opens a store over db.
 //
 // reload rebuilds whatever the chain caches in memory from committed state. It
@@ -111,6 +129,16 @@ func (s *Store[B]) Base() database.Database { return s.base }
 
 // Accept applies b and commits it.
 //
+// A block extends the tip or it is not accepted, and that is decided HERE,
+// under the lock that commits. Verify reached the same verdict earlier against
+// the tip AT THAT TIME; the tip moves between the two, so a caller that asks
+// before calling this asks in a window the store then reopens — it releases
+// the read, the tip moves, and the commit lands anyway. The height index and
+// the tip pointer would then name a block on an abandoned branch, and every
+// peer bootstrapping from that index is served an orphan as canonical. The
+// lock is not reentrant, so the check cannot come from the caller and be held
+// across the commit; it comes from here or it is not held at all.
+//
 // Every write b makes goes through the view and lands in ONE commit, together
 // with the block itself, its height entry and the tip pointer. So the chain
 // has the whole block or none of it. Any failure rolls the view back, rebuilds
@@ -124,6 +152,17 @@ func (s *Store[B]) Accept(b B) error {
 	defer s.Unlock()
 
 	id := b.ID()
+	if s.tip == ids.Empty {
+		// A store that has not opened has no sequence to extend, and a block
+		// naming no parent would otherwise match that emptiness and commit
+		// itself as the beginning.
+		return fmt.Errorf("%w, so %s extends nothing", ErrNotOpen, id)
+	}
+	if parent := b.Parent(); parent != s.tip {
+		return fmt.Errorf("%w: %s extends %s, and the tip is %s",
+			ErrNotOnTip, id, parent, s.tip)
+	}
+
 	raw := b.Bytes()
 	if len(raw) == 0 {
 		return s.undo(fmt.Errorf("chain: block %s has no encoding", id))
@@ -172,11 +211,26 @@ func (s *Store[B]) undo(cause error) error {
 // It commits for the same reason Accept does. Left staged, a genesis
 // allocation would ride on whichever block committed first and vanish with a
 // chain that never accepted one.
+//
+// The tip goes in that same commit, because seeding is the act that makes a
+// chain no longer fresh. Open calls a chain fresh when no tip is recorded, and
+// a seed that recorded none left the two disagreeing: a chain that had
+// allocated its genesis and not yet accepted a block reported itself fresh on
+// every boot and allocated again. On the second start that is a duplicate the
+// chain's own state refuses — "already exists" — and the node cannot restart
+// until it produces a block it cannot produce. One commit holds both, so a
+// chain has allocated and recorded it, or has done neither.
 func (s *Store[B]) Seed(write func(database.Database) error) error {
 	s.Lock()
 	defer s.Unlock()
 
+	if s.tip == ids.Empty {
+		return fmt.Errorf("%w, so there is no genesis to seed", ErrNotOpen)
+	}
 	if err := write(s.view); err != nil {
+		return s.undo(err)
+	}
+	if err := s.view.Put(tipKey, s.tip[:]); err != nil {
 		return s.undo(err)
 	}
 	if err := s.view.Commit(); err != nil {

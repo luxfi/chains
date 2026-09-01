@@ -75,6 +75,35 @@ func TestARestartedNodeResumesItsCustodyRegistry(t *testing.T) {
 	require.Equal(t, blk.ID(), got.ID())
 }
 
+// A restart before the first block. This chain seeds nothing — Seed commits
+// what NewState staged and writes no records of its own — so re-running the
+// genesis path was idempotent and this node never carried the restart failure
+// that a chain WITH an allocation carries. It shares the shape and not the
+// defect, and the difference is worth pinning: the tip Seed now records is
+// what makes the second boot resume rather than install genesis again, and
+// either way the root it comes back at is the one it left.
+func TestARestartBeforeTheFirstBlockKeepsItsGenesisRoot(t *testing.T) {
+	db := memdb.New()
+	chainID := ids.GenerateTestID()
+
+	first := openVM(t, db, chainID, nil, nil)
+	root := first.StateRoot()
+	require.NoError(t, first.Shutdown(ctx()))
+
+	second := openVM(t, db, chainID, nil, nil)
+	defer second.Shutdown(ctx())
+
+	require.Equal(t, root, second.StateRoot())
+	tip, height := second.chain.Tip()
+	require.Equal(t, second.genesisBlock.ID(), tip, "still sitting on genesis")
+	require.Zero(t, height)
+
+	// And it can do what a node that restarted is for.
+	key := newCustody(t, "vault", quorum.MustNew(3, 5), 62)
+	blk := key.register(t, second)
+	require.EqualValues(t, 1, blk.BlockHeight)
+}
+
 // "Fresh chain" is a claim about the tip pointer, and this checks it against
 // the thing it implies: a chain that has applied nothing is at its genesis
 // root, and one that has applied anything is not.

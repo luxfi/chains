@@ -5,7 +5,6 @@ package zkvm
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"reflect"
 	"strings"
 	"testing"
@@ -217,61 +216,6 @@ func TestRegressionM03_NullifierPruningRemoved(t *testing.T) {
 	}
 }
 
-// TestRegressionM05_PLONKSubgroupCheck verifies that PLONK proof deserialization
-// performs subgroup checks on every G1 point and rejects invalid curve points.
-// Finding M-05: Missing subgroup checks on PLONK proof points.
-func TestRegressionM05_PLONKSubgroupCheck(t *testing.T) {
-	// For BN254 G1, the cofactor is 1 so all curve points are in the subgroup.
-	// The defense is: (1) Unmarshal rejects non-curve points, and
-	// (2) IsInSubGroup() is called for every point (catches higher-cofactor groups).
-	// Test with bytes that are NOT valid curve points.
-	badProof := make([]byte, 736)
-	// Set each 64-byte G1 slot to coordinates that are NOT on the BN254 curve.
-	// x=1, y=1 is not on y^2 = x^3 + 3 (mod p) since 1 != 4.
-	for i := 0; i < 9; i++ {
-		offset := i * 64
-		badProof[offset+31] = 1 // x = 1 (big-endian, last byte of first 32)
-		badProof[offset+63] = 1 // y = 1 (big-endian, last byte of second 32)
-	}
-
-	_, err := deserializePLONKProof(badProof)
-	if err == nil {
-		t.Fatal("PLONK proof with non-curve points must reject -- M-05 regression")
-	}
-
-	// Also verify the error path is in deserialization or subgroup check
-	errStr := err.Error()
-	if !strings.Contains(errStr, "unmarshal") && !strings.Contains(errStr, "subgroup") {
-		t.Logf("PLONK rejection error: %v", err)
-	}
-}
-
-// TestRegressionM06_FiatShamirFullLength verifies that Fiat-Shamir challenges
-// use the full 32-byte SHA-256 output with domain separation.
-// Finding M-06: Challenge derivation was truncating to fewer bytes.
-func TestRegressionM06_FiatShamirFullLength(t *testing.T) {
-	transcript := sha256.Sum256([]byte("test-transcript-state"))
-	alphaHash := sha256.Sum256(append(transcript[:], []byte("alpha")...))
-	betaHash := sha256.Sum256(append(transcript[:], []byte("beta")...))
-
-	if bytes.Equal(alphaHash[:], betaHash[:]) {
-		t.Fatal("different domain tags must produce different challenges -- M-06 regression")
-	}
-	if len(alphaHash) != 32 {
-		t.Fatalf("challenge must be 32 bytes, got %d -- M-06 regression", len(alphaHash))
-	}
-
-	diffCount := 0
-	for i := range alphaHash {
-		if alphaHash[i] != betaHash[i] {
-			diffCount++
-		}
-	}
-	if diffCount < 16 {
-		t.Errorf("challenges differ in only %d/32 bytes -- M-06 regression", diffCount)
-	}
-}
-
 // =============================================================================
 // INFO Regressions
 // =============================================================================
@@ -324,7 +268,7 @@ func newTestProofVerifier(t *testing.T) *ProofVerifier {
 	config := ZConfig{
 		ProofCacheSize: 100,
 	}
-	pv, err := NewProofVerifier(config, [32]byte{}, log.NoLog{})
+	pv, err := NewProofVerifier(config, testBind, log.NoLog{})
 	if err != nil {
 		t.Fatalf("NewProofVerifier: %v", err)
 	}

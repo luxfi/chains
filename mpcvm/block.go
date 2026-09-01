@@ -458,6 +458,17 @@ func verifyGroupSignature(groupPub, digest, sig []byte) error {
 // validation failure, and must not be swallowed — a block the engine believes
 // is accepted but whose state was not written is exactly the divergence the
 // state root exists to catch.
+//
+// The store decides whether this block still extends the tip, under the lock
+// that commits. Write's root comparison stays, and is not that check said
+// twice: it asks whether applying this block to THIS NODE'S state reaches the
+// root the network agreed on, which is false for a node whose state moved for
+// any reason — an operation applied outside a block, a share that arrived late,
+// a divergence carried in from an earlier height. That a moved tip also shows
+// up there is a consequence of this chain refusing empty blocks, so its root
+// strictly advances; it is not what the comparison is for, and a chain that
+// later admits a block changing nothing would keep the root check and lose the
+// lineage check with it.
 func (b *Block) Accept(ctx context.Context) error {
 	return b.vm.chain.Accept(b)
 }
