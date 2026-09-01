@@ -90,17 +90,12 @@ func platformCandidates() []backendCandidate {
 func candidatePaths(c backendCandidate) []string {
 	var paths []string
 	if dir := os.Getenv("LUX_GPU_PLUGIN_DIR"); dir != "" {
+		// The layouts the GPU plugin install tree ships: the directory itself,
+		// `backends/<kind>/`, `build/backends/<kind>/` from the default CMake
+		// build, and the per-flavor subdirs used for matrix builds.
 		paths = append(paths,
 			filepath.Join(dir, c.filename),
 			filepath.Join(dir, "backends", c.subdir, c.filename),
-		)
-	}
-	if dir := os.Getenv("LUX_GPU_PLUGIN_DIR"); dir != "" {
-		// Match the on-disk layout shipped by the GPU plugin install tree:
-		// `build/backends/<kind>/<filename>` from the default CMake build,
-		// plus the per-flavor subdirs the kernel team uses for matrix
-		// builds (metal-only, vulkan-m1, …).
-		paths = append(paths,
 			filepath.Join(dir, "build", "backends", c.subdir, c.filename),
 			filepath.Join(dir, "build", "metal-only", "backends", c.subdir, c.filename),
 			filepath.Join(dir, "build", "vulkan-m1", "backends", c.subdir, c.filename),
