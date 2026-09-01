@@ -87,9 +87,11 @@ func candidatesFor(kind GPUBackendKind) []string {
 		}
 	}
 
-	// Bare leaf names — dynamic-linker default search picks them up if
-	// LD_LIBRARY_PATH / DYLD_LIBRARY_PATH or /usr/local/lib has them.
-	out = append(out, leaves...)
+	// Deliberately no bare leaf names. With one the dynamic linker searches
+	// its own default path, and a GPU plugin replaces mpcvm's ceremony and
+	// key-share transitions wholesale — a library found rather than named
+	// would be minting threshold-signing custody. Every entry above is
+	// somewhere an operator said.
 	return out
 }
 
