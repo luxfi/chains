@@ -37,7 +37,7 @@ func (h *harness) rpc(t *testing.T, method string, args interface{}) (json.RawMe
 	handlers, err := h.CreateHandlers(context.Background())
 	require.NoError(t, err)
 
-	r := httptest.NewRequest(http.MethodPost, "/v1/bc/chain/rpc", bytes.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, "/v1/chain/chain/rpc", bytes.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	handlers["/rpc"].ServeHTTP(rec, r)

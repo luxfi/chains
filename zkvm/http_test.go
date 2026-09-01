@@ -19,7 +19,7 @@ import (
 )
 
 // call drives one endpoint at the path the node mounts it on. The node matches
-// /v1/bc/<chainID>+key EXACTLY and hands the handler the full path, so a
+// /v1/chain/<chainID>+key EXACTLY and hands the handler the full path, so a
 // handler that dispatches on r.URL.Path recognises nothing — which is what a
 // mux behind a single key does.
 func call(t *testing.T, vm *VM, verb, route, query string, body string) *httptest.ResponseRecorder {
@@ -27,7 +27,7 @@ func call(t *testing.T, vm *VM, verb, route, query string, body string) *httptes
 	h, ok := vm.endpoints()[route]
 	require.True(t, ok, "no endpoint at %s", route)
 
-	url := "/v1/bc/24C9zm36x43T7LqcaKF1ikHxSeuQeTXnstzi5Gwh2apo18rXNE" + route
+	url := "/v1/chain/24C9zm36x43T7LqcaKF1ikHxSeuQeTXnstzi5Gwh2apo18rXNE" + route
 	if query != "" {
 		url += "?" + query
 	}
@@ -41,7 +41,7 @@ func TestEveryEndpointAnswersAtItsMountedPath(t *testing.T) {
 	vm := newVM(t)
 	for route, h := range vm.endpoints() {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/bc/chain"+route, nil))
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/chain/chain"+route, nil))
 		require.NotEqual(t, http.StatusNotFound, rec.Code,
 			"GET %s: the handler dispatches on the request path instead of answering at its mount", route)
 	}

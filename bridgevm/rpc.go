@@ -20,7 +20,7 @@ import (
 //   - Permissionless bridge settlement
 //     (EstimateFee, SubmitRequest, GetStatus, CancelRequest, …)
 //
-// Any client that can reach /v1/bc/B/rpc has equal authority — the
+// Any client that can reach /v1/chain/B/rpc has equal authority — the
 // daemon at cmd/bridge is one such client. There are no privileged
 // methods on this surface; rate-limiting and auth (when desired) are
 // applied at the ingress layer.

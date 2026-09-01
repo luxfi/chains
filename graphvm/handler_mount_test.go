@@ -10,11 +10,11 @@ import (
 	"testing"
 )
 
-// The node mounts each CreateHandlers key at /v1/bc/<chainID>+key and matches
+// The node mounts each CreateHandlers key at /v1/chain/<chainID>+key and matches
 // that path EXACTLY, then hands the handler the request on the path it arrived
 // on. A handler that dispatches on r.URL.Path is therefore unreachable.
 func TestHandlersAnswerAtTheMountedPath(t *testing.T) {
-	const base = "/v1/bc/24C9zm36x43T7LqcaKF1ikHxSeuQeTXnstzi5Gwh2apo18rXNE"
+	const base = "/v1/chain/24C9zm36x43T7LqcaKF1ikHxSeuQeTXnstzi5Gwh2apo18rXNE"
 
 	handlers, err := (&VM{}).CreateHandlers(context.Background())
 	if err != nil {
