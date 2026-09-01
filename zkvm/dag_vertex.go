@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/luxfi/chains/chain"
 	"github.com/luxfi/consensus/core/choices"
 	"github.com/luxfi/consensus/engine/dag/vertex"
 	"github.com/luxfi/database"
@@ -43,6 +44,16 @@ func (v *Vertex) Parents() []ids.ID      { return v.parents }
 func (v *Vertex) Txs() []ids.ID          { return v.txIDs }
 func (v *Vertex) Status() choices.Status { return v.status }
 
+// Parent is the one block this vertex extends, for a store that keeps one tip.
+// A vertex naming several parents extends no single block and names none here,
+// so the store refuses it rather than committing whichever one came first.
+func (v *Vertex) Parent() ids.ID {
+	if len(v.parents) != 1 {
+		return ids.Empty
+	}
+	return v.parents[0]
+}
+
 // Verify holds a vertex to what a block is held to. It used to check the
 // transactions and NOTHING ELSE — not the parents, not the height — so a vertex
 // naming no parent at height 1<<40 verified, and accepting it set the store's
@@ -59,7 +70,7 @@ func (v *Vertex) Verify(ctx context.Context) error {
 	tip, tipHeight := v.vm.chain.Tip()
 	if len(v.parents) != 1 || v.parents[0] != tip {
 		return fmt.Errorf("%w: vertex parents %v do not name the tip %s",
-			ErrNotOnTip, v.parents, tip)
+			chain.ErrNotOnTip, v.parents, tip)
 	}
 	if v.height != tipHeight+1 {
 		return fmt.Errorf("%w: height %d does not follow the tip at %d",
@@ -91,15 +102,9 @@ func (v *Vertex) Verify(ctx context.Context) error {
 // spends and outputs are staged and committed in one batch with the vertex and
 // the tip. A vertex is not a block — it has several parents and no timestamp —
 // but it changes state the same way, and this is that way.
-func (v *Vertex) Accept(ctx context.Context) error {
-	// The tip moves between Verify and here. See Block.Accept.
-	tip, _ := v.vm.chain.Tip()
-	if len(v.parents) != 1 || v.parents[0] != tip {
-		return fmt.Errorf("%w: vertex %s extends %v, and the tip is %s",
-			ErrNotOnTip, v.id, v.parents, tip)
-	}
-	return v.vm.chain.Accept(v)
-}
+// Whether it still extends the tip is the store's to decide, under the lock
+// that commits — the tip moves between Verify and here. See Block.Accept.
+func (v *Vertex) Accept(ctx context.Context) error { return v.vm.chain.Accept(v) }
 
 // Write records the vertex's spends and its outputs.
 func (v *Vertex) Write(database.Database) error {
@@ -275,7 +280,7 @@ func (v *Vertex) serialize() []byte {
 	binary.BigEndian.PutUint32(b4, uint32(len(v.txs)))
 	buf = append(buf, b4...)
 	for _, tx := range v.txs {
-		txBytes, _ := tx.Marshal()
+		txBytes := tx.Marshal()
 		binary.BigEndian.PutUint32(b4, uint32(len(txBytes)))
 		buf = append(buf, b4...)
 		buf = append(buf, txBytes...)

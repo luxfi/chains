@@ -34,11 +34,11 @@ import (
 // EVM_NATIVE/ERC20) and a P-Chain + X-Chain API base (for the C-Chain consensus-id
 // confirm and UTXO asset descriptions).
 type Verifier struct {
-	eth        *ethclient.Client
-	apiBase    string // e.g. https://api.lux.network — used for platform/avm JSON-RPC
-	httpc      *http.Client
-	nativeDec  uint8
-	timeout    time.Duration
+	eth       *ethclient.Client
+	apiBase   string // e.g. https://api.lux.network — used for platform/avm JSON-RPC
+	httpc     *http.Client
+	nativeDec uint8
+	timeout   time.Duration
 }
 
 // New dials the C-Chain EVM RPC and records the node API base for P/X queries.

@@ -5,7 +5,6 @@ package zkvm
 
 import (
 	"encoding/binary"
-	"errors"
 	"strings"
 	"testing"
 
@@ -49,36 +48,12 @@ func groth16Frame() []byte {
 	return out
 }
 
-// plonkKey is G1 | G2 | [alpha]_2 | 5 selectors | 3 permutations, all
-// generators, padded to the 1024 bytes the decoder requires.
-func plonkKey() []byte {
-	_, _, g1, g2 := bn254.Generators()
-	out := make([]byte, 0, 1024)
-	out = append(out, g1.Marshal()...)
-	out = append(out, g2.Marshal()...)
-	out = append(out, g2.Marshal()...)
-	for i := 0; i < 8; i++ {
-		out = append(out, g1.Marshal()...)
-	}
-	return append(out, make([]byte, 1024-len(out))...)
-}
-
-// plonkFrame is 9 G1 generators followed by 5 zero evaluations: 736 bytes.
-func plonkFrame() []byte {
-	_, _, g1, _ := bn254.Generators()
-	out := make([]byte, 0, 736)
-	for i := 0; i < 9; i++ {
-		out = append(out, g1.Marshal()...)
-	}
-	return append(out, make([]byte, 160)...)
-}
-
 func keyedVerifier(t *testing.T, keys map[string][]byte) *ProofVerifier {
 	t.Helper()
 	pv, err := NewProofVerifier(ZConfig{
 		ProofCacheSize: 16,
 		VerifyingKeys:  keys,
-	}, [32]byte{}, log.NoLog{})
+	}, testBind, log.NoLog{})
 	if err != nil {
 		t.Fatalf("NewProofVerifier: %v", err)
 	}
@@ -181,50 +156,6 @@ func TestGroth16ReachesItsPairing(t *testing.T) {
 	}
 }
 
-// TestPLONKReachesItsPairing is the same property for the other classical
-// system a non-strict chain may be configured with.
-func TestPLONKIsRefusedForTheStatedReason(t *testing.T) {
-	pv := keyedVerifier(t, map[string][]byte{
-		string(TransactionTypeTransfer): plonkKey(),
-	})
-
-	nullifier := make([]byte, 32)
-	nullifier[0] = 0xA1
-	commitment := make([]byte, 32)
-	commitment[0] = 0xC1
-
-	tx := &Transaction{
-		Type:       TransactionTypeTransfer,
-		Version:    1,
-		Nullifiers: [][]byte{nullifier},
-		Outputs:    []*ShieldedOutput{{Commitment: commitment}},
-		Proof: &ZKProof{
-			ProofType:    "plonk",
-			ProofData:    plonkFrame(),
-			PublicInputs: [][]byte{testBind[:], nullifier, commitment},
-		},
-	}
-	tx.ID = tx.ComputeID()
-
-	var err error
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				t.Fatalf("verifying a well-formed PLONK proof must not panic: %v", r)
-			}
-		}()
-		err = pv.VerifyTransactionProof(tx)
-	}()
-
-	// The verification equation is not implemented, so every PLONK proof is
-	// refused rather than bound to nothing. Pin the refusal to that reason: a
-	// decode failure, a panic, or any other error would also be non-nil, and
-	// none of them would mean what this test is named for.
-	if !errors.Is(err, errPLONKIncomplete) {
-		t.Fatalf("a PLONK proof must be refused because the equation is not implemented, got: %v", err)
-	}
-}
-
 // TestInfinityIsNotAUsablePoint. gnark decodes all-zero bytes to the point at
 // infinity and reports it in-subgroup, and a pairing skips every term whose
 // argument is infinity. A proof or key element at infinity therefore deletes
@@ -241,23 +172,16 @@ func TestInfinityIsNotAUsablePoint(t *testing.T) {
 		}
 	}
 
-	if _, err := deserializePLONKProof(make([]byte, 736)); err == nil {
-		t.Fatal("a PLONK proof of infinity points must not decode")
-	}
-
-	if _, err := deserializePLONKVerifyingKey(make([]byte, 1024)); err == nil {
-		t.Fatal("a PLONK key of infinity points must not decode")
-	}
 }
 
 // TestCircuitWithoutAKeyIsRefused. A chain is keyed per circuit; the circuits
-// the operator did not key get an all-zero placeholder. Those zeros decode to
-// infinity, and a PLONK key of infinity points makes both sides of the pairing
-// empty — every proof valid, value minted from nothing. A circuit with no key
-// must be refused instead.
+// the operator did not key have no key at all. A proof judged against a key
+// that is not there must be refused, not accepted on the zeros standing in for
+// one — zeros decode to points at infinity, and a pairing drops any term whose
+// argument is infinity, which empties both sides and makes every proof valid.
 func TestCircuitWithoutAKeyIsRefused(t *testing.T) {
 	pv := keyedVerifier(t, map[string][]byte{
-		string(TransactionTypeTransfer): plonkKey(), // shield and unshield keyed with zeros
+		string(TransactionTypeTransfer): groth16Key(2), // shield and unshield unkeyed
 	})
 
 	commitment := make([]byte, 32)
@@ -268,9 +192,9 @@ func TestCircuitWithoutAKeyIsRefused(t *testing.T) {
 		Version: 1,
 		Outputs: []*ShieldedOutput{{Commitment: commitment}},
 		Proof: &ZKProof{
-			ProofType:    "plonk",
-			ProofData:    plonkFrame(),
-			PublicInputs: [][]byte{commitment},
+			ProofType:    "groth16",
+			ProofData:    groth16Frame(),
+			PublicInputs: [][]byte{testBind[:], commitment},
 		},
 	}
 	tx.ID = tx.ComputeID()
@@ -319,36 +243,6 @@ func TestKeyingOneCircuitDoesNotEnableTheOthers(t *testing.T) {
 	}
 }
 
-// TestPLONKProofMustBeWholeAndNoMore pins the proof's size exactly. Every
-// evaluation is part of the proof, so a frame short of one is not a proof; and
-// bytes the format does not describe are bytes two proofs can differ in while
-// decoding alike.
-func TestPLONKProofMustBeWholeAndNoMore(t *testing.T) {
-	whole := plonkFrame()
-	if len(whole) != plonkProofSize {
-		t.Fatalf("the test frame is %d bytes, want %d", len(whole), plonkProofSize)
-	}
-	if _, err := deserializePLONKProof(whole); err != nil {
-		t.Fatalf("a whole proof was refused: %v", err)
-	}
-
-	for _, tc := range []struct {
-		name string
-		data []byte
-	}{
-		{"missing every evaluation", whole[:9*64]},
-		{"missing the last evaluation", whole[:plonkProofSize-32]},
-		{"one byte short", whole[:plonkProofSize-1]},
-		{"one byte over", append(append([]byte(nil), whole...), 0)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, err := deserializePLONKProof(tc.data); err == nil {
-				t.Fatalf("%d bytes decoded as a whole proof", len(tc.data))
-			}
-		})
-	}
-}
-
 // TestWitnessMustMatchWhatTheKeysCircuitTakes. A verifying key holds one K point
 // per public input plus a constant term, so it states exactly how many inputs
 // the circuit it was made for takes, and a peer picks the length it sends.
@@ -392,8 +286,13 @@ func TestWitnessMustMatchWhatTheKeysCircuitTakes(t *testing.T) {
 	}
 }
 
-// testBind is the chain binding a test verifier is built with: the zero bind,
-// which is what NewProofVerifier(cfg, [32]byte{}, …) carries. Every proof's
-// public inputs lead with it, so a proof made for one chain does not verify on
-// another.
-var testBind [32]byte
+// testBind is the chain binding every test verifier is built with. It is not
+// the zero value, so "the chain this proof was made for" is distinguishable
+// from "no chain at all" — a zero bind would make every wrong-chain case look
+// right. Every proof's public inputs lead with it.
+var testBind = [32]byte{
+	0x5A, 0xC1, 0x00, 0xDE, 0xAD, 0xBE, 0xEF, 0x11,
+	0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+	0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x02,
+	0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+}

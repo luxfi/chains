@@ -44,7 +44,6 @@ func blockAround(txBlob []byte) []byte {
 	ob.SetList(48, txOff, 1)
 	ob.SetBytes(56, txBlob)
 	ob.SetBytes(64, []byte("root"))
-	ob.SetBytes(72, nil)
 	ob.FinishAsRoot()
 	return bld.Finish()
 }
@@ -59,8 +58,7 @@ func TestBlockRefusesPaddedTransaction(t *testing.T) {
 	require := require.New(t)
 
 	tx := blockTx(3)
-	txRaw, err := tx.Marshal()
-	require.NoError(err)
+	txRaw := tx.Marshal()
 
 	// Positive control: the same hand-assembled shape without padding parses,
 	// so the refusal below is caused by the padding and nothing else.
@@ -85,10 +83,8 @@ func TestBlockReencodesToTheBytesItParsed(t *testing.T) {
 		BlockTimestamp: 1_600_000_000,
 		Txs:            []*Transaction{blockTx(1), blockTx(2)},
 		StateRoot:      []byte("state-root"),
-		BlockProof:     &ZKProof{ProofType: "plonk", ProofData: []byte("agg")},
 	}
-	raw, err := blk.Marshal()
-	require.NoError(err)
+	raw := blk.Marshal()
 
 	var got Block
 	require.NoError(parseBlockBytes(raw, &got))

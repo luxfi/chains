@@ -4,242 +4,409 @@
 package identityvm
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/luxfi/database"
+	"github.com/luxfi/database/memdb"
 	"github.com/luxfi/ids"
+	"github.com/luxfi/log"
+	"github.com/luxfi/zap"
 )
 
-// sampleCredential is a fully-populated credential exercising every wire
-// field: fixed ids, times (with sub-second precision), a dynamic claims
-// document, a type list, and an optional proof.
-func sampleCredential() *Credential {
-	return &Credential{
-		ID:              ids.ID{1, 2, 3},
-		Type:            []string{"VerifiableCredential", "KYCCredential"},
-		Issuer:          ids.ID{4, 5, 6},
-		Subject:         ids.ID{7, 8, 9},
-		IssuanceDate:    time.Unix(1_700_000_000, 500).UTC(),
-		ExpirationDate:  time.Unix(1_800_000_000, 0).UTC(),
-		Claims:          map[string]interface{}{"name": "alice", "age": float64(30), "verified": true},
-		Status:          CredentialActive,
-		RevocationIndex: 7,
-		Proof: &CredentialProof{
-			Type:               "Ed25519Signature2020",
-			Created:            "2026-07-14T00:00:00Z",
-			VerificationMethod: "did:lux:abc#key-1",
-			ProofPurpose:       "assertionMethod",
-			ProofValue:         []byte{0xde, 0xad, 0xbe, 0xef},
-			ZKProof:            []byte{0x01, 0x02},
-		},
-	}
+// Every record round-trips whole. A field that survives marshalling and comes
+// back different is a record the chain agreed on and then holds differently.
+func TestRecordsRoundTrip(t *testing.T) {
+	h := newHarness(t)
+	p := newParty(t)
+
+	identity := h.identity(t, p, map[string]string{"b": "2", "a": "1"})
+	back, err := parseIdentity(marshalIdentity(identity))
+	require.NoError(t, err)
+	require.Equal(t, identity, back)
+
+	issuer := h.issuer(t, p, "registry")
+	issuer.TrustLevel = 7
+	issuer.Signature = p.sign(t, issuer.signable(), h.bind)
+	gotIssuer, err := parseIssuer(marshalIssuer(issuer))
+	require.NoError(t, err)
+	require.Equal(t, issuer, gotIssuer)
+
+	cred := h.credential(t, p, identity.ID, identity.ID, time.Unix(0, 9).UTC())
+	gotCred, err := parseCredential(marshalCredential(cred))
+	require.NoError(t, err)
+	require.Equal(t, cred, gotCred)
+
+	rev := h.revocation(t, p, cred.ID, identity.ID)
+	gotRev, err := parseRevocation(marshalRevocation(rev))
+	require.NoError(t, err)
+	require.Equal(t, rev, gotRev)
+
+	// A record with nothing optional set round-trips too. Its time is an
+	// instant, not the zero value: the wire carries UnixNano, and Go's zero
+	// time is not one nanosecond count.
+	bare := &Identity{ID: ids.ID{1}, PublicKey: []byte("k"), Created: time.Unix(0, 0).UTC()}
+	back, err = parseIdentity(marshalIdentity(bare))
+	require.NoError(t, err)
+	require.Equal(t, bare, back)
 }
 
-func sampleIdentity() *Identity {
-	return &Identity{
-		ID:          ids.ID{10, 11, 12},
-		DID:         "did:lux:0123456789abcdef",
-		PublicKey:   []byte{0xaa, 0xbb, 0xcc, 0xdd},
-		Controllers: []ids.ID{{13}, {14}, {15}},
-		Services: []ServiceEndpoint{
-			{ID: "svc-1", Type: "LinkedDomains", ServiceEndpoint: "https://example.com"},
-			{ID: "svc-2", Type: "MessagingService", ServiceEndpoint: "https://msg.example.com"},
-		},
-		Created:  time.Unix(1_650_000_000, 0).UTC(),
-		Updated:  time.Unix(1_660_000_000, 123).UTC(),
-		Metadata: map[string]string{"org": "lux", "role": "issuer", "tier": "gold"},
-	}
-}
+// A block round-trips whole, and its bytes are the same bytes every time —
+// which is what makes the id the same id on every node.
+func TestBlockRoundTripIsDeterministic(t *testing.T) {
+	h := newHarness(t)
+	p, q := newParty(t), newParty(t)
 
-func sampleRevocation() *RevocationEntry {
-	return &RevocationEntry{
-		CredentialID: ids.ID{1, 2, 3},
-		RevokedBy:    ids.ID{4, 5, 6},
-		RevokedAt:    time.Unix(1_750_000_000, 0).UTC(),
-		Reason:       "key compromise",
-	}
-}
+	subject := h.identity(t, p, map[string]string{"z": "26", "a": "1"})
+	issuer := h.issuer(t, q, "registry")
+	cred := h.credential(t, q, issuer.ID, subject.ID, time.Unix(0, 9).UTC())
+	rev := h.revocation(t, p, cred.ID, subject.ID)
 
-func requireCredentialEqual(t *testing.T, want, got *Credential) {
-	t.Helper()
-	require.Equal(t, want.ID, got.ID)
-	require.Equal(t, want.Type, got.Type)
-	require.Equal(t, want.Issuer, got.Issuer)
-	require.Equal(t, want.Subject, got.Subject)
-	require.Equal(t, want.IssuanceDate.UnixNano(), got.IssuanceDate.UnixNano())
-	require.Equal(t, want.ExpirationDate.UnixNano(), got.ExpirationDate.UnixNano())
-	require.Equal(t, want.Claims, got.Claims)
-	require.Equal(t, want.Status, got.Status)
-	require.Equal(t, want.RevocationIndex, got.RevocationIndex)
-	require.Equal(t, want.Proof, got.Proof)
-}
-
-func requireIdentityEqual(t *testing.T, want, got *Identity) {
-	t.Helper()
-	require.Equal(t, want.ID, got.ID)
-	require.Equal(t, want.DID, got.DID)
-	require.Equal(t, want.PublicKey, got.PublicKey)
-	require.Equal(t, want.Controllers, got.Controllers)
-	require.Equal(t, want.Services, got.Services)
-	require.Equal(t, want.Created.UnixNano(), got.Created.UnixNano())
-	require.Equal(t, want.Updated.UnixNano(), got.Updated.UnixNano())
-	require.Equal(t, want.Metadata, got.Metadata)
-}
-
-func requireRevocationEqual(t *testing.T, want, got *RevocationEntry) {
-	t.Helper()
-	require.Equal(t, want.CredentialID, got.CredentialID)
-	require.Equal(t, want.RevokedBy, got.RevokedBy)
-	require.Equal(t, want.RevokedAt.UnixNano(), got.RevokedAt.UnixNano())
-	require.Equal(t, want.Reason, got.Reason)
-}
-
-func TestWireRoundTrip_Credential(t *testing.T) {
-	require := require.New(t)
-	c := sampleCredential()
-
-	got, err := parseCredential(marshalCredential(c))
-	require.NoError(err)
-	requireCredentialEqual(t, c, got)
-
-	// canonical: trailing byte rejected
-	_, err = parseCredential(append(marshalCredential(c), 0))
-	require.Error(err)
-
-	// no-proof credential: Proof stays nil
-	c.Proof = nil
-	got, err = parseCredential(marshalCredential(c))
-	require.NoError(err)
-	require.Nil(got.Proof)
-	requireCredentialEqual(t, c, got)
-}
-
-func TestWireRoundTrip_Identity(t *testing.T) {
-	require := require.New(t)
-	id := sampleIdentity()
-
-	got, err := parseIdentity(marshalIdentity(id))
-	require.NoError(err)
-	requireIdentityEqual(t, id, got)
-
-	_, err = parseIdentity(append(marshalIdentity(id), 0))
-	require.Error(err)
-
-	// minimal identity: empty collections come back nil
-	min := &Identity{ID: ids.ID{99}, DID: "did:lux:min", Created: time.Unix(1, 0).UTC(), Updated: time.Unix(2, 0).UTC()}
-	got, err = parseIdentity(marshalIdentity(min))
-	require.NoError(err)
-	require.Nil(got.Controllers)
-	require.Nil(got.Services)
-	require.Nil(got.Metadata)
-	requireIdentityEqual(t, min, got)
-}
-
-func TestWireRoundTrip_Revocation(t *testing.T) {
-	require := require.New(t)
-	r := sampleRevocation()
-
-	parsed, err := parseRevocation(marshalRevocation(r))
-	require.NoError(err)
-	requireRevocationEqual(t, r, parsed)
-
-	// canonical: trailing byte rejected
-	_, err = parseRevocation(append(marshalRevocation(r), 0))
-	require.Error(err)
-}
-
-func TestWireRoundTrip_Block(t *testing.T) {
-	require := require.New(t)
 	blk := &Block{
-		ID_:            ids.ID{0xff}, // derived; must NOT affect wire
-		ParentID_:      ids.ID{1, 2, 3},
-		BlockHeight:    42,
+		ParentID_:      ids.ID{2},
+		BlockHeight:    5,
 		BlockTimestamp: 1_700_000_000,
-		StateRoot:      []byte{0xca, 0xfe, 0xba, 0xbe},
-		Credentials:    []*Credential{sampleCredential(), sampleCredential()},
-		Revocations:    []*RevocationEntry{sampleRevocation()},
-		Identities:     []*Identity{sampleIdentity()},
+		Identities:     []*Identity{subject},
+		Issuers:        []*Issuer{issuer},
+		Credentials:    []*Credential{cred},
+		Revocations:    []*Revocation{rev},
+		vm:             h.VM,
 	}
-
-	b, err := blk.Marshal()
-	require.NoError(err)
+	raw := blk.Marshal()
+	require.Equal(t, raw, blk.Marshal(), "the same block encodes the same way twice")
 
 	var got Block
-	require.NoError(parseBlock(b, &got))
-	require.Equal(blk.ParentID_, got.ParentID_)
-	require.Equal(blk.BlockHeight, got.BlockHeight)
-	require.Equal(blk.BlockTimestamp, got.BlockTimestamp)
-	require.Equal(blk.StateRoot, got.StateRoot)
+	require.NoError(t, parseBlock(raw, &got))
+	require.Equal(t, blk.ParentID_, got.ParentID_)
+	require.Equal(t, blk.BlockHeight, got.BlockHeight)
+	require.Equal(t, blk.BlockTimestamp, got.BlockTimestamp)
+	require.Equal(t, blk.Identities, got.Identities)
+	require.Equal(t, blk.Issuers, got.Issuers)
+	require.Equal(t, blk.Credentials, got.Credentials)
+	require.Equal(t, blk.Revocations, got.Revocations)
 
-	require.Len(got.Credentials, 2)
-	for i := range blk.Credentials {
-		requireCredentialEqual(t, blk.Credentials[i], got.Credentials[i])
-	}
-	require.Len(got.Revocations, 1)
-	requireRevocationEqual(t, blk.Revocations[0], got.Revocations[0])
-	require.Len(got.Identities, 1)
-	requireIdentityEqual(t, blk.Identities[0], got.Identities[0])
-
-	// canonical: trailing byte rejected
-	require.Error(parseBlock(append(b, 0), &got))
-
-	// empty block: nested slices come back nil, StateRoot nil
-	empty := &Block{ParentID_: ids.ID{5}, BlockHeight: 1, BlockTimestamp: 2}
-	eb, err := empty.Marshal()
-	require.NoError(err)
-	var egot Block
-	require.NoError(parseBlock(eb, &egot))
-	require.Nil(egot.Credentials)
-	require.Nil(egot.Revocations)
-	require.Nil(egot.Identities)
-	require.Nil(egot.StateRoot)
-	require.Equal(uint64(1), egot.BlockHeight)
-	require.Equal(int64(2), egot.BlockTimestamp)
+	// An empty block round-trips: nothing is not something.
+	empty := &Block{vm: h.VM}
+	var back Block
+	require.NoError(t, parseBlock(empty.Marshal(), &back))
+	require.Empty(t, back.Identities)
+	require.Empty(t, back.Issuers)
+	require.Empty(t, back.Credentials)
+	require.Empty(t, back.Revocations)
 }
 
-func TestWireDeterminism_Block(t *testing.T) {
-	require := require.New(t)
+// One value has one byte string. Every frame is canonical, INCLUDING a nested
+// one: the top-level parsers checked this and the nested ones did not, so a
+// record inside a block could carry padding — and since the block id is the
+// hash of its bytes and a parsed block keeps the bytes it arrived in, one
+// logical block had unboundedly many ids, all of which verified.
+func TestEveryFrameIsCanonical(t *testing.T) {
+	h := newHarness(t)
+	p := newParty(t)
+	identity := h.identity(t, p, nil)
 
-	build := func() *Block {
-		return &Block{
-			ParentID_:      ids.ID{1, 2, 3},
-			BlockHeight:    42,
-			BlockTimestamp: 1_700_000_000,
-			StateRoot:      []byte{0xca, 0xfe},
-			Credentials:    []*Credential{sampleCredential()},
-			Revocations:    []*RevocationEntry{sampleRevocation()},
-			Identities:     []*Identity{sampleIdentity()},
-		}
+	for _, tail := range [][]byte{{0}, {0xFF}, make([]byte, 32)} {
+		padded := append(append([]byte(nil), marshalIdentity(identity)...), tail...)
+		_, err := parseIdentity(padded)
+		require.ErrorIs(t, err, errTrailing)
 	}
 
-	b1, err := build().Marshal()
-	require.NoError(err)
-	b2, err := build().Marshal()
-	require.NoError(err)
-	require.Equal(b1, b2, "same logical block must marshal to identical bytes")
+	// The same padding NESTED inside a block.
+	nested := append(append([]byte(nil), marshalIdentity(identity)...), 0xFF)
+	lens, blob := []uint32{uint32(len(nested))}, nested
 
-	// blockID = hash of wire, stable across independent constructions
-	require.Equal(build().ID(), build().ID())
-	// a changed field moves the id
-	other := build()
-	other.BlockHeight = 43
-	require.NotEqual(build().ID(), other.ID())
+	b := zap.NewBuilder(zap.HeaderSize + blkSize + len(blob) + 64)
+	off := writeU32List(b, lens)
+	ob := b.StartObject(blkSize)
+	ob.SetBytesFixed(blkParent, make([]byte, 32))
+	ob.SetList(blkIdnLens, off, 1)
+	ob.SetBytes(blkIdnBlob, blob)
+	ob.FinishAsRoot()
+
+	var blk Block
+	require.ErrorIs(t, parseBlock(b.Finish(), &blk), errTrailing)
+
+	// And a block frame with its own padding.
+	whole := (&Block{vm: h.VM, Identities: []*Identity{identity}}).Marshal()
+	require.ErrorIs(t, parseBlock(append(append([]byte(nil), whole...), 0), &blk), errTrailing)
+	require.Error(t, parseBlock([]byte("not a frame"), &blk))
 }
 
-func TestWireDeterminism_Credential(t *testing.T) {
-	require := require.New(t)
-	// Multi-key claims + multi-key identity metadata: Go map iteration order
-	// is randomized, so identical bytes prove key-sorted canonicalization.
-	c := &Credential{
-		ID:     ids.ID{1},
-		Type:   []string{"A", "B", "C"},
-		Claims: map[string]interface{}{"z": float64(1), "a": "x", "m": true, "b": float64(2)},
-		Status: CredentialActive,
-	}
-	require.Equal(marshalCredential(c), marshalCredential(c))
+// A length vector and the blob it indexes both come from the peer, and both are
+// checked: a length the blob cannot back is refused rather than dropped, and
+// blob bytes no length claims are refused too — either way the value read is
+// not the value that was sent.
+func TestDeclaredLengthsMustCoverTheirBlob(t *testing.T) {
+	_, err := unpackEach([]uint32{4}, []byte("ab"), parseIdentity)
+	require.ErrorIs(t, err, errLength)
 
-	id := sampleIdentity()
-	require.Equal(marshalIdentity(id), marshalIdentity(id))
+	_, err = unpackEach(nil, []byte("orphan"), parseIdentity)
+	require.ErrorIs(t, err, errLength)
+
+	_, err = unpackEach([]uint32{2}, []byte("ab"), parseIdentity)
+	require.Error(t, err, "the element is decoded, and is not an identity")
+
+	// unpackStrings used to BREAK on a length past the end, silently
+	// truncating the list — so a credential's type list arrived shorter than
+	// it was sent.
+	_, err = unpackStrings([]uint32{4}, []byte("ab"))
+	require.ErrorIs(t, err, errLength)
+
+	_, err = unpackStrings(nil, []byte("orphan"))
+	require.ErrorIs(t, err, errLength)
+
+	_, err = unpackStrings([]uint32{1}, []byte("ab"))
+	require.ErrorIs(t, err, errLength)
+
+	got, err := unpackStrings([]uint32{1, 1}, []byte("ab"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"a", "b"}, got)
+
+	got, err = unpackStrings(nil, nil)
+	require.NoError(t, err)
+	require.Nil(t, got)
+}
+
+// Metadata is a map: an odd number of strings is a key with no value, which
+// the reader used to drop.
+func TestMetadataMustPair(t *testing.T) {
+	lens, blob := packMetadata(map[string]string{"b": "2", "a": "1"})
+	back, err := unpackMetadata(lens, blob)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"a": "1", "b": "2"}, back)
+
+	// Key-sorted, so the same map is the same bytes.
+	againLens, againBlob := packMetadata(map[string]string{"a": "1", "b": "2"})
+	require.Equal(t, lens, againLens)
+	require.Equal(t, blob, againBlob)
+
+	_, err = unpackMetadata([]uint32{1}, []byte("a"))
+	require.ErrorIs(t, err, errLength)
+
+	_, err = unpackMetadata([]uint32{4}, []byte("a"))
+	require.ErrorIs(t, err, errLength)
+
+	back, err = unpackMetadata(nil, nil)
+	require.NoError(t, err)
+	require.Nil(t, back)
+}
+
+// A claims blob that will not decode is a failure. Read as "no claims", it
+// passed the claims bound trivially and the credential the chain recorded was
+// not the credential that was sent.
+func TestClaimsMustDecode(t *testing.T) {
+	claims := map[string]interface{}{"a": float64(1), "b": "two"}
+	back, err := parseClaims(marshalClaims(claims))
+	require.NoError(t, err)
+	require.Equal(t, claims, back)
+
+	back, err = parseClaims(marshalClaims(nil))
+	require.NoError(t, err)
+	require.Nil(t, back)
+
+	_, err = parseClaims([]byte("{"))
+	require.ErrorIs(t, err, errClaims)
+
+	_, err = parseCredential(func() []byte {
+		b := zap.NewBuilder(zap.HeaderSize + crSize + 64)
+		ob := b.StartObject(crSize)
+		ob.SetBytes(crClaims, []byte("{"))
+		ob.FinishAsRoot()
+		return b.Finish()
+	}())
+	require.ErrorIs(t, err, errClaims)
+}
+
+// A block whose records do not decode is not a block, whichever list they are
+// in.
+func TestABlocksRecordsMustDecode(t *testing.T) {
+	for _, slot := range []struct {
+		lens, blob int
+	}{
+		{blkIdnLens, blkIdnBlob},
+		{blkIssLens, blkIssBlob},
+		{blkCredLens, blkCredBlob},
+		{blkRevLens, blkRevBlob},
+	} {
+		junk := []byte("not a frame")
+		b := zap.NewBuilder(zap.HeaderSize + blkSize + len(junk) + 64)
+		off := writeU32List(b, []uint32{uint32(len(junk))})
+		ob := b.StartObject(blkSize)
+		ob.SetBytesFixed(blkParent, make([]byte, 32))
+		ob.SetList(slot.lens, off, 1)
+		ob.SetBytes(slot.blob, junk)
+		ob.FinishAsRoot()
+
+		var blk Block
+		require.Error(t, parseBlock(b.Finish(), &blk))
+	}
+}
+
+// A public key on the wire that is not an ML-DSA-65 key is refused where it is
+// used, not where it is read.
+func TestAKeyMustBeAKey(t *testing.T) {
+	require.ErrorIs(t, verify([]byte("short"), []byte("msg"), []byte("sig"), nil), errNoKey)
+
+	h := newHarness(t)
+	p := newParty(t)
+	require.ErrorIs(t,
+		verify(p.pub, []byte("msg"), []byte("not a signature"), h.bind[:]),
+		errNotAuthorized)
+}
+
+// ======== store failures ========
+
+type refusingWrites struct {
+	database.Database
+	err error
+}
+
+func (d *refusingWrites) Put([]byte, []byte) error { return d.err }
+
+// A block that cannot record what it decides records nothing: Write is
+// discarded whole.
+func TestABlockThatCannotWriteChangesNothing(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+
+	issuer, subject := newParty(t), newParty(t)
+	issuerRecord := h.issuer(t, issuer, "registry")
+	subjectRecord := h.identity(t, subject, nil)
+	cred := h.credential(t, issuer, issuerRecord.ID, subjectRecord.ID, time.Now().Add(time.Hour))
+	rev := h.revocation(t, subject, cred.ID, subjectRecord.ID)
+
+	tip, height := h.chain.Tip()
+	blk := &Block{
+		ParentID_:      tip,
+		BlockHeight:    height + 1,
+		BlockTimestamp: time.Now().Unix(),
+		Identities:     []*Identity{subjectRecord},
+		Issuers:        []*Issuer{issuerRecord},
+		Credentials:    []*Credential{cred},
+		Revocations:    []*Revocation{rev},
+		vm:             h.VM,
+	}
+	require.NoError(t, blk.Verify(ctx))
+
+	boom := errors.New("disk gone")
+	require.ErrorIs(t, blk.Write(&refusingWrites{err: boom}), boom)
+
+	// Each list in turn: a store that takes the first n writes and refuses the
+	// next names which one the block could not record.
+	for n := 1; n <= 3; n++ {
+		require.ErrorIs(t, blk.Write(&refusingAfter{Database: memdb.New(), n: n, err: boom}), boom)
+	}
+	require.NoError(t, blk.Write(memdb.New()))
+
+	_, err := h.Identity(subjectRecord.ID)
+	require.Error(t, err, "a block that was not accepted changed nothing")
+}
+
+// refusingAfter takes n writes and refuses the rest.
+type refusingAfter struct {
+	database.Database
+	n   int
+	err error
+}
+
+func (d *refusingAfter) Put(k, v []byte) error {
+	if d.n <= 0 {
+		return d.err
+	}
+	d.n--
+	return d.Database.Put(k, v)
+}
+
+// A record on disk that will not decode is a failure, not a record to skip:
+// the chain wrote it, so a node that cannot read it back does not hold the
+// state it believes it holds.
+func TestAnUnreadableRecordRefusesToOpen(t *testing.T) {
+	for _, prefix := range [][]byte{identityPrefix, issuerPrefix, credentialPrefix, revocationPrefix} {
+		db := memdb.New()
+		require.NoError(t, db.Put(key(prefix, ids.ID{1}), []byte("not a frame")))
+
+		h := &harness{db: db, chainID: ids.ID{5}, network: 1}
+		vm := &VM{}
+		err := vm.Initialize(context.Background(), initFor(h, nil))
+		require.Error(t, err, "prefix %s", prefix)
+		require.Contains(t, err.Error(), "record")
+	}
+}
+
+// A set that cannot be READ is not an empty set: the iterator's failure is
+// the answer, not the zero records it produced before failing.
+func TestAnUnreadableStoreIsAFailure(t *testing.T) {
+	boom := errors.New("iterator gone")
+	_, err := load(&failIterDB{Database: memdb.New(), err: boom}, identityPrefix, parseIdentity)
+	require.ErrorIs(t, err, boom)
+}
+
+type failIterDB struct {
+	database.Database
+	err error
+}
+
+func (d *failIterDB) NewIteratorWithPrefix([]byte) database.Iterator {
+	return &brokenIter{err: d.err}
+}
+
+type brokenIter struct {
+	database.Iterator
+	err error
+}
+
+func (i *brokenIter) Next() bool    { return false }
+func (i *brokenIter) Error() error  { return i.err }
+func (i *brokenIter) Release()      {}
+func (i *brokenIter) Key() []byte   { return nil }
+func (i *brokenIter) Value() []byte { return nil }
+
+var _ = log.NoLog{}
+
+// A record whose own length vectors disagree with their blob is refused where
+// it is read, not carried half-decoded into the chain's state.
+func TestARecordsListsMustAgreeWithTheirBlob(t *testing.T) {
+	// An identity whose metadata lengths overrun their blob.
+	b := zap.NewBuilder(zap.HeaderSize + idnSize + 64)
+	off := writeU32List(b, []uint32{9})
+	ob := b.StartObject(idnSize)
+	ob.SetList(idnMetaLen, off, 1)
+	ob.SetBytes(idnMetaBlb, []byte("ab"))
+	ob.FinishAsRoot()
+	_, err := parseIdentity(b.Finish())
+	require.ErrorIs(t, err, errLength)
+
+	// An issuer whose type lengths overrun theirs.
+	b = zap.NewBuilder(zap.HeaderSize + isSize + 64)
+	off = writeU32List(b, []uint32{9})
+	ob = b.StartObject(isSize)
+	ob.SetList(isTypeLens, off, 1)
+	ob.SetBytes(isTypeBlob, []byte("ab"))
+	ob.FinishAsRoot()
+	_, err = parseIssuer(b.Finish())
+	require.ErrorIs(t, err, errLength)
+
+	// And a credential's.
+	b = zap.NewBuilder(zap.HeaderSize + crSize + 64)
+	off = writeU32List(b, []uint32{9})
+	ob = b.StartObject(crSize)
+	ob.SetList(crTypeLens, off, 1)
+	ob.SetBytes(crTypeBlob, []byte("ab"))
+	ob.FinishAsRoot()
+	_, err = parseCredential(b.Finish())
+	require.ErrorIs(t, err, errLength)
+}
+
+// Blob bytes no length claims are refused: what a peer sent and what the node
+// reads have to be the same thing, in both directions.
+func TestUnclaimedBlobBytesAreRefused(t *testing.T) {
+	h := newHarness(t)
+	frame := marshalIdentity(h.identity(t, newParty(t), nil))
+
+	_, err := unpackEach([]uint32{uint32(len(frame))}, append(append([]byte(nil), frame...), 0xFF), parseIdentity)
+	require.ErrorIs(t, err, errLength)
 }
