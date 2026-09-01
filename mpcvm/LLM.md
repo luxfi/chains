@@ -50,7 +50,7 @@ resolves a `CreateChainTx`'s vmID. `TestVMID_IsCanonicalAndStable` pins it.
   the state root; key shares live under `n/`, node-private.
 - Do **not** make `Block.Verify` trust the proposer. Every operation carries a
   verifiable artifact and the block carries its post-state root.
-- Do **not** reintroduce `t-chain`/`tchain` types or a "T-Chain". Per LP-134 /
+- Do **not** reintroduce `t-chain`/`tchain` types or a "T-Chain". Per LP-1340 /
   LP-7050 it is removed with zero remainder: MPC→M-Chain, FHE→F-Chain
   (`fhevm`), teleport→B-Chain (`bridgevm`).
 - Do **not** derive an external custody address with anything but Keccak-256.

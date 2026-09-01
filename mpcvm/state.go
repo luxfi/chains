@@ -41,7 +41,7 @@ package mpcvm
 // proves two nodes agree on the whole registry, but it cannot prove to a third
 // party that one particular key is in it without replaying the log. That is
 // enough for M-Chain's job (validators must agree on custody), and it is what
-// LP-134's mchain_ceremony_root asks for. A Merkle registry root is the upgrade
+// LP-1340's mchain_ceremony_root asks for. A Merkle registry root is the upgrade
 // if external membership proofs are ever needed; it is deliberately not built
 // on speculation.
 

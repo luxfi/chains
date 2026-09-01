@@ -16,7 +16,7 @@ to do that on-chain instead of in an off-chain signer cluster.
 - **Genesis chain.** M-Chain is in the P-Chain chain set at height 0 on every
   network (`genesis/configs/*/mchain.json`), tracked by validators from boot —
   not created later by a `CreateChainTx` someone has to remember to submit.
-- Per LP-134 / LP-7050 there is no T-Chain and no `teleportvm`: teleport IS
+- Per LP-1340 / LP-7050 there is no T-Chain and no `teleportvm`: teleport IS
   `bridgevm` (B-Chain, LP-6000), and the FHE half of the retired ThresholdVM is
   `fhevm` (F-Chain, LP-8200). Any identifier still naming "T-Chain" or
   "ThresholdVM-as-a-chain" is stale.

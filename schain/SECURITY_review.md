@@ -66,7 +66,7 @@ Note the 20-byte (160-bit) NodeID truncation: collision security ~80-bit classic
 ### 2.2 Validator / block / vote signatures — **PQ-ready HYBRID, strong design** ✅
 
 `~/work/lux/consensus/protocol/quasar/`:
-- Per-validator vote evidence can be **Pulsar (ML-DSA-65)**, **Corona (Ring-LWE threshold)**, **Magnetar (SLH-DSA / FIPS-205)**, or **classical BLS12-381** (`consensus_cert.go:178-191`).
+- Per-validator vote evidence can be **Pulsar (ML-DSA-65)**, **Corona (Module-LWE threshold)**, **Magnetar (SLH-DSA / FIPS-205)**, or **classical BLS12-381** (`consensus_cert.go:178-191`).
 - The finality certificate is a **policy-gated envelope** (`ConsensusCert`, `:296-340`). **Invariant I11** (`:80-83`, enforced `:741-750`): a classical-only cert is **rejected** under any policy requiring a PQ leg; classical (BLS) is accepted *only after every required PQ leg is already satisfied by PQ evidence* → `ErrMissingRequiredPQLeg`.
 - Production profiles (`polaris.go:11-13`): **Pulsar** = BLS‖Puls‖ZK, **Aurora** = +Corona, **Polaris** = +Magnetar (cross-family). All require ≥1 PQ leg.
 - Hybrid is explicit: `PolarisLegs.BLS *bls.Signature` is **optional / nil for pure-PQ** (`polaris.go:56-59`), always verified when present (`cert_policy_verify.go:122-128`).

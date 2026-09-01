@@ -60,7 +60,7 @@ are the ten chains live on 96369.
 
 | Name | Status |
 |------|--------|
-| `teleportvm` / T-Chain | **Removed.** LP-134 dissolves T-Chain with zero remainder: threshold signing → M-Chain, FHE → F-Chain, cross-chain messaging/teleport → B-Chain (`bridgevm`). LP-5013 and LP-7330 are deprecated by LP-134; see LP-7050 for the migration map. No `teleportvm` VM ID exists in `luxfi/constants`. |
+| `teleportvm` / T-Chain | **Removed.** LP-1340 dissolves T-Chain with zero remainder: threshold signing → M-Chain, FHE → F-Chain, cross-chain messaging/teleport → B-Chain (`bridgevm`). LP-5013 and LP-7330 are deprecated by LP-1340; see LP-7050 for the migration map. No `teleportvm` VM ID exists in `luxfi/constants`. |
 | `servicenodevm` | **Never existed.** The service-node registry was never built under this name; the S-Chain directory here is `schain/` and is object storage, not a registry. |
 
 ### Plugin filenames

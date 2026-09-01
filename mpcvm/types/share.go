@@ -8,9 +8,9 @@ import (
 	"fmt"
 )
 
-// CertLane mirrors LP-134 §QuasarCertLane. We declare it here in the
+// CertLane mirrors LP-1340 §QuasarCertLane. We declare it here in the
 // substrate because the share envelope is the wire form on which
-// every chain's verifier dispatches. The values must match LP-134
+// every chain's verifier dispatches. The values must match LP-1340
 // exactly. New lanes append; values never move.
 type CertLane uint8
 

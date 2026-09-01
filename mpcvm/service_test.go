@@ -5,7 +5,7 @@ package mpcvm
 
 import "testing"
 
-// TestServiceSurfaces_Decomposition documents and locks the LP-134 / LP-7050
+// TestServiceSurfaces_Decomposition documents and locks the LP-1340 / LP-7050
 // service decomposition: the single *VM satisfies all three orthogonal
 // surfaces today (compatibility bridge), and — critically — the layering is
 // real, not cosmetic: MPCService and FHEService each EMBED ThresholdService,

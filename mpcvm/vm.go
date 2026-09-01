@@ -4,7 +4,7 @@
 // Package mpcvm implements the shared threshold VM substrate — a LIBRARY,
 // not a chain — consumed by M-Chain (MPC: CGGMP21/FROST/Pulsar-general threshold
 // signing for bridge custody of external wallets, LP-7100) and F-Chain (FHE:
-// TFHE compute / threshold decrypt, LP-8200). Per LP-134 / LP-7050 there is NO
+// TFHE compute / threshold decrypt, LP-8200). Per LP-1340 / LP-7050 there is NO
 // T-Chain and NO teleportvm; teleport IS bridgevm (B-Chain, LP-6000). Any live
 // identifier still naming "T-Chain" or "ThresholdVM-as-a-chain" is stale.
 // See ../README.md.
