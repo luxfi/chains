@@ -813,8 +813,12 @@ func tryLoadPlugin(kind GPUBackendKind, candidates ...string) *GPUBackend {
 		return nil
 	}
 
-	// Identify the library before trusting any symbol in it.
+	// Identify the library before trusting any symbol in it. Closing it is
+	// part of refusing it: dlopen has already run the library's constructors,
+	// and the probe walks five backends, so leaving it mapped keeps code we
+	// declined to trust resident in the node for the life of the process.
 	if rc := C.mpcvm_plugin_trusted(h); rc != 0 {
+		_ = C.dlclose(h)
 		return nil
 	}
 
