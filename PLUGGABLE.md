@@ -19,7 +19,7 @@ operator daemons (no luxd validator required), the same way `mpcd` and
 | I-Chain (identity) | `chains/identityvm/` | `luxfi/id` | n/a |
 
 M and F are both canonical here — they are written in this repo, not shimmed
-from another. They divide the work LP-134 took off T-Chain: M does threshold
+from another. They divide the work LP-1340 took off T-Chain: M does threshold
 signing and bridge custody, F coordinates confidential compute. F wraps the FHE
 runtime library at `mpcvm/fhe/`, which stays where it is because `mpcvm` also
 uses it; F reuses that package's types and threshold parameters and owns its own

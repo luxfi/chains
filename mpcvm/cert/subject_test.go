@@ -105,7 +105,7 @@ func TestSubject_VerifyAcceptsOnlyTheDerivedClaim(t *testing.T) {
 
 // Each chain root is required on its own.
 //
-// LP-134 binds mchain_ceremony_root and fchain_fhe_root on every round, even
+// LP-1340 binds mchain_ceremony_root and fchain_fhe_root on every round, even
 // the rounds where one chain finalizes nothing (its unchanged root satisfies
 // the binding). A check that only fired when *both* were zero would let a round
 // that omits one chain through, and the subject would then attest to a single

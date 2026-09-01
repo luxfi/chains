@@ -3,7 +3,7 @@
 
 // service.go carves the (currently single, overloaded) threshold VM into
 // three orthogonal SERVICE surfaces — ThresholdService, MPCService, FHEService
-// — per LP-134 / LP-7050. This is the "separate what the primitive IS from
+// — per LP-1340 / LP-7050. This is the "separate what the primitive IS from
 // where it is APPLIED" decomposition (Hammock-driven composition, not
 // inheritance).
 //

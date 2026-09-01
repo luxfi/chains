@@ -183,7 +183,7 @@ func TestRegistry_UnownedRegistryRefusesEveryLane(t *testing.T) {
 // they are Quasar's own consensus and attestation lanes. Sweeping all 256
 // encodable lane values rather than the ten named ones is deliberate: the lane
 // arrives on the wire as a byte, so the ownership predicate has to answer for
-// values LP-134 never assigned.
+// values LP-1340 never assigned.
 func TestRegistry_OwnerPartitionsTheLaneSpace(t *testing.T) {
 	for _, owner := range []struct {
 		owner Owner

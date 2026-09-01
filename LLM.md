@@ -110,7 +110,7 @@ TheGapSinceTheLastBlock` measures exactly that. Removing it means counting
 lifetimes in block heights, which no proposer can rewind — a change to the grant
 API, not a patch.
 
-T-Chain is gone entirely — LP-134 dissolves it with zero remainder (threshold
+T-Chain is gone entirely — LP-1340 dissolves it with zero remainder (threshold
 signing → M, FHE → F, cross-chain messaging/teleport → B). There is no
 `teleportvm` here and no `teleportvm` VM ID in `luxfi/constants`.
 

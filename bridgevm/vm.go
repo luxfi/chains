@@ -871,7 +871,7 @@ func (vm *VM) RemoveSigner(nodeID ids.NodeID, replacementNodeID *ids.NodeID) *Si
 		log.String("reshareSession", reshareSession),
 	)
 
-	// Trigger the reshare on M-Chain (LP-134) over warp. A failure here is
+	// Trigger the reshare on M-Chain (LP-1340) over warp. A failure here is
 	// retryable and does not undo the removal: the signer is out either way.
 	if err := vm.triggerReshareProtocol(reshareSession, nodeID, replacement); err != nil {
 		vm.log.Warn("bridgevm: reshare protocol not triggered",
