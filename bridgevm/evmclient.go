@@ -28,6 +28,7 @@ import (
 	"crypto/ecdsa"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"strings"
 	"sync"
@@ -65,10 +66,10 @@ type ExternalChainConfig struct {
 	//
 	// Left unset, that question is unanswered for this chain and startup says
 	// so by name.
-	Genesis string `json:"genesis,omitempty"`
-	MinGasPrice   string   `json:"minGasPrice,omitempty"` // wei floor; release uses max(suggested, floor)
-	GasLimit      uint64   `json:"gasLimit,omitempty"`    // release call gas limit (default 300000)
-	GasKeyKMSPath string   `json:"gasKeyKmsPath,omitempty"` // KMS path for the relayer key — NEVER inline
+	Genesis       string `json:"genesis,omitempty"`
+	MinGasPrice   string `json:"minGasPrice,omitempty"`   // wei floor; release uses max(suggested, floor)
+	GasLimit      uint64 `json:"gasLimit,omitempty"`      // release call gas limit (default 300000)
+	GasKeyKMSPath string `json:"gasKeyKmsPath,omitempty"` // KMS path for the relayer key — NEVER inline
 }
 
 // ReleaseCall is the typed payload SendTransaction expects. It binds one
@@ -114,18 +115,18 @@ var parsedGatewayABI = func() abi.ABI {
 
 // evmChainClient is the concrete ChainClient for one external EVM chain.
 type evmChainClient struct {
-	name        string
-	chainID     *big.Int
-	gateway     common.Address
-	custody     common.Address
-	gasKey      *ecdsa.PrivateKey
-	gasAddr     common.Address
-	gasLimit    uint64
-	minGasPrice *big.Int
-	signer      types.Signer
-	endpoints   []*ethclient.Client
+	name         string
+	chainID      *big.Int
+	gateway      common.Address
+	custody      common.Address
+	gasKey       *ecdsa.PrivateKey
+	gasAddr      common.Address
+	gasLimit     uint64
+	minGasPrice  *big.Int
+	signer       types.Signer
+	endpoints    []*ethclient.Client
 	rawEndpoints []string
-	log         log.Logger
+	log          log.Logger
 
 	mu sync.Mutex // serialises nonce acquisition + broadcast for this gas key
 }
@@ -269,26 +270,43 @@ func (c *evmChainClient) GetTransaction(ctx context.Context, txID ids.ID) (inter
 	return c.primary().TransactionReceipt(ctx, common.BytesToHash(txID[:]))
 }
 
-// GetConfirmations returns head-height − txBlock + 1 from B's OWN view of the
-// chain. This is the fix for the trust gap: confirmations are observed here, not
-// taken on faith from whoever submitted the bridge request.
+// GetConfirmations returns how deep the source transaction is buried, observed
+// here rather than taken on faith from whoever submitted the bridge request.
+//
+// Every endpoint is asked and the least advanced answer is the one returned. A
+// release rests on this number, and the client holds N endpoints because no one
+// of them is trusted: reading a single endpoint hands it the decision, while
+// the smallest of N is a depth all of them have reached — an endpoint can then
+// hold back a release and cannot manufacture one. An endpoint that cannot
+// answer has reached nothing, so the read fails rather than settling for the
+// rest of the set.
 func (c *evmChainClient) GetConfirmations(ctx context.Context, txID ids.ID) (uint32, error) {
-	rcpt, err := c.primary().TransactionReceipt(ctx, common.BytesToHash(txID[:]))
-	if err != nil {
-		return 0, err
+	hash := common.BytesToHash(txID[:])
+	least := uint64(math.MaxUint64)
+	for i, ep := range c.endpoints {
+		rcpt, err := ep.TransactionReceipt(ctx, hash)
+		if err != nil {
+			return 0, fmt.Errorf("bridgevm: chain %q: endpoint %q: receipt for %x: %w", c.name, c.rawEndpoints[i], txID[:], err)
+		}
+		if rcpt.Status != types.ReceiptStatusSuccessful {
+			return 0, fmt.Errorf("bridgevm: chain %q: source tx %x reverted", c.name, txID[:])
+		}
+		head, err := ep.BlockNumber(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("bridgevm: chain %q: endpoint %q: head: %w", c.name, c.rawEndpoints[i], err)
+		}
+		var depth uint64
+		if txBlk := rcpt.BlockNumber.Uint64(); head >= txBlk {
+			depth = head - txBlk + 1
+		}
+		if depth < least {
+			least = depth
+		}
 	}
-	if rcpt.Status != types.ReceiptStatusSuccessful {
-		return 0, fmt.Errorf("bridgevm: chain %q: source tx %x reverted", c.name, txID[:])
+	if least > math.MaxUint32 {
+		least = math.MaxUint32
 	}
-	head, err := c.primary().BlockNumber(ctx)
-	if err != nil {
-		return 0, err
-	}
-	txBlk := rcpt.BlockNumber.Uint64()
-	if head < txBlk {
-		return 0, nil
-	}
-	return uint32(head - txBlk + 1), nil
+	return uint32(least), nil
 }
 
 // ValidateAddress checks a 20-byte EVM address.

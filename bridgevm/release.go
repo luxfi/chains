@@ -35,6 +35,8 @@ var (
 	errNoDestClient              = errors.New("bridgevm: no EVM client for destination chain")
 	errBadAttestation            = errors.New("bridgevm: attestation failed local verification")
 	errInsufficientConfirmations = errors.New("bridgevm: source confirmations below minimum")
+	errNoSourceClient            = errors.New("bridgevm: no EVM client for source chain")
+	errNoSourceTx                = errors.New("bridgevm: request names no source transaction")
 	errAlreadyReleased           = errors.New("bridgevm: transfer already released on destination")
 )
 
@@ -149,18 +151,29 @@ func (r *releaser) handle(req *BridgeRequest) {
 		log.Stringer("requestID", req.ID), log.Uint64("nonce", transfer.Nonce))
 }
 
-// releaseOnce re-confirms the source lock from B's OWN view (the trust-gap fix)
-// then runs the release. Confirmation re-check needs the source tx hash, which
-// lives on the request — so it happens here, not in releaseTransfer.
+// releaseOnce confirms the source lock from B's OWN view, then runs the
+// release. The depth check needs the source tx hash, which lives on the
+// request — so it happens here, not in releaseTransfer.
+//
+// The source chain id and the transaction id both arrive in the event data a
+// request is built from, and this is the only place either is checked against a
+// chain: M signs the digest it is handed. A chain this node has no client for,
+// or a request naming no transaction, therefore leaves the lock unobserved, and
+// an unobserved lock releases nothing.
 func (r *releaser) releaseOnce(ctx context.Context, req *BridgeRequest, transfer bridgeattest.BridgeTransfer) error {
-	if src := r.vm.evmClientByID(transfer.SrcChainID); src != nil && req.SourceTxID != ids.Empty {
-		conf, err := src.GetConfirmations(ctx, req.SourceTxID)
-		if err != nil {
-			return fmt.Errorf("bridgevm: source confirmation check: %w", err)
-		}
-		if conf < r.vm.config.MinConfirmations {
-			return fmt.Errorf("%w: %d < %d", errInsufficientConfirmations, conf, r.vm.config.MinConfirmations)
-		}
+	src := r.vm.evmClientByID(transfer.SrcChainID)
+	if src == nil {
+		return fmt.Errorf("%w: srcChainId=%d", errNoSourceClient, transfer.SrcChainID)
+	}
+	if req.SourceTxID == ids.Empty {
+		return fmt.Errorf("%w: request %s", errNoSourceTx, req.ID)
+	}
+	conf, err := src.GetConfirmations(ctx, req.SourceTxID)
+	if err != nil {
+		return fmt.Errorf("bridgevm: source confirmation check: %w", err)
+	}
+	if conf < r.vm.config.MinConfirmations {
+		return fmt.Errorf("%w: %d < %d", errInsufficientConfirmations, conf, r.vm.config.MinConfirmations)
 	}
 	destTx, err := r.vm.releaseTransfer(ctx, transfer)
 	if err != nil {

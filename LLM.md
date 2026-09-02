@@ -199,3 +199,13 @@ which is what `BuildBlock` gates on.
 The bridge's API is the JSON-RPC service in `rpc.go`, and `bridge_health`
 reports what the node can do: a node with no chains wired is not a relayer and
 is healthy, while one that is configured to relay but cannot attest says so.
+
+The depth a release rests on is read again in `release.go` before anything is
+signed, because the count a block carries is written by its proposer and the
+source chain id travels in the same event data. A chain the node has no client
+for, or a request naming no source transaction, leaves the lock unobserved, and
+`releaseOnce` refuses: M signs the digest it is handed and asks nothing about
+the source, so this is the only place a lock is checked against a chain. The
+depth itself is the least advanced answer of every configured endpoint
+(`GetConfirmations`), so an endpoint can hold a release back and cannot
+manufacture one.
