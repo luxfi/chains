@@ -35,6 +35,8 @@ var (
 	errNoDestClient              = errors.New("bridgevm: no EVM client for destination chain")
 	errBadAttestation            = errors.New("bridgevm: attestation failed local verification")
 	errInsufficientConfirmations = errors.New("bridgevm: source confirmations below minimum")
+	errNoSourceClient            = errors.New("bridgevm: no client for the source chain, so its lock cannot be observed")
+	errNoSourceTx                = errors.New("bridgevm: request names no source transaction, so there is no lock to observe")
 	errAlreadyReleased           = errors.New("bridgevm: transfer already released on destination")
 )
 
@@ -164,14 +166,32 @@ func (r *releaser) handle(req *BridgeRequest) {
 // then runs the release. Confirmation re-check needs the source tx hash, which
 // lives on the request — so it happens here, not in releaseTransfer.
 func (r *releaser) releaseOnce(ctx context.Context, req *BridgeRequest, transfer bridgeattest.BridgeTransfer) error {
-	if src := r.vm.evmClientByID(transfer.SrcChainID); src != nil && req.SourceTxID != ids.Empty {
-		conf, err := src.GetConfirmations(ctx, req.SourceTxID)
-		if err != nil {
-			return fmt.Errorf("bridgevm: source confirmation check: %w", err)
-		}
-		if conf < r.vm.config.MinConfirmations {
-			return fmt.Errorf("%w: %d < %d", errInsufficientConfirmations, conf, r.vm.config.MinConfirmations)
-		}
+	// AN UNOBSERVED LOCK RELEASES NOTHING. Both the source chain id and the
+	// source transaction id arrive in the event data a request is built from,
+	// and this is the only place either is checked against a chain — M signs
+	// the digest it is handed and asks nothing about the source. Skipping the
+	// check when the chain is unknown or the transaction absent therefore let a
+	// caller choose to be unchecked, and went on to request the custody
+	// signature that authorizes the mint.
+	//
+	// What the check establishes is narrow, and worth stating: it reads the
+	// receipt's status and block number. It does not decode the lock event, and
+	// nothing here compares the cited transaction to this transfer, so it shows
+	// the named transaction succeeded and is buried — not that it is THIS
+	// transfer's lock.
+	src := r.vm.evmClientByID(transfer.SrcChainID)
+	if src == nil {
+		return fmt.Errorf("%w: srcChainId=%d", errNoSourceClient, transfer.SrcChainID)
+	}
+	if req.SourceTxID == ids.Empty {
+		return fmt.Errorf("%w: requestID=%s", errNoSourceTx, req.ID)
+	}
+	conf, err := src.GetConfirmations(ctx, req.SourceTxID)
+	if err != nil {
+		return fmt.Errorf("bridgevm: source confirmation check: %w", err)
+	}
+	if conf < r.vm.config.MinConfirmations {
+		return fmt.Errorf("%w: %d < %d", errInsufficientConfirmations, conf, r.vm.config.MinConfirmations)
 	}
 	destTx, err := r.vm.releaseTransfer(ctx, transfer)
 	if err != nil {

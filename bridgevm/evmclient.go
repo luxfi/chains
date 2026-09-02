@@ -28,6 +28,7 @@ import (
 	"crypto/ecdsa"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"strings"
 	"sync"
@@ -205,23 +206,48 @@ func (c *evmChainClient) GetTransaction(ctx context.Context, txID ids.ID) (inter
 // GetConfirmations returns head-height − txBlock + 1 from B's OWN view of the
 // chain. This is the fix for the trust gap: confirmations are observed here, not
 // taken on faith from whoever submitted the bridge request.
+// GetConfirmations reports how deeply the source lock is buried, as the LEAST
+// advanced answer any configured endpoint gives.
+//
+// It is the number a release is gated on, and it used to come from endpoints[0]
+// alone. Verifying every endpoint at dial time then trusting one of them
+// afterwards buys nothing for the decision that matters: a single endpoint
+// could present a one-block-deep lock as a hundred deep and the release would
+// proceed. Taking the minimum inverts who can do what — an endpoint can hold a
+// release back, and none can manufacture one.
 func (c *evmChainClient) GetConfirmations(ctx context.Context, txID ids.ID) (uint32, error) {
-	rcpt, err := c.primary().TransactionReceipt(ctx, common.BytesToHash(txID[:]))
-	if err != nil {
-		return 0, err
+	// The loop needs something to be less than and so starts at the maximum.
+	// With no endpoints nothing lowers it and the seed would be the answer: a
+	// depth of infinity, with no error, clearing any minimum.
+	if len(c.endpoints) == 0 {
+		return 0, fmt.Errorf("bridgevm: chain %q: no endpoint to confirm against", c.name)
 	}
-	if rcpt.Status != types.ReceiptStatusSuccessful {
-		return 0, fmt.Errorf("bridgevm: chain %q: source tx %x reverted", c.name, txID[:])
+	hash := common.BytesToHash(txID[:])
+	least := uint64(math.MaxUint64)
+	for i, ep := range c.endpoints {
+		rcpt, err := ep.TransactionReceipt(ctx, hash)
+		if err != nil {
+			return 0, fmt.Errorf("bridgevm: chain %q: endpoint %q: receipt for %x: %w", c.name, c.rawEndpoints[i], txID[:], err)
+		}
+		if rcpt.Status != types.ReceiptStatusSuccessful {
+			return 0, fmt.Errorf("bridgevm: chain %q: source tx %x reverted", c.name, txID[:])
+		}
+		head, err := ep.BlockNumber(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("bridgevm: chain %q: endpoint %q: head: %w", c.name, c.rawEndpoints[i], err)
+		}
+		var depth uint64
+		if txBlk := rcpt.BlockNumber.Uint64(); head >= txBlk {
+			depth = head - txBlk + 1
+		}
+		if depth < least {
+			least = depth
+		}
 	}
-	head, err := c.primary().BlockNumber(ctx)
-	if err != nil {
-		return 0, err
+	if least > math.MaxUint32 {
+		least = math.MaxUint32
 	}
-	txBlk := rcpt.BlockNumber.Uint64()
-	if head < txBlk {
-		return 0, nil
-	}
-	return uint32(head - txBlk + 1), nil
+	return uint32(least), nil
 }
 
 // ValidateAddress checks a 20-byte EVM address.
