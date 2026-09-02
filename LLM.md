@@ -205,7 +205,13 @@ signed, because the count a block carries is written by its proposer and the
 source chain id travels in the same event data. A chain the node has no client
 for, or a request naming no source transaction, leaves the lock unobserved, and
 `releaseOnce` refuses: M signs the digest it is handed and asks nothing about
-the source, so this is the only place a lock is checked against a chain. The
+the source, so this is the only place a lock is checked against a chain.
+
+That check reads the receipt's status and block number only. It does not decode
+the lock event, and nothing compares the cited transaction to the transfer, so
+what it establishes is that the named transaction succeeded and is buried —
+not that it is this transfer's lock. Any unrelated deep successful transaction
+on the right chain satisfies it. The
 depth itself is the least advanced answer of every configured endpoint
 (`GetConfirmations`), so an endpoint can hold a release back and cannot
 manufacture one.

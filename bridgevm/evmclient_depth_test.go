@@ -144,3 +144,19 @@ func TestDepthOfAgreeingEndpoints(t *testing.T) {
 		t.Fatalf("depth = %d, want 10", got)
 	}
 }
+
+// A client with no endpoint cannot report a depth, and must not report the seed
+// the loop starts from — that seed is the maximum, so it clears every minimum a
+// release is gated on. Reached only by constructing the client directly, which
+// is the point: the refusal belongs in the function that answers, not only in
+// the constructor that happens to guard it today.
+func TestDepthRefusesWithNoEndpoints(t *testing.T) {
+	c := &evmChainClient{name: "lux"}
+	got, err := c.GetConfirmations(context.Background(), ids.ID{1})
+	if err == nil {
+		t.Fatalf("a client with no endpoints answered depth %d with no error", got)
+	}
+	if got != 0 {
+		t.Errorf("depth %d returned alongside an error; it must be 0", got)
+	}
+}

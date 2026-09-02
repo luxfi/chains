@@ -282,6 +282,16 @@ func (c *evmChainClient) GetTransaction(ctx context.Context, txID ids.ID) (inter
 // rest of the set.
 func (c *evmChainClient) GetConfirmations(ctx context.Context, txID ids.ID) (uint32, error) {
 	hash := common.BytesToHash(txID[:])
+	// The loop below reports the LEAST advanced answer, so it needs something
+	// to be less than and starts at the maximum. With no endpoints there is
+	// nothing to lower it and the seed is what would be returned: a depth of
+	// infinity, with a nil error, clearing any minimum a release is gated on.
+	// newEVMChainClient refuses an empty list today, so nothing reaches this —
+	// but a function whose whole purpose is to fail closed should not be one
+	// constructor away from answering "deep enough" about a chain it cannot see.
+	if len(c.endpoints) == 0 {
+		return 0, fmt.Errorf("bridgevm: chain %q: no endpoint to confirm against", c.name)
+	}
 	least := uint64(math.MaxUint64)
 	for i, ep := range c.endpoints {
 		rcpt, err := ep.TransactionReceipt(ctx, hash)

@@ -160,6 +160,14 @@ func (r *releaser) handle(req *BridgeRequest) {
 // chain: M signs the digest it is handed. A chain this node has no client for,
 // or a request naming no transaction, therefore leaves the lock unobserved, and
 // an unobserved lock releases nothing.
+//
+// WHAT IT DOES NOT ESTABLISH. The check reads the receipt's status and block
+// number and nothing else. It never decodes the logs, and nothing here compares
+// the cited transaction to this transfer — so it establishes that the named
+// transaction succeeded and is buried, not that it is THIS transfer's lock. A
+// request citing any unrelated deep successful transaction on the right chain
+// passes it. Binding the two needs the lock event decoded and its fields
+// matched against the transfer, which this does not do.
 func (r *releaser) releaseOnce(ctx context.Context, req *BridgeRequest, transfer bridgeattest.BridgeTransfer) error {
 	src := r.vm.evmClientByID(transfer.SrcChainID)
 	if src == nil {
