@@ -240,7 +240,9 @@ func TestAnEVMClientRefusesTheWrongNetwork(t *testing.T) {
 	node := newEVMNode(999)
 	cfg := chainCfg("zoo", uint64(dstChain), node.serve(t))
 	_, err := newEVMChainClient(context.Background(), cfg, relayerKey(t), nil)
-	require.ErrorContains(t, err, "endpoint reports chainId")
+	// The refusal names the endpoint between "endpoint" and "reports", so the
+	// assertion is on the claim itself: which chain it answered with.
+	require.ErrorContains(t, err, "reports chainId 999")
 
 	node.fail["eth_chainId"] = "no"
 	_, err = newEVMChainClient(context.Background(), cfg, relayerKey(t), nil)
