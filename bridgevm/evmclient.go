@@ -53,14 +53,23 @@ const defaultReleaseGasLimit uint64 = 300_000
 // resolved by the VM's KeyProvider at Initialize; the private key never lives in
 // genesis, config JSON, or logs.
 type ExternalChainConfig struct {
-	Name          string   `json:"name"`                    // logical key, e.g. "zoo-testnet", "lux-testnet-c"
-	ChainID       uint64   `json:"chainId"`                 // EVM chain id (200201, 96368)
-	RPCEndpoints  []string `json:"rpcEndpoints"`            // 1..N validator RPCs; release broadcast to ALL
-	Gateway       string   `json:"gateway"`                 // BridgeGateway contract address (0x..)
-	CustodySigner string   `json:"custodySigner"`           // MPC custody signer EVM address baked into the gateway
-	MinGasPrice   string   `json:"minGasPrice,omitempty"`   // wei floor; release uses max(suggested, floor)
-	GasLimit      uint64   `json:"gasLimit,omitempty"`      // release call gas limit (default 300000)
-	GasKeyKMSPath string   `json:"gasKeyKmsPath,omitempty"` // KMS path for the relayer key — NEVER inline
+	Name          string   `json:"name"`          // logical key, e.g. "zoo-testnet", "lux-testnet-c"
+	ChainID       uint64   `json:"chainId"`       // EVM chain id (200201, 96368)
+	RPCEndpoints  []string `json:"rpcEndpoints"`  // 1..N validator RPCs; release broadcast to ALL
+	Gateway       string   `json:"gateway"`       // BridgeGateway contract address (0x..)
+	CustodySigner string   `json:"custodySigner"` // MPC custody signer EVM address baked into the gateway
+	// Genesis commits to WHICH chain bears ChainID: the hash of block 0, as
+	// 0x-prefixed hex. A chain id is not an identity — a fork inherits the id of
+	// the chain it left, so a forked endpoint answers eth_chainId correctly and
+	// the id check cannot see it. This is the same commitment
+	// vms/platformvm/adopt.Record calls Identity, where it is required.
+	//
+	// Left unset, that question is unanswered for this chain and startup says
+	// so by name.
+	Genesis       string `json:"genesis,omitempty"`
+	MinGasPrice   string `json:"minGasPrice,omitempty"`   // wei floor; release uses max(suggested, floor)
+	GasLimit      uint64 `json:"gasLimit,omitempty"`      // release call gas limit (default 300000)
+	GasKeyKMSPath string `json:"gasKeyKmsPath,omitempty"` // KMS path for the relayer key — NEVER inline
 }
 
 // ReleaseCall is the typed payload SendTransaction expects. It binds one
@@ -169,13 +178,53 @@ func newEVMChainClient(ctx context.Context, cfg ExternalChainConfig, gasKey *ecd
 		clients = append(clients, c)
 	}
 
-	// Refuse a mismatched network: the primary endpoint must report cfg.ChainID.
-	got, err := clients[0].ChainID(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("bridgevm: chain %q: eth_chainId: %w", cfg.Name, err)
+	// Refuse a mismatched network — every endpoint, not just the first. Reads go
+	// to the primary, but a signed release is broadcast to all of them
+	// (broadcastRelease, and RPCEndpoints says so on its own field), so an
+	// endpoint nobody asked what chain it was on still received a signed
+	// transaction.
+	//
+	// What this establishes is that each endpoint answers with the chain id we
+	// configured. It does not establish that they are the same chain: a fork
+	// reports the id of the chain it left, so a forked endpoint passes here.
+	// Telling those apart takes a commitment to the genesis rather than to the
+	// id — vms/platformvm/adopt.Record.Identity is that commitment, and it is
+	// not consulted from this path yet.
+	var wantGenesis *common.Hash
+	if g := strings.TrimSpace(cfg.Genesis); g != "" {
+		if !isHash32(g) {
+			return nil, fmt.Errorf("bridgevm: chain %q: genesis %q is not a 32-byte hex hash", cfg.Name, cfg.Genesis)
+		}
+		h := common.HexToHash(g)
+		wantGenesis = &h
+	} else if logger != nil {
+		logger.Warn("bridgevm: chain adopted on its chain id alone",
+			log.String("chain", cfg.Name),
+			log.String("note", "no genesis configured, so a fork of this chain is indistinguishable from it"),
+		)
 	}
-	if got.Cmp(chainID) != 0 {
-		return nil, fmt.Errorf("bridgevm: chain %q: endpoint reports chainId %s, config says %s", cfg.Name, got, chainID)
+
+	for i, c := range clients {
+		got, err := c.ChainID(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("bridgevm: chain %q: endpoint %q: eth_chainId: %w", cfg.Name, cfg.RPCEndpoints[i], err)
+		}
+		if got.Cmp(chainID) != 0 {
+			return nil, fmt.Errorf("bridgevm: chain %q: endpoint %q reports chainId %s, config says %s", cfg.Name, cfg.RPCEndpoints[i], got, chainID)
+		}
+		if wantGenesis == nil {
+			continue
+		}
+		// Block 0 rather than any later block: it is the one block a fork
+		// shares with the chain it left only if it forked at height 0, which
+		// is not a fork but a different chain.
+		head, err := c.HeaderByNumber(ctx, new(big.Int))
+		if err != nil {
+			return nil, fmt.Errorf("bridgevm: chain %q: endpoint %q: genesis header: %w", cfg.Name, cfg.RPCEndpoints[i], err)
+		}
+		if h := head.Hash(); h != *wantGenesis {
+			return nil, fmt.Errorf("bridgevm: chain %q: endpoint %q is on chainId %s but genesis %s, config says %s", cfg.Name, cfg.RPCEndpoints[i], got, h, wantGenesis)
+		}
 	}
 
 	gasAddr := common.BytesToAddress(crypto.PubkeyToAddress(gasKey.PublicKey).Bytes())
@@ -194,6 +243,24 @@ func newEVMChainClient(ctx context.Context, cfg ExternalChainConfig, gasKey *ecd
 		rawEndpoints: append([]string(nil), cfg.RPCEndpoints...),
 		log:          logger,
 	}, nil
+}
+
+// isHash32 reports whether s is 0x followed by exactly 64 hex digits.
+// common.HexToHash silently zero-pads anything shorter and truncates anything
+// longer, so a typo would otherwise become a valid-looking hash that no chain
+// can match — a refusal at startup naming the config is the better answer.
+func isHash32(s string) bool {
+	if len(s) != 66 || s[0] != '0' || (s[1] != 'x' && s[1] != 'X') {
+		return false
+	}
+	for _, r := range s[2:] {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f', r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (c *evmChainClient) primary() *ethclient.Client { return c.endpoints[0] }
