@@ -4,7 +4,7 @@
 package bridgevm
 
 import (
-	"github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/chains/fee"
 )
 
 // gateUserBridgeFee refuses a bridge transfer whose declared fee does not meet

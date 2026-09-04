@@ -30,7 +30,6 @@ import (
 	"github.com/luxfi/database/versiondb"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	nodefee "github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/timer/mockable"
 	vmcore "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
@@ -152,7 +151,7 @@ type VM struct {
 	// Admission policy (node/vms/types/fee). Orthogonal to settlement: this is
 	// the boot-time floor declaration Manager validates; the per-op burn is done
 	// through `ledger`. Kept so the chain still satisfies the zero-fee refusal.
-	feePolicy nodefee.Policy
+	feePolicy fee.Policy
 
 	// Block bookkeeping, under stateLock.
 	pendingBlocks map[ids.ID]*Block
@@ -223,7 +222,7 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 
 	vm.ledger = fee.NewLedger(vm.versdb)
 	vm.feePolicy = newFeePolicy(vm.networkID)
-	if err := nodefee.Validate(vm.feePolicy); err != nil {
+	if err := fee.Validate(vm.feePolicy); err != nil {
 		return fmt.Errorf("keyvm: fee policy: %w", err)
 	}
 

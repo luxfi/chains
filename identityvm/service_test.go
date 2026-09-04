@@ -16,8 +16,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/luxfi/chains/fee"
 	"github.com/luxfi/ids"
-	"github.com/luxfi/node/vms/types/fee"
 )
 
 // rpc drives the JSON-RPC server the node mounts, which is what a client

@@ -5,7 +5,7 @@ package chain
 
 import (
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms"
+	"github.com/luxfi/vm/manager"
 )
 
 // Factory builds one chain's VM. The zero VM is the whole of it: a VM gets its
@@ -14,7 +14,7 @@ import (
 // that decide what a fresh VM holds, and they drift.
 type Factory[T any] struct{}
 
-var _ vms.Factory = Factory[struct{}]{}
+var _ manager.Factory = Factory[struct{}]{}
 
 // New returns a VM with nothing set. Initialize does the rest.
 func (Factory[T]) New(log.Logger) (interface{}, error) { return new(T), nil }

@@ -9,7 +9,14 @@ package oraclevm
 // caller that constructs a VM through this shim transitively gets the
 // NoUserTxPolicy{} declared in ~/work/lux/oracle/vm/feegate.go.
 //
+// The policy value this shim hands back is the one luxfi/oracle constructs, and
+// luxfi/oracle v1.1.1 still builds it from the node's fee package. So the test
+// beside this file asserts against that package and not against
+// github.com/luxfi/chains/fee: the two declare the same shape under the same
+// name, but they are different types, and a test may only claim the type the
+// value actually has. O-Chain reaches a node-free closure when luxfi/oracle
+// programs against the chains fee surface; nothing in this repo can move it.
+//
 // See:
 //   - oraclevm.go: re-export shim
-//   - ~/work/lux/oracle/vm/feegate.go: canonical NoUserTxPolicy
-//   - ~/work/lux/node/CLAUDE.md FeePolicy section
+//   - luxfi/oracle/vm: canonical NoUserTxPolicy

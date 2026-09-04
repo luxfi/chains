@@ -4,8 +4,8 @@
 package fhevm
 
 import (
+	"github.com/luxfi/chains/fee"
 	"github.com/luxfi/constants"
-	nodefee "github.com/luxfi/node/vms/types/fee"
 )
 
 // newFeePolicy returns the F-Chain ADMISSION policy: a non-zero floor so the
@@ -17,13 +17,13 @@ import (
 // fee, driven in block Accept) performs the actual per-operation debit + burn,
 // priced by the per-scheme gas schedule (gas.go). The floor declared here is
 // below MinScheduledFee(), so the two surfaces agree — proven in gas_test.go.
-func newFeePolicy(networkID uint32) nodefee.Policy {
-	return nodefee.FlatPolicy{
-		Fee:     nodefee.MinTxFeeFloor,
+func newFeePolicy(networkID uint32) fee.Policy {
+	return fee.FlatPolicy{
+		Fee:     fee.MinTxFeeFloor,
 		AssetID: constants.UTXOAssetIDFor(networkID),
 	}
 }
 
 // FeePolicy exposes the chain's declared admission policy for diagnostics and
 // the boot-time Validate gate.
-func (vm *VM) FeePolicy() nodefee.Policy { return vm.feePolicy }
+func (vm *VM) FeePolicy() fee.Policy { return vm.feePolicy }

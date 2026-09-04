@@ -20,10 +20,10 @@ import (
 	grjson "github.com/gorilla/rpc/v2/json2"
 
 	"github.com/luxfi/chains/chain"
+	"github.com/luxfi/chains/fee"
 	"github.com/luxfi/consensus/core/choices"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/runtime"
 	vmcore "github.com/luxfi/vm"
 	vmchain "github.com/luxfi/vm/chain"
