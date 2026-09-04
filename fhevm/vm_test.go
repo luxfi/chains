@@ -22,7 +22,6 @@ import (
 	"github.com/luxfi/database/memdb"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	nodefee "github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/runtime"
 	vmcore "github.com/luxfi/vm"
 )
@@ -523,7 +522,7 @@ func TestLifecycleCallsAreAnswered(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, h)
 
-	require.Equal(t, nodefee.MinTxFeeFloor, vm.FeePolicy().(nodefee.FlatPolicy).Fee)
+	require.Equal(t, fee.MinTxFeeFloor, vm.FeePolicy().(fee.FlatPolicy).Fee)
 
 	// A factory-built VM holds nothing until Initialize.
 	raw, err := (&Factory{}).New(log.NewNoOpLogger())

@@ -8,7 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	nodefee "github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/chains/fee"
 )
 
 // TestGas_PerSchemeDistinct proves the cost model is real: a TFHE boolean, a
@@ -35,17 +35,17 @@ func TestGas_AllOperationsMeetFloor(t *testing.T) {
 			for scheme := range schemeGas {
 				f, err := FeeFor(&Transaction{Type: op, Scheme: scheme})
 				require.NoError(t, err)
-				require.GreaterOrEqualf(t, f, nodefee.MinTxFeeFloor,
-					"op %d scheme %s fee %d below floor %d", op, scheme, f, nodefee.MinTxFeeFloor)
+				require.GreaterOrEqualf(t, f, fee.MinTxFeeFloor,
+					"op %d scheme %s fee %d below floor %d", op, scheme, f, fee.MinTxFeeFloor)
 			}
 			continue
 		}
 		f, err := FeeFor(&Transaction{Type: op})
 		require.NoError(t, err)
-		require.GreaterOrEqualf(t, f, nodefee.MinTxFeeFloor,
-			"op %d fee %d below floor %d", op, f, nodefee.MinTxFeeFloor)
+		require.GreaterOrEqualf(t, f, fee.MinTxFeeFloor,
+			"op %d fee %d below floor %d", op, f, fee.MinTxFeeFloor)
 	}
-	require.GreaterOrEqual(t, MinScheduledFee(), nodefee.MinTxFeeFloor,
+	require.GreaterOrEqual(t, MinScheduledFee(), fee.MinTxFeeFloor,
 		"the cheapest scheduled fee must satisfy the admission floor")
 }
 

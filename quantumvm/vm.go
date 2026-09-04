@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/rpc/v2"
+	"github.com/luxfi/chains/fee"
 	"github.com/luxfi/chains/internal/codec"
 	"github.com/luxfi/chains/quantumvm/config"
 	"github.com/luxfi/chains/quantumvm/quantum"
@@ -22,7 +23,6 @@ import (
 	"github.com/luxfi/database/versiondb"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/timer/mockable"
 	"github.com/luxfi/version"
 	luxvm "github.com/luxfi/vm"

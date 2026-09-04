@@ -6,8 +6,8 @@ package quantumvm
 import (
 	"fmt"
 
+	"github.com/luxfi/chains/fee"
 	"github.com/luxfi/ids"
-	"github.com/luxfi/node/vms/types/fee"
 )
 
 // Per LP-0130 §6, Q-Chain has NO user-payable blockspace: finality-cert

@@ -6,7 +6,7 @@ package schain
 import (
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms"
+	"github.com/luxfi/vm/manager"
 )
 
 var (
@@ -15,13 +15,13 @@ var (
 	// byte pattern dexvm uses (dexvm/factory.go:31, ids.ID{'d','e','x','v','m'}).
 	VMID = ids.ID{'s', 'c', 'h', 'a', 'i', 'n'}
 
-	_ vms.Factory = (*Factory)(nil)
+	_ manager.Factory = (*Factory)(nil)
 )
 
 // Factory creates new S-Chain VM instances for the chains manager.
 type Factory struct{}
 
-// New implements vms.Factory. It returns a ChainVM (which implements
+// New implements manager.Factory. It returns a ChainVM (which implements
 // chain.ChainVM) for the chains manager to drive. Unlike dexvm, the storage VM
 // allocates no GPU session — there is no latency-critical compute on its hot
 // path; manifest commits are pure database writes.

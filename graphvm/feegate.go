@@ -3,7 +3,7 @@
 
 package graphvm
 
-import "github.com/luxfi/node/vms/types/fee"
+import "github.com/luxfi/chains/fee"
 
 // newFeePolicy returns the canonical G-Chain FeePolicy.
 //

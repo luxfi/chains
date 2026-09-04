@@ -260,6 +260,35 @@ the discipline in their own code and are the shape it was generalised from;
 schain and quantumvm are partway. graphvm is NOT on it and does not need to be —
 it writes nothing at all, so there is no partial state to have.
 
+## What a plugin programs against
+
+A VM here ships as its own binary. The daemon that loads it is not in its
+dependency closure and must not be: `go list -deps ./<vm>/...` names no
+`github.com/luxfi/node`. The four surfaces a VM used to reach into the daemon
+for now have their own homes:
+
+| what the VM needs | where it lives |
+| --- | --- |
+| fee admission (`Policy`, `FlatPolicy`, `NoUserTxPolicy`, `Validate`) | `github.com/luxfi/chains/fee` — beside settlement, one fee package |
+| cross-chain artifacts (`CredentialProof`, the `Artifact` interface, suites) | `github.com/luxfi/chains/artifacts` |
+| the factory the daemon registers | `github.com/luxfi/vm/manager.Factory` |
+| protocol + semantic version | `github.com/luxfi/version` |
+
+Two of those are ordinary modules the daemon also reads, so there is no shim
+between a VM and them — importing the module directly is the whole mechanism.
+
+The GPU switch is gone rather than moved. It was a process-global set during
+daemon startup; a plugin is a different process and could never observe it, so
+it always read its default. `FHEOptions.Backend` is now the only switch, which
+is what a plugin actually had.
+
+O-Chain and R-Chain are the exception, and the reason is upstream: `oraclevm`
+and `relayvm` are re-export shims over `luxfi/oracle` and `luxfi/relay`, whose
+own `/vm` packages still build fee policies and artifacts from the daemon. They
+reach a clean closure when those two repos make this same cut; nothing here can
+move them, and their fee tests name the daemon's fee package because that is the
+type their value actually has.
+
 ## Sibling repos
 
 See the org-level `LLM.md` at `/Users/a/work/lux/luxfi/LLM.md` for the full inventory of sibling repos and inter-repo dependencies.
