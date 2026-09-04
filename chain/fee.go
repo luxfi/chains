@@ -4,9 +4,9 @@
 package chain
 
 import (
+	"github.com/luxfi/chains/fee"
 	"github.com/luxfi/constants"
 	"github.com/luxfi/ids"
-	nodefee "github.com/luxfi/node/vms/types/fee"
 )
 
 // Fee is what a chain charges to admit a user transaction, and the check that
@@ -16,23 +16,23 @@ import (
 // what the chain costs to submit to, while the actual per-operation debit and
 // burn happen inside consensus against the payer's on-chain balance
 // (github.com/luxfi/chains/fee). A chain declares one of these at Initialize;
-// the node's boot-time nodefee.Validate reads it.
+// the node's boot-time fee.Validate reads it.
 //
 // The zero Fee admits nothing, so a chain that forgets to declare one refuses
 // every caller rather than admitting every caller.
 type Fee struct {
-	policy nodefee.Policy
+	policy fee.Policy
 	asset  ids.ID
 }
 
 // Floor is the canonical declaration for a chain that accepts user-submitted
 // work: the network's UTXO asset at the minimum transaction fee. A chain with
-// a user-facing entry MUST charge at least this, or nodefee.Validate flags it
+// a user-facing entry MUST charge at least this, or fee.Validate flags it
 // at boot as a zero-fee user-facing chain.
 func Floor(networkID uint32) Fee {
 	asset := constants.UTXOAssetIDFor(networkID)
 	return Fee{
-		policy: nodefee.FlatPolicy{Fee: nodefee.MinTxFeeFloor, AssetID: asset},
+		policy: fee.FlatPolicy{Fee: fee.MinTxFeeFloor, AssetID: asset},
 		asset:  asset,
 	}
 }
@@ -42,7 +42,7 @@ func Floor(networkID uint32) Fee {
 // Every caller is refused, so an entry that exposes itself as user-callable
 // still refuses explicitly instead of by omission.
 func Closed() Fee {
-	return Fee{policy: nodefee.NoUserTxPolicy{}, asset: nodefee.NoUserTxPolicy{}.FeeAssetID()}
+	return Fee{policy: fee.NoUserTxPolicy{}, asset: fee.NoUserTxPolicy{}.FeeAssetID()}
 }
 
 // Admit refuses a payment the declaration does not cover. Every user-facing
@@ -50,10 +50,10 @@ func Closed() Fee {
 // is reachable.
 func (f Fee) Admit(paid uint64) error {
 	if f.policy == nil {
-		return nodefee.ErrChainAcceptsNoUserTxs
+		return fee.ErrChainAcceptsNoUserTxs
 	}
 	return f.policy.ValidateFee(paid, f.asset)
 }
 
 // Policy is the declaration itself, for diagnostics and the boot-time gate.
-func (f Fee) Policy() nodefee.Policy { return f.policy }
+func (f Fee) Policy() fee.Policy { return f.policy }

@@ -55,7 +55,6 @@ import (
 	"github.com/luxfi/database/versiondb"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	nodefee "github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/timer/mockable"
 	vmcore "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
@@ -186,7 +185,7 @@ type VM struct {
 	// Admission policy (node/vms/types/fee). Orthogonal to settlement: this is
 	// the boot-time floor declaration Manager validates; the per-op burn is done
 	// through `ledger`.
-	feePolicy nodefee.Policy
+	feePolicy fee.Policy
 
 	// Consensus mempool. `claims` holds the effect of every queued transaction
 	// so admission can refuse a second claim on it, and `queued` the highest
@@ -287,7 +286,7 @@ func (vm *VM) Initialize(ctx context.Context, init vmcore.Init) error {
 
 	vm.ledger = fee.NewLedger(vm.versdb)
 	vm.feePolicy = newFeePolicy(vm.networkID)
-	if err := nodefee.Validate(vm.feePolicy); err != nil {
+	if err := fee.Validate(vm.feePolicy); err != nil {
 		return fmt.Errorf("fhevm: fee policy: %w", err)
 	}
 

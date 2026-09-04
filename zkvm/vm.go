@@ -24,8 +24,8 @@ import (
 	vmchain "github.com/luxfi/vm/chain"
 	"github.com/luxfi/warp"
 
-	"github.com/luxfi/node/version"
-	"github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/chains/fee"
+	"github.com/luxfi/version"
 )
 
 var (

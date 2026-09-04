@@ -1,15 +1,19 @@
-// Copyright (C) 2019-2026, Lux Industries Inc. All rights reserved.
-// See the file LICENSE for licensing terms.
+// Copyright (c) 2019-2026 Lux Industries Inc.
+// SPDX-License-Identifier: BSD-3-Clause-Eco
 
-// Package fee is the native fee/gas SETTLEMENT primitive for Lux service
-// chains (K-Chain keyvm today; M-Chain and F-Chain next). It is the half the
-// 2026-05 fee audit found missing: node/vms/types/fee declares an ADMISSION
-// policy (is a submitted fee acceptable at the gate?), but nothing could
-// actually METER, DEBIT, and BURN a fee during block execution the way the
-// C-Chain EVM does (evm/core/state_transition.go buyGas: balance check ->
-// ErrInsufficientFunds -> SubBalance). Service chains charged "fees" that were
-// unbacked integers a caller wrote into a JSON request — never settled against
-// real on-chain balance.
+// Package fee is the whole native fee model of a Lux service chain: the
+// ADMISSION policy a VM declares at boot (policy.go) and the SETTLEMENT
+// mechanism that meters, debits and burns the admitted fee during block
+// execution (balance.go, meter.go, settle.go).
+//
+// Admission is the half every user-facing chain must declare: a Policy whose
+// MinTxFee is > 0, or the NoUserTxPolicy sentinel for committee-only chains,
+// checked once by Validate. Settlement is the half the 2026-05 fee audit found
+// missing: nothing could actually METER, DEBIT, and BURN a fee during block
+// execution the way the C-Chain EVM does (evm/core/state_transition.go buyGas:
+// balance check -> ErrInsufficientFunds -> SubBalance). Service chains charged
+// "fees" that were unbacked integers a caller wrote into a JSON request —
+// never settled against real on-chain balance.
 //
 // This package supplies the three pillars those chains lacked, modelled on the
 // EVM's buyGas but for the native account model (P/X-Chain style direct usage,
@@ -34,18 +38,13 @@
 //     INSIDE consensus block processing, atomically with the operation's state
 //     effect via the VM's versiondb commit — never in a synchronous RPC.
 //
-// Orthogonality. This package is deliberately separate from, and complementary
-// to, node/vms/types/fee: that package is ADMISSION POLICY (the boot-time floor
-// declaration Manager validates); this package is SETTLEMENT MECHANISM (the
-// per-block debit+burn). A VM declares a Policy AND settles through a Ledger;
-// the two compose, they do not overlap. The schedule of "which operation costs
-// how much gas" is supplied BY THE VM (keyvm prices per cryptographic
-// algorithm) — this package is the pure mechanism, the VM owns the values.
+// Orthogonality. Admission and settlement are two files of one package, not
+// one mechanism: a VM declares a Policy AND settles through a Ledger; the two
+// compose, they do not overlap. The schedule of "which operation costs how
+// much gas" is supplied BY THE VM (keyvm prices per cryptographic algorithm) —
+// this package is the pure mechanism, the VM owns the values.
 //
-// It lives in the chains module (not node) on purpose: a service VM must be
-// able to build and settle fees under the reproducible GOWORK=off build, where
-// the chains module resolves a pinned node from the module cache and therefore
-// cannot see VM-local additions made to the node tree. Keeping the settlement
-// primitive beside the VMs that use it is what makes it buildable and reusable
-// by K/M/F under that build.
+// It lives in the chains module on purpose: the VMs are plugin binaries built
+// without the node daemon in their dependency closure, so the fee surface they
+// program against must live beside them.
 package fee

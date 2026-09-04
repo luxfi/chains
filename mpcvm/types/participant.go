@@ -11,7 +11,7 @@ import (
 )
 
 // NodeID identifies a Lux validator. Same definition as the rest of
-// luxfi/node — 32 bytes, content-addressed.
+// the platform — 32 bytes, content-addressed.
 type NodeID [32]byte
 
 // Participant is one validator selected (via stake-weighted VRF) into

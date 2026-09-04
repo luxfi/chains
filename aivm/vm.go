@@ -59,9 +59,9 @@ import (
 	vmcore "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
 
+	"github.com/luxfi/chains/fee"
 	"github.com/luxfi/consensus/engine/dag/vertex"
-	"github.com/luxfi/node/version"
-	"github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/version"
 
 	"github.com/luxfi/ai/pkg/aivm"
 	"github.com/luxfi/ai/pkg/attestation"

@@ -4,7 +4,7 @@
 package zkvm
 
 import (
-	"github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/chains/fee"
 )
 
 // gateUserTx admits a user-submitted Transaction iff its declared Fee

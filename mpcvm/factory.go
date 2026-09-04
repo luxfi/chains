@@ -6,10 +6,10 @@ package mpcvm
 import (
 	"github.com/luxfi/constants"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms"
+	"github.com/luxfi/vm/manager"
 )
 
-var _ vms.Factory = (*Factory)(nil)
+var _ manager.Factory = (*Factory)(nil)
 
 // VMID identifies M-Chain: MPC threshold signing and bridge custody of external
 // wallets (LP-7100). It is constants.MPCVMID and nothing else.

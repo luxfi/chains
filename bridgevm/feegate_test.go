@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"github.com/luxfi/chains/chain"
+	"github.com/luxfi/chains/fee"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms/types/fee"
 )
 
 // newBridgeVMWithPolicy wires a VM with the canonical FlatPolicy

@@ -4,8 +4,8 @@
 package keyvm
 
 import (
+	"github.com/luxfi/chains/fee"
 	"github.com/luxfi/constants"
-	nodefee "github.com/luxfi/node/vms/types/fee"
 )
 
 // newFeePolicy returns the K-Chain ADMISSION policy: a non-zero floor so the
@@ -20,13 +20,13 @@ import (
 // gas_test.go. The old per-RPC "fee is a uint64 the caller writes into the JSON
 // request" gate is GONE: a fee is never an unbacked integer, it is gas metered
 // and burned from the payer's on-chain balance inside consensus.
-func newFeePolicy(networkID uint32) nodefee.Policy {
-	return nodefee.FlatPolicy{
-		Fee:     nodefee.MinTxFeeFloor,
+func newFeePolicy(networkID uint32) fee.Policy {
+	return fee.FlatPolicy{
+		Fee:     fee.MinTxFeeFloor,
 		AssetID: constants.UTXOAssetIDFor(networkID),
 	}
 }
 
 // FeePolicy exposes the chain's declared admission policy for diagnostics and
 // the boot-time Validate gate.
-func (vm *VM) FeePolicy() nodefee.Policy { return vm.feePolicy }
+func (vm *VM) FeePolicy() fee.Policy { return vm.feePolicy }

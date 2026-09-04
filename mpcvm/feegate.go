@@ -4,7 +4,7 @@
 package mpcvm
 
 import (
-	"github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/chains/fee"
 )
 
 // Fee is what M-Chain charges to admit a user transaction, which is nothing,

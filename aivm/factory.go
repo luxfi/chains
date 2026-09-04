@@ -7,15 +7,15 @@ import (
 	"github.com/luxfi/accel"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms"
+	"github.com/luxfi/vm/manager"
 )
 
-var _ vms.Factory = (*Factory)(nil)
+var _ manager.Factory = (*Factory)(nil)
 
 // VMID is the unique identifier for AIVM (A-Chain)
 var VMID = ids.ID{'a', 'i', 'v', 'm'}
 
-// Factory implements vms.Factory interface for creating AIVM instances
+// Factory implements manager.Factory interface for creating AIVM instances
 type Factory struct{}
 
 // New creates a new AIVM instance.
