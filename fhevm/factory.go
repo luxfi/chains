@@ -7,10 +7,10 @@ import (
 	"github.com/luxfi/constants"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms"
+	"github.com/luxfi/vm/manager"
 )
 
-var _ vms.Factory = (*Factory)(nil)
+var _ manager.Factory = (*Factory)(nil)
 
 // VMID identifies F-Chain: coordination of confidential compute — ciphertext
 // handles, access permits, and threshold decryption (LP-8200, LP-167). It is

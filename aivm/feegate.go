@@ -7,8 +7,8 @@ import (
 	"fmt"
 
 	"github.com/luxfi/ai/pkg/aivm"
+	"github.com/luxfi/chains/fee"
 	"github.com/luxfi/constants"
-	"github.com/luxfi/node/vms/types/fee"
 )
 
 // newFeePolicy returns the canonical A-Chain FeePolicy. A-Chain accepts

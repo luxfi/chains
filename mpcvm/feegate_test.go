@@ -7,7 +7,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/chains/fee"
 )
 
 // M-Chain declares the closed policy: it is a committee-driven service VM and

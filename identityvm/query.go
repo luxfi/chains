@@ -10,8 +10,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/luxfi/chains/artifacts"
 	"github.com/luxfi/ids"
-	"github.com/luxfi/node/vms/artifacts"
 )
 
 // Submit queues one state change for a block. Nothing here writes state: a

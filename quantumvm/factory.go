@@ -7,15 +7,15 @@ import (
 	"github.com/luxfi/chains/quantumvm/config"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms"
+	"github.com/luxfi/vm/manager"
 )
 
-var _ vms.Factory = (*Factory)(nil)
+var _ manager.Factory = (*Factory)(nil)
 
 // VMID is the unique identifier for QuantumVM (Q-Chain)
 var VMID = ids.ID{'q', 'u', 'a', 'n', 't', 'u', 'm', 'v', 'm'}
 
-// Factory implements vms.Factory interface for creating QVM instances
+// Factory implements manager.Factory interface for creating QVM instances
 type Factory struct {
 	config.Config
 }

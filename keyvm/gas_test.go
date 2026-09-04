@@ -9,7 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	nodefee "github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/chains/fee"
 )
 
 // TestGas_PerAlgorithmDistinct proves the audit fix: ML-KEM encapsulation,
@@ -41,17 +41,17 @@ func TestGas_AllOperationsMeetFloor(t *testing.T) {
 		for algo := range algoGas {
 			f, err := FeeFor(&Transaction{Type: op, Algorithm: algo})
 			require.NoError(t, err)
-			require.GreaterOrEqualf(t, f, nodefee.MinTxFeeFloor,
-				"op %d algo %s fee %d below floor %d", op, algo, f, nodefee.MinTxFeeFloor)
+			require.GreaterOrEqualf(t, f, fee.MinTxFeeFloor,
+				"op %d algo %s fee %d below floor %d", op, algo, f, fee.MinTxFeeFloor)
 		}
 	}
 	// Policy-only operations (algorithm-independent).
 	for _, op := range []uint8{TxSetPolicy, TxRevokeKey} {
 		f, err := FeeFor(&Transaction{Type: op})
 		require.NoError(t, err)
-		require.GreaterOrEqual(t, f, nodefee.MinTxFeeFloor)
+		require.GreaterOrEqual(t, f, fee.MinTxFeeFloor)
 	}
-	require.GreaterOrEqual(t, MinScheduledFee(), nodefee.MinTxFeeFloor,
+	require.GreaterOrEqual(t, MinScheduledFee(), fee.MinTxFeeFloor,
 		"the cheapest scheduled fee must satisfy the admission floor")
 }
 

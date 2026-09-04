@@ -9,7 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	nodefee "github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/chains/fee"
 )
 
 // TestAdmissionPolicy_AttachedAtInit proves the chain still declares a non-zero
@@ -21,13 +21,13 @@ func TestAdmissionPolicy_AttachedAtInit(t *testing.T) {
 	defer func() { _ = vm.Shutdown(context.Background()) }()
 
 	require.NotNil(t, vm.FeePolicy())
-	require.Equal(t, nodefee.MinTxFeeFloor, vm.FeePolicy().MinTxFee())
-	require.NoError(t, nodefee.Validate(vm.FeePolicy()))
+	require.Equal(t, fee.MinTxFeeFloor, vm.FeePolicy().MinTxFee())
+	require.NoError(t, fee.Validate(vm.FeePolicy()))
 }
 
 // TestAdmissionAndSettlementAgree proves the two fee surfaces are consistent:
 // the cheapest fee the per-algorithm settlement schedule can charge is at least
 // the declared admission floor, so they can never drift apart.
 func TestAdmissionAndSettlementAgree(t *testing.T) {
-	require.GreaterOrEqual(t, MinScheduledFee(), nodefee.MinTxFeeFloor)
+	require.GreaterOrEqual(t, MinScheduledFee(), fee.MinTxFeeFloor)
 }

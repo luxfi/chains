@@ -6,10 +6,10 @@ package keyvm
 import (
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms"
+	"github.com/luxfi/vm/manager"
 )
 
-var _ vms.Factory = (*Factory)(nil)
+var _ manager.Factory = (*Factory)(nil)
 
 // VMID is the K-Chain VM identifier (matches constants.KeyVMID).
 var VMID = ids.ID{'k', 'e', 'y', 'v', 'm'}

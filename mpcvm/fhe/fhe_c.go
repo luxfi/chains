@@ -22,7 +22,6 @@ import (
 	"github.com/luxfi/accel"
 	"github.com/luxfi/lattice/v7/ring"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/config"
 )
 
 // FHEAccelerator provides GPU-accelerated FHE operations for ThresholdVM.
@@ -59,16 +58,11 @@ func NewFHEAccelerator(logger log.Logger) (*FHEAccelerator, error) {
 }
 
 // NewFHEAcceleratorWithOptions creates a new GPU FHE accelerator with custom options.
-// If options are zero-valued, it uses the global GPU config.
 func NewFHEAcceleratorWithOptions(logger log.Logger, opts FHEOptions) (*FHEAccelerator, error) {
-	// Get global config if options not specified
-	gpuCfg := config.GetGlobalGPUConfig()
-
-	// Determine if GPU should be enabled
-	enabled := gpuCfg.Enabled
-	if opts.Backend == "cpu" {
-		enabled = false
-	}
+	// The device is used unless the caller asks for the CPU by name. A plugin
+	// is its own process, so no node-side setting can reach it: the option is
+	// the only switch there is.
+	enabled := opts.Backend != "cpu"
 
 	// Check if accel is available
 	available := accel.Available() && enabled
@@ -93,7 +87,7 @@ func NewFHEAcceleratorWithOptions(logger log.Logger, opts FHEOptions) (*FHEAccel
 				"device", session.DeviceInfo().Name)
 		} else {
 			logger.Warn("GPU FHE acceleration not available, using CPU fallback",
-				"gpuConfigEnabled", gpuCfg.Enabled,
+				"gpuEnabled", enabled,
 				"accelAvailable", accel.Available())
 		}
 	}
