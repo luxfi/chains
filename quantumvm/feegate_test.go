@@ -12,7 +12,7 @@ import (
 	"github.com/luxfi/chains/quantumvm/quantum"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/vm/vms/types/fee"
 )
 
 // feeTestTx implements the Q-Chain Transaction interface with a

@@ -12,9 +12,9 @@ import (
 	"github.com/luxfi/database/memdb"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/runtime"
 	vmcore "github.com/luxfi/vm"
+	"github.com/luxfi/vm/vms/types/fee"
 )
 
 func newIdentityVMForFeeTest(t *testing.T) *VM {

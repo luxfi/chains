@@ -17,13 +17,13 @@ import (
 	"time"
 
 	"github.com/luxfi/accel"
+	"github.com/luxfi/cache"
+	"github.com/luxfi/chains/quantumvm/quantum"
 	"github.com/luxfi/crypto/mldsa"
 	"github.com/luxfi/crypto/slhdsa"
 	"github.com/luxfi/geth/common"
 	"github.com/luxfi/geth/core/types"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/cache"
-	"github.com/luxfi/chains/quantumvm/quantum"
 )
 
 var (

@@ -7,7 +7,7 @@ import (
 	"fmt"
 
 	"github.com/luxfi/constants"
-	"github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/vm/vms/types/fee"
 )
 
 // newFeePolicy returns the canonical Z-Chain FeePolicy. Z-Chain accepts

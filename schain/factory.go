@@ -6,7 +6,7 @@ package schain
 import (
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms"
+	"github.com/luxfi/vm/vms"
 )
 
 var (

@@ -13,15 +13,15 @@ import (
 	"time"
 
 	"github.com/luxfi/accel"
+	"github.com/luxfi/cache"
 	"github.com/luxfi/crypto/mldsa"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/cache"
 )
 
 var (
 	ErrInvalidQuantumSignature   = errors.New("invalid quantum signature")
-	ErrInvalidCoronaKey        = errors.New("invalid corona key")
+	ErrInvalidCoronaKey          = errors.New("invalid corona key")
 	ErrQuantumStampExpired       = errors.New("quantum stamp expired")
 	ErrQuantumVerificationFailed = errors.New("quantum verification failed")
 	ErrUnsupportedAlgorithm      = errors.New("unsupported quantum algorithm")
@@ -50,7 +50,7 @@ type QuantumSignature struct {
 	Timestamp    time.Time
 	PublicKey    []byte
 	Signature    []byte
-	CoronaKey  []byte
+	CoronaKey    []byte
 	QuantumStamp []byte
 }
 
@@ -170,7 +170,7 @@ func (qs *QuantumSigner) Sign(message []byte, key *MLDSAValidatorKey) (*QuantumS
 		Timestamp:    time.Now(),
 		PublicKey:    key.PublicKey,
 		Signature:    signature,
-		CoronaKey:  key.PublicKey,
+		CoronaKey:    key.PublicKey,
 		QuantumStamp: stamp,
 	}
 

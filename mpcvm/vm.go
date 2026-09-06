@@ -29,15 +29,15 @@ import (
 	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/version"
-	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/runtime"
 	"github.com/luxfi/threshold/pkg/party"
 	"github.com/luxfi/threshold/pkg/pool"
 	"github.com/luxfi/threshold/pkg/protocol"
 	"github.com/luxfi/threshold/pkg/quorum"
+	"github.com/luxfi/version"
 	vmcore "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
+	"github.com/luxfi/vm/vms/types/fee"
 	"github.com/luxfi/warp"
 )
 

@@ -22,8 +22,8 @@ import (
 	"github.com/luxfi/vm/chain"
 	"github.com/luxfi/warp"
 
-	"github.com/luxfi/node/version"
-	"github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/version"
+	"github.com/luxfi/vm/vms/types/fee"
 )
 
 var (

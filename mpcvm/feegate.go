@@ -4,7 +4,7 @@
 package mpcvm
 
 import (
-	"github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/vm/vms/types/fee"
 )
 
 // newFeePolicy returns the canonical M-Chain FeePolicy. M-Chain is a

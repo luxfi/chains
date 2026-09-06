@@ -23,7 +23,7 @@ import (
 	"github.com/luxfi/accel"
 	"github.com/luxfi/lattice/v7/ring"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/config"
+	"github.com/luxfi/vm/gpu"
 )
 
 // FHEAccelerator provides GPU-accelerated operations for CKKS FHE.
@@ -64,7 +64,7 @@ type FHEAccelOptions struct {
 // NewFHEAcceleratorWithOptions creates a new FHE accelerator with custom options.
 func NewFHEAcceleratorWithOptions(logger log.Logger, opts FHEAccelOptions) (*FHEAccelerator, error) {
 	// Get global config if options not specified
-	gpuCfg := config.GetGlobalGPUConfig()
+	gpuCfg := gpu.GetGlobalGPUConfig()
 
 	// Determine if GPU should be enabled
 	enabled := gpuCfg.Enabled

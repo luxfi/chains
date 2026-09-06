@@ -20,19 +20,18 @@ import (
 	"github.com/luxfi/database"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/runtime"
+	"github.com/luxfi/version"
 	vmcore "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
+	"github.com/luxfi/vm/vms/types/fee"
 	"github.com/luxfi/warp"
-
-	nodeversion "github.com/luxfi/node/version"
 )
 
 var (
 	_ chain.ChainVM = (*VM)(nil)
 
-	Version = &nodeversion.Semantic{
+	Version = &version.Semantic{
 		Major: 1,
 		Minor: 0,
 		Patch: 0,

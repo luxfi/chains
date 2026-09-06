@@ -61,8 +61,8 @@ import (
 	"github.com/luxfi/vm/chain"
 
 	"github.com/luxfi/consensus/engine/dag/vertex"
-	"github.com/luxfi/node/version"
-	"github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/version"
+	"github.com/luxfi/vm/vms/types/fee"
 
 	"github.com/luxfi/ai/pkg/aivm"
 	"github.com/luxfi/ai/pkg/attestation"

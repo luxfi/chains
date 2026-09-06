@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/rpc/v2"
+	"github.com/luxfi/cache"
 	"github.com/luxfi/chains/quantumvm/config"
 	"github.com/luxfi/chains/quantumvm/quantum"
 	consensuschain "github.com/luxfi/consensus/engine/chain"
@@ -22,13 +23,12 @@ import (
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
 	"github.com/luxfi/metric"
-	"github.com/luxfi/node/cache"
-	"github.com/luxfi/node/utils/json"
-	"github.com/luxfi/node/vms/types/fee"
 	"github.com/luxfi/timer/mockable"
+	"github.com/luxfi/utils/json"
 	"github.com/luxfi/version"
 	luxvm "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
+	"github.com/luxfi/vm/vms/types/fee"
 )
 
 const (

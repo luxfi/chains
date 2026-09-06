@@ -4,10 +4,10 @@
 package quantumvm
 
 import (
+	"github.com/luxfi/chains/quantumvm/config"
 	"github.com/luxfi/ids"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/vms"
-	"github.com/luxfi/chains/quantumvm/config"
+	"github.com/luxfi/vm/vms"
 )
 
 var _ vms.Factory = (*Factory)(nil)

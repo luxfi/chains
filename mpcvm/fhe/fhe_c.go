@@ -22,7 +22,7 @@ import (
 	"github.com/luxfi/accel"
 	"github.com/luxfi/lattice/v7/ring"
 	"github.com/luxfi/log"
-	"github.com/luxfi/node/config"
+	"github.com/luxfi/vm/gpu"
 )
 
 // FHEAccelerator provides GPU-accelerated FHE operations for ThresholdVM.
@@ -62,7 +62,7 @@ func NewFHEAccelerator(logger log.Logger) (*FHEAccelerator, error) {
 // If options are zero-valued, it uses the global GPU config.
 func NewFHEAcceleratorWithOptions(logger log.Logger, opts FHEOptions) (*FHEAccelerator, error) {
 	// Get global config if options not specified
-	gpuCfg := config.GetGlobalGPUConfig()
+	gpuCfg := gpu.GetGlobalGPUConfig()
 
 	// Determine if GPU should be enabled
 	enabled := gpuCfg.Enabled

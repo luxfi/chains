@@ -7,7 +7,7 @@ import (
 	"fmt"
 
 	"github.com/luxfi/ids"
-	"github.com/luxfi/node/vms/types/fee"
+	"github.com/luxfi/vm/vms/types/fee"
 )
 
 // newFeePolicy returns the canonical Q-Chain FeePolicy. Per LP-0130 §6,
