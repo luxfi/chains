@@ -157,24 +157,52 @@ func NewQuantumStamper(log log.Logger, mode QuantumStampMode, cacheSize int) (*Q
 }
 
 // initializeSigners creates the cryptographic signers based on mode
-func (qs *QuantumStamper) initializeSigners() error {
-	switch qs.mode {
+// mldsaMode is the ONE statement of which ML-DSA parameter set a stamp mode
+// means. The signer and the verifier both read it, so a stamp can only ever be
+// checked against the parameter set it was made under. Stating it twice is what
+// let the verifier reconstruct every public key as ML-DSA-65 while the signer
+// issued 44 and 87 keys, and a node then refused stamps it had just written.
+// The second result is false for modes that carry no ML-DSA signature at all.
+func (m QuantumStampMode) mldsaMode() (mldsa.Mode, bool) {
+	switch m {
 	case StampModeMLDSA44:
-		return qs.initMLDSA(mldsa.MLDSA44)
-	case StampModeMLDSA65:
-		return qs.initMLDSA(mldsa.MLDSA65)
+		return mldsa.MLDSA44, true
+	case StampModeMLDSA65, StampModeHybrid:
+		return mldsa.MLDSA65, true
 	case StampModeMLDSA87:
-		return qs.initMLDSA(mldsa.MLDSA87)
-	case StampModeSLHDSA:
-		return qs.initSLHDSA(slhdsa.SHA2_128f)
-	case StampModeHybrid:
-		if err := qs.initMLDSA(mldsa.MLDSA65); err != nil {
-			return err
-		}
-		return qs.initSLHDSA(slhdsa.SHA2_128f)
+		return mldsa.MLDSA87, true
 	default:
+		return 0, false
+	}
+}
+
+// slhdsaMode is the same statement for the hash-based leg.
+func (m QuantumStampMode) slhdsaMode() (slhdsa.Mode, bool) {
+	switch m {
+	case StampModeSLHDSA, StampModeHybrid:
+		return slhdsa.SHA2_128f, true
+	default:
+		return 0, false
+	}
+}
+
+func (qs *QuantumStamper) initializeSigners() error {
+	ml, hasML := qs.mode.mldsaMode()
+	slh, hasSLH := qs.mode.slhdsaMode()
+	if !hasML && !hasSLH {
 		return ErrInvalidSignatureMode
 	}
+	if hasML {
+		if err := qs.initMLDSA(ml); err != nil {
+			return err
+		}
+	}
+	if hasSLH {
+		if err := qs.initSLHDSA(slh); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (qs *QuantumStamper) initMLDSA(mode mldsa.Mode) error {
@@ -510,8 +538,13 @@ func (qs *QuantumStamper) verifyMLDSA(stamp *QuantumStamp, data []byte) bool {
 		return false
 	}
 
+	mode, ok := stamp.Mode.mldsaMode()
+	if !ok {
+		return false
+	}
+
 	// Recreate public key from bytes
-	pubKey, err := mldsa.PublicKeyFromBytes(stamp.PublicKeyML, mldsa.MLDSA65)
+	pubKey, err := mldsa.PublicKeyFromBytes(stamp.PublicKeyML, mode)
 	if err != nil {
 		return false
 	}
@@ -525,8 +558,13 @@ func (qs *QuantumStamper) verifySLHDSA(stamp *QuantumStamp, data []byte) bool {
 		return false
 	}
 
+	mode, ok := stamp.Mode.slhdsaMode()
+	if !ok {
+		return false
+	}
+
 	// Recreate public key from bytes
-	pubKey, err := slhdsa.PublicKeyFromBytes(stamp.PublicKeySLH, slhdsa.SHA2_128f)
+	pubKey, err := slhdsa.PublicKeyFromBytes(stamp.PublicKeySLH, mode)
 	if err != nil {
 		return false
 	}
@@ -545,7 +583,14 @@ func (qs *QuantumStamper) VerifyStampBatch(stamps []*QuantumStamp, blocks []*typ
 
 	// Try GPU batch path for ML-DSA stamps
 	if accel.Available() && len(stamps) >= accel.DilithiumBatchThreshold && qs.mldsaSigner != nil {
-		if qs.gpuBatchVerifyStamps(stamps, blocks, results) {
+		plan := planBatch(stamps, blocks)
+		if len(plan.batched) >= accel.DilithiumBatchThreshold &&
+			qs.gpuBatchVerifyStamps(stamps, plan, results) {
+			// Whatever the accelerator did not lay out still gets an answer, and
+			// it is the same answer the sequential path would give.
+			for _, i := range plan.sequential {
+				results[i] = qs.verifyStampSync(stamps[i], blocks[i])
+			}
 			return results
 		}
 		// GPU failed, fall through to CPU
@@ -558,45 +603,72 @@ func (qs *QuantumStamper) VerifyStampBatch(stamps []*QuantumStamp, blocks []*typ
 	return results
 }
 
-// gpuBatchVerifyStamps runs ML-DSA batch verification on GPU.
-// Returns true if GPU path succeeded (results populated), false to fall back.
-func (qs *QuantumStamper) gpuBatchVerifyStamps(stamps []*QuantumStamp, blocks []*types.Block, results []bool) bool {
-	n := len(stamps)
+// batchPlan assigns every entry of a batch to exactly one decider. An entry the
+// accelerator does not lay out is not thereby invalid, which is what the earlier
+// shape got wrong: SLH-DSA stamps were skipped and left holding the zero value,
+// so a valid hash-based stamp was refused whenever its batch happened to be big
+// enough to reach the accelerator, and accepted whenever it was not.
+type batchPlan struct {
+	batched    []int      // decided by the accelerator, under mode
+	sequential []int      // decided by verifyStampSync
+	refused    []int      // decided false here: wrong block, or nothing to check
+	mode       mldsa.Mode // parameter set the accelerator buffers are laid out for
+}
 
-	// Pre-validate block correspondence before GPU work
-	signDataSlice := make([][]byte, 0, n)
-	sigSlice := make([][]byte, 0, n)
-	pkSlice := make([][]byte, 0, n)
-	indices := make([]int, 0, n) // original indices of ML-DSA stamps
+// planBatch decides who verifies what. It takes no accelerator and touches no
+// results, so the assignment can be checked on any machine.
+//
+// The accelerator copies signatures and keys into fixed strides, so one call
+// carries one ML-DSA parameter set: the set of the first stamp that has one.
+// A stamp under any other set is a stamp whose key does not fit the slot it
+// would be written into, and goes to the sequential path instead.
+func planBatch(stamps []*QuantumStamp, blocks []*types.Block) batchPlan {
+	plan := batchPlan{}
+	haveMode := false
 
 	for i, stamp := range stamps {
-		block := blocks[i]
-		// Skip non-ML-DSA modes
-		if stamp.Mode == StampModeSLHDSA {
+		mode, carriesML := stamp.Mode.mldsaMode()
+		if !carriesML {
+			plan.sequential = append(plan.sequential, i)
 			continue
 		}
-		// Verify block correspondence first (cheap check), through the same
-		// predicate the sequential path uses. Re-listing the fields here had
-		// already lost ReceiptsRoot, so a stamp with a forged receipts root was
-		// accepted whenever the batch went to the accelerator and refused when it
-		// did not.
-		if !stampMatchesBlock(stamp, block) {
-			results[i] = false
+		// Block correspondence is the cheap half of the decision and does not
+		// depend on which path checks the signature, so it is settled here for
+		// both. It runs through the same predicate the sequential path uses.
+		if !stampMatchesBlock(stamp, blocks[i]) {
+			plan.refused = append(plan.refused, i)
 			continue
 		}
 		if len(stamp.MLDSASignature) == 0 || len(stamp.PublicKeyML) == 0 {
-			results[i] = false
+			plan.refused = append(plan.refused, i)
 			continue
 		}
-
-		signDataSlice = append(signDataSlice, qs.prepareSignatureData(stamp))
-		sigSlice = append(sigSlice, stamp.MLDSASignature)
-		pkSlice = append(pkSlice, stamp.PublicKeyML)
-		indices = append(indices, i)
+		if !haveMode {
+			plan.mode, haveMode = mode, true
+		}
+		if mode != plan.mode {
+			plan.sequential = append(plan.sequential, i)
+			continue
+		}
+		plan.batched = append(plan.batched, i)
 	}
+	return plan
+}
 
-	if len(signDataSlice) < accel.DilithiumBatchThreshold {
-		return false
+// gpuBatchVerifyStamps runs ML-DSA batch verification on GPU.
+// Returns true if GPU path succeeded (results populated), false to fall back.
+func (qs *QuantumStamper) gpuBatchVerifyStamps(stamps []*QuantumStamp, plan batchPlan, results []bool) bool {
+	indices := plan.batched
+	n := len(indices)
+
+	signDataSlice := make([][]byte, 0, n)
+	sigSlice := make([][]byte, 0, n)
+	pkSlice := make([][]byte, 0, n)
+
+	for _, i := range indices {
+		signDataSlice = append(signDataSlice, qs.prepareSignatureData(stamps[i]))
+		sigSlice = append(sigSlice, stamps[i].MLDSASignature)
+		pkSlice = append(pkSlice, stamps[i].PublicKeyML)
 	}
 
 	sess, err := accel.NewSession()
@@ -607,9 +679,11 @@ func (qs *QuantumStamper) gpuBatchVerifyStamps(stamps []*QuantumStamp, blocks []
 
 	latticeOps := sess.Lattice()
 
-	// Determine fixed sizes
-	sigSize := mldsa.GetSignatureSize(mldsa.MLDSA65)
-	pkSize := mldsa.GetPublicKeySize(mldsa.MLDSA65)
+	// Fixed strides, for the one parameter set planBatch admitted into the batch.
+	// Reading them off ML-DSA-65 while the batch held 44 or 87 keys wrote each
+	// key past its own slot and into the next stamp's.
+	sigSize := mldsa.GetSignatureSize(plan.mode)
+	pkSize := mldsa.GetPublicKeySize(plan.mode)
 
 	maxMsgLen := 0
 	for _, d := range signDataSlice {
