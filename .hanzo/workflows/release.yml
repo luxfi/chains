@@ -22,9 +22,17 @@ name: Release
 # ghcr auth is GHCR_USER / GHCR_TOKEN, org Actions secrets sourced from KMS. The
 # instance GITHUB_TOKEN is a Hanzo Git token and has no rights at ghcr.io.
 #
-# amd64 only. The reusable was asked for an arm64 leg on a
-# `["self-hosted","linux","arm64"]` pool that does not exist; arm64 returns as a
-# native matrix entry when we own an arm64 runner.
+# Both architectures, each compiled on its own native pool. Dockerfile.plugin
+# compiles nothing — it copies build/<vm>, the binary the step above it produced
+# with `go build` on the runner — so the architecture of the image is the
+# architecture of the machine that ran that go build. Asking one amd64 runner
+# for two platforms would therefore stamp an arm64 manifest onto an amd64 ELF:
+# an image that pulls happily on an arm64 host and dies with `exec format
+# error`, which is worse than the amd64-only manifest it replaced, because the
+# manifest promises it will run. One job per arch compiles natively — evm's CGO
+# included, with no cross-toolchain and no emulation — pushes
+# <image>:sha-<sha7>-<arch>, and the merge job joins the pair under the release
+# names.
 #
 # Semver-only: a v* tag produces the version tags, and every run produces an
 # immutable sha tag. No :latest, no floating tags.
@@ -60,7 +68,8 @@ jobs:
       fail-fast: false
       matrix:
         image: ${{ fromJson(needs.plan.outputs.images) }}
-    runs-on: [lux-build-linux-amd64]
+        arch: [amd64, arm64]
+    runs-on: ['lux-build-linux-${{ matrix.arch }}']
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -108,14 +117,94 @@ jobs:
             type=semver,pattern=v{{version}}
             type=sha,prefix=sha-
 
+      - name: Name this arch's image
+        id: arch
+        # A per-arch name, never a release name: only the merge job writes those.
+        # A release tag that resolves to one architecture is worse than one that
+        # does not exist yet, because it pulls on that architecture and fails on
+        # the other.
+        run: echo "image=${{ matrix.image.image }}:sha-${GITHUB_SHA:0:7}-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
+
       - uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.plugin
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.arch }}
           build-args: |
             VM=${{ matrix.image.vm }}
           labels: ${{ steps.meta.outputs.labels }}
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.arch.outputs.image }}
           provenance: false
           push: true
+
+  merge:
+    needs: [plan, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJson(needs.plan.outputs.images) }}
+    # Registry-side only: imagetools reads the two per-arch manifests and writes
+    # a list that points at both. No builder and no platform of its own, so which
+    # pool runs this does not matter.
+    runs-on: [lux-build-linux-amd64]
+    timeout-minutes: 15
+    steps:
+      - name: Compute the release names
+        id: meta
+        # The same set docker/metadata-action produces in the build job: the
+        # semver pair on a v* tag, and the immutable sha tag on every run.
+        run: |
+          set -euo pipefail
+          SHA_TAG="${{ matrix.image.image }}:sha-${GITHUB_SHA:0:7}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            {
+              echo "tags<<EOF"
+              echo "${{ matrix.image.image }}:v${VERSION}"
+              echo "${{ matrix.image.image }}:${VERSION}"
+              echo "$SHA_TAG"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "tags<<EOF"
+              echo "$SHA_TAG"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USER }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Join both architectures under every release name
+        run: |
+          set -euo pipefail
+          base="${{ matrix.image.image }}:sha-${GITHUB_SHA:0:7}"
+          args=''
+          while IFS= read -r t; do
+            [ -n "$t" ] && args="$args -t $t"
+          done <<< "${{ steps.meta.outputs.tags }}"
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $args "${base}-amd64" "${base}-arm64"
+
+      - name: Prove every release name carries BOTH architectures
+        # A manifest list with one entry pulls fine on the arch that built it and
+        # fails everywhere else, which is exactly the state this workflow is
+        # replacing. Counting the platforms is what makes "multi-arch" a fact
+        # rather than an intention.
+        run: |
+          set -euo pipefail
+          while IFS= read -r t; do
+            [ -z "$t" ] && continue
+            got=$(docker buildx imagetools inspect "$t" --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}')
+            echo "$t -> ${got}"
+            for want in linux/amd64 linux/arm64; do
+              case " $got " in
+                *" $want "*) ;;
+                *) echo "::error::$t does not carry $want"; exit 1 ;;
+              esac
+            done
+          done <<< "${{ steps.meta.outputs.tags }}"
