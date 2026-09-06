@@ -1,6 +1,6 @@
 module github.com/luxfi/chains
 
-go 1.26.4
+go 1.26.5
 
 require (
 	github.com/consensys/gnark-crypto v0.20.1
@@ -9,7 +9,7 @@ require (
 	github.com/holiman/uint256 v1.3.2
 	github.com/luxfi/accel v1.3.2
 	github.com/luxfi/ai v0.1.0
-	github.com/luxfi/consensus v1.36.63
+	github.com/luxfi/consensus v1.36.81
 	github.com/luxfi/constants v1.6.2
 	github.com/luxfi/crypto v1.20.5
 	github.com/luxfi/database v1.21.5
@@ -20,17 +20,16 @@ require (
 	github.com/luxfi/log v1.4.3
 	github.com/luxfi/math v1.5.1
 	github.com/luxfi/metric v1.8.1
-	github.com/luxfi/node v1.36.15
-	github.com/luxfi/oracle v1.1.1
+	github.com/luxfi/oracle v1.1.3
 	github.com/luxfi/precompile v0.19.8
-	github.com/luxfi/relay v1.1.1
+	github.com/luxfi/relay v1.1.2
 	github.com/luxfi/runtime v1.3.1
 	github.com/luxfi/sys v0.1.0
 	github.com/luxfi/threshold v1.12.6
 	github.com/luxfi/timer v1.1.1
 	github.com/luxfi/validators v1.3.1
-	github.com/luxfi/version v1.0.1
-	github.com/luxfi/vm v1.3.16
+	github.com/luxfi/version v1.1.2
+	github.com/luxfi/vm v1.3.17
 	github.com/luxfi/warp v1.24.1
 	github.com/luxfi/zap v1.2.6
 	github.com/stretchr/testify v1.11.1
@@ -95,7 +94,6 @@ require (
 	github.com/gballet/go-libpcsclite v0.0.0-20250918194357-1ec6f2e601c6 // indirect
 	github.com/getsentry/sentry-go v0.46.2 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect
-	github.com/go-json-experiment/json v0.0.0-20260601182631-00ed12fed2a6 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
@@ -129,7 +127,7 @@ require (
 	github.com/luxfi/age v1.6.0 // indirect
 	github.com/luxfi/api v1.1.9 // indirect
 	github.com/luxfi/atomic v1.0.0 // indirect
-	github.com/luxfi/cache v1.3.1 // indirect
+	github.com/luxfi/cache v1.3.5 // indirect
 	github.com/luxfi/compress v0.1.1 // indirect
 	github.com/luxfi/concurrent v0.1.1 // indirect
 	github.com/luxfi/container v0.2.2 // indirect
@@ -157,7 +155,7 @@ require (
 	github.com/luxfi/sampler v1.1.0 // indirect
 	github.com/luxfi/trace v1.2.1 // indirect
 	github.com/luxfi/upgrade v1.0.3 // indirect
-	github.com/luxfi/utils v1.3.1 // indirect
+	github.com/luxfi/utils v1.3.3 // indirect
 	github.com/luxfi/zapdb v1.10.6 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
