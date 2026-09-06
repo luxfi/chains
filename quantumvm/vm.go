@@ -24,7 +24,7 @@ import (
 	"github.com/luxfi/log"
 	"github.com/luxfi/metric"
 	"github.com/luxfi/timer/mockable"
-	"github.com/luxfi/utils/json"
+	"github.com/luxfi/util/json"
 	"github.com/luxfi/version"
 	luxvm "github.com/luxfi/vm"
 	"github.com/luxfi/vm/chain"
