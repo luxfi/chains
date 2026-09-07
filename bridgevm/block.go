@@ -221,7 +221,7 @@ func (b *Block) Verify(ctx context.Context) error {
 		// admit records each transfer as it goes, so a block carrying the same
 		// one twice fails on the second: the first has already been recorded
 		// settled, in this same state.
-		if err := state.admit(&b.vm.config, day, req); err != nil {
+		if err := state.admit(&b.vm.limits, day, req); err != nil {
 			return err
 		}
 	}

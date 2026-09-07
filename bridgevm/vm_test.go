@@ -50,19 +50,19 @@ func TestInitializeRefusesWhatItCannotRunOn(t *testing.T) {
 
 	require.ErrorContains(t, (&VM{}).Initialize(ctx, vmcore.Init{}), "no runtime")
 
-	noDB := initFor(memdb.New(), testConfig())
+	noDB := initFor(memdb.New(), testLimits())
 	noDB.DB = nil
 	require.ErrorContains(t, (&VM{}).Initialize(ctx, noDB), "no database")
 
-	noLog := initFor(memdb.New(), testConfig())
+	noLog := initFor(memdb.New(), testLimits())
 	noLog.Runtime = &runtime.Runtime{NetworkID: 96369}
 	require.ErrorContains(t, (&VM{}).Initialize(ctx, noLog), "invalid logger")
 
-	badConfig := initFor(memdb.New(), testConfig())
-	badConfig.Config = []byte(`{"maxBridgeAmount": "not a number"}`)
+	badConfig := initFor(memdb.New(), testLimits())
+	badConfig.Config = []byte(`{"externalChains": "not a list"}`)
 	require.ErrorContains(t, (&VM{}).Initialize(ctx, badConfig), "parse config")
 
-	badGenesis := initFor(memdb.New(), testConfig())
+	badGenesis := initFor(memdb.New(), testLimits())
 	badGenesis.Genesis = []byte(`{`)
 	require.ErrorContains(t, (&VM{}).Initialize(ctx, badGenesis), "parse genesis")
 }
@@ -73,30 +73,30 @@ func TestInitializeRefusesWhatItCannotRunOn(t *testing.T) {
 func TestABridgeDeclaresItsCaps(t *testing.T) {
 	ctx := context.Background()
 
-	for name, mutate := range map[string]func(*BridgeConfig){
-		"minConfirmations must be at least 1": func(c *BridgeConfig) { c.MinConfirmations = 0 },
-		"maxBridgeAmount must be declared":    func(c *BridgeConfig) { c.MaxBridgeAmount = 0 },
-		"is below maxBridgeAmount":            func(c *BridgeConfig) { c.DailyBridgeLimit = c.MaxBridgeAmount - 1 },
-		"is below the":                        func(c *BridgeConfig) { c.RequireValidatorBond = minValidatorBond - 1 },
+	for name, mutate := range map[string]func(*Limits){
+		"minConfirmations must be at least 1": func(c *Limits) { c.MinConfirmations = 0 },
+		"maxBridgeAmount must be declared":    func(c *Limits) { c.MaxBridgeAmount = 0 },
+		"is below maxBridgeAmount":            func(c *Limits) { c.DailyBridgeLimit = c.MaxBridgeAmount - 1 },
+		"is below the":                        func(c *Limits) { c.RequireValidatorBond = minValidatorBond - 1 },
 	} {
-		cfg := testConfig()
+		cfg := testLimits()
 		mutate(&cfg)
 		require.ErrorContains(t, (&VM{}).Initialize(ctx, initFor(memdb.New(), cfg)), name)
 	}
 
-	// An empty configuration declares nothing, so it runs nothing.
-	empty := initFor(memdb.New(), testConfig())
-	empty.Config = nil
+	// A genesis that declares no limits declares nothing, so it runs nothing.
+	empty := initFor(memdb.New(), testLimits())
+	empty.Genesis = nil
 	require.Error(t, (&VM{}).Initialize(ctx, empty))
 }
 
 // The signer set freezes at a size, and that size has a default because it is a
 // capacity rather than a risk decision.
 func TestTheSignerSetSizeDefaults(t *testing.T) {
-	cfg := testConfig()
+	cfg := testLimits()
 	cfg.MaxSigners = 0
 	vm := bootOn(t, memdb.New(), cfg)
-	require.Equal(t, 100, vm.config.MaxSigners)
+	require.Equal(t, 100, vm.limits.MaxSigners)
 }
 
 // TestTheGenesisTimestampIsTheChainsFirstTime.

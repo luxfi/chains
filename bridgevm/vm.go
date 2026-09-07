@@ -46,26 +46,25 @@ var (
 // minimum in two places eventually enforces the smaller one.
 const minValidatorBond uint64 = 1_000_000 * 1e9 // 1M LUX
 
-// BridgeConfig contains VM configuration
-type BridgeConfig struct {
+// Limits are the bridge's risk parameters, and they are declared by the
+// NETWORK in genesis rather than by the operator. They decide which transfers a
+// block may carry (ledger.go admissible/admit), so two nodes holding different
+// values disagree about whether a transfer is admissible — and the first one
+// they disagree about is a transfer the builder keeps proposing and everyone
+// else keeps refusing, which stops block production and does not resume. A cap
+// each operator sets for themselves is not a cap.
+//
+// Nothing here is defaulted. A bridge whose cap is whatever the code happened
+// to pick is a bridge nobody decided the risk of, and a zero per-transfer cap
+// refuses every transfer silently at every block, which looks exactly like a
+// bridge nobody is using.
+type Limits struct {
 	// MinConfirmations is how deep a lock must be buried on its source chain
 	// before this chain will carry it. It is applied where the lock is read,
 	// so a lock that is not yet deep enough is left for a later pass rather
 	// than admitted and held.
 	MinConfirmations uint32 `json:"minConfirmations"`
-	BridgeFee        uint64 `json:"bridgeFee"` // Fee in LUX for bridge operations
 
-	// ExternalChains is the ONE declaration of which chains this bridge
-	// serves. It carries endpoints, gateway + custody addresses, and KMS paths
-	// for the relayer keys — never key material. A relayer node reads this and
-	// calls EnableBridgeRelease with a KMS-backed KeyProvider and a Warp-backed
-	// AttestationClient; every other node uses it to name the chains it will
-	// carry transfers between.
-	ExternalChains []ExternalChainConfig `json:"externalChains,omitempty"`
-
-	// The spend caps. Both are declared, never defaulted: a bridge whose cap
-	// is whatever the code happens to pick is a bridge nobody decided the risk
-	// of.
 	MaxBridgeAmount  uint64 `json:"maxBridgeAmount"`  // Maximum amount per transfer
 	DailyBridgeLimit uint64 `json:"dailyBridgeLimit"` // Maximum per destination per day
 
@@ -75,24 +74,34 @@ type BridgeConfig struct {
 	MaxSigners int `json:"maxSigners"`
 }
 
-// validate refuses a configuration this chain cannot enforce. A bridge with no
-// declared cap does not fail safe by accident: a zero per-transfer cap refuses
-// every transfer silently at every block, which looks exactly like a bridge
-// nobody is using.
-func (c *BridgeConfig) validate() error {
+// validate refuses limits this chain cannot enforce.
+func (l *Limits) validate() error {
 	switch {
-	case c.MinConfirmations == 0:
+	case l.MinConfirmations == 0:
 		return errors.New("bridgevm: minConfirmations must be at least 1")
-	case c.MaxBridgeAmount == 0:
+	case l.MaxBridgeAmount == 0:
 		return errors.New("bridgevm: maxBridgeAmount must be declared")
-	case c.DailyBridgeLimit < c.MaxBridgeAmount:
+	case l.DailyBridgeLimit < l.MaxBridgeAmount:
 		return fmt.Errorf("bridgevm: dailyBridgeLimit %d is below maxBridgeAmount %d",
-			c.DailyBridgeLimit, c.MaxBridgeAmount)
-	case c.RequireValidatorBond < minValidatorBond:
+			l.DailyBridgeLimit, l.MaxBridgeAmount)
+	case l.RequireValidatorBond < minValidatorBond:
 		return fmt.Errorf("bridgevm: requireValidatorBond %d is below the %d minimum",
-			c.RequireValidatorBond, minValidatorBond)
+			l.RequireValidatorBond, minValidatorBond)
 	}
 	return nil
+}
+
+// BridgeConfig is the operator's half: how THIS node reaches the chains the
+// network told it to bridge. Nothing here can change which transfers are
+// valid, so two operators may hold different values without disagreeing.
+type BridgeConfig struct {
+	// ExternalChains is the ONE declaration of which chains this bridge
+	// serves. It carries endpoints, gateway + custody addresses, and KMS paths
+	// for the relayer keys — never key material. A relayer node reads this and
+	// calls EnableBridgeRelease with a KMS-backed KeyProvider and a Warp-backed
+	// AttestationClient; every other node uses it to name the chains it will
+	// carry transfers between.
+	ExternalChains []ExternalChainConfig `json:"externalChains,omitempty"`
 }
 
 // SignerSet tracks the current MPC signer set (LP-333)
@@ -216,6 +225,7 @@ const maxRequestsPerBlock = 100
 type VM struct {
 	rt     *runtime.Runtime
 	config BridgeConfig
+	limits Limits
 	log    log.Logger
 
 	// chainID is the chain this VM is running, hashed into every block id so a
@@ -341,15 +351,23 @@ func (vm *VM) Initialize(
 			return fmt.Errorf("bridgevm: parse config: %w", err)
 		}
 	}
-	if vm.config.MaxSigners == 0 {
-		vm.config.MaxSigners = 100 // LP-333: the set freezes here
+
+	genesis := &Genesis{}
+	if len(vmInit.Genesis) > 0 {
+		if err := json.Unmarshal(vmInit.Genesis, genesis); err != nil {
+			return fmt.Errorf("bridgevm: parse genesis: %w", err)
+		}
 	}
-	if err := vm.config.validate(); err != nil {
+	vm.limits = genesis.Limits
+	if vm.limits.MaxSigners == 0 {
+		vm.limits.MaxSigners = 100 // LP-333: the set freezes here. A capacity, not a risk decision.
+	}
+	if err := vm.limits.validate(); err != nil {
 		return err
 	}
 
 	vm.signerSet = &SignerSet{
-		Signers:  make([]*SignerInfo, 0, vm.config.MaxSigners),
+		Signers:  make([]*SignerInfo, 0, vm.limits.MaxSigners),
 		Waitlist: make([]ids.NodeID, 0),
 	}
 
@@ -363,13 +381,6 @@ func (vm *VM) Initialize(
 	// AttestationClient — runtime deps not available at consensus boot. Config
 	// carries the chain list; a relayer reads vm.config.ExternalChains and calls
 	// EnableBridgeRelease. Non-relayer nodes never broadcast.
-
-	genesis := &Genesis{}
-	if len(vmInit.Genesis) > 0 {
-		if err := json.Unmarshal(vmInit.Genesis, genesis); err != nil {
-			return fmt.Errorf("bridgevm: parse genesis: %w", err)
-		}
-	}
 
 	vm.chain = chain.New[*Block](vmInit.DB, nil)
 
@@ -461,7 +472,7 @@ func (vm *VM) BuildBlock(ctx context.Context) (vmchain.Block, error) {
 			if len(requests) == maxRequestsPerBlock {
 				break
 			}
-			if err := state.admit(&vm.config, day, req); err != nil {
+			if err := state.admit(&vm.limits, day, req); err != nil {
 				vm.log.Debug("bridgevm: transfer not carried",
 					log.Stringer("requestID", req.ID), log.String("reason", err.Error()))
 				continue
@@ -655,6 +666,9 @@ func (vm *VM) WaitForEvent(ctx context.Context) (vmcore.Message, error) {
 // Genesis represents the genesis state
 type Genesis struct {
 	Timestamp int64 `json:"timestamp"`
+	// Limits are inline so a network declares its caps beside the rest of the
+	// chain's genesis, in one file, and every validator reads the same numbers.
+	Limits
 }
 
 // =============================================================================
@@ -720,12 +734,12 @@ func (vm *VM) RegisterValidator(input *RegisterValidatorInput) (*RegisterValidat
 	if err != nil {
 		return nil, fmt.Errorf("bridgevm: bond amount %q is not a number", input.BondAmount)
 	}
-	if bondAmount < vm.config.RequireValidatorBond {
+	if bondAmount < vm.limits.RequireValidatorBond {
 		return nil, fmt.Errorf("bridgevm: bond %d is below the required %d",
-			bondAmount, vm.config.RequireValidatorBond)
+			bondAmount, vm.limits.RequireValidatorBond)
 	}
 
-	if !vm.signerSet.SetFrozen && len(vm.signerSet.Signers) < vm.config.MaxSigners {
+	if !vm.signerSet.SetFrozen && len(vm.signerSet.Signers) < vm.limits.MaxSigners {
 		signerInfo := &SignerInfo{
 			NodeID:     nodeID,
 			PartyID:    party.ID(nodeID.String()),
@@ -739,7 +753,7 @@ func (vm *VM) RegisterValidator(input *RegisterValidatorInput) (*RegisterValidat
 
 		vm.signerSet.Signers = append(vm.signerSet.Signers, signerInfo)
 		vm.signerSet.renumber()
-		if len(vm.signerSet.Signers) >= vm.config.MaxSigners {
+		if len(vm.signerSet.Signers) >= vm.limits.MaxSigners {
 			vm.signerSet.SetFrozen = true
 		}
 
@@ -760,7 +774,7 @@ func (vm *VM) RegisterValidator(input *RegisterValidatorInput) (*RegisterValidat
 			Threshold:      vm.signerSet.ThresholdT,
 			CurrentEpoch:   vm.signerSet.CurrentEpoch,
 			SetFrozen:      vm.signerSet.SetFrozen,
-			RemainingSlots: vm.config.MaxSigners - len(vm.signerSet.Signers),
+			RemainingSlots: vm.limits.MaxSigners - len(vm.signerSet.Signers),
 			Message:        "registered as bridge signer",
 		}, nil
 	}
@@ -795,10 +809,10 @@ func (vm *VM) GetSignerSetInfo() *SignerSetInfo {
 	info := &SignerSetInfo{
 		TotalSigners:   len(vm.signerSet.Signers),
 		Threshold:      vm.signerSet.ThresholdT,
-		MaxSigners:     vm.config.MaxSigners,
+		MaxSigners:     vm.limits.MaxSigners,
 		CurrentEpoch:   vm.signerSet.CurrentEpoch,
 		SetFrozen:      vm.signerSet.SetFrozen,
-		RemainingSlots: vm.config.MaxSigners - len(vm.signerSet.Signers),
+		RemainingSlots: vm.limits.MaxSigners - len(vm.signerSet.Signers),
 		WaitlistSize:   len(vm.signerSet.Waitlist),
 		Signers:        vm.signerSet.Signers,
 	}
@@ -1045,7 +1059,7 @@ func (vm *VM) SlashSigner(input *SlashSignerInput) (*SlashSignerResult, error) {
 	// A signer whose bond no longer meets what the chain requires is not a
 	// signer. The requirement is read from the same declaration registration
 	// applies, so the two cannot drift apart.
-	if remainingBond < vm.config.RequireValidatorBond {
+	if remainingBond < vm.limits.RequireValidatorBond {
 		vm.signerSet.Signers = append(vm.signerSet.Signers[:signerIndex], vm.signerSet.Signers[signerIndex+1:]...)
 		vm.signerSet.renumber()
 		vm.signerSet.CurrentEpoch++

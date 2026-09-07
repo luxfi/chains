@@ -19,7 +19,7 @@ import (
 // they should be carried in.
 func vmWithPending(t *testing.T, n int) (*VM, []ids.ID) {
 	t.Helper()
-	cfg := testConfig()
+	cfg := testLimits()
 	cfg.DailyBridgeLimit = 1 << 40
 	vm := bootOn(t, memdb.New(), cfg)
 
@@ -94,7 +94,7 @@ func TestBuildBlockRefusesWhenNothingIsReady(t *testing.T) {
 // pending set by the rejection, and proposed again — block production stopped
 // and did not resume.
 func TestWhatIsBuiltIsWhatVerifies(t *testing.T) {
-	cfg := testConfig()
+	cfg := testLimits()
 	cfg.MaxBridgeAmount = 100
 	cfg.DailyBridgeLimit = 250
 	vm := bootOn(t, memdb.New(), cfg)

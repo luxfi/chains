@@ -132,7 +132,7 @@ func (w *watcher) pass() {
 // chain requiring 100 permanently ineligible: the depth was never revisited and
 // the cursor had already moved past the lock.
 func (w *watcher) lag() uint64 {
-	if conf := uint64(w.vm.config.MinConfirmations); conf > minWatchLag {
+	if conf := uint64(w.vm.limits.MinConfirmations); conf > minWatchLag {
 		return conf
 	}
 	return minWatchLag
@@ -199,7 +199,7 @@ func (w *watcher) enqueue(l lock) {
 	// A lock this chain can never carry is not held: it would be proposed,
 	// refused, and proposed again for as long as the node runs. What can be
 	// decided without the chain's state is decided here, once.
-	if err := admissible(&w.vm.config, req); err != nil {
+	if err := admissible(&w.vm.limits, req); err != nil {
 		w.vm.log.Warn("bridgevm: lock not admitted",
 			log.Stringer("requestID", id), log.String("reason", err.Error()))
 		return

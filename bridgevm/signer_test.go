@@ -17,7 +17,7 @@ import (
 // boots one.
 func signerVM(t *testing.T, maxSigners int) *VM {
 	t.Helper()
-	cfg := testConfig()
+	cfg := testLimits()
 	cfg.MaxSigners = maxSigners
 	return bootOn(t, memdb.New(), cfg)
 }

@@ -174,7 +174,7 @@ func TestWatchStaysBehindTheHeadAndBoundsAPass(t *testing.T) {
 // ever carried. Reading as deep as the chain asks makes anything read eligible
 // by construction, and there is no depth left to go stale.
 func TestWatchReadsAsDeepAsTheChainAsksFor(t *testing.T) {
-	cfg := testConfig()
+	cfg := testLimits()
 	cfg.MinConfirmations = 500
 	vm := bootOn(t, memdb.New(), cfg)
 	src := &fakeSource{head: 1000}
@@ -239,7 +239,7 @@ func TestAClientThatIsNotASourceIsSkipped(t *testing.T) {
 // lock is read, is the difference between one warning and a proposer that
 // never makes progress again.
 func TestALockThatCanNeverBeCarriedIsNotHeld(t *testing.T) {
-	cfg := testConfig()
+	cfg := testLimits()
 	cfg.MaxBridgeAmount = 10
 	vm := bootOn(t, memdb.New(), cfg)
 	src := &fakeSource{head: 1000}

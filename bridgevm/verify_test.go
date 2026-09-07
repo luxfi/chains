@@ -57,11 +57,11 @@ func TestATransferSettledByAnEarlierBlockCannotBeSettledAgain(t *testing.T) {
 // and a re-observed lock was released a second time.
 func TestATransferSettledBeforeARestartCannotBeSettledAgain(t *testing.T) {
 	db := memdb.New()
-	vm := bootOn(t, db, testConfig())
+	vm := bootOn(t, db, testLimits())
 	pend(vm, requestFor(1, 500))
 	first := buildAndAccept(t, vm)
 
-	restarted := bootOn(t, db, testConfig())
+	restarted := bootOn(t, db, testLimits())
 	again := blockOn(t, restarted, first, now(), requestFor(1, 500))
 	require.ErrorIs(t, again.Verify(context.Background()), errReplay)
 }
@@ -85,7 +85,7 @@ func TestATransferInFlightCannotAlsoRideItsChild(t *testing.T) {
 // TestTheDailyCapHoldsAcrossBlocksInFlight. Checked against the tip alone, a
 // run of blocks that are all in the air each get the whole day's allowance.
 func TestTheDailyCapHoldsAcrossBlocksInFlight(t *testing.T) {
-	cfg := testConfig()
+	cfg := testLimits()
 	cfg.MaxBridgeAmount = 100
 	cfg.DailyBridgeLimit = 150
 	vm := bootOn(t, memdb.New(), cfg)
@@ -140,7 +140,7 @@ func TestARequestMustBeTheDigestOfWhatItCarries(t *testing.T) {
 
 func TestARequestMustBeWellFormed(t *testing.T) {
 	vm := boot(t)
-	cfg := &vm.config
+	cfg := &vm.limits
 
 	// A recipient that is not an address cannot be released to.
 	short := requestFor(1, 500)
@@ -307,8 +307,8 @@ func TestTwoAcceptsAtOnceLeaveOneChain(t *testing.T) {
 // database holding settled transfers is a read fault, not a new chain.
 func TestARestartBeforeTheFirstBlockComesUp(t *testing.T) {
 	db := memdb.New()
-	first := bootOn(t, db, testConfig())
-	second := bootOn(t, db, testConfig())
+	first := bootOn(t, db, testLimits())
+	second := bootOn(t, db, testLimits())
 
 	require.Equal(t, first.genesisBlock.ID(), second.genesisBlock.ID(),
 		"one chain, two nodes of it")
@@ -576,7 +576,7 @@ func TestABlockOfAnotherChainIsNotABlockOfThisOne(t *testing.T) {
 // been spent — durably, with Initialize returning nil.
 func TestAChainDoesNotRestartOverItself(t *testing.T) {
 	db := memdb.New()
-	vm := bootOn(t, db, testConfig())
+	vm := bootOn(t, db, testLimits())
 	pend(vm, requestFor(1, 500))
 	buildAndAccept(t, vm)
 
@@ -584,7 +584,7 @@ func TestAChainDoesNotRestartOverItself(t *testing.T) {
 	// they say this database is not a new chain.
 	require.NoError(t, db.Delete([]byte("chain/tip")))
 
-	err := (&VM{}).Initialize(context.Background(), initFor(db, testConfig()))
+	err := (&VM{}).Initialize(context.Background(), initFor(db, testLimits()))
 	require.ErrorContains(t, err, "refusing to restart the chain over it")
 }
 

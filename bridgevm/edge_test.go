@@ -24,13 +24,13 @@ import (
 // starting somewhere else.
 func TestAChainThatCannotReadItsTipDoesNotStart(t *testing.T) {
 	db := memdb.New()
-	vm := bootOn(t, db, testConfig())
+	vm := bootOn(t, db, testLimits())
 	pend(vm, requestFor(1, 100))
 	blk := buildAndAccept(t, vm)
 
 	// The tip is recorded; the block it names is gone.
 	require.NoError(t, db.Delete(blockRecordKey(blk.ID())))
-	require.Error(t, (&VM{}).Initialize(context.Background(), initFor(db, testConfig())))
+	require.Error(t, (&VM{}).Initialize(context.Background(), initFor(db, testLimits())))
 }
 
 // blockRecordKey is where the shared store keeps a block's bytes.
@@ -43,7 +43,7 @@ func TestAChainWithAnUnreadableTipDoesNotStart(t *testing.T) {
 	db := memdb.New()
 	require.NoError(t, db.Put([]byte("chain/tip"), make([]byte, ids.IDLen)))
 	// Zero is a well-formed id naming no block.
-	require.Error(t, (&VM{}).Initialize(context.Background(), initFor(db, testConfig())))
+	require.Error(t, (&VM{}).Initialize(context.Background(), initFor(db, testLimits())))
 }
 
 // TestARelayerThatIsNotReadingReportsIt. A node with chains wired and a
@@ -212,7 +212,7 @@ func TestRPC_ReplaceSignerWithANamedReplacement(t *testing.T) {
 
 func TestRPC_TheWaitlistIsNamed(t *testing.T) {
 	srv, vm := newRPCRig(t)
-	vm.config.MaxSigners = 1
+	vm.limits.MaxSigners = 1
 	first, waiting := ids.GenerateTestNodeID(), ids.GenerateTestNodeID()
 	require.NoError(t, registerSigner(vm, first))
 	require.NoError(t, registerSigner(vm, waiting))
@@ -268,7 +268,7 @@ func TestRPC_GetInfoOnceThereIsAGroupKey(t *testing.T) {
 // A counter bridge_getInfo cannot read is reported, not summed as zero.
 func TestRPC_GetInfoSaysWhenItCannotRead(t *testing.T) {
 	vm := bootOn(t, &unreadableDB{Database: memdb.New(), prefix: movedPrefix, err: errUnreadable},
-		testConfig())
+		testLimits())
 	srv, _ := serveVM(t, vm)
 
 	code, msg := callRPC(t, srv.URL, "bridge_getInfo", nil, &GetBridgeInfoReply{})
@@ -408,7 +408,7 @@ func (*brokenIterator) Value() []byte { return nil }
 
 func TestAStoreThatCannotBeWalkedDoesNotBoot(t *testing.T) {
 	err := (&VM{}).Initialize(context.Background(),
-		initFor(unlistableDB{Database: memdb.New()}, testConfig()))
+		initFor(unlistableDB{Database: memdb.New()}, testLimits()))
 	require.ErrorContains(t, err, "read settlement records")
 }
 

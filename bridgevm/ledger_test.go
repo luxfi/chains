@@ -57,7 +57,7 @@ func TestASpendItCannotReadIsNotZero(t *testing.T) {
 
 	// And the rule that reads it refuses rather than admitting on a total it
 	// could not obtain.
-	cfg := testConfig()
+	cfg := testLimits()
 	require.ErrorIs(t, s.admit(&cfg, 1, requestFor(1, 100)), errUnreadable)
 }
 
@@ -68,7 +68,7 @@ func TestASettlementItCannotReadIsNotAbsent(t *testing.T) {
 	_, err := s.isSettled(ids.GenerateTestID())
 	require.ErrorIs(t, err, errUnreadable)
 
-	cfg := testConfig()
+	cfg := testLimits()
 	require.ErrorIs(t, s.admit(&cfg, 1, requestFor(1, 100)), errUnreadable)
 }
 
@@ -124,7 +124,7 @@ func TestAChildsSpendIsItsOwn(t *testing.T) {
 	db := memdb.New()
 	parent := newSpend(db)
 	req := requestFor(1, 100)
-	cfg := testConfig()
+	cfg := testLimits()
 	require.NoError(t, parent.admit(&cfg, 1, req))
 
 	child := parent.clone()
@@ -142,7 +142,7 @@ func TestAChildsSpendIsItsOwn(t *testing.T) {
 // A total near the top of the range does not wrap past the cap.
 func TestTheCapDoesNotWrap(t *testing.T) {
 	db := memdb.New()
-	cfg := testConfig()
+	cfg := testLimits()
 	cfg.MaxBridgeAmount = ^uint64(0)
 	cfg.DailyBridgeLimit = 1000
 	require.NoError(t, db.Put(movedKey(1, dstChain), counterBytes(999)))

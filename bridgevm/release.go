@@ -190,8 +190,8 @@ func (r *releaser) releaseOnce(ctx context.Context, req *BridgeRequest, transfer
 	if err != nil {
 		return fmt.Errorf("bridgevm: source confirmation check: %w", err)
 	}
-	if conf < r.vm.config.MinConfirmations {
-		return fmt.Errorf("%w: %d < %d", errInsufficientConfirmations, conf, r.vm.config.MinConfirmations)
+	if conf < r.vm.limits.MinConfirmations {
+		return fmt.Errorf("%w: %d < %d", errInsufficientConfirmations, conf, r.vm.limits.MinConfirmations)
 	}
 	destTx, err := r.vm.releaseTransfer(ctx, transfer)
 	if err != nil {

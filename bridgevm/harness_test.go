@@ -41,13 +41,20 @@ const (
 // would make every cross-node block mismatch look like correct behaviour.
 var testChainID = ids.ID{'b', '-', 'c', 'h', 'a', 'i', 'n', '-', 't', 'e', 's', 't'}
 
-func testConfig() BridgeConfig {
-	return BridgeConfig{
+// testLimits is what the NETWORK declares in genesis.
+func testLimits() Limits {
+	return Limits{
 		MinConfirmations:     12,
 		MaxBridgeAmount:      1_000_000,
 		DailyBridgeLimit:     10_000_000,
 		RequireValidatorBond: minValidatorBond,
 		MaxSigners:           100,
+	}
+}
+
+// testChains is what the OPERATOR declares: how this node reaches them.
+func testChains() BridgeConfig {
+	return BridgeConfig{
 		ExternalChains: []ExternalChainConfig{
 			{Name: "lux-testnet-c", ChainID: uint64(srcChain), Gateway: "0x0000000000000000000000000000000000000001"},
 			{Name: "zoo-testnet", ChainID: uint64(dstChain), Gateway: "0x0000000000000000000000000000000000000002"},
@@ -82,8 +89,12 @@ func (b *refusingBatch) Write() error {
 }
 
 // initFor is what the node hands Initialize.
-func initFor(db database.Database, cfg BridgeConfig) vmcore.Init {
-	raw, err := json.Marshal(cfg)
+func initFor(db database.Database, lim Limits) vmcore.Init {
+	raw, err := json.Marshal(testChains())
+	if err != nil {
+		panic(err)
+	}
+	gen, err := json.Marshal(Genesis{Timestamp: 1000000, Limits: lim})
 	if err != nil {
 		panic(err)
 	}
@@ -95,31 +106,31 @@ func initFor(db database.Database, cfg BridgeConfig) vmcore.Init {
 			NodeID:    ids.GenerateTestNodeID(),
 		},
 		DB:      db,
-		Genesis: []byte(`{"timestamp":1000000}`),
+		Genesis: gen,
 		Config:  raw,
 	}
 }
 
 // bootOn brings a VM up over db exactly as the node does, with cfg as its
 // configuration.
-func bootOn(t *testing.T, db database.Database, cfg BridgeConfig) *VM {
+func bootOn(t *testing.T, db database.Database, lim Limits) *VM {
 	t.Helper()
 	vm := &VM{}
-	require.NoError(t, vm.Initialize(context.Background(), initFor(db, cfg)))
+	require.NoError(t, vm.Initialize(context.Background(), initFor(db, lim)))
 	return vm
 }
 
 // boot is a VM on a fresh database with the standard configuration.
 func boot(t *testing.T) *VM {
 	t.Helper()
-	return bootOn(t, memdb.New(), testConfig())
+	return bootOn(t, memdb.New(), testLimits())
 }
 
 // bootRefusing is a VM whose database can be told to refuse a flush.
 func bootRefusing(t *testing.T) (*VM, *refusingDB) {
 	t.Helper()
 	db := &refusingDB{Database: memdb.New()}
-	return bootOn(t, db, testConfig()), db
+	return bootOn(t, db, testLimits()), db
 }
 
 // transferFor is one locked transfer. The request's id is the digest of its

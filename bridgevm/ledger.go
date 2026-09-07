@@ -148,7 +148,7 @@ func counterBytes(v uint64) []byte {
 // transfer that fails here can never be carried by any block, and holding one
 // would have it proposed, refused, and proposed again for as long as the node
 // runs.
-func admissible(cfg *BridgeConfig, req *BridgeRequest) error {
+func admissible(lim *Limits, req *BridgeRequest) error {
 	transfer, err := req.transfer()
 	if err != nil {
 		return err
@@ -169,9 +169,9 @@ func admissible(cfg *BridgeConfig, req *BridgeRequest) error {
 	if req.Amount == 0 {
 		return fmt.Errorf("bridgevm: request %s moves nothing", req.ID)
 	}
-	if req.Amount > cfg.MaxBridgeAmount {
+	if req.Amount > lim.MaxBridgeAmount {
 		return fmt.Errorf("bridgevm: request %s moves %d, over the %d per-transfer cap",
-			req.ID, req.Amount, cfg.MaxBridgeAmount)
+			req.ID, req.Amount, lim.MaxBridgeAmount)
 	}
 	return nil
 }
@@ -183,8 +183,8 @@ func admissible(cfg *BridgeConfig, req *BridgeRequest) error {
 // order. Two rules would disagree eventually, and the first transfer they
 // disagreed about would be one the builder keeps proposing and every node
 // keeps refusing — block production stops and does not resume.
-func (s *spend) admit(cfg *BridgeConfig, day int64, req *BridgeRequest) error {
-	if err := admissible(cfg, req); err != nil {
+func (s *spend) admit(lim *Limits, day int64, req *BridgeRequest) error {
+	if err := admissible(lim, req); err != nil {
 		return err
 	}
 	already, err := s.isSettled(req.ID)
@@ -200,9 +200,9 @@ func (s *spend) admit(cfg *BridgeConfig, day int64, req *BridgeRequest) error {
 	}
 	// Written as a subtraction so a total near the top of the range cannot
 	// wrap past the cap.
-	if req.Amount > cfg.DailyBridgeLimit-was {
+	if req.Amount > lim.DailyBridgeLimit-was {
 		return fmt.Errorf("bridgevm: request %s would move %d to chain %d, over the %d daily cap (%d already moved)",
-			req.ID, req.Amount, req.DstChainID, cfg.DailyBridgeLimit, was)
+			req.ID, req.Amount, req.DstChainID, lim.DailyBridgeLimit, was)
 	}
 	s.record(day, req, was)
 	return nil

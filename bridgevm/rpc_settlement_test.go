@@ -252,7 +252,7 @@ func TestRPC_GetSupportedChains(t *testing.T) {
 		require.Equal(t, strconv.FormatUint(vm.config.ExternalChains[i].ChainID, 10), c.ChainID)
 		require.Equal(t, vm.config.ExternalChains[i].Name, c.ChainName)
 		require.True(t, c.Enabled)
-		require.Equal(t, int(vm.config.MinConfirmations), c.Confirmations)
+		require.Equal(t, int(vm.limits.MinConfirmations), c.Confirmations)
 	}
 }
 

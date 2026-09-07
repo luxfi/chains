@@ -51,7 +51,7 @@ func releaseReq() *BridgeRequest {
 func confirmationRig(t *testing.T, depth uint32) (*releaser, *sourceClient, *recordingClient, *fixedAttester) {
 	t.Helper()
 	vm, dst, ac := releaseRig(t, nil)
-	vm.config.MinConfirmations = 12
+	vm.limits.MinConfirmations = 12
 	src := &sourceClient{recordingClient: &recordingClient{}, depth: depth}
 	vm.evmByChainID[1] = src
 	return &releaser{vm: vm}, src, dst, ac

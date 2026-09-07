@@ -663,7 +663,7 @@ func (s *Service) chainConfig(cfg ExternalChainConfig) ChainConfigReply {
 		ChainID:        strconv.FormatUint(cfg.ChainID, 10),
 		ChainName:      cfg.Name,
 		BridgeContract: cfg.Gateway,
-		Confirmations:  int(s.vm.config.MinConfirmations),
+		Confirmations:  int(s.vm.limits.MinConfirmations),
 		Enabled:        true,
 	}
 }

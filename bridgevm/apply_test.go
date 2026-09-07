@@ -126,7 +126,7 @@ func TestTheHeightIndexNamesOnlyAcceptedBlocks(t *testing.T) {
 // the number that bounds what this bridge can move.
 func TestTheDailyCapSurvivesARestart(t *testing.T) {
 	db := memdb.New()
-	cfg := testConfig()
+	cfg := testLimits()
 	cfg.MaxBridgeAmount = 600
 	cfg.DailyBridgeLimit = 1000
 
@@ -157,7 +157,7 @@ func TestTheDailyCapSurvivesARestart(t *testing.T) {
 
 // TestTheCapIsCountedPerDestination keeps one busy route from closing another.
 func TestTheCapIsCountedPerDestination(t *testing.T) {
-	cfg := testConfig()
+	cfg := testLimits()
 	cfg.MaxBridgeAmount = 100
 	cfg.DailyBridgeLimit = 100
 	vm := bootOn(t, memdb.New(), cfg)
@@ -187,7 +187,7 @@ func TestTheCapIsCountedPerDestination(t *testing.T) {
 // window is the BLOCK's time — the whole point of measuring it there rather
 // than off each node's clock.
 func TestTheWindowReopensOnTheNextDay(t *testing.T) {
-	cfg := testConfig()
+	cfg := testLimits()
 	cfg.MaxBridgeAmount = 100
 	cfg.DailyBridgeLimit = 100
 	vm := bootOn(t, memdb.New(), cfg)
