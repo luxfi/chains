@@ -21,7 +21,7 @@ name: CI
 #
 # This replaces .github/workflows/validate-asset-manifests.yml, whose two jobs
 # named the bare `['self-hosted', 'linux', 'amd64']` triple. The pool on this
-# forge is `lux-build-linux-amd64`; nothing answers to the triple, and a job
+# forge is `linux-amd64`; nothing answers to the triple, and a job
 # naming a label no runner carries does not fail — it waits. So this gate has
 # not actually been gating anything.
 
@@ -53,7 +53,7 @@ env:
 
 jobs:
   registry-tests:
-    runs-on: [lux-build-linux-amd64]
+    runs-on: [linux-amd64]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +66,7 @@ jobs:
 
   live-validation:
     needs: registry-tests
-    runs-on: [lux-build-linux-amd64]
+    runs-on: [linux-amd64]
     timeout-minutes: 30
     strategy:
       fail-fast: false

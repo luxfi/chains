@@ -53,7 +53,7 @@ concurrency:
 
 jobs:
   plan:
-    runs-on: [lux-build-linux-amd64]
+    runs-on: [linux-amd64]
     timeout-minutes: 10
     outputs:
       images: ${{ steps.load.outputs.images }}
@@ -146,7 +146,7 @@ jobs:
     # Registry-side only: imagetools reads the two per-arch manifests and writes
     # a list that points at both. No builder and no platform of its own, so which
     # pool runs this does not matter.
-    runs-on: [lux-build-linux-amd64]
+    runs-on: [linux-amd64]
     timeout-minutes: 15
     steps:
       - name: Compute the release names
