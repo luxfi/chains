@@ -1,6 +1,6 @@
 module github.com/luxfi/chains
 
-go 1.26.5
+go 1.26.8
 
 require (
 	github.com/consensys/gnark-crypto v0.20.1
