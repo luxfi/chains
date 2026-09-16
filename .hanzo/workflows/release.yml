@@ -69,7 +69,7 @@ jobs:
       matrix:
         image: ${{ fromJson(needs.plan.outputs.images) }}
         arch: [amd64, arm64]
-    runs-on: ['lux-build-linux-${{ matrix.arch }}']
+    runs-on: ['linux-${{ matrix.arch }}']
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
