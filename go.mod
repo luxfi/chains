@@ -221,6 +221,18 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
+// v1.7.7 does not name one body of code. proxy.golang.org and sum.golang.org
+// hold the content it was published with and always will, because a published
+// version is immutable to them; GitHub serves something else, and go.sum files
+// in this org have held a third. Builds through the proxy and builds that go
+// direct therefore disagree, and the direct ones only look fine because
+// GOPRIVATE skips the checksum database — so this is a checksum SECURITY ERROR
+// waiting for the first consumer who builds without it.
+//
+// The answer to a moved tag is a new version, never a re-pointed one. Use
+// v1.7.8 or later.
+retract v1.7.7
+
 // v1.7.37 branched from a commit before v1.7.36 and carries a higher number
 // than the release it does not contain: 38 commits are missing, among them the
 // fix that stops a store reading any failed tip read as a fresh chain. A module
