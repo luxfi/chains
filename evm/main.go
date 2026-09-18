@@ -117,10 +117,9 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) int {
 		return fail(errOut, err)
 	}
 
-	// Resolve the execution backend before serving. With cgo this links
-	// luxcpp/cevm and selects AutoEVM (CppEVM when luxfi/evm is built
-	// with -tags cevm; GoEVM otherwise). Without cgo this stays on GoEVM.
-	selectExecutionBackend(log.Root())
+	// Say what this binary linked before it serves, so an operator reading
+	// the log knows which library answered.
+	reportCevm(log.Root())
 
 	if err := rpc.Serve(ctx, log.Root(), &evm.VM{}); err != nil {
 		return fail(errOut, err)

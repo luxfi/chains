@@ -11,10 +11,8 @@ import (
 	"testing"
 
 	"github.com/luxfi/constants"
-	"github.com/luxfi/evm/core/parallel"
 	"github.com/luxfi/evm/plugin/evm"
 	"github.com/luxfi/ids"
-	"github.com/luxfi/log"
 	"github.com/luxfi/version"
 	"github.com/luxfi/vm/rpc/runtime"
 )
@@ -152,36 +150,5 @@ func TestEveryRefusalIsAttributedAndNonZero(t *testing.T) {
 	}
 	if got := w.String(); got != "evm plugin: disk fell off\n" {
 		t.Fatalf("fail() wrote %q", got)
-	}
-}
-
-// Selecting the backend leaves exactly one lane active, and it is one this
-// build actually has. A binary that resolved to a backend it cannot run would
-// execute nothing and report a name.
-func TestSelectingTheBackendLeavesARunnableLaneActive(t *testing.T) {
-	selectExecutionBackend(log.Root())
-
-	active := parallel.ActiveBackend()
-	available := parallel.AvailableBackends()
-	if len(available) == 0 {
-		t.Fatal("no execution backend is available; the EVM cannot run a block")
-	}
-	for _, b := range available {
-		if b == active {
-			return
-		}
-	}
-	t.Fatalf("active backend %q is not among the available ones %q", active, available)
-}
-
-// Selection is idempotent: the node calls it once at start-up, but a value
-// that changed on a second call would mean the answer depends on when it was
-// asked.
-func TestSelectingTheBackendTwiceGivesTheSameLane(t *testing.T) {
-	selectExecutionBackend(log.Root())
-	first := parallel.ActiveBackend()
-	selectExecutionBackend(log.Root())
-	if second := parallel.ActiveBackend(); second != first {
-		t.Fatalf("backend moved from %q to %q between two identical calls", first, second)
 	}
 }
