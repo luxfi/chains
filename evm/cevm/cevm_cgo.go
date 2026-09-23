@@ -87,9 +87,11 @@ var (
 	_ [unsafe.Sizeof(BlockContext{}) - unsafe.Sizeof(C.CBlockContext{})]struct{}
 )
 
-// libraryABI is the ABI the loaded library reports (gpu_abi_version), read
-// once in init. The library a binary loads at run time need not be the one
-// whose header it was built against.
+// libraryABI is the ABI the loaded library speaks, read once in init: the one
+// it reports (gpu_abi_version), or 0 where its CGpuTx is not this file's
+// (gpu_abi_tx_size), as it is not in a version 7 library built before the tx
+// carried its fee cap and tip. The library a binary loads at run time need not
+// be the one whose header it was built against.
 var libraryABI uint32
 
 // init reads the loaded library's ABI. A library of another ABI lays the
@@ -97,6 +99,9 @@ var libraryABI uint32
 // every block is declined, and the caller runs it on its own EVM.
 func init() {
 	libraryABI = uint32(C.gpu_abi_version())
+	if uint32(C.gpu_abi_tx_size()) != uint32(unsafe.Sizeof(C.CGpuTx{})) {
+		libraryABI = 0
+	}
 }
 
 // errOtherABI is ExecuteBlock's decline when the loaded library, or a result
@@ -327,8 +332,9 @@ func AvailableBackends() []Backend {
 	return out
 }
 
-// LibraryABIVersion returns the ABI the loaded library reports. When it is
-// not ABIVersion, ExecuteBlock declines every block.
+// LibraryABIVersion returns the ABI the loaded library speaks: the one it
+// reports, or 0 where its CGpuTx is not this build's. When it is not
+// ABIVersion, ExecuteBlock declines every block.
 func LibraryABIVersion() uint32 {
 	return libraryABI
 }

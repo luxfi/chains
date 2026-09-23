@@ -232,10 +232,8 @@ func shape(txs types.Transactions, senders []common.Address, statedb *state.Stat
 		if !ok {
 			return out, i
 		}
-		tipCap, ok := fits(tx.GasTipCap())
-		if !ok {
-			return out, i
-		}
+		// The tip is at most the fee cap (carried), so it fits too.
+		tipCap := tx.GasTipCap().Uint64()
 		ct := cevm.Transaction{
 			GasLimit:  tx.Gas(),
 			Nonce:     tx.Nonce(),

@@ -45,8 +45,10 @@
 // build does not compile against a header that names another, and init reads
 // the loaded library's gpu_abi_version(): against a library of another ABI,
 // ExecuteBlock sends it no block and declines every one, so the caller runs
-// them all on its own EVM. It catches a library built against another ABI number;
-// two libraries that report the same number are not told apart.
+// them all on its own EVM. It catches a library built against another ABI
+// number, and a version 7 library whose CGpuTx is not this build's
+// (gpu_abi_tx_size), which one built before the tx carried its fee cap and tip
+// is not; two libraries alike in both are not told apart.
 //
 // Use Health() at startup to see which lanes can run a block: it runs a
 // funded plain transfer on each.
