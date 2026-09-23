@@ -330,7 +330,8 @@ type healthProbe struct {
 // code, and the CPU lanes run nothing without a host. So the battery is one
 // such block — a funded sender's transfer to a fresh address — which a lane
 // that can run anything runs to TxOK at its 21000 intrinsic gas, and which
-// every other lane declines.
+// every other lane declines. Its limit is above that, so a lane that answers
+// a gas estimate (the limit) instead of running it is not taken for healthy.
 func healthBattery() []healthProbe {
 	from, to, coinbase := [20]byte{0x01}, [20]byte{0x02}, [20]byte{0xC0}
 	row := func(addr [20]byte, balance uint64) StateAccount {
@@ -343,7 +344,7 @@ func healthBattery() []healthProbe {
 	}
 	return []healthProbe{{
 		name:    "transfer",
-		txs:     []Transaction{{From: from, To: to, HasTo: true, GasLimit: 21000, Value: 1, GasPrice: 1}},
+		txs:     []Transaction{{From: from, To: to, HasTo: true, GasLimit: 30000, Value: 1, GasPrice: 1}},
 		ctx:     BlockContext{GasLimit: 30_000_000, ChainID: 1, BaseFee: 1, Coinbase: coinbase},
 		state:   []StateAccount{row(from, 1_000_000), row(to, 0), row(coinbase, 0)},
 		wantGas: 21000,

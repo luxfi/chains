@@ -162,6 +162,13 @@ func (e *Executor) run(
 	senders []common.Address,
 	statedb *state.StateDB,
 ) ([]*types.Receipt, error) {
+	// cevm's Go entry runs nothing on a CPU lane: it passes no host, and a
+	// CPU lane runs no plain transfer without one (go_bridge.h, ABI 6). A
+	// library that answers there anyway answers something else — a gas
+	// estimate — so it is not asked.
+	if e.CevmBackend != cevm.GPUMetal && e.CevmBackend != cevm.GPUCUDA {
+		return declineBlock("cpu_lane", header.Number.Uint64(), 0)
+	}
 	cevmTxs, i := shape(txs, senders, statedb)
 	if i < len(txs) {
 		return declineBlock("tx_not_representable", header.Number.Uint64(), uint64(i))

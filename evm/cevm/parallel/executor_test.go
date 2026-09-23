@@ -83,6 +83,7 @@ func TestABlockCevmDeclinesRunsOnTheGoEVM(t *testing.T) {
 func TestACevmFailureThatIsNotADeclineIsAnError(t *testing.T) {
 	broken := errors.New("cevm: ABI version mismatch in result")
 	e := &Executor{
+		CevmBackend: cevm.GPUMetal,
 		execute: func(cevm.Backend, uint32, []cevm.Transaction, *cevm.BlockContext, []cevm.StateAccount) (*cevm.BlockResult, error) {
 			return nil, broken
 		},
@@ -101,6 +102,7 @@ func TestACevmFailureThatIsNotADeclineIsAnError(t *testing.T) {
 func TestABlockCevmRanIsReceipted(t *testing.T) {
 	txs := types.Transactions{transfer(t, 0, big.NewInt(1)), transfer(t, 1, big.NewInt(1))}
 	e := &Executor{
+		CevmBackend: cevm.GPUMetal,
 		execute: func(cevm.Backend, uint32, []cevm.Transaction, *cevm.BlockContext, []cevm.StateAccount) (*cevm.BlockResult, error) {
 			return &cevm.BlockResult{
 				GasUsed: []uint64{21000, 21000},
@@ -172,6 +174,28 @@ func TestWhatDoesNotFitTheWireNeverReachesCevm(t *testing.T) {
 			receipts, err := e.run(config, header, txs, senders(len(txs)), newState(t))
 			if err != nil || receipts != nil {
 				t.Fatalf("run = (%v, %v), want (nil, nil): the Go EVM runs the block", receipts, err)
+			}
+		})
+	}
+}
+
+// A CPU lane runs nothing through cevm's Go entry, so the block goes to the Go
+// EVM without asking cevm — a library that answered there would answer a gas
+// estimate.
+func TestACPULaneDeclinesWithoutAskingCevm(t *testing.T) {
+	for _, b := range []cevm.Backend{cevm.CPUSequential, cevm.CPUParallel} {
+		t.Run(b.String(), func(t *testing.T) {
+			e := &Executor{
+				CevmBackend: b,
+				execute: func(cevm.Backend, uint32, []cevm.Transaction, *cevm.BlockContext, []cevm.StateAccount) (*cevm.BlockResult, error) {
+					t.Fatal("cevm was asked to run a block on a CPU lane")
+					return nil, nil
+				},
+			}
+			txs := types.Transactions{transfer(t, 0, big.NewInt(1))}
+			receipts, err := e.run(chainConfig(), newHeader(), txs, senders(len(txs)), newState(t))
+			if err != nil || receipts != nil {
+				t.Fatalf("run = (%v, %v), want (nil, nil)", receipts, err)
 			}
 		})
 	}
@@ -602,6 +626,7 @@ func TestABlockBeyondValueTransferIsDeclinedBeforeCevm(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := &Executor{
+				CevmBackend: cevm.GPUMetal,
 				execute: func(cevm.Backend, uint32, []cevm.Transaction, *cevm.BlockContext, []cevm.StateAccount) (*cevm.BlockResult, error) {
 					t.Fatal("cevm was asked to run a block it could not receipt")
 					return nil, nil
