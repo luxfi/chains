@@ -5,6 +5,7 @@ package cevm
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -314,6 +315,9 @@ func allTransfers(r *BlockResult, n int) bool {
 func ranTransfers(t *testing.T, r *BlockResult, err error, n int) {
 	t.Helper()
 	if err != nil {
+		// The ABI carries no reason: on a host with the device, a decline is
+		// its shader not found, a driver or architecture mismatch, or a
+		// regression in its path.
 		t.Fatalf("ExecuteBlock: %v", err)
 	}
 	if !allTransfers(r, n) {
@@ -350,15 +354,20 @@ func deviceLanes(t *testing.T) []Backend {
 }
 
 // hasDevice reports whether this host has the device GPU lane b runs on: the
-// GPU every Apple silicon Mac has for Metal, and an NVIDIA driver's control
-// device for CUDA. The library lists a lane it was built with either way.
+// GPU every Apple silicon Mac has for Metal, and for CUDA an NVIDIA driver's
+// control device with at least one GPU node this process can see (a container
+// can be given the first without the second). The library lists a lane it
+// was built with either way.
 func hasDevice(b Backend) bool {
 	switch b {
 	case GPUMetal:
 		return runtime.GOOS == "darwin" && runtime.GOARCH == "arm64"
 	case GPUCUDA:
-		_, err := os.Stat("/dev/nvidiactl")
-		return err == nil
+		if _, err := os.Stat("/dev/nvidiactl"); err != nil {
+			return false
+		}
+		gpus, _ := filepath.Glob("/dev/nvidia[0-9]*")
+		return len(gpus) > 0
 	}
 	return false
 }

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"math/big"
 	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 
@@ -100,15 +101,20 @@ func TestAPlainTransferBlockIsReceiptedOrDeclined(t *testing.T) {
 }
 
 // hasDevice reports whether this host has the device GPU lane b runs on: the
-// GPU every Apple silicon Mac has for Metal, and an NVIDIA driver's control
-// device for CUDA. The library lists a lane it was built with either way.
+// GPU every Apple silicon Mac has for Metal, and for CUDA an NVIDIA driver's
+// control device with at least one GPU node this process can see (a container
+// can be given the first without the second). The library lists a lane it
+// was built with either way.
 func hasDevice(b cevm.Backend) bool {
 	switch b {
 	case cevm.GPUMetal:
 		return runtime.GOOS == "darwin" && runtime.GOARCH == "arm64"
 	case cevm.GPUCUDA:
-		_, err := os.Stat("/dev/nvidiactl")
-		return err == nil
+		if _, err := os.Stat("/dev/nvidiactl"); err != nil {
+			return false
+		}
+		gpus, _ := filepath.Glob("/dev/nvidia[0-9]*")
+		return len(gpus) > 0
 	}
 	return false
 }
