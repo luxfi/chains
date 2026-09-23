@@ -281,7 +281,7 @@ func transfers(n int) ([]Transaction, BlockContext, []StateAccount) {
 	for i := range txs {
 		from := [20]byte{0xA0, byte(i >> 8), byte(i)}
 		to := [20]byte{0xB0, byte(i >> 8), byte(i)}
-		txs[i] = Transaction{From: from, To: to, HasTo: true, GasLimit: 30_000, Value: 1, GasPrice: 1}
+		txs[i] = Transaction{From: from, To: to, HasTo: true, GasLimit: 30_000, Value: 1, GasFeeCap: 1, GasTipCap: 1}
 		state = append(state, account(from, 1_000_000), account(to, 0))
 	}
 	state = append(state, account(ctx.Coinbase, 0))
@@ -396,12 +396,13 @@ func bytecodeTx(i uint64, code []byte) Transaction {
 	from[19] = byte(i)
 	from[18] = byte(i >> 8)
 	return Transaction{
-		From:     from,
-		HasTo:    true,
-		Code:     code,
-		GasLimit: 1_000_000,
-		Nonce:    i,
-		GasPrice: 1,
+		From:      from,
+		HasTo:     true,
+		Code:      code,
+		GasLimit:  1_000_000,
+		Nonce:     i,
+		GasFeeCap: 1,
+		GasTipCap: 1,
 	}
 }
 

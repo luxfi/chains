@@ -281,15 +281,17 @@ func TestShapeCarriesEachTransactionsOwnFields(t *testing.T) {
 			GasPrice: big.NewInt(5), Data: []byte{0xAB},
 		}),
 		types.NewTx(&types.LegacyTx{Nonce: 8, Value: big.NewInt(1), Gas: 53000, GasPrice: big.NewInt(9)}),
+		types.NewTx(&types.DynamicFeeTx{Nonce: 9, To: &to, Gas: 21000, GasFeeCap: big.NewInt(30), GasTipCap: big.NewInt(2)}),
 	}
-	senders := []common.Address{{0x11}, {0x33}}
+	senders := []common.Address{{0x11}, {0x33}, {0x44}}
 
 	got, i := shape(txs, senders, sdb)
 	if i != len(txs) {
 		t.Fatalf("shape declined at index %d; every transaction here is representable", i)
 	}
 
-	if got[0].Nonce != 7 || got[0].Value != 1234 || got[0].GasLimit != 21000 || got[0].GasPrice != 5 {
+	if got[0].Nonce != 7 || got[0].Value != 1234 || got[0].GasLimit != 21000 ||
+		got[0].GasFeeCap != 5 || got[0].GasTipCap != 5 {
 		t.Errorf("tx 0 shaped as %+v", got[0])
 	}
 	if !got[0].HasTo || common.Address(got[0].To) != to {
@@ -315,12 +317,19 @@ func TestShapeCarriesEachTransactionsOwnFields(t *testing.T) {
 	if common.Address(got[1].From) != senders[1] {
 		t.Errorf("tx 1 sender = %x, want %x", got[1].From, senders[1])
 	}
+
+	// A dynamic-fee tx carries its fee cap and its tip: it pays the base fee
+	// and the tip, capped at the cap. Before, the wire had one price, the cap,
+	// and cevm charged it whole.
+	if got[2].GasFeeCap != 30 || got[2].GasTipCap != 2 {
+		t.Errorf("tx 2 fee cap/tip = %d/%d, want 30/2", got[2].GasFeeCap, got[2].GasTipCap)
+	}
 }
 
-// cevm.Transaction holds Value and GasPrice as uint64. A value or price above
-// 2^64-1 is rare but legal, and truncating it would execute a transaction
-// other than the one that was signed — so the block is declined at the index
-// that cannot be carried.
+// cevm.Transaction holds Value, GasFeeCap and GasTipCap as uint64. A value or
+// fee above 2^64-1 is rare but legal, and truncating it would execute a
+// transaction other than the one that was signed — so the block is declined at
+// the index that cannot be carried.
 func TestAValueOrPriceTooLargeForTheWireIsDeclinedAtItsIndex(t *testing.T) {
 	huge := new(big.Int).Lsh(big.NewInt(1), 64) // 2^64: one past what fits
 	max := new(big.Int).Sub(huge, big.NewInt(1))
@@ -356,17 +365,19 @@ func TestAValueOrPriceTooLargeForTheWireIsDeclinedAtItsIndex(t *testing.T) {
 			if i != 2 {
 				t.Fatalf("shape declined 2^64-1 at index %d; it is exactly representable", i)
 			}
-			if got[1].Value != tc.exact.Value().Uint64() || got[1].GasPrice != tc.exact.GasPrice().Uint64() {
-				t.Errorf("shaped value/price = %d/%d, want %d/%d", got[1].Value, got[1].GasPrice,
-					tc.exact.Value().Uint64(), tc.exact.GasPrice().Uint64())
+			if got[1].Value != tc.exact.Value().Uint64() || got[1].GasFeeCap != tc.exact.GasFeeCap().Uint64() ||
+				got[1].GasTipCap != tc.exact.GasTipCap().Uint64() {
+				t.Errorf("shaped value/fee cap/tip = %d/%d/%d, want %d/%d/%d", got[1].Value, got[1].GasFeeCap,
+					got[1].GasTipCap, tc.exact.Value().Uint64(), tc.exact.GasFeeCap().Uint64(),
+					tc.exact.GasTipCap().Uint64())
 			}
 		})
 	}
 }
 
-// CGpuTx has one price and no access list, blob hashes, authorizations or tip.
-// A tx that carries any of them is charged for them, or invalid by them, where
-// cevm would not see it: it is declined at its index.
+// CGpuTx has no access list, blob hashes or authorizations. A tx that carries
+// any of them is charged for them where cevm would not see it, and one whose
+// tip is above its fee cap is invalid: it is declined at its index.
 func TestATransactionTheWireDropsPartOfIsDeclinedAtItsIndex(t *testing.T) {
 	to := common.Address{0x11}
 	plain := types.NewTx(&types.LegacyTx{To: &to, Value: big.NewInt(1), Gas: 21000, GasPrice: big.NewInt(1)})
@@ -403,8 +414,8 @@ func TestANilGasPriceIsZeroAndNotAPanic(t *testing.T) {
 	if i != 1 {
 		t.Fatalf("shape declined at %d", i)
 	}
-	if got[0].GasPrice != 0 {
-		t.Errorf("gas price = %d, want 0", got[0].GasPrice)
+	if got[0].GasFeeCap != 0 || got[0].GasTipCap != 0 {
+		t.Errorf("fee cap/tip = %d/%d, want 0/0", got[0].GasFeeCap, got[0].GasTipCap)
 	}
 }
 

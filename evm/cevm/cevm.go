@@ -131,18 +131,26 @@ func (b Backend) String() string {
 // declined (ErrDeclined), because gpu_execute_block passes no host and would
 // run that code as a message, on its whole limit, which is not the tx's gas.
 //
-// Value and GasPrice are 64-bit on the wire. A transaction whose value or
-// price does not fit is the caller's to run; it never belongs in a batch.
+// GasFeeCap and GasTipCap are the tx's maxFeePerGas and maxPriorityFeePerGas,
+// both its gas price for a legacy or access-list tx. It pays per gas the
+// block's base fee and its tip, capped at its fee cap, and its sender must
+// hold its limit at its fee cap. cevm declines a batch with a tx whose tip is
+// above its fee cap or whose fee cap is under the base fee.
+//
+// Value, GasFeeCap and GasTipCap are 64-bit on the wire. A transaction whose
+// value or fee does not fit is the caller's to run; it never belongs in a
+// batch.
 type Transaction struct {
-	From     [20]byte
-	To       [20]byte
-	HasTo    bool
-	Data     []byte // Calldata
-	Code     []byte // The recipient's code; any makes cevm decline the batch
-	GasLimit uint64
-	Value    uint64
-	Nonce    uint64
-	GasPrice uint64
+	From      [20]byte
+	To        [20]byte
+	HasTo     bool
+	Data      []byte // Calldata
+	Code      []byte // The recipient's code; any makes cevm decline the batch
+	GasLimit  uint64
+	Value     uint64
+	Nonce     uint64
+	GasFeeCap uint64
+	GasTipCap uint64
 }
 
 // TxStatus is a per-transaction execution outcome from the V2 ABI.

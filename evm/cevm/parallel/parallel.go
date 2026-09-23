@@ -214,28 +214,35 @@ func (e *Executor) Backend() cevm.Backend { return e.CevmBackend }
 // paired with the recovered senders.
 //
 // It returns the index of the first transaction that cannot be represented, or
-// len(txs) when every one can. cevm.Transaction carries Value and GasPrice as
-// uint64; a value or price above 2^64-1 is rare but legal, and truncating it
-// would execute a transaction other than the one that was signed. The price is
-// tx.GasPrice(), the fee cap of a dynamic-fee tx: what the EVM's buy-gas
-// balance check charges, and what cevm checks against the base fee. A tx the
-// wire drops part of (see carried) is not representable either.
+// len(txs) when every one can. cevm.Transaction carries Value, GasFeeCap and
+// GasTipCap as uint64; a value or fee above 2^64-1 is rare but legal, and
+// truncating it would execute a transaction other than the one that was
+// signed. The fee cap and tip are tx.GasFeeCap() and tx.GasTipCap(), both the
+// gas price of a legacy or access-list tx: cevm charges the base fee and the
+// tip, capped at the fee cap, as the EVM does, and checks the sender's balance
+// at the fee cap. A tx the wire drops part of (see carried) is not
+// representable either.
 func shape(txs types.Transactions, senders []common.Address, statedb *state.StateDB) ([]cevm.Transaction, int) {
 	out := make([]cevm.Transaction, len(txs))
 	for i, tx := range txs {
 		if !carried(tx) || !tx.Value().IsUint64() {
 			return out, i
 		}
-		price, ok := fits(tx.GasPrice())
+		feeCap, ok := fits(tx.GasFeeCap())
+		if !ok {
+			return out, i
+		}
+		tipCap, ok := fits(tx.GasTipCap())
 		if !ok {
 			return out, i
 		}
 		ct := cevm.Transaction{
-			GasLimit: tx.Gas(),
-			Nonce:    tx.Nonce(),
-			Data:     tx.Data(),
-			Value:    tx.Value().Uint64(),
-			GasPrice: price,
+			GasLimit:  tx.Gas(),
+			Nonce:     tx.Nonce(),
+			Data:      tx.Data(),
+			Value:     tx.Value().Uint64(),
+			GasFeeCap: feeCap,
+			GasTipCap: tipCap,
 		}
 		copy(ct.From[:], senders[i].Bytes())
 		if to := tx.To(); to != nil {
@@ -252,10 +259,10 @@ func shape(txs types.Transactions, senders []common.Address, statedb *state.Stat
 }
 
 // carried reports whether cevm's wire carries everything tx's gas and status
-// depend on. CGpuTx has one price and no access list, blob hashes,
-// authorizations or tip: a tx with an access list is charged for it, a blob
-// or set-code tx for what it carries, and one whose tip exceeds its fee cap is
-// invalid, which only the Go EVM would see.
+// depend on. CGpuTx has no access list, blob hashes or authorizations: a tx
+// with an access list is charged for it, and a blob or set-code tx for what it
+// carries. One whose tip exceeds its fee cap is invalid (ErrTipAboveFeeCap):
+// cevm declines it too, and the Go EVM says why.
 func carried(tx *types.Transaction) bool {
 	switch tx.Type() {
 	case types.LegacyTxType, types.AccessListTxType, types.DynamicFeeTxType:

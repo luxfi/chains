@@ -77,8 +77,8 @@ var (
 // is how storage_root went unset. Each pair fails when the size is larger
 // (the first) or smaller (the second).
 var (
-	_ [unsafe.Sizeof(C.CGpuTx{}) - 112]struct{}
-	_ [112 - unsafe.Sizeof(C.CGpuTx{})]struct{}
+	_ [unsafe.Sizeof(C.CGpuTx{}) - 120]struct{}
+	_ [120 - unsafe.Sizeof(C.CGpuTx{})]struct{}
 	_ [unsafe.Sizeof(C.CGpuStateAccount{}) - 136]struct{}
 	_ [136 - unsafe.Sizeof(C.CGpuStateAccount{})]struct{}
 	_ [unsafe.Sizeof(C.CGpuBlockResult{}) - 88]struct{}
@@ -122,7 +122,8 @@ func buildTxs(txs []Transaction, pinner *runtime.Pinner) []C.CGpuTx {
 		ctxs[i].gas_limit = C.uint64_t(t.GasLimit)
 		ctxs[i].value = C.uint64_t(t.Value)
 		ctxs[i].nonce = C.uint64_t(t.Nonce)
-		ctxs[i].gas_price = C.uint64_t(t.GasPrice)
+		ctxs[i].max_fee_per_gas = C.uint64_t(t.GasFeeCap)
+		ctxs[i].max_priority_fee_per_gas = C.uint64_t(t.GasTipCap)
 		if t.HasTo {
 			ctxs[i].has_to = 1
 		}
@@ -363,7 +364,7 @@ func healthBattery() []healthProbe {
 	}
 	return []healthProbe{{
 		name:    "transfer",
-		txs:     []Transaction{{From: from, To: to, HasTo: true, GasLimit: 30000, Value: 1, GasPrice: 1}},
+		txs:     []Transaction{{From: from, To: to, HasTo: true, GasLimit: 30000, Value: 1, GasFeeCap: 1, GasTipCap: 1}},
 		ctx:     BlockContext{GasLimit: 30_000_000, ChainID: 1, BaseFee: 1, Coinbase: coinbase},
 		state:   []StateAccount{row(from, 1_000_000), row(to, 0), row(coinbase, 0)},
 		wantGas: 21000,

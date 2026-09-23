@@ -29,12 +29,13 @@ import (
 // no result.
 func TestABatchWithCodeIsDeclinedOnEveryBackend(t *testing.T) {
 	tx := cevm.Transaction{
-		From:     [20]byte{0x11},
-		To:       [20]byte{0x22},
-		HasTo:    true,
-		Code:     []byte{0x60, 0x01, 0x60, 0x01, 0x01, 0x50, 0x00}, // 1+1, POP, STOP
-		GasLimit: 100_000,
-		GasPrice: 1,
+		From:      [20]byte{0x11},
+		To:        [20]byte{0x22},
+		HasTo:     true,
+		Code:      []byte{0x60, 0x01, 0x60, 0x01, 0x01, 0x50, 0x00}, // 1+1, POP, STOP
+		GasLimit:  100_000,
+		GasFeeCap: 1,
+		GasTipCap: 1,
 	}
 	for _, b := range cevm.AvailableBackends() {
 		t.Run(cevm.BackendName(b), func(t *testing.T) {
