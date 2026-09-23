@@ -17,28 +17,18 @@
 //
 // # Wiring
 //
-// Explicit, and it has to stay explicit:
+// Nothing registers this executor, and nothing may yet: it returns receipts
+// for a block cevm ran and writes no state. gpu_execute_block roots no state
+// and hands none back, so a block it runs leaves the StateDB as it was, and a
+// node that registered the executor would finalize that block on the parent's
+// state and reject it for its root.
 //
-//	import (
-//	    "github.com/luxfi/evm/core/parallel"
-//	    cevmparallel "github.com/luxfi/chains/evm/cevm/parallel"
-//	    "github.com/luxfi/chains/evm/cevm"
-//	)
-//	parallel.RegisterExecutor(&cevmparallel.Executor{
-//	    CevmBackend: cevm.GPUMetal,
-//	    Threads:     0,
-//	})
-//
+// When it is registered, it is registered explicitly, with
+// parallel.RegisterExecutor(&cevmparallel.Executor{CevmBackend: ...}).
 // luxfi/evm/core/parallel holds ONE executor: RegisterExecutor is a plain
 // assignment to a package variable, so a second call replaces the first with
-// no complaint. luxfi/evm's own cevmShadowExecutor takes that slot from an
-// init() when the binary is built with -tags cevm. A package that registered
-// itself on import would therefore replace a consensus-gated applier with this
-// one, depending only on link order — so this package has no init().
-//
-// This doc used to advertise `import _ ".../cevm/parallel" // registers` as an
-// alternative. There is no init() and never was, so that form registers
-// nothing: a caller following it got the Go EVM and no error saying otherwise.
+// no complaint. A package that registered itself on import would take that
+// slot depending only on link order — so this package has no init().
 //
 // # Execution
 //
@@ -47,6 +37,9 @@
 //	shape / blockContext / buildStateSnapshot — the block, in cevm's wire form
 //	cevm.ExecuteBlock                         — one cgo call
 //	assemble                                  — what comes back, as receipts
+//
+// cevm's Go entry runs nothing on the CPU lanes (no host, and code is
+// declined), so only a GPU lane with a device ever returns a block.
 //
 // Parity contract: every receipt produced here must byte-equal the receipt
 // produced by Go EVM Block-STM for the same input tuple.
@@ -70,6 +63,7 @@ import (
 	evmparallel "github.com/luxfi/evm/core/parallel"
 	"github.com/luxfi/evm/core/state"
 	"github.com/luxfi/geth/common"
+	"github.com/luxfi/geth/consensus/misc/eip4844"
 	"github.com/luxfi/geth/core/types"
 	"github.com/luxfi/geth/core/vm"
 	ethparams "github.com/luxfi/geth/params"
@@ -87,7 +81,7 @@ import (
 // code, and go_bridge.h's contract is that the caller runs a declined block
 // itself.
 func declineBlock(reason string, blockNumber, txIndex uint64) ([]*types.Receipt, error) {
-	backend.RecordFallback(backend.FallbackUnsupported, "cevm:"+reason)
+	backend.RecordFallback(backend.FallbackBackendUnavailable, "cevm:"+reason)
 	log.Debug("cevm: declining block to the Go EVM",
 		"reason", reason, "block", blockNumber, "tx_index", txIndex)
 	return nil, nil
@@ -99,11 +93,10 @@ type execute func(cevm.Backend, uint32, []cevm.Transaction, *cevm.BlockContext, 
 // Executor is a luxfi/evm/core/parallel.BlockExecutor that dispatches
 // every block to cevm.ExecuteBlock in one cgo call.
 type Executor struct {
-	// CevmBackend selects the cevm execution lane:
-	//   cevm.CPUSequential — single-threaded CPU baseline (parity reference)
-	//   cevm.CPUParallel   — Block-STM on CPU
-	//   cevm.GPUMetal      — Metal kernel dispatch (M1/M2/M3)
-	//   cevm.GPUCUDA       — CUDA kernel dispatch (NVIDIA)
+	// CevmBackend selects the cevm lane: cevm.GPUMetal (Apple silicon) or
+	// cevm.GPUCUDA (NVIDIA). The CPU lanes, cevm.CPUSequential and
+	// cevm.CPUParallel, decline every block through cevm's Go entry, which
+	// passes no host.
 	CevmBackend cevm.Backend
 
 	// Threads is the worker count for parallel backends. Ignored by
@@ -173,6 +166,12 @@ func (e *Executor) run(
 	if i < len(txs) {
 		return declineBlock("tx_not_representable", header.Number.Uint64(), uint64(i))
 	}
+	// cevm declines a batch with code, and its answer could not be receipted
+	// past a plain value transfer anyway: neither is worth a snapshot and a
+	// cgo call.
+	if i := firstBeyondValueTransfer(txs, statedb); i < len(txs) {
+		return declineBlock("non_value_transfer", header.Number.Uint64(), uint64(i))
+	}
 	blockCtx, ok := blockContext(config, header)
 	if !ok {
 		return declineBlock("block_context_overflow_uint64", header.Number.Uint64(), 0)
@@ -190,7 +189,7 @@ func (e *Executor) run(
 	result, err := call(e.CevmBackend, threads, cevmTxs, &blockCtx, snapshot)
 	switch {
 	case err == nil:
-		return assemble(txs, statedb, result, header)
+		return assemble(txs, result, header)
 	case errors.Is(err, cevm.ErrDeclined):
 		// ok=0: no gas or status in it is the block's, so none is read.
 		return declineBlock("cevm_declined", header.Number.Uint64(), 0)
@@ -275,8 +274,8 @@ func fits(v *big.Int) (uint64, bool) {
 // block sees: what TIMESTAMP, NUMBER, CHAINID, BASEFEE, COINBASE, GASLIMIT,
 // PREVRANDAO and BLOBBASEFEE answer.
 //
-// It reports false when the chain id or the base fee does not fit cevm's
-// 64-bit wire. A base fee carried as anything else would let cevm pass a tx
+// It reports false when the chain id, the base fee or the blob base fee does
+// not fit cevm's 64-bit wire. A base fee carried as anything else would let cevm pass a tx
 // priced below the real one, which the EVM rejects.
 func blockContext(config *ethparams.ChainConfig, header *types.Header) (cevm.BlockContext, bool) {
 	chainID, ok := fits(config.ChainID)
@@ -294,8 +293,14 @@ func blockContext(config *ethparams.ChainConfig, header *types.Header) (cevm.Blo
 		ChainID:   chainID,
 		BaseFee:   baseFee,
 	}
+	// BLOBBASEFEE is the fee the header's excess blob gas prices, under the
+	// chain's blob schedule; none before Cancun.
 	if header.ExcessBlobGas != nil {
-		ctx.BlobBaseFee = *header.ExcessBlobGas
+		fee, ok := fits(eip4844.CalcBlobFee(config, header))
+		if !ok {
+			return cevm.BlockContext{}, false
+		}
+		ctx.BlobBaseFee = fee
 	}
 	copy(ctx.Coinbase[:], header.Coinbase.Bytes())
 	// Prevrandao = post-merge MixDigest. Pre-merge headers carry zero
@@ -304,14 +309,14 @@ func blockContext(config *ethparams.ChainConfig, header *types.Header) (cevm.Blo
 	return ctx, true
 }
 
-// assemble turns what cevm returned into receipts, or declines the block.
+// assemble turns what cevm returned for a block of plain value transfers into
+// receipts, or declines the block.
 //
 // It needs no library — only the result — which is why it is separate from the
 // dispatch: this is the parity-critical half and it has to be exercisable in
 // a build that cannot execute anything.
 func assemble(
 	txs types.Transactions,
-	statedb *state.StateDB,
 	result *cevm.BlockResult,
 	header *types.Header,
 ) ([]*types.Receipt, error) {
@@ -320,27 +325,25 @@ func assemble(
 			len(result.GasUsed), len(result.Status), len(txs))
 	}
 
-	// CallNotSupported is cevm's internal hand-off signal and go_bridge.h
-	// says it never reaches a caller. One that does is a result that is not
-	// the block's: decline rather than mix backends mid-block.
-	for i, st := range result.Status {
-		if st == cevm.TxCallNotSupported {
-			return declineBlock("call_or_create_unsupported", header.Number.Uint64(), uint64(i))
+	// cevm answers ok=1 only for a batch its value-transfer paths ran through,
+	// every tx a valid plain transfer that succeeded on its intrinsic gas
+	// (go_bridge.h; gpu_dispatch.cpp ran_through). Any other status or gas —
+	// CallNotSupported, which never reaches a caller, a gas estimate, a
+	// kernel's own answer — is not that, and not the block's: decline rather
+	// than receipt it. This also holds a library that answers ok=1 on other
+	// terms to the one answer this executor can use.
+	for i := range txs {
+		if result.Status[i] != cevm.TxOK || result.GasUsed[i] != ethparams.TxGas {
+			return declineBlock("result_not_value_transfer", header.Number.Uint64(), uint64(i))
 		}
-	}
-
-	// The ABI returns (gas_used, status) and nothing else, so a receipt is
-	// only reconstructable where (status, gas_used) determines it completely.
-	// That is a plain value transfer and nothing more.
-	if i := firstBeyondValueTransfer(txs, statedb); i < len(txs) {
-		return declineBlock("non_value_transfer_no_logs_in_abi", header.Number.Uint64(), uint64(i))
 	}
 	return receipts(txs, result, header), nil
 }
 
 // firstBeyondValueTransfer returns the index of the first transaction whose
 // receipt does not follow from (status, gas_used) alone, or len(txs) when
-// every one does.
+// every one does. The ABI returns (gas_used, status) and nothing else, so a
+// receipt is only reconstructable for a plain value transfer.
 //
 // Three things put a transaction beyond that:
 //

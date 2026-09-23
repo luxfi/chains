@@ -3,6 +3,7 @@
 package cevm
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -156,23 +157,25 @@ func contains(s []Backend, b Backend) bool {
 	return false
 }
 
-// TestHealth runs the Health() battery and verifies every available backend
-// reports OK with non-zero gas. This is the production-readiness gate.
+// TestHealth runs the Health() battery: a funded plain transfer. A GPU lane
+// runs it to TxOK at 21000 gas; a CPU lane declines it, because the Go entry
+// runs nothing on the CPU without a host (go_bridge.h). This is the
+// production-readiness gate.
 func TestHealth(t *testing.T) {
 	reports := Health()
 	if len(reports) == 0 {
 		t.Fatal("Health() returned no reports — runtime cannot enumerate backends")
 	}
 	for _, r := range reports {
-		if !r.OK {
-			t.Errorf("Health: backend %q failed: %v (probe=%s)", r.Name, r.Err, r.Probe)
+		if r.Backend == GPUMetal || r.Backend == GPUCUDA {
+			if !r.OK || r.GasUsed != 21000 {
+				t.Errorf("Health: GPU lane %q: ok=%v gas=%d err=%v, want ok at 21000", r.Name, r.OK, r.GasUsed, r.Err)
+			}
 			continue
 		}
-		if r.GasUsed == 0 {
-			t.Errorf("Health: backend %q probe %q reported 0 gas", r.Name, r.Probe)
+		if r.OK || !errors.Is(r.Err, ErrDeclined) {
+			t.Errorf("Health: CPU lane %q: ok=%v err=%v, want declined", r.Name, r.OK, r.Err)
 		}
-		t.Logf("Health: %s ok (probes=%d gas=%d time=%.2fms)",
-			r.Name, r.ProbesRun, r.GasUsed, r.ExecTime)
 	}
 }
 

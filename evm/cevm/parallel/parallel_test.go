@@ -47,8 +47,9 @@ func TestABatchWithCodeIsDeclinedOnEveryBackend(t *testing.T) {
 }
 
 // A block of plain transfers from funded senders, end to end through the
-// executor: a lane that runs it receipts every transfer at 21000 gas; a lane
-// that does not declines it to the Go EVM. Neither is an error.
+// executor: a GPU lane runs it and receipts every transfer at 21000 gas; a
+// CPU lane, which runs nothing through the Go entry, declines it to the Go
+// EVM. Neither is an error.
 func TestAPlainTransferBlockIsReceiptedOrDeclined(t *testing.T) {
 	const n = 8
 	sdb := newState(t)
@@ -70,9 +71,14 @@ func TestAPlainTransferBlockIsReceiptedOrDeclined(t *testing.T) {
 			if err != nil {
 				t.Fatalf("run: %v", err)
 			}
-			if receipts == nil {
-				t.Logf("%s declined the block to the Go EVM", cevm.BackendName(b))
+			if b != cevm.GPUMetal && b != cevm.GPUCUDA {
+				if receipts != nil {
+					t.Fatalf("CPU lane %s receipted a block; it runs none", cevm.BackendName(b))
+				}
 				return
+			}
+			if receipts == nil {
+				t.Fatalf("GPU lane %s declined a block of funded plain transfers", cevm.BackendName(b))
 			}
 			if len(receipts) != n {
 				t.Fatalf("%d receipts for %d transactions", len(receipts), n)

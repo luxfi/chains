@@ -15,6 +15,7 @@ import (
 	evmparallel "github.com/luxfi/evm/core/parallel"
 	"github.com/luxfi/evm/core/state"
 	"github.com/luxfi/geth/common"
+	"github.com/luxfi/geth/consensus/misc/eip4844"
 	"github.com/luxfi/geth/core/rawdb"
 	"github.com/luxfi/geth/core/tracing"
 	"github.com/luxfi/geth/core/types"
@@ -28,7 +29,7 @@ import (
 
 // fallbacks is how many declines crypto/backend has counted.
 func fallbacks() uint64 {
-	return backend.FallbackCounters()[backend.FallbackUnsupported.String()]
+	return backend.FallbackCounters()[backend.FallbackBackendUnavailable.String()]
 }
 
 // A decline is luxfi/evm's "not handled", (nil, nil), on which the state
@@ -384,7 +385,7 @@ func TestANilGasPriceIsZeroAndNotAPanic(t *testing.T) {
 // from the header, and a field read from the wrong place is a block that
 // executes against someone else's chain, height or time.
 func TestTheBlockContextIsTheHeader(t *testing.T) {
-	excess := uint64(131072)
+	excess := uint64(10_000_000)
 	header := &types.Header{
 		Time:          1717171717,
 		Number:        big.NewInt(9_000_001),
@@ -394,7 +395,13 @@ func TestTheBlockContextIsTheHeader(t *testing.T) {
 		Coinbase:      common.Address{0xC0, 0xFF, 0xEE},
 		MixDigest:     common.Hash{0xAB, 0xCD},
 	}
-	config := &ethparams.ChainConfig{ChainID: big.NewInt(96369)}
+	cancun := uint64(0)
+	config := &ethparams.ChainConfig{
+		ChainID:            big.NewInt(96369),
+		LondonBlock:        big.NewInt(0),
+		CancunTime:         &cancun,
+		BlobScheduleConfig: &ethparams.BlobScheduleConfig{Cancun: ethparams.DefaultCancunBlobConfig},
+	}
 
 	got, ok := blockContext(config, header)
 	if !ok {
@@ -415,8 +422,13 @@ func TestTheBlockContextIsTheHeader(t *testing.T) {
 	if got.BaseFee != header.BaseFee.Uint64() {
 		t.Errorf("BaseFee = %d, want %d", got.BaseFee, header.BaseFee.Uint64())
 	}
-	if got.BlobBaseFee != excess {
-		t.Errorf("BlobBaseFee = %d, want %d", got.BlobBaseFee, excess)
+	// BLOBBASEFEE is the fee the excess blob gas prices, not the excess.
+	if want := eip4844.CalcBlobFee(config, header).Uint64(); got.BlobBaseFee != want || want == excess {
+		t.Errorf("BlobBaseFee = %d, want %d (the fee %d excess blob gas prices)", got.BlobBaseFee, want, excess)
+	}
+	// Before a blob schedule there is no blob fee.
+	if got, _ := blockContext(&ethparams.ChainConfig{ChainID: big.NewInt(96369)}, header); got.BlobBaseFee != 0 {
+		t.Errorf("BlobBaseFee = %d with no blob schedule, want 0", got.BlobBaseFee)
 	}
 	if common.Address(got.Coinbase) != header.Coinbase {
 		t.Errorf("Coinbase = %x, want %x", got.Coinbase, header.Coinbase)
@@ -470,25 +482,46 @@ func TestAResultThatDoesNotMatchTheBlockIsRefused(t *testing.T) {
 		{GasUsed: []uint64{21000, 21000}, Status: []cevm.TxStatus{cevm.TxOK}},
 		{},
 	} {
-		if _, err := assemble(txs, newState(t), r, newHeader()); err == nil {
+		if _, err := assemble(txs, r, newHeader()); err == nil {
 			t.Errorf("assemble accepted a result with %d gas entries and %d statuses for %d transactions",
 				len(r.GasUsed), len(r.Status), len(txs))
 		}
 	}
 }
 
-// CallNotSupported never reaches a caller, go_bridge.h says. One that does
-// is a result that is not the block's; mixing backends mid-block would execute
-// part of it on cevm and part on the Go EVM, so the whole block is declined.
-func TestATransactionTheKernelCannotRunDeclinesTheWholeBlock(t *testing.T) {
+// cevm answers ok=1 only when every tx is a valid plain transfer that
+// succeeded on its 21000 intrinsic gas (gpu_dispatch.cpp ran_through). Any
+// other answer — CallNotSupported, which never reaches a caller, a reverted or
+// returning status, a gas estimate at the tx's limit — is not the block's, and
+// the whole block is declined rather than part of it receipted.
+func TestOnlyAnAnswerOfPlainTransfersIsReceipted(t *testing.T) {
 	txs := types.Transactions{transfer(t, 1, big.NewInt(1)), transfer(t, 2, big.NewInt(1))}
-	result := &cevm.BlockResult{
-		GasUsed: []uint64{21000, 0},
-		Status:  []cevm.TxStatus{cevm.TxOK, cevm.TxCallNotSupported},
+	ok := &cevm.BlockResult{GasUsed: []uint64{21000, 21000}, Status: []cevm.TxStatus{cevm.TxOK, cevm.TxOK}}
+	if got, err := assemble(txs, ok, newHeader()); err != nil || len(got) != 2 {
+		t.Fatalf("assemble(two transfers at 21000) = (%v, %v), want two receipts", got, err)
 	}
-	receipts, err := assemble(txs, newState(t), result, newHeader())
-	if err != nil || receipts != nil {
-		t.Fatalf("assemble = (%v, %v), want the block declined", receipts, err)
+	for _, tc := range []struct {
+		name   string
+		gas    uint64
+		status cevm.TxStatus
+	}{
+		{"call not supported", 21000, cevm.TxCallNotSupported},
+		{"return", 21000, cevm.TxReturn},
+		{"revert", 21000, cevm.TxRevert},
+		{"error", 21000, cevm.TxError},
+		{"a gas estimate at the limit", 100000, cevm.TxOK},
+		{"one gas over intrinsic", 21001, cevm.TxOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := &cevm.BlockResult{
+				GasUsed: []uint64{21000, tc.gas},
+				Status:  []cevm.TxStatus{cevm.TxOK, tc.status},
+			}
+			receipts, err := assemble(txs, result, newHeader())
+			if err != nil || receipts != nil {
+				t.Fatalf("assemble = (%v, %v), want the block declined: (nil, nil)", receipts, err)
+			}
+		})
 	}
 }
 
@@ -551,26 +584,42 @@ func TestOnlyAPlainValueTransferIsReconstructable(t *testing.T) {
 	}
 }
 
-// A block cevm cannot receipt is declined to the Go EVM rather than receipted
-// without the logs or contract address it would need.
-func TestABlockBeyondValueTransferIsDeclined(t *testing.T) {
-	to := common.Address{0x11}
-	txs := types.Transactions{
-		types.NewTx(&types.LegacyTx{To: &to, Value: big.NewInt(1), Gas: 21000}),
-		types.NewTx(&types.LegacyTx{Gas: 53000}), // a creation
-	}
-	result := &cevm.BlockResult{
-		GasUsed: []uint64{21000, 53000},
-		Status:  []cevm.TxStatus{cevm.TxOK, cevm.TxOK},
-	}
-	receipts, err := assemble(txs, newState(t), result, newHeader())
-	if err != nil || receipts != nil {
-		t.Fatalf("assemble = (%v, %v), want the block declined: (nil, nil)", receipts, err)
+// A block cevm cannot receipt is declined to the Go EVM before cevm is asked:
+// a creation, calldata, or a recipient with code. cevm declines code anyway,
+// and no answer it gives could be receipted past a plain transfer.
+func TestABlockBeyondValueTransferIsDeclinedBeforeCevm(t *testing.T) {
+	sdb := newState(t)
+	to, withCode := common.Address{0x11}, common.Address{0x99}
+	sdb.SetCode(withCode, []byte{0x00}, tracing.CodeChangeUnspecified)
+	plain := types.NewTx(&types.LegacyTx{To: &to, Value: big.NewInt(1), Gas: 21000})
+	for _, tc := range []struct {
+		name string
+		tx   *types.Transaction
+	}{
+		{"a creation", types.NewTx(&types.LegacyTx{Gas: 53000})},
+		{"calldata", types.NewTx(&types.LegacyTx{To: &to, Gas: 30000, Data: []byte{0x01}})},
+		{"a recipient with code", types.NewTx(&types.LegacyTx{To: &withCode, Value: big.NewInt(1), Gas: 21000})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &Executor{
+				execute: func(cevm.Backend, uint32, []cevm.Transaction, *cevm.BlockContext, []cevm.StateAccount) (*cevm.BlockResult, error) {
+					t.Fatal("cevm was asked to run a block it could not receipt")
+					return nil, nil
+				},
+			}
+			txs := types.Transactions{plain, tc.tx}
+			receipts, err := e.run(chainConfig(), newHeader(), txs, senders(len(txs)), sdb)
+			if err != nil || receipts != nil {
+				t.Fatalf("run = (%v, %v), want the block declined: (nil, nil)", receipts, err)
+			}
+		})
 	}
 }
 
 // The receipt is the parity-critical seam: the receipt trie hash is in the
-// header, so every field has to be what the Go EVM would have produced.
+// header, so every field has to be what the Go EVM would have produced. The
+// reconstruction is read here for every status, though assemble only ever
+// hands it plain transfers at 21000.
 func TestReceiptsCarryEachTransactionsOwnResult(t *testing.T) {
 	to := common.Address{0x11}
 	txs := types.Transactions{
@@ -584,10 +633,7 @@ func TestReceiptsCarryEachTransactionsOwnResult(t *testing.T) {
 	}
 	header := newHeader()
 
-	got, err := assemble(txs, newState(t), result, header)
-	if err != nil {
-		t.Fatalf("assemble: %v", err)
-	}
+	got := receipts(txs, result, header)
 	if len(got) != len(txs) {
 		t.Fatalf("got %d receipts for %d transactions", len(got), len(txs))
 	}

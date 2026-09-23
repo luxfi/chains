@@ -1,12 +1,9 @@
 // Package cevm provides Go bindings to the C++ EVM (cevm) with GPU acceleration.
-// Import this package to use the C++ EVM as a drop-in replacement for go-ethereum's EVM.
 //
-// The C++ EVM supports:
-//   - Block-STM parallel execution
-//   - GPU Keccak-256 state hashing (Metal/CUDA)
-//   - GPU batch ecrecover (Metal/CUDA)
-//   - GPU EVM opcode interpreter (Metal/CUDA)
-//   - ZAP VM plugin protocol (native)
+// Its block entry, gpu_execute_block (go_bridge.h, ABI 6), runs one kind of
+// block: plain value transfers, on a GPU lane's value-transfer path, answering
+// per-tx gas and status. Anything else it declines (ErrDeclined) and the
+// caller runs on its own EVM. BatchRecoverSenders batches ecrecover.
 //
 // Build against the native library: CGO_ENABLED=1 go build -tags lux_cevm_native
 // Build without it: go build (types only, no execution) — the default,
@@ -46,13 +43,11 @@
 //
 // The Go module's ABIVersion constant is checked against the loaded
 // library's gpu_abi_version() in init(). A mismatch panics at process
-// start — that is intentional. A silent ABI mismatch produces wrong
-// gas/state results and would corrupt consensus, so fail-fast is the
-// only safe behaviour.
+// start — that is intentional. It catches a library built against another
+// ABI number; two libraries that report the same number are not told apart.
 //
-// Use Health() at startup to additionally verify each backend executes
-// the canonical health-check battery (arithmetic, storage, hashing,
-// memory, and the call bridge) without error.
+// Use Health() at startup to see which lanes can run a block: it runs a
+// funded plain transfer on each.
 package cevm
 
 import (

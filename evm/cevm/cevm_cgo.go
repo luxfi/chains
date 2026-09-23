@@ -47,6 +47,8 @@ import (
 	"fmt"
 	"runtime"
 	"unsafe"
+
+	"github.com/luxfi/geth/core/types"
 )
 
 // AutoDetect returns the best available backend for this machine.
@@ -311,78 +313,41 @@ func LibraryABIVersion() uint32 {
 	return uint32(C.gpu_abi_version())
 }
 
-// healthProbe is one entry in the Health() battery — a named bytecode
-// program with its expected execution status. Every conformant backend must
-// run each probe to its expected status with non-zero gas.
+// healthProbe is one entry in the Health() battery: a block, the state before
+// it, and the gas each of its transactions must come back with at TxOK.
 type healthProbe struct {
-	name       string
-	bytecode   []byte
-	wantStatus TxStatus
-	// callBridge=true marks probes whose top-level opcode is in the CALL
-	// family (CALL/CALLCODE/DELEGATECALL/STATICCALL/CREATE/CREATE2). On the
-	// GPU path these currently route through the dispatcher's "not supported"
-	// shim — we only require that the bridge is exercised (i.e. the probe
-	// runs to completion, not that it succeeds with TxOK). Only enforced on
-	// CPU backends; for GPU we accept any status as long as the kernel
-	// returned cleanly.
-	callBridge bool
-	// strictParity=true means gas must match exactly across all backends
-	// that ran this probe. False for probes whose dynamic gas accounting is
-	// known to differ between the interpretive CPU path (cevm) and the
-	// flat GPU kernel (e.g. KECCAK256 dynamic word cost, MCOPY dynamic
-	// memory expansion). Differences on strict probes are kernel bugs and
-	// must fail Health.
-	strictParity bool
+	name    string
+	txs     []Transaction
+	ctx     BlockContext
+	state   []StateAccount
+	wantGas uint64
 }
 
-// healthBattery is the ordered list of probes Health() runs against every
-// backend. Each probe targets a different EVM subsystem so a backend that's
-// silently broken in one area (e.g. storage) fails its own probe instead
-// of slipping through.
+// healthBattery is what Health runs on every backend.
 //
-// Order matters only insofar as we want simple programs first so a complete
-// breakage shows up on probe[0] before we waste time on later probes.
+// gpu_execute_block runs one kind of block (go_bridge.h, ABI 6): plain value
+// transfers, on a GPU lane's value-transfer path. It declines a batch with
+// code, and the CPU lanes run nothing without a host. So the battery is one
+// such block — a funded sender's transfer to a fresh address — which a lane
+// that can run anything runs to TxOK at its 21000 intrinsic gas, and which
+// every other lane declines.
 func healthBattery() []healthProbe {
-	// arith: PUSH1 1, PUSH1 1, ADD, POP, STOP — pure arithmetic.
-	arith := []byte{0x60, 0x01, 0x60, 0x01, 0x01, 0x50, 0x00}
-
-	// storage: PUSH1 0xAB, PUSH1 0x01, SSTORE, PUSH1 0x01, SLOAD, POP, STOP.
-	storage := []byte{0x60, 0xab, 0x60, 0x01, 0x55, 0x60, 0x01, 0x54, 0x50, 0x00}
-
-	// keccak: hash 32 bytes of zero memory at offset 0.
-	// PUSH1 32, PUSH1 0, KECCAK256, POP, STOP.
-	keccak := []byte{0x60, 0x20, 0x60, 0x00, 0x20, 0x50, 0x00}
-
-	// memory: MSTORE 0xAB at offset 0, MLOAD it back, MCOPY 32 bytes 0->32, STOP.
-	// PUSH1 0xAB, PUSH1 0, MSTORE, PUSH1 0, MLOAD, POP,
-	// PUSH1 32, PUSH1 0, PUSH1 32, MCOPY, STOP.
-	memOps := []byte{
-		0x60, 0xab, 0x60, 0x00, 0x52,
-		0x60, 0x00, 0x51, 0x50,
-		0x60, 0x20, 0x60, 0x00, 0x60, 0x20, 0x5e,
-		0x00,
+	from, to, coinbase := [20]byte{0x01}, [20]byte{0x02}, [20]byte{0xC0}
+	row := func(addr [20]byte, balance uint64) StateAccount {
+		return StateAccount{
+			Address:     addr,
+			Balance:     [4]uint64{balance},
+			CodeHash:    types.EmptyCodeHash,
+			StorageRoot: types.EmptyRootHash,
+		}
 	}
-
-	// callBridge: CALL with constant target. On GPU this should hit the
-	// "call not supported" branch in the dispatcher and return cleanly with
-	// TxCallNotSupported. On CPU it executes to TxOK (the in-process EVM
-	// supports CALL).
-	// PUSH1 0 (retSize), PUSH1 0 (retOff), PUSH1 0 (argSize), PUSH1 0 (argOff),
-	// PUSH1 0 (value), ADDRESS (to), PUSH1 0 (gas), CALL, POP, STOP.
-	callBridge := []byte{
-		0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
-		0x60, 0x00, 0x30,
-		0x60, 0x00, 0xf1,
-		0x50, 0x00,
-	}
-
-	return []healthProbe{
-		{name: "arith", bytecode: arith, wantStatus: TxOK, strictParity: true},
-		{name: "storage", bytecode: storage, wantStatus: TxOK, strictParity: true},
-		{name: "keccak", bytecode: keccak, wantStatus: TxOK, strictParity: false},
-		{name: "memory", bytecode: memOps, wantStatus: TxOK, strictParity: false},
-		{name: "call-bridge", bytecode: callBridge, wantStatus: TxOK, callBridge: true, strictParity: false},
-	}
+	return []healthProbe{{
+		name:    "transfer",
+		txs:     []Transaction{{From: from, To: to, HasTo: true, GasLimit: 21000, Value: 1, GasPrice: 1}},
+		ctx:     BlockContext{GasLimit: 30_000_000, ChainID: 1, BaseFee: 1, Coinbase: coinbase},
+		state:   []StateAccount{row(from, 1_000_000), row(to, 0), row(coinbase, 0)},
+		wantGas: 21000,
+	}}
 }
 
 // HealthProbeResult is the outcome of a single probe on a single backend.
@@ -396,7 +361,7 @@ type HealthProbeResult struct {
 
 // HealthReport is the per-backend result of Health(). It aggregates the
 // per-probe results into a single OK / not-OK signal: a backend is healthy
-// iff every probe ran to its expected status with non-zero gas.
+// iff every probe ran every transaction to TxOK at the gas it must cost.
 type HealthReport struct {
 	Backend      Backend
 	Name         string
@@ -405,29 +370,21 @@ type HealthReport struct {
 	Probe        string // first failing probe name, empty when OK
 	ProbesRun    int
 	ProbeResults []HealthProbeResult
-	// Aggregate stats — sum of gas across probes, time of the last probe.
+	// Aggregate stats — sum of gas across probes, status of the last probe.
 	GasUsed  uint64
 	Status   TxStatus
 	ExecTime float64
 }
 
-// Health runs a battery of canonical bytecode programs through every backend
-// the loaded library exposes and returns a per-backend report. Use at
-// process start to fail-fast on misconfigured GPUs (driver missing, library
-// mismatch, device permissions, kernel coverage gaps). Returns nil only if
-// the runtime cannot enumerate backends at all.
+// Health runs the battery through every backend the loaded library exposes
+// and returns a per-backend report. Use at process start to see which lanes
+// can run a block at all: a GPU lane whose device, driver or library is
+// wrong fails here. Returns nil only if the runtime cannot enumerate
+// backends.
 //
-// The battery covers:
-//   - arithmetic (ADD/POP) — strict gas parity required across backends
-//   - storage (SSTORE / SLOAD) — strict gas parity required
-//   - hashing (KECCAK256) — non-zero gas required, parity not strict
-//   - memory ops (MSTORE / MLOAD / MCOPY) — non-zero gas required, parity not strict
-//   - the CALL bridge (CALL with a constant target) — must complete cleanly
-//
-// A backend is reported OK iff every probe executed to its expected status
-// with non-zero gas AND its gas matches every other backend on the strict-
-// parity probes. A failure sets Err and Probe to identify the offending
-// case.
+// A backend is OK iff it ran every probe's transactions to TxOK at the gas
+// they cost. A lane that declines is not OK and says so: its Err wraps
+// ErrDeclined, which is the answer every CPU lane gives this entry.
 func Health() []HealthReport {
 	backends := AvailableBackends()
 	if len(backends) == 0 {
@@ -441,10 +398,9 @@ func Health() []HealthReport {
 			Name:         BackendName(b),
 			ProbeResults: make([]HealthProbeResult, 0, len(probes)),
 		}
-		isGPU := b == GPUMetal || b == GPUCUDA
 		allOK := true
 		for _, p := range probes {
-			pr := runHealthProbe(b, p, isGPU)
+			pr := runHealthProbe(b, p)
 			rep.ProbeResults = append(rep.ProbeResults, pr)
 			rep.ProbesRun++
 			rep.GasUsed += pr.GasUsed
@@ -458,128 +414,28 @@ func Health() []HealthReport {
 		rep.OK = allOK
 		out = append(out, rep)
 	}
-	// Cross-backend strict-parity check on probes flagged strictParity=true.
-	// Two backends that disagree on gas for "arith" or "storage" indicate a
-	// real consensus bug — mark BOTH as not healthy so the deploy fails fast.
-	enforceStrictParity(out, probes)
 	return out
 }
 
-// enforceStrictParity walks the per-backend reports, finds probes flagged
-// strictParity=true, and marks any backend whose gas differs from the
-// majority value as NotOK. We use the median (robust to one outlier) as
-// the reference rather than the first-seen, so a single buggy CPU build
-// doesn't poison every GPU report.
-func enforceStrictParity(reports []HealthReport, probes []healthProbe) {
-	if len(reports) < 2 {
-		return // nothing to compare
-	}
-	// Build map: probe name → strictParity bit.
-	strict := make(map[string]bool, len(probes))
-	for _, p := range probes {
-		if p.strictParity {
-			strict[p.name] = true
-		}
-	}
-	// For each strict probe, collect the gas values across all backends
-	// that produced an OK probe result, find the majority value, and flag
-	// any backend whose gas differs from it.
-	probeNames := make([]string, 0, len(strict))
-	for n := range strict {
-		probeNames = append(probeNames, n)
-	}
-	for _, probeName := range probeNames {
-		// Per-probe gas histogram across backends.
-		hist := make(map[uint64]int)
-		for _, r := range reports {
-			for _, pr := range r.ProbeResults {
-				if pr.Name == probeName && pr.OK {
-					hist[pr.GasUsed]++
-				}
-			}
-		}
-		if len(hist) <= 1 {
-			continue // all backends agree (or only one backend ran this probe)
-		}
-		// Find majority gas value. Tie → smallest gas (the most CPU-interpretive-like).
-		var majorityGas uint64
-		var majorityCount int
-		for g, c := range hist {
-			if c > majorityCount || (c == majorityCount && g < majorityGas) {
-				majorityGas = g
-				majorityCount = c
-			}
-		}
-		// Flag backends whose gas differs from majority.
-		for i := range reports {
-			for _, pr := range reports[i].ProbeResults {
-				if pr.Name != probeName || !pr.OK {
-					continue
-				}
-				if pr.GasUsed != majorityGas {
-					reports[i].OK = false
-					if reports[i].Err == nil {
-						reports[i].Err = fmt.Errorf(
-							"strict-parity probe %q: gas=%d but majority=%d (likely kernel gas-accounting bug)",
-							probeName, pr.GasUsed, majorityGas)
-						reports[i].Probe = probeName
-					}
-				}
-			}
-		}
-	}
-}
-
 // runHealthProbe executes one probe on one backend and returns its result.
-// The result.OK rule: gas must be > 0 AND status must match the probe's
-// expectation, modulo the call-bridge exception described in healthProbe.
-func runHealthProbe(b Backend, p healthProbe, isGPU bool) HealthProbeResult {
-	tx := Transaction{
-		HasTo:    true,
-		Code:     p.bytecode,
-		GasLimit: 200_000,
-		Nonce:    0,
-		GasPrice: 1,
-	}
+func runHealthProbe(b Backend, p healthProbe) HealthProbeResult {
 	pr := HealthProbeResult{Name: p.name}
-	r, err := ExecuteBlock(b, 0, []Transaction{tx}, nil, nil)
+	r, err := ExecuteBlock(b, 0, p.txs, &p.ctx, p.state)
 	if err != nil {
 		pr.Err = fmt.Errorf("probe %q: %w", p.name, err)
 		return pr
 	}
-	if len(r.GasUsed) != 1 || len(r.Status) != 1 {
-		pr.Err = fmt.Errorf("probe %q: malformed result (gas=%d status=%d)",
-			p.name, len(r.GasUsed), len(r.Status))
+	if len(r.GasUsed) != len(p.txs) || len(r.Status) != len(p.txs) {
+		pr.Err = fmt.Errorf("probe %q: malformed result (gas=%d status=%d, want %d)",
+			p.name, len(r.GasUsed), len(r.Status), len(p.txs))
 		return pr
 	}
-	pr.GasUsed = r.GasUsed[0]
-	pr.Status = r.Status[0]
-	if pr.GasUsed == 0 {
-		pr.Err = fmt.Errorf("probe %q: 0 gas — kernel did not execute", p.name)
-		return pr
-	}
-	// Call-bridge probe: any returning status is fine on every backend.
-	// CALL/CREATE/DELEGATECALL/STATICCALL/CREATE2 still emit
-	// CallNotSupported across CPU and GPU paths today (V5 kernel work
-	// pending). The probe's purpose is to confirm the dispatcher reached
-	// the bridge and returned cleanly — not to assert successful CALL
-	// execution. Under the old V2 wire shape this hid behind a status
-	// mask; now that the canonical ExecuteBlock surfaces the real kernel
-	// status, the exception is explicit.
-	if p.callBridge {
-		pr.OK = true
-		return pr
-	}
-	if pr.Status != p.wantStatus {
-		// Accept TxReturn for arith probes that end in RETURN; we don't
-		// because arith ends in STOP. But a backend that maps STOP-with-no-
-		// data to TxReturn instead of TxOK is acceptable: both indicate
-		// successful termination. So treat TxOK and TxReturn as equivalent
-		// here.
-		if !(pr.Status == TxReturn && p.wantStatus == TxOK) &&
-			!(pr.Status == TxOK && p.wantStatus == TxReturn) {
-			pr.Err = fmt.Errorf("probe %q: status=%s want=%s",
-				p.name, pr.Status, p.wantStatus)
+	for i := range p.txs {
+		pr.GasUsed += r.GasUsed[i]
+		pr.Status = r.Status[i]
+		if r.Status[i] != TxOK || r.GasUsed[i] != p.wantGas {
+			pr.Err = fmt.Errorf("probe %q: tx %d came back %s at %d gas, want ok at %d",
+				p.name, i, r.Status[i], r.GasUsed[i], p.wantGas)
 			return pr
 		}
 	}
