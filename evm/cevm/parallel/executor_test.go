@@ -4,6 +4,7 @@
 package parallel
 
 import (
+	"context"
 	"errors"
 	"math/big"
 	"testing"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/luxfi/chains/evm/cevm"
 	"github.com/luxfi/crypto/backend"
+	"github.com/luxfi/evm/consensus"
+	evmcore "github.com/luxfi/evm/core"
 	evmparallel "github.com/luxfi/evm/core/parallel"
 	"github.com/luxfi/evm/core/state"
 	"github.com/luxfi/geth/common"
@@ -417,6 +420,7 @@ func TestTheBlockContextIsTheHeader(t *testing.T) {
 		BaseFee:       big.NewInt(25_000_000_000),
 		ExcessBlobGas: &excess,
 		Coinbase:      common.Address{0xC0, 0xFF, 0xEE},
+		Difficulty:    big.NewInt(0x1234),
 		MixDigest:     common.Hash{0xAB, 0xCD},
 	}
 	cancun := uint64(0)
@@ -457,8 +461,52 @@ func TestTheBlockContextIsTheHeader(t *testing.T) {
 	if common.Address(got.Coinbase) != header.Coinbase {
 		t.Errorf("Coinbase = %x, want %x", got.Coinbase, header.Coinbase)
 	}
-	if common.Hash(got.Prevrandao) != header.MixDigest {
-		t.Errorf("Prevrandao = %x, want the header's MixDigest %x", got.Prevrandao, header.MixDigest)
+	if want := common.BigToHash(header.Difficulty); common.Hash(got.Prevrandao) != want {
+		t.Errorf("Prevrandao = %x, want the header's difficulty %x, not its MixDigest %x",
+			got.Prevrandao, want, header.MixDigest)
+	}
+}
+
+// PREVRANDAO (0x44) is what luxfi/evm's EVM answers for the same header: the
+// block context's Random from Shanghai on, DIFFICULTY before it, and both are
+// the header's difficulty. The MixDigest, which is zero on a Lux header, is
+// neither: sending it would have every contract that reads 0x44 see a number
+// the Go EVM does not give it.
+func TestPrevrandaoIsWhatTheGoEVMAnswers(t *testing.T) {
+	shanghai := uint64(0)
+	for name, config := range map[string]*ethparams.ChainConfig{
+		"before Shanghai": {ChainID: big.NewInt(96369)},
+		"Shanghai":        {ChainID: big.NewInt(96369), LondonBlock: big.NewInt(0), ShanghaiTime: &shanghai},
+	} {
+		t.Run(name, func(t *testing.T) {
+			header := &types.Header{
+				Number:     big.NewInt(7),
+				Time:       7,
+				BaseFee:    big.NewInt(1),
+				Difficulty: big.NewInt(0x1234),
+				MixDigest:  common.Hash{0xAB, 0xCD},
+			}
+			evmCtx := evmcore.NewEVMBlockContext(header, chainOf{config}, nil)
+			want := common.BigToHash(evmCtx.Difficulty) // what DIFFICULTY pushes
+			if evmCtx.Random != nil {
+				want = *evmCtx.Random // what PREVRANDAO pushes
+			}
+			got, ok := blockContext(config, header)
+			if !ok {
+				t.Fatal("blockContext refused a header whose every field fits")
+			}
+			if common.Hash(got.Prevrandao) != want {
+				t.Errorf("Prevrandao = %x, the Go EVM answers %x", got.Prevrandao, want)
+			}
+		})
+	}
+}
+
+// A header without a difficulty gives a zero PREVRANDAO, not a dereference.
+func TestAHeaderWithoutDifficultyHasAZeroPrevrandao(t *testing.T) {
+	got, ok := blockContext(chainConfig(), &types.Header{Number: big.NewInt(1)})
+	if !ok || got.Prevrandao != ([32]byte{}) {
+		t.Fatalf("blockContext = (%x, %v), want a zero Prevrandao", got.Prevrandao, ok)
 	}
 }
 
@@ -904,6 +952,15 @@ func newHeader() *types.Header {
 func chainConfig() *ethparams.ChainConfig {
 	return &ethparams.ChainConfig{ChainID: big.NewInt(96369)}
 }
+
+// chainOf is the chain luxfi/evm's NewEVMBlockContext reads a config from, and
+// nothing else.
+type chainOf struct{ config *ethparams.ChainConfig }
+
+func (chainOf) Engine() consensus.Engine                    { return nil }
+func (chainOf) GetHeader(common.Hash, uint64) *types.Header { return nil }
+func (c chainOf) Config() *ethparams.ChainConfig            { return c.config }
+func (chainOf) ConsensusContext() context.Context           { return nil }
 
 // senders is n distinct sender addresses, positionally paired with a block.
 func senders(n int) []common.Address {

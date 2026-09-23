@@ -279,7 +279,8 @@ func fits(v *big.Int) (uint64, bool) {
 
 // blockContext is the block-level execution context every transaction in the
 // block sees: what TIMESTAMP, NUMBER, CHAINID, BASEFEE, COINBASE, GASLIMIT,
-// PREVRANDAO and BLOBBASEFEE answer.
+// PREVRANDAO and BLOBBASEFEE answer, as luxfi/evm's NewEVMBlockContext has
+// them.
 //
 // It reports false when the chain id, the base fee or the blob base fee does
 // not fit cevm's 64-bit wire. A base fee carried as anything else would let cevm pass a tx
@@ -310,9 +311,12 @@ func blockContext(config *ethparams.ChainConfig, header *types.Header) (cevm.Blo
 		ctx.BlobBaseFee = fee
 	}
 	copy(ctx.Coinbase[:], header.Coinbase.Bytes())
-	// Prevrandao = post-merge MixDigest. Pre-merge headers carry zero
-	// MixDigest; the cevm side treats zero as "not set".
-	copy(ctx.Prevrandao[:], header.MixDigest.Bytes())
+	// PREVRANDAO (0x44) is the header's difficulty as a 32-byte word:
+	// NewEVMBlockContext sets Random to it from Shanghai on, and DIFFICULTY
+	// before that answers the same number. A Lux header's MixDigest is zero.
+	if header.Difficulty != nil {
+		ctx.Prevrandao = common.BigToHash(header.Difficulty)
+	}
 	return ctx, true
 }
 
