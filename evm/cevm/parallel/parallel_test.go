@@ -8,6 +8,8 @@ package parallel
 import (
 	"errors"
 	"math/big"
+	"os"
+	"runtime"
 	"testing"
 
 	"github.com/holiman/uint256"
@@ -50,8 +52,8 @@ func TestABatchWithCodeIsDeclinedOnEveryBackend(t *testing.T) {
 // executor: a GPU lane runs it and receipts every transfer at 21000 gas; a
 // CPU lane, which runs nothing through the Go entry, declines it to the Go
 // EVM. Neither is an error. A GPU lane is listed when the library was built
-// with it, whether or not this host has the device, and one without it
-// declines too: that lane is skipped.
+// with it, whether or not this host has the device: a lane whose device this
+// host lacks is skipped, and one whose device it has must run the block.
 func TestAPlainTransferBlockIsReceiptedOrDeclined(t *testing.T) {
 	const n = 8
 	sdb := newState(t)
@@ -69,6 +71,9 @@ func TestAPlainTransferBlockIsReceiptedOrDeclined(t *testing.T) {
 
 	for _, b := range cevm.AvailableBackends() {
 		t.Run(cevm.BackendName(b), func(t *testing.T) {
+			if (b == cevm.GPUMetal || b == cevm.GPUCUDA) && !hasDevice(b) {
+				t.Skipf("this host has no %s device", cevm.BackendName(b))
+			}
 			receipts, err := (&Executor{CevmBackend: b}).run(chainConfig(), header, txs, from, sdb)
 			if err != nil {
 				t.Fatalf("run: %v", err)
@@ -80,8 +85,7 @@ func TestAPlainTransferBlockIsReceiptedOrDeclined(t *testing.T) {
 				return
 			}
 			if receipts == nil {
-				t.Skipf("GPU lane %s declined a block of funded plain transfers: no device on this host",
-					cevm.BackendName(b))
+				t.Fatalf("GPU lane %s declined a block of funded plain transfers", cevm.BackendName(b))
 			}
 			if len(receipts) != n {
 				t.Fatalf("%d receipts for %d transactions", len(receipts), n)
@@ -93,4 +97,18 @@ func TestAPlainTransferBlockIsReceiptedOrDeclined(t *testing.T) {
 			}
 		})
 	}
+}
+
+// hasDevice reports whether this host has the device GPU lane b runs on: the
+// GPU every Apple silicon Mac has for Metal, and an NVIDIA driver's control
+// device for CUDA. The library lists a lane it was built with either way.
+func hasDevice(b cevm.Backend) bool {
+	switch b {
+	case cevm.GPUMetal:
+		return runtime.GOOS == "darwin" && runtime.GOARCH == "arm64"
+	case cevm.GPUCUDA:
+		_, err := os.Stat("/dev/nvidiactl")
+		return err == nil
+	}
+	return false
 }

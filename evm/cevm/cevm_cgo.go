@@ -164,8 +164,8 @@ func copyU64(ptr *C.uint64_t, want uint32) []uint64 {
 //
 // When the library declines the block (ok=0) ExecuteBlock returns ErrDeclined
 // and no result: the caller runs the block on its own EVM. A loaded library
-// of another ABI is never called: ExecuteBlock declines every block it is
-// given, with an error that wraps ErrDeclined.
+// of another ABI is never sent a block: ExecuteBlock declines every block it
+// is given, with an error that wraps ErrDeclined.
 func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext, state []StateAccount) (*BlockResult, error) {
 	if len(txs) == 0 {
 		return &BlockResult{ABIVersion: ABIVersion}, nil

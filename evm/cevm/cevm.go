@@ -44,8 +44,8 @@
 // ABIVersion is the go_bridge.h ABI the native build is written to, 7. The
 // build does not compile against a header that names another, and init reads
 // the loaded library's gpu_abi_version(): against a library of another ABI,
-// ExecuteBlock calls nothing and declines every block, so the caller runs them
-// all on its own EVM. It catches a library built against another ABI number;
+// ExecuteBlock sends it no block and declines every one, so the caller runs
+// them all on its own EVM. It catches a library built against another ABI number;
 // two libraries that report the same number are not told apart.
 //
 // Use Health() at startup to see which lanes can run a block: it runs a
@@ -75,7 +75,7 @@ var ErrNotLinked = errors.New("cevm: native EVM not linked (rebuild with CGO_ENA
 // and any batch its value-transfer paths cannot run as the EVM does — a
 // refusal on balance, nonce, price, block gas limit or revision, a snapshot
 // row without its hashes, or a device that failed. Against a loaded library
-// of another ABI, every batch is declined without a call.
+// of another ABI, every batch is declined without being sent.
 //
 // A declined result carries no gas or status a caller may use, so ExecuteBlock
 // returns none with it.
@@ -210,8 +210,9 @@ type BlockContext struct {
 	NumBlobHashes uint32
 }
 
-// ABIVersion (cevm_cgo.go / cevm_nocgo.go) is the C ABI this build reads:
-// go_bridge.h's EVM_GPU_ABI_VERSION, 7. It is one entry, gpu_execute_block,
+// ABIVersion is the C ABI this build reads: go_bridge.h's EVM_GPU_ABI_VERSION,
+// 7, in the native build (cevm_cgo.go), and 0 in a build with no library
+// (cevm_nocgo.go). ABI 7 is one entry, gpu_execute_block,
 // taking a block context and a state snapshot (CGpuStateAccount) and
 // answering per-tx gas and status with ok, freed by gpu_free_result; ok=1
 // only for a result that is the block's. The versioned _v2/_v3/_v4 entries

@@ -4,6 +4,8 @@ package cevm
 
 import (
 	"errors"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -20,9 +22,11 @@ import (
 // result, and the caller runs it on its own EVM.
 //
 // A GPU lane is listed when the library was built with it, whether or not
-// this host has the device, and without one it declines every block. The ABI
-// carries nothing else that says a device is there, so a test that needs one
-// skips on a GPU lane that declines the funded transfers.
+// this host has the device, and without one it declines every block. A test
+// that needs a device skips a lane whose device this host does not have
+// (hasDevice), and on a lane whose device it has, a decline fails: a missing
+// shader or a device-path regression declines too, and must not pass for an
+// absent device.
 
 func TestLibraryABIVersion(t *testing.T) {
 	if got := LibraryABIVersion(); got != ABIVersion {
@@ -50,21 +54,18 @@ func TestAvailableBackends_HasCPU(t *testing.T) {
 }
 
 // A block of funded plain transfers runs on a GPU lane to TxOK at 21000 gas
-// each, or is declined there (no device); a CPU lane declines it. No lane
-// answers anything else.
-func TestAFundedTransferBlockRunsOnADeviceOrIsDeclined(t *testing.T) {
+// each; a CPU lane declines it. No lane answers anything else.
+func TestAFundedTransferBlockRunsOnADeviceAndNowhereElse(t *testing.T) {
 	const n = 4
 	txs, ctx, state := transfers(n)
 	for _, b := range AvailableBackends() {
 		t.Run(BackendName(b), func(t *testing.T) {
+			if isGPU(b) && !hasDevice(b) {
+				t.Skipf("this host has no %s device", BackendName(b))
+			}
 			r, err := ExecuteBlock(b, 0, txs, &ctx, state)
 			if !isGPU(b) {
 				declined(t, r, err)
-				return
-			}
-			if errors.Is(err, ErrDeclined) {
-				declined(t, r, err)
-				t.Logf("%s declined funded transfers: no device on this host", BackendName(b))
 				return
 			}
 			ranTransfers(t, r, err, n)
@@ -93,10 +94,10 @@ func TestABatchWithCodeIsDeclined(t *testing.T) {
 	}
 }
 
-// TestHealth runs the Health() battery: a funded plain transfer. A GPU lane
-// runs it to TxOK at 21000 gas, or declines it on a host without its device;
-// a CPU lane declines it, because the Go entry runs nothing on the CPU
-// without a host (go_bridge.h).
+// TestHealth runs the Health() battery: a funded plain transfer. A GPU
+// lane whose device this host has runs it to TxOK at 21000 gas; a CPU lane
+// declines it, because the Go entry runs nothing on the CPU without a host
+// (go_bridge.h).
 func TestHealth(t *testing.T) {
 	reports := Health()
 	if len(reports) == 0 {
@@ -104,15 +105,12 @@ func TestHealth(t *testing.T) {
 	}
 	for _, r := range reports {
 		switch {
-		case isGPU(r.Backend) && r.OK:
-			if r.GasUsed != 21000 {
-				t.Errorf("Health: GPU lane %q ran the probe at %d gas, want 21000", r.Name, r.GasUsed)
-			}
+		case isGPU(r.Backend) && !hasDevice(r.Backend):
+			t.Logf("Health: GPU lane %q: this host has no device for it (ok=%v err=%v)", r.Name, r.OK, r.Err)
 		case isGPU(r.Backend):
-			if !errors.Is(r.Err, ErrDeclined) {
-				t.Errorf("Health: GPU lane %q: err=%v, want ok at 21000 or declined", r.Name, r.Err)
+			if !r.OK || r.GasUsed != 21000 {
+				t.Errorf("Health: GPU lane %q: ok=%v gas=%d err=%v, want ok at 21000", r.Name, r.OK, r.GasUsed, r.Err)
 			}
-			t.Logf("Health: GPU lane %q declined the probe: no device on this host", r.Name)
 		case r.OK || !errors.Is(r.Err, ErrDeclined):
 			t.Errorf("Health: CPU lane %q: ok=%v err=%v, want declined", r.Name, r.OK, r.Err)
 		}
@@ -190,7 +188,7 @@ func TestConcurrent_Stress(t *testing.T) {
 	wg.Wait()
 }
 
-// TestExecuteBlock_LargeCode: 64 KiB of code crosses the boundary (the
+// TestExecuteBlock_LargeCode: 48 KB of code crosses the boundary (the
 // library copies it) and the batch is declined cleanly, never a segfault from
 // an unchecked uint32 or an unpinned slice.
 func TestExecuteBlock_LargeCode(t *testing.T) {
@@ -335,24 +333,34 @@ func declined(t *testing.T, r *BlockResult, err error) {
 	}
 }
 
-// deviceLanes is the GPU lanes on which this host runs a block of funded
-// transfers. It skips the test when there is none.
+// deviceLanes is the GPU lanes whose device this host has. It skips the test
+// when there is none.
 func deviceLanes(t *testing.T) []Backend {
 	t.Helper()
-	txs, ctx, state := transfers(1)
 	var out []Backend
 	for _, b := range AvailableBackends() {
-		if !isGPU(b) {
-			continue
-		}
-		if _, err := ExecuteBlock(b, 0, txs, &ctx, state); err == nil {
+		if isGPU(b) && hasDevice(b) {
 			out = append(out, b)
 		}
 	}
 	if len(out) == 0 {
-		t.Skip("no GPU lane runs a block on this host: no device")
+		t.Skip("this host has no device for any GPU lane the library offers")
 	}
 	return out
+}
+
+// hasDevice reports whether this host has the device GPU lane b runs on: the
+// GPU every Apple silicon Mac has for Metal, and an NVIDIA driver's control
+// device for CUDA. The library lists a lane it was built with either way.
+func hasDevice(b Backend) bool {
+	switch b {
+	case GPUMetal:
+		return runtime.GOOS == "darwin" && runtime.GOARCH == "arm64"
+	case GPUCUDA:
+		_, err := os.Stat("/dev/nvidiactl")
+		return err == nil
+	}
+	return false
 }
 
 // computeBytecode returns deterministic EVM bytecode that does iters
