@@ -174,11 +174,12 @@ Expected single log line:
 
 ## 8. cevm declines to the Go EVM
 
-cevm's Go entry (`gpu_execute_block`, go_bridge.h ABI 6) answers ok=0 for any
+cevm's Go entry (`gpu_execute_block`, go_bridge.h ABI 7) answers ok=0 for any
 block it does not run — any batch with code, and any refusal on balance, nonce,
-price, block gas limit, revision or hashes. The executor in
-`evm/cevm/parallel` then returns `(nil, nil)`, and the Go EVM runs the block.
-There is no switch: a decline is never an error.
+price, block gas limit, revision or hashes. A loaded library that reports
+another ABI than the binding reads is sent nothing, and every block is
+declined. The executor in `evm/cevm/parallel` then returns `(nil, nil)`, and
+the Go EVM runs the block. There is no switch: a decline is never an error.
 
 ```bash
 cd ~/work/lux/chains

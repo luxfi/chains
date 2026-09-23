@@ -46,7 +46,7 @@
 //
 // # Declining
 //
-// cevm's Go entry (go_bridge.h, ABI 6) answers ok=0 for any block it does not
+// cevm's Go entry (go_bridge.h, ABI 7) answers ok=0 for any block it does not
 // run: a batch with code, and any refusal on balance, nonce, price, block gas
 // limit, revision or hashes. Such a block, and one whose values do not fit its
 // 64-bit wire, is the caller's to run. Every one of them leaves through
@@ -163,7 +163,7 @@ func (e *Executor) run(
 	statedb *state.StateDB,
 ) ([]*types.Receipt, error) {
 	// cevm's Go entry runs nothing on a CPU lane: it passes no host, and a
-	// CPU lane runs no plain transfer without one (go_bridge.h, ABI 6). A
+	// CPU lane runs no plain transfer without one (go_bridge.h, ABI 7). A
 	// library that answers there anyway answers something else — a gas
 	// estimate — so it is not asked.
 	if e.CevmBackend != cevm.GPUMetal && e.CevmBackend != cevm.GPUCUDA {

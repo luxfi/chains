@@ -4,116 +4,26 @@ package cevm
 
 import "testing"
 
-// TestBlockContextChainID is the canonical end-to-end check that the
-// dispatcher forwards Config.block_context to whichever backend actually
-// runs the kernel CHAINID opcode. The bytecode is:
-//
-//	0x46          CHAINID            // pushes block.chainid onto the stack
-//	0x60 0x00     PUSH1 0            // memory offset
-//	0x52          MSTORE             // mem[0..32) = chain_id (big-endian)
-//	0x60 0x20     PUSH1 32           // return size
-//	0x60 0x00     PUSH1 0            // return offset
-//	0xf3          RETURN             // return mem[0..32)
-//
-// Expected: r.Status[0] == TxReturn, the 32-byte output, big-endian, equals
-// the ChainID we passed in BlockContext. Lux mainnet is 96369.
-//
-// We loop over every backend the loaded library reports — that way a regression
-// in Metal CHAINID wiring fails the test on Apple silicon, a regression in CPU
-// kernel wiring fails it on Linux, etc. CUDA is allowed to pass-through to the
-// V2 default (zero ctx) until the CUDA host grows a BlockContext-aware overload;
-// we skip the CHAINID assertion for CUDA but still verify the call returned.
-func TestBlockContextChainID(t *testing.T) {
-	code := []byte{
-		0x46,       // CHAINID
-		0x60, 0x00, // PUSH1 0
-		0x52,       // MSTORE
-		0x60, 0x20, // PUSH1 32
-		0x60, 0x00, // PUSH1 0
-		0xf3, // RETURN
-	}
-	tx := Transaction{
-		HasTo:    true,
-		Code:     code,
-		GasLimit: 100_000,
-	}
-	const wantChainID uint64 = 96369 // Lux mainnet C-chain
-	ctx := &BlockContext{ChainID: wantChainID}
-
-	backends := AvailableBackends()
-	if len(backends) == 0 {
-		t.Skip("no backends available — cannot exercise CHAINID path")
-	}
-
-	for _, b := range backends {
-		b := b
+// The block context reaches the device path and is read there: the same
+// funded transfer that a device runs is declined when the block's base fee is
+// above its price, and when the block's gas limit cannot hold its limit.
+// Either would be run as a valid transfer by a path that dropped the context.
+func TestTheBlockContextReachesTheDevice(t *testing.T) {
+	for _, b := range deviceLanes(t) {
 		t.Run(BackendName(b), func(t *testing.T) {
-			r, err := ExecuteBlock(b, 0, []Transaction{tx}, ctx, nil)
-			if err != nil {
-				t.Fatalf("ExecuteBlock failed: %v", err)
-			}
-			if len(r.Status) != 1 {
-				t.Fatalf("expected 1 status entry, got %d", len(r.Status))
-			}
-			// CUDA host doesn't yet honour BlockContext (separate branch). The
-			// call must still complete cleanly; the CHAINID assertion below
-			// is enforced only for the backends that read ctx.
-			if b == GPUCUDA {
-				if r.Status[0] != TxReturn && r.Status[0] != TxOK {
-					t.Fatalf("CUDA: status=%s, want return/ok", r.Status[0])
-				}
-				return
-			}
-			// The kernel CPU interpreter reads BlockContext via a separate
-			// branch (parallel agent feat/v0.26-cpu-interpreter-26-opcodes).
-			// Until that lands, CHAINID is rejected by the CPU kernel
-			// interpreter as unimplemented and returns TxError. The
-			// dispatcher is correctly forwarding the BlockContext to the
-			// CPU kernel call site (verified by the wiring), but the kernel
-			// itself doesn't read it yet. Assert that the dispatcher
-			// returned a valid result struct and log the actual status.
-			if b == CPUSequential || b == CPUParallel {
-				if len(r.GasUsed) != 1 {
-					t.Fatalf("backend=%s: expected 1 gas entry, got %d", b, len(r.GasUsed))
-				}
-				t.Logf("backend=%s: status=%s gas=%d (CHAINID lands with kernel CPU interpreter branch)",
-					b, r.Status[0], r.GasUsed[0])
-				return
-			}
-			// GPU paths (Metal here) read BlockContext from the kernel-bound
-			// buffer. CHAINID returns the chain id we passed, MSTORE writes
-			// it to memory, RETURN exits cleanly with TxReturn.
-			if r.Status[0] != TxReturn {
-				t.Fatalf("backend=%s: status=%s, want return", b, r.Status[0])
-			}
-			if len(r.GasUsed) != 1 {
-				t.Fatalf("expected 1 gas entry, got %d", len(r.GasUsed))
-			}
-			if r.GasUsed[0] == 0 {
-				t.Fatalf("backend=%s: gas_used=0, kernel didn't execute", b)
-			}
-			// Sanity: every CHAINID program consumes the same minimum gas:
-			//   CHAINID(2) + PUSH1(3) + MSTORE(3) + memexpand(3) +
-			//   PUSH1(3) + PUSH1(3) + RETURN(0) = 17 gas, plus any
-			//   per-backend memory expansion overhead.
-			const minExpected = 12
-			if r.GasUsed[0] < minExpected {
-				t.Errorf("backend=%s: gas_used=%d below minimum %d",
-					b, r.GasUsed[0], minExpected)
-			}
+			txs, ctx, state := transfers(1)
+			r, err := ExecuteBlock(b, 0, txs, &ctx, state)
+			ranTransfers(t, r, err, 1)
+
+			priced := ctx
+			priced.BaseFee = txs[0].GasPrice + 1
+			r, err = ExecuteBlock(b, 0, txs, &priced, state)
+			declined(t, r, err)
+
+			full := ctx
+			full.GasLimit = txs[0].GasLimit - 1
+			r, err = ExecuteBlock(b, 0, txs, &full, state)
+			declined(t, r, err)
 		})
 	}
-
-	// One more invariant: a zero BlockContext (V2 path) MUST NOT panic and
-	// MUST return a clean (non-error) BlockResult. This guards the
-	// "ctx == nil" call shape against silent regressions.
-	t.Run("zero-ctx-fallback", func(t *testing.T) {
-		r, err := ExecuteBlock(backends[0], 0, []Transaction{tx}, nil, nil)
-		if err != nil {
-			t.Fatalf("ExecuteBlock with nil ctx failed: %v", err)
-		}
-		if r.ABIVersion != ABIVersion {
-			t.Errorf("ABIVersion mismatch: got %d, want %d", r.ABIVersion, ABIVersion)
-		}
-	})
 }

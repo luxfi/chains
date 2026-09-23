@@ -4,31 +4,36 @@ package cevm
 
 import (
 	"errors"
-	"fmt"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
+
+	"github.com/luxfi/crypto"
+	"github.com/luxfi/geth/core/types"
 )
 
 // Tests in this file require the C++ EVM library (CGO_ENABLED=1
-// -tags=lux_cevm_native). They are excluded from every build that does not
-// link it, so those builds don't fail on API calls that can't possibly
-// succeed without the library.
+// -tags=lux_cevm_native) and hold it to go_bridge.h, ABI 7: a batch of plain
+// transfers from funded senders runs on a GPU lane that has its device, to
+// TxOK at 21000 gas each. Everything else is declined — a batch with code or
+// calldata on any lane, and every batch on a CPU lane — as ErrDeclined and no
+// result, and the caller runs it on its own EVM.
+//
+// A GPU lane is listed when the library was built with it, whether or not
+// this host has the device, and without one it declines every block. The ABI
+// carries nothing else that says a device is there, so a test that needs one
+// skips on a GPU lane that declines the funded transfers.
 
 func TestLibraryABIVersion(t *testing.T) {
-	got := LibraryABIVersion()
-	if got != ABIVersion {
+	if got := LibraryABIVersion(); got != ABIVersion {
 		t.Errorf("LibraryABIVersion() = %d, want %d (rebuild libevm-gpu)", got, ABIVersion)
 	}
 }
 
-// TestABIVersion locks the ABIVersion constant so a careless bump is caught
-// by code review. Update both this test and ABIVersion together when the
-// C ABI surface changes. It lives here because ABIVersion reports the linked
-// library's ABI: without the library there is none, and cevm_nocgo.go says so
-// with 0.
+// TestABIVersion holds the constant to the ABI this binding is written to. A
+// new ABI is read against this file before the number moves.
 func TestABIVersion(t *testing.T) {
-	const want uint32 = 6
+	const want uint32 = 7
 	if ABIVersion != want {
 		t.Errorf("ABIVersion = %d, want %d (update C-side EVM_GPU_ABI_VERSION in lockstep)",
 			ABIVersion, want)
@@ -44,47 +49,316 @@ func TestAvailableBackends_HasCPU(t *testing.T) {
 	}
 }
 
-func smokeTx(i uint64) Transaction {
-	var from [20]byte
-	from[19] = byte(i + 1) // distinct sender per tx
-	return Transaction{
-		From:     from,
-		HasTo:    true,
-		GasLimit: 21000,
-		Value:    1,
-		Nonce:    i,
-		GasPrice: 1,
+// A block of funded plain transfers runs on a GPU lane to TxOK at 21000 gas
+// each, or is declined there (no device); a CPU lane declines it. No lane
+// answers anything else.
+func TestAFundedTransferBlockRunsOnADeviceOrIsDeclined(t *testing.T) {
+	const n = 4
+	txs, ctx, state := transfers(n)
+	for _, b := range AvailableBackends() {
+		t.Run(BackendName(b), func(t *testing.T) {
+			r, err := ExecuteBlock(b, 0, txs, &ctx, state)
+			if !isGPU(b) {
+				declined(t, r, err)
+				return
+			}
+			if errors.Is(err, ErrDeclined) {
+				declined(t, r, err)
+				t.Logf("%s declined funded transfers: no device on this host", BackendName(b))
+				return
+			}
+			ranTransfers(t, r, err, n)
+		})
 	}
 }
 
-func TestExecuteBlockSmoke_AllBackends(t *testing.T) {
-	const N = 4
-	txs := make([]Transaction, N)
-	for i := range txs {
-		txs[i] = smokeTx(uint64(i))
+// A batch that carries code is declined on every backend: gpu_execute_block
+// passes no host, so it runs no code (go_bridge.h). The block is otherwise
+// one a device runs, so the code is what declines it.
+func TestABatchWithCodeIsDeclined(t *testing.T) {
+	txs, ctx, state := transfers(1)
+	code := computeBytecode(1)
+	txs[0].Code = code
+	for i := range state {
+		if state[i].Address == txs[0].To {
+			state[i].Code = code
+			state[i].CodeHash = crypto.Keccak256Hash(code)
+		}
 	}
-
 	for _, b := range AvailableBackends() {
 		t.Run(BackendName(b), func(t *testing.T) {
-			r, err := ExecuteBlock(b, 0, txs, nil, nil)
-			if err != nil {
-				t.Fatalf("ExecuteBlock(%s): %v", BackendName(b), err)
+			r, err := ExecuteBlock(b, 0, txs, &ctx, state)
+			declined(t, r, err)
+		})
+	}
+}
+
+// TestHealth runs the Health() battery: a funded plain transfer. A GPU lane
+// runs it to TxOK at 21000 gas, or declines it on a host without its device;
+// a CPU lane declines it, because the Go entry runs nothing on the CPU
+// without a host (go_bridge.h).
+func TestHealth(t *testing.T) {
+	reports := Health()
+	if len(reports) == 0 {
+		t.Fatal("Health() returned no reports — runtime cannot enumerate backends")
+	}
+	for _, r := range reports {
+		switch {
+		case isGPU(r.Backend) && r.OK:
+			if r.GasUsed != 21000 {
+				t.Errorf("Health: GPU lane %q ran the probe at %d gas, want 21000", r.Name, r.GasUsed)
 			}
-			if r.TotalGas == 0 {
-				t.Errorf("expected non-zero total gas, got 0")
+		case isGPU(r.Backend):
+			if !errors.Is(r.Err, ErrDeclined) {
+				t.Errorf("Health: GPU lane %q: err=%v, want ok at 21000 or declined", r.Name, r.Err)
 			}
-			if len(r.GasUsed) != N {
-				t.Errorf("len(GasUsed) = %d, want %d", len(r.GasUsed), N)
+			t.Logf("Health: GPU lane %q declined the probe: no device on this host", r.Name)
+		case r.OK || !errors.Is(r.Err, ErrDeclined):
+			t.Errorf("Health: CPU lane %q: ok=%v err=%v, want declined", r.Name, r.OK, r.Err)
+		}
+	}
+}
+
+// Goroutines running blocks on one device at once each get their own block's
+// answer.
+func TestConcurrentExecuteBlock(t *testing.T) {
+	for _, b := range deviceLanes(t) {
+		t.Run(BackendName(b), func(t *testing.T) {
+			const goroutines, iterations, n = 8, 16, 8
+			txs, ctx, state := transfers(n)
+			var wg sync.WaitGroup
+			for g := 0; g < goroutines; g++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for i := 0; i < iterations; i++ {
+						r, err := ExecuteBlock(b, 0, txs, &ctx, state)
+						if err != nil || !allTransfers(r, n) {
+							t.Errorf("concurrent run on %s: err=%v result=%+v", BackendName(b), err, r)
+							return
+						}
+					}
+				}()
+			}
+			wg.Wait()
+		})
+	}
+}
+
+// TestConcurrent_Stress: 100 goroutines × 100 txs, each tx with its own code
+// and calldata allocation. The library copies both before it declines the
+// batch, so this is the regression test for runtime.Pinner: an unpinned Go
+// pointer read from C panics or corrupts here. Every call must decline, and
+// none may panic. Run with -race for full effect.
+func TestConcurrent_Stress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stress test skipped in -short mode")
+	}
+	backends := AvailableBackends()
+	const goroutines, txsPerGoroutine = 100, 100
+	makeBlock := func(seed uint64) []Transaction {
+		txs := make([]Transaction, txsPerGoroutine)
+		for i := range txs {
+			data := make([]byte, 32)
+			for j := range data {
+				data[j] = byte(seed + uint64(i) + uint64(j))
+			}
+			tx := bytecodeTx(seed*txsPerGoroutine+uint64(i), computeBytecode(30))
+			tx.Data = data
+			txs[i] = tx
+		}
+		return txs
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func(seed uint64) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("goroutine %d panicked: %v", seed, r)
+				}
+			}()
+			b := backends[int(seed)%len(backends)]
+			r, err := ExecuteBlock(b, 0, makeBlock(seed), nil, nil)
+			if !errors.Is(err, ErrDeclined) || r != nil {
+				t.Errorf("goroutine %d on %s: (%+v, %v), want declined", seed, BackendName(b), r, err)
+			}
+		}(uint64(g))
+	}
+	wg.Wait()
+}
+
+// TestExecuteBlock_LargeCode: 64 KiB of code crosses the boundary (the
+// library copies it) and the batch is declined cleanly, never a segfault from
+// an unchecked uint32 or an unpinned slice.
+func TestExecuteBlock_LargeCode(t *testing.T) {
+	code := computeBytecode(8000)
+	if len(code) < 32_000 {
+		t.Fatalf("expected >= 32K bytecode, got %d", len(code))
+	}
+	tx := bytecodeTx(0, code)
+	tx.GasLimit = 50_000_000
+	r, err := ExecuteBlock(CPUSequential, 0, []Transaction{tx}, nil, nil)
+	declined(t, r, err)
+}
+
+// TestExecuteBlock_LargeData: 64 KiB of calldata on an otherwise funded
+// transfer crosses the boundary through the data pin, and every lane
+// declines it: the value-transfer device paths do not price calldata.
+func TestExecuteBlock_LargeData(t *testing.T) {
+	txs, ctx, state := transfers(1)
+	txs[0].Data = make([]byte, 1<<16)
+	for i := range txs[0].Data {
+		txs[0].Data[i] = byte(i)
+	}
+	txs[0].GasLimit = 2_000_000
+	state[0].Balance[0] = 10_000_000 // covers the limit: calldata is the only reason left
+	for _, b := range AvailableBackends() {
+		t.Run(BackendName(b), func(t *testing.T) {
+			r, err := ExecuteBlock(b, 0, txs, &ctx, state)
+			declined(t, r, err)
+		})
+	}
+}
+
+// TestBackendUnavailable: a backend the library does not offer declines the
+// block, and never panics.
+func TestBackendUnavailable(t *testing.T) {
+	available := AvailableBackends()
+	missing := Backend(-1)
+	for _, b := range []Backend{CPUSequential, CPUParallel, GPUMetal, GPUCUDA} {
+		if !contains(available, b) {
+			missing = b
+			break
+		}
+	}
+	if missing < 0 {
+		t.Skip("all backends available — cannot test unavailable path")
+	}
+	txs, ctx, state := transfers(1)
+	r, err := ExecuteBlock(missing, 0, txs, &ctx, state)
+	declined(t, r, err)
+}
+
+// A library that reports another ABI is sent nothing: every block is
+// declined, a block a device would have run included, and the error says why.
+func TestALibraryOfAnotherABIIsDeclined(t *testing.T) {
+	loaded := libraryABI
+	t.Cleanup(func() { libraryABI = loaded })
+	libraryABI = ABIVersion - 1
+
+	if got := LibraryABIVersion(); got != ABIVersion-1 {
+		t.Fatalf("LibraryABIVersion() = %d, want the library's %d", got, ABIVersion-1)
+	}
+	txs, ctx, state := transfers(2)
+	for _, b := range AvailableBackends() {
+		t.Run(BackendName(b), func(t *testing.T) {
+			r, err := ExecuteBlock(b, 0, txs, &ctx, state)
+			declined(t, r, err)
+			if !strings.Contains(err.Error(), "ABI") {
+				t.Errorf("the decline does not say the ABI is why: %v", err)
 			}
 		})
 	}
 }
 
-// computeBytecode returns deterministic EVM bytecode that does N additions
-// then returns. Used to exercise the GPU opcode interpreter with measurable
-// gas consumption.
+// -----------------------------------------------------------------------------
+// helpers
+// -----------------------------------------------------------------------------
+
+func isGPU(b Backend) bool { return b == GPUMetal || b == GPUCUDA }
+
+// transfers is a block of n plain transfers, each from its own funded sender
+// to its own fresh recipient, with the block context and the state before the
+// block that go_bridge.h asks for. Each limit is above the 21000 a transfer
+// costs, so a lane that answers the limit as an estimate is not taken for one
+// that ran it.
+func transfers(n int) ([]Transaction, BlockContext, []StateAccount) {
+	ctx := BlockContext{GasLimit: 30_000_000, ChainID: 1, BaseFee: 1, Coinbase: [20]byte{0xC0}}
+	txs := make([]Transaction, n)
+	state := make([]StateAccount, 0, 2*n+1)
+	for i := range txs {
+		from := [20]byte{0xA0, byte(i >> 8), byte(i)}
+		to := [20]byte{0xB0, byte(i >> 8), byte(i)}
+		txs[i] = Transaction{From: from, To: to, HasTo: true, GasLimit: 30_000, Value: 1, GasPrice: 1}
+		state = append(state, account(from, 1_000_000), account(to, 0))
+	}
+	state = append(state, account(ctx.Coinbase, 0))
+	return txs, ctx, state
+}
+
+// account is a snapshot row for an account without code or storage.
+func account(addr [20]byte, balance uint64) StateAccount {
+	return StateAccount{
+		Address:     addr,
+		Balance:     [4]uint64{balance},
+		CodeHash:    types.EmptyCodeHash,
+		StorageRoot: types.EmptyRootHash,
+	}
+}
+
+// allTransfers reports whether r is n plain transfers run: every one TxOK at
+// 21000 gas, at ABI 7.
+func allTransfers(r *BlockResult, n int) bool {
+	if r == nil || len(r.GasUsed) != n || len(r.Status) != n || r.ABIVersion != ABIVersion {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		if r.Status[i] != TxOK || r.GasUsed[i] != 21000 {
+			return false
+		}
+	}
+	return r.TotalGas == uint64(n)*21000
+}
+
+func ranTransfers(t *testing.T, r *BlockResult, err error, n int) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("ExecuteBlock: %v", err)
+	}
+	if !allTransfers(r, n) {
+		t.Fatalf("result is not %d transfers run at 21000 gas: %+v", n, r)
+	}
+}
+
+// declined holds an answer to the one other thing ExecuteBlock may say:
+// ErrDeclined, and no result.
+func declined(t *testing.T, r *BlockResult, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrDeclined) {
+		t.Fatalf("ExecuteBlock = %v, want ErrDeclined", err)
+	}
+	if r != nil {
+		t.Fatalf("a declined block came back with a result: %+v", r)
+	}
+}
+
+// deviceLanes is the GPU lanes on which this host runs a block of funded
+// transfers. It skips the test when there is none.
+func deviceLanes(t *testing.T) []Backend {
+	t.Helper()
+	txs, ctx, state := transfers(1)
+	var out []Backend
+	for _, b := range AvailableBackends() {
+		if !isGPU(b) {
+			continue
+		}
+		if _, err := ExecuteBlock(b, 0, txs, &ctx, state); err == nil {
+			out = append(out, b)
+		}
+	}
+	if len(out) == 0 {
+		t.Skip("no GPU lane runs a block on this host: no device")
+	}
+	return out
+}
+
+// computeBytecode returns deterministic EVM bytecode that does iters
+// additions then returns.
 func computeBytecode(iters int) []byte {
-	out := make([]byte, 0, iters*5+5)
+	out := make([]byte, 0, iters*6+5)
 	for i := 0; i < iters; i++ {
 		out = append(out,
 			0x60, 0x01, // PUSH1 1
@@ -93,18 +367,17 @@ func computeBytecode(iters int) []byte {
 			0x50, // POP
 		)
 	}
-	out = append(out,
+	return append(out,
 		0x60, 0x00, // PUSH1 0
 		0x60, 0x00, // PUSH1 0
 		0xf3, // RETURN
 	)
-	return out
 }
 
 func bytecodeTx(i uint64, code []byte) Transaction {
 	var from [20]byte
-	from[19] = byte((i & 0xff))
-	from[18] = byte((i >> 8) & 0xff)
+	from[19] = byte(i)
+	from[18] = byte(i >> 8)
 	return Transaction{
 		From:     from,
 		HasTo:    true,
@@ -115,39 +388,7 @@ func bytecodeTx(i uint64, code []byte) Transaction {
 	}
 }
 
-// TestGPUBytecodeExecution sends a batch of txs each with real EVM bytecode
-// through the GPU-Metal backend.
-func TestGPUBytecodeExecution(t *testing.T) {
-	if !contains(AvailableBackends(), GPUMetal) {
-		t.Skip("Metal backend not available")
-	}
-	const N = 32
-	code := computeBytecode(50)
-	txs := make([]Transaction, N)
-	for i := range txs {
-		txs[i] = bytecodeTx(uint64(i), code)
-	}
-	r, err := ExecuteBlock(GPUMetal, 0, txs, nil, nil)
-	if err != nil {
-		t.Fatalf("GPU bytecode execute: %v", err)
-	}
-	if len(r.GasUsed) != N {
-		t.Fatalf("len(GasUsed)=%d, want %d", len(r.GasUsed), N)
-	}
-	zeros := 0
-	for _, g := range r.GasUsed {
-		if g == 0 {
-			zeros++
-		}
-	}
-	if zeros == N {
-		t.Fatalf("all %d txs reported 0 gas — kernel didn't execute bytecode", N)
-	}
-	t.Logf("GPU bytecode: %d txs, total gas=%d, time=%.2fms", N, r.TotalGas, r.ExecTimeMs)
-}
-
-// contains reports whether b appears in s. Local helper so test files don't
-// pull in slices.Contains and our go.mod stays minimal.
+// contains reports whether b appears in s.
 func contains(s []Backend, b Backend) bool {
 	for _, x := range s {
 		if x == b {
@@ -155,369 +396,4 @@ func contains(s []Backend, b Backend) bool {
 		}
 	}
 	return false
-}
-
-// TestHealth runs the Health() battery: a funded plain transfer. A GPU lane
-// runs it to TxOK at 21000 gas; a CPU lane declines it, because the Go entry
-// runs nothing on the CPU without a host (go_bridge.h). This is the
-// production-readiness gate.
-func TestHealth(t *testing.T) {
-	reports := Health()
-	if len(reports) == 0 {
-		t.Fatal("Health() returned no reports — runtime cannot enumerate backends")
-	}
-	for _, r := range reports {
-		if r.Backend == GPUMetal || r.Backend == GPUCUDA {
-			if !r.OK || r.GasUsed != 21000 {
-				t.Errorf("Health: GPU lane %q: ok=%v gas=%d err=%v, want ok at 21000", r.Name, r.OK, r.GasUsed, r.Err)
-			}
-			continue
-		}
-		if r.OK || !errors.Is(r.Err, ErrDeclined) {
-			t.Errorf("Health: CPU lane %q: ok=%v err=%v, want declined", r.Name, r.OK, r.Err)
-		}
-	}
-}
-
-// TestHealth_BackendParity asserts that every probe runs on every available
-// backend and that gas across backends matches for the bytecode-only probes.
-// CPU and GPU MUST agree on gas for canonical opcode programs — divergence
-// means a kernel is wrong.
-func TestHealth_BackendParity(t *testing.T) {
-	reports := Health()
-	if len(reports) < 2 {
-		t.Skipf("need >= 2 backends for parity check, have %d", len(reports))
-	}
-	// Group probe results by probe name → list of (backend, gas, status).
-	type point struct {
-		backend Backend
-		gas     uint64
-		status  TxStatus
-		probeOK bool
-	}
-	byProbe := map[string][]point{}
-	for _, r := range reports {
-		if !r.OK {
-			continue
-		}
-		for _, p := range r.ProbeResults {
-			byProbe[p.Name] = append(byProbe[p.Name], point{
-				backend: r.Backend,
-				gas:     p.GasUsed,
-				status:  p.Status,
-				probeOK: p.OK,
-			})
-		}
-	}
-	for probe, pts := range byProbe {
-		if len(pts) < 2 {
-			continue // only one backend ran this probe — nothing to compare
-		}
-		ref := pts[0]
-		for _, p := range pts[1:] {
-			if !p.probeOK || !ref.probeOK {
-				continue
-			}
-			if p.status != ref.status {
-				t.Errorf("probe %q: status mismatch %s=%s vs %s=%s",
-					probe, ref.backend, ref.status, p.backend, p.status)
-			}
-			if p.gas != ref.gas {
-				t.Logf("probe %q: gas differs across backends %s=%d vs %s=%d",
-					probe, ref.backend, ref.gas, p.backend, p.gas)
-			}
-		}
-	}
-}
-
-// TestConcurrentExecuteBlock fires multiple goroutines at every available
-// backend simultaneously to exercise thread-safety.
-func TestConcurrentExecuteBlock(t *testing.T) {
-	if !contains(AvailableBackends(), GPUMetal) {
-		t.Skip("Metal backend not available")
-	}
-	const goroutines = 8
-	const iterations = 16
-	const N = 8
-	code := computeBytecode(20)
-	txs := make([]Transaction, N)
-	for i := range txs {
-		txs[i] = bytecodeTx(uint64(i), code)
-	}
-
-	ref, err := ExecuteBlock(GPUMetal, 0, txs, nil, nil)
-	if err != nil {
-		t.Fatalf("reference ExecuteBlock: %v", err)
-	}
-	want := ref.TotalGas
-	if want == 0 {
-		t.Fatal("reference total gas == 0")
-	}
-
-	errCh := make(chan error, goroutines*iterations)
-	doneCh := make(chan struct{}, goroutines)
-	for g := 0; g < goroutines; g++ {
-		go func() {
-			defer func() { doneCh <- struct{}{} }()
-			for i := 0; i < iterations; i++ {
-				r, err := ExecuteBlock(GPUMetal, 0, txs, nil, nil)
-				if err != nil {
-					errCh <- err
-					return
-				}
-				if r.TotalGas != want {
-					errCh <- fmt.Errorf("concurrent total gas drift: got %d want %d",
-						r.TotalGas, want)
-					return
-				}
-			}
-		}()
-	}
-	for g := 0; g < goroutines; g++ {
-		<-doneCh
-	}
-	close(errCh)
-	for err := range errCh {
-		t.Error(err)
-	}
-}
-
-// TestConcurrent_Stress: 100 goroutines × 100 txs each, real bytecode.
-// This is the regression test for runtime.Pinner correctness — if any Go
-// pointer reachable from C is unpinned, this test will panic or report
-// corrupted gas. Race detector must be enabled with -race for full effect.
-func TestConcurrent_Stress(t *testing.T) {
-	if testing.Short() {
-		t.Skip("stress test skipped in -short mode")
-	}
-	backends := AvailableBackends()
-	if len(backends) == 0 {
-		t.Skip("no backends")
-	}
-	// Pick the most parallel backend present; falls back to CPUSequential.
-	var backend Backend
-	switch {
-	case contains(backends, GPUMetal):
-		backend = GPUMetal
-	case contains(backends, CPUParallel):
-		backend = CPUParallel
-	default:
-		backend = CPUSequential
-	}
-
-	const goroutines = 100
-	const txsPerGoroutine = 100
-	const iters = 30 // smaller body so each block runs fast on CPU paths
-
-	// Build a reference block once. Each goroutine sends an independent
-	// copy of the slices to maximize the chance of catching unpinned aliasing.
-	makeBlock := func(seed uint64) []Transaction {
-		txs := make([]Transaction, txsPerGoroutine)
-		// Each tx gets its own bytecode + calldata slice (separate Go-heap
-		// allocations) — this is deliberately the worst case for the pinner.
-		for i := range txs {
-			code := computeBytecode(iters)
-			data := make([]byte, 32)
-			for j := range data {
-				data[j] = byte((seed + uint64(i) + uint64(j)) & 0xff)
-			}
-			tx := bytecodeTx(seed*uint64(txsPerGoroutine)+uint64(i), code)
-			tx.Data = data
-			txs[i] = tx
-		}
-		return txs
-	}
-
-	// Single-goroutine reference run for total-gas assertion.
-	ref, err := ExecuteBlock(backend, 0, makeBlock(0), nil, nil)
-	if err != nil {
-		t.Fatalf("reference: %v", err)
-	}
-	if ref.TotalGas == 0 {
-		t.Fatal("reference total gas == 0")
-	}
-	want := ref.TotalGas
-
-	var (
-		wg      sync.WaitGroup
-		failed  atomic.Int32
-		drifted atomic.Int32
-	)
-	wg.Add(goroutines)
-	for g := 0; g < goroutines; g++ {
-		go func(seed uint64) {
-			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					failed.Add(1)
-					t.Errorf("goroutine %d panicked: %v", seed, r)
-				}
-			}()
-			block := makeBlock(seed)
-			r, err := ExecuteBlock(backend, 0, block, nil, nil)
-			if err != nil {
-				failed.Add(1)
-				t.Errorf("goroutine %d: ExecuteBlock: %v", seed, err)
-				return
-			}
-			if r.TotalGas != want {
-				drifted.Add(1)
-				t.Errorf("goroutine %d: TotalGas drift: got %d want %d",
-					seed, r.TotalGas, want)
-			}
-		}(uint64(g))
-	}
-	wg.Wait()
-
-	if failed.Load() > 0 {
-		t.Errorf("%d goroutines failed", failed.Load())
-	}
-	if drifted.Load() > 0 {
-		t.Errorf("%d goroutines reported drifted gas", drifted.Load())
-	}
-	t.Logf("stress: %d goroutines × %d txs on %s — all consistent (gas=%d)",
-		goroutines, txsPerGoroutine, BackendName(backend), want)
-}
-
-// TestExecuteBlock_LargeCode: a single tx with a very large bytecode buffer
-// must not segfault and must either succeed or return a clean error. This
-// guards against unchecked uint32 truncation or pinner failure on big slices.
-func TestExecuteBlock_LargeCode(t *testing.T) {
-	// 64 KiB of harmless ADD/POP loops + RETURN — well within EIP-170 limits
-	// but big enough that an unpinned slice would crash quickly.
-	code := computeBytecode(8000)
-	if len(code) < 32_000 {
-		t.Fatalf("expected >= 32K bytecode, got %d", len(code))
-	}
-	tx := bytecodeTx(0, code)
-	tx.GasLimit = 50_000_000
-	r, err := ExecuteBlock(CPUSequential, 0, []Transaction{tx}, nil, nil)
-	if err != nil {
-		t.Fatalf("large code: %v", err)
-	}
-	if len(r.GasUsed) != 1 {
-		t.Fatalf("len(GasUsed) = %d, want 1", len(r.GasUsed))
-	}
-	t.Logf("large code: %d bytes, gas=%d", len(code), r.GasUsed[0])
-}
-
-// TestExecuteBlock_LargeData: large calldata path. Same intent as the
-// large-code test but exercising the data-pointer pin.
-func TestExecuteBlock_LargeData(t *testing.T) {
-	const size = 1 << 16 // 64 KiB
-	data := make([]byte, size)
-	for i := range data {
-		data[i] = byte(i & 0xff)
-	}
-	tx := smokeTx(0)
-	tx.Data = data
-	r, err := ExecuteBlock(CPUSequential, 0, []Transaction{tx}, nil, nil)
-	if err != nil {
-		t.Fatalf("large data: %v", err)
-	}
-	if len(r.GasUsed) != 1 {
-		t.Fatalf("len(GasUsed) = %d, want 1", len(r.GasUsed))
-	}
-}
-
-// TestExecuteBlock_EmptyCodeAndData: a tx with neither Code nor Data must
-// route through the scheduler-only path and return a sane result. Verifies
-// that the conditional pinner code paths (only pin when len > 0) don't
-// erroneously dereference nil.
-func TestExecuteBlock_EmptyCodeAndData(t *testing.T) {
-	tx := smokeTx(0)
-	// Explicitly clear in case smokeTx ever changes.
-	tx.Code = nil
-	tx.Data = nil
-	r, err := ExecuteBlock(CPUSequential, 0, []Transaction{tx}, nil, nil)
-	if err != nil {
-		t.Fatalf("empty code+data: %v", err)
-	}
-	if len(r.GasUsed) != 1 {
-		t.Fatalf("len(GasUsed) = %d, want 1", len(r.GasUsed))
-	}
-}
-
-// TestBackendUnavailable: requesting a backend that isn't in
-// AvailableBackends() must return an error or a zero-gas result, never panic.
-func TestBackendUnavailable(t *testing.T) {
-	available := AvailableBackends()
-	// Find a backend that is NOT in available.
-	all := []Backend{CPUSequential, CPUParallel, GPUMetal, GPUCUDA}
-	var missing Backend = -1
-	for _, b := range all {
-		if !contains(available, b) {
-			missing = b
-			break
-		}
-	}
-	if missing < 0 {
-		t.Skip("all backends available — cannot test unavailable path")
-	}
-	tx := smokeTx(0)
-	defer func() {
-		// We don't care which mode the C++ side picks — error or zero gas
-		// or graceful fallback — but it MUST NOT panic.
-		if r := recover(); r != nil {
-			t.Errorf("requesting unavailable backend %s panicked: %v", missing, r)
-		}
-	}()
-	r, err := ExecuteBlock(missing, 0, []Transaction{tx}, nil, nil)
-	if err != nil {
-		t.Logf("unavailable backend %s returned error (expected): %v", missing, err)
-		return
-	}
-	t.Logf("unavailable backend %s fell back gracefully: TotalGas=%d", missing, r.TotalGas)
-}
-
-// TestExecuteBlock_GasParity_AcrossBackends compares gas across backends
-// for the same canonical workload. Where backends agree, they must agree
-// exactly on gas. Where they don't (kernel still in development), we just
-// log the divergence — the strict gate is in TestOpcodeCoverage_GPU_vs_CPU.
-//
-// This test is the cross-backend complement to per-opcode gas parity:
-// it catches block-level gas accounting bugs that wouldn't show up in a
-// single-opcode test (e.g. block-STM commit accounting).
-func TestExecuteBlock_GasParity_AcrossBackends(t *testing.T) {
-	available := AvailableBackends()
-	if len(available) < 2 {
-		t.Skipf("need >= 2 backends for parity check, have %d", len(available))
-	}
-	const N = 16
-	code := computeBytecode(20)
-	makeTxs := func() []Transaction {
-		txs := make([]Transaction, N)
-		for i := range txs {
-			txs[i] = bytecodeTx(uint64(i), code)
-		}
-		return txs
-	}
-
-	results := make(map[Backend]uint64)
-	for _, b := range available {
-		r, err := ExecuteBlock(b, 0, makeTxs(), nil, nil)
-		if err != nil {
-			t.Logf("ExecuteBlock(%s): %v (skipping in parity check)", b, err)
-			continue
-		}
-		results[b] = r.TotalGas
-		t.Logf("backend=%s TotalGas=%d", b, r.TotalGas)
-	}
-	if len(results) < 2 {
-		t.Skip("only one backend produced a result; cannot compare")
-	}
-	// Compare each backend against every other; report on mismatches.
-	var first Backend
-	var firstGas uint64
-	pickedFirst := false
-	for b, g := range results {
-		if !pickedFirst {
-			first, firstGas, pickedFirst = b, g, true
-			continue
-		}
-		if g != firstGas {
-			t.Logf("gas diverges across backends: %s=%d %s=%d (acceptable when "+
-				"GPU kernel coverage differs from CPU)", first, firstGas, b, g)
-		}
-	}
 }

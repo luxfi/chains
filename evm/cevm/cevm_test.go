@@ -4,18 +4,15 @@
 package cevm
 
 import (
-	"strings"
 	"testing"
 	"unsafe"
-
-	"github.com/luxfi/geth/core/types"
 )
 
-// Tests in this file run under every build. They cover the parts of the API
-// that do not depend on the C++ library: the enum stringers, the wire layout
-// the C ABI reads by memcpy, and — the part that matters — what the package
-// does when the native library is NOT linked, which is the default build and
-// the only one that works on a host without the lux-cevm bundle.
+// Tests in this file run under every build, the native one included. They
+// cover the parts of the API that answer the same with or without the C++
+// library: the enum stringers, the wire layout the C ABI reads by memcpy, an
+// empty block, and what a build says about its own lanes. What the package
+// does when the library is NOT linked is in cevm_nolib_test.go.
 
 func TestBackendString(t *testing.T) {
 	tests := []struct {
@@ -57,48 +54,8 @@ func TestTxStatusString(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// Refusing, rather than pretending to execute
+// An empty block
 // -----------------------------------------------------------------------------
-
-// The one property that matters when the native EVM is not linked: a block
-// with transactions in it must NOT come back as a result.
-//
-// A successful-looking BlockResult here is a block whose transactions were
-// never applied. The caller writes the state root and the gas, consensus
-// accepts it, and the chain has diverged from every node that did link the
-// library — silently, because nothing errored. So the refusal is the
-// consensus-relevant behaviour, not a convenience.
-func TestABlockWithTransactionsIsRefusedRatherThanFaked(t *testing.T) {
-	for _, backend := range []Backend{CPUSequential, CPUParallel, GPUMetal, GPUCUDA} {
-		result, err := ExecuteBlock(backend, 4, []Transaction{{GasLimit: 21000}}, nil, nil)
-		if err == nil {
-			t.Fatalf("ExecuteBlock(%s, 1 tx) returned no error; a block that was never "+
-				"executed must not come back as a result", backend)
-		}
-		if result != nil {
-			t.Errorf("ExecuteBlock(%s, 1 tx) returned a result (%+v) alongside its refusal",
-				backend, result)
-		}
-		// The message has to say what to do about it: an operator reading a
-		// bare "not supported" cannot tell a missing build tag from a missing
-		// GPU.
-		if !strings.Contains(err.Error(), "lux_cevm_native") {
-			t.Errorf("ExecuteBlock error %q does not name the build tag that fixes it", err)
-		}
-	}
-}
-
-// A block context and a state snapshot do not change the refusal. They are the
-// V4 arguments; accepting them and then not executing would be the same
-// divergence with more ceremony.
-func TestContextAndSnapshotDoNotBuyExecution(t *testing.T) {
-	ctx := &BlockContext{ChainID: 96369, Number: 7}
-	snapshot := []StateAccount{{Nonce: 1}}
-
-	if _, err := ExecuteBlock(GPUCUDA, 8, []Transaction{{GasLimit: 21000}}, ctx, snapshot); err == nil {
-		t.Fatal("ExecuteBlock accepted a block once it was handed a context and a snapshot")
-	}
-}
 
 // An empty block is the documented exception: there is nothing to execute, so
 // there is nothing to get wrong, and the caller gets the ABI the linked library
@@ -122,35 +79,6 @@ func TestAnEmptyBlockIsTheOneThingThatCanBeAnswered(t *testing.T) {
 		if result.ABIVersion != ABIVersion {
 			t.Errorf("ABIVersion = %d, want %d", result.ABIVersion, ABIVersion)
 		}
-	}
-}
-
-// BatchRecoverSenders is the same shape: no transactions is not a failure, and
-// any transaction is a refusal. Its doc tells the caller to fall back to
-// per-tx types.Sender, which is only actionable if the caller can tell the two
-// apart — so the empty case must not error.
-func TestBatchRecoveryRefusesWorkAndNotEmptiness(t *testing.T) {
-	signer := types.LatestSignerForChainID(nil)
-
-	senders, err := BatchRecoverSenders(nil, signer)
-	if err != nil {
-		t.Fatalf("BatchRecoverSenders(nil) = %v, want no error", err)
-	}
-	if senders != nil {
-		t.Errorf("BatchRecoverSenders(nil) returned %d senders", len(senders))
-	}
-
-	txs := types.Transactions{types.NewTx(&types.LegacyTx{Gas: 21000})}
-	senders, err = BatchRecoverSenders(txs, signer)
-	if err == nil {
-		t.Fatal("BatchRecoverSenders returned no error with the native library unlinked; " +
-			"a caller would read the zero addresses as recovered senders")
-	}
-	if senders != nil {
-		t.Errorf("BatchRecoverSenders returned %d senders alongside its refusal", len(senders))
-	}
-	if !strings.Contains(err.Error(), "lux_cevm_native") {
-		t.Errorf("BatchRecoverSenders error %q does not name the build tag that fixes it", err)
 	}
 }
 
@@ -180,28 +108,6 @@ func TestThisBuildReportsExactlyTheBackendItCanRun(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("AutoDetect() = %s, which is not in AvailableBackends() = %v", auto, got)
-	}
-}
-
-// The name is the Backend's own String under this build — there is no library
-// to ask — so the two cannot drift into two vocabularies for one lane.
-func TestBackendNameAgreesWithTheStringer(t *testing.T) {
-	for _, b := range []Backend{CPUSequential, CPUParallel, GPUMetal, GPUCUDA, Backend(99)} {
-		if got, want := BackendName(b), b.String(); got != want {
-			t.Errorf("BackendName(%d) = %q, Backend.String() = %q", int(b), got, want)
-		}
-	}
-}
-
-// The ABI the Go module expects and the ABI the loaded library reports are
-// compared at process start, and a mismatch panics on purpose: a silent skew
-// produces wrong gas and wrong state roots, which is a consensus fault. With
-// no library linked there is nothing to compare against, and LibraryABIVersion
-// must say so by agreeing with the Go-side constant rather than inventing a
-// number that would pass a check it never made.
-func TestWithNoLibraryTheReportedABIIsTheGoSideConstant(t *testing.T) {
-	if got := LibraryABIVersion(); got != ABIVersion {
-		t.Fatalf("LibraryABIVersion() = %d, want ABIVersion = %d", got, ABIVersion)
 	}
 }
 
@@ -238,9 +144,9 @@ func TestHealthAlwaysAnswersAndSaysWhyWhenItCannotRun(t *testing.T) {
 // left it passing. Offsets are what a reorder changes.
 //
 // A change to any number below means the C side's CBlockContext must move in
-// lockstep AND ABIVersion must be bumped on both sides — the mismatch check at
-// process start is the only thing that catches a skew, and it can only catch a
-// skew that was declared.
+// lockstep AND ABIVersion must be bumped on both sides — the ABI checks (the
+// header's number at build time, the library's at start) are the only thing
+// that catches a skew, and they can only catch a skew that was declared.
 func TestBlockContextIsTheWireLayout(t *testing.T) {
 	var c BlockContext
 

@@ -56,11 +56,21 @@ func AutoDetect() Backend {
 	return Backend(C.gpu_auto_detect_backend())
 }
 
-// ABIVersion is the ABI this build was compiled against, taken from the
-// library's own header. There is no second copy to keep in sync.
-const ABIVersion = uint32(C.EVM_GPU_ABI_VERSION)
+// ABIVersion is the go_bridge.h ABI this file is written to: 7, in which ok
+// says whether the result is the block's. A version 6 library answers ok=1 for
+// results that are not, so this file is not correct against it even where the
+// structs line up.
+const ABIVersion uint32 = 7
 
-// The C structs this file fills and reads, at the sizes go_bridge.h (ABI 6)
+// The header this builds against names the same ABI, or this file does not
+// compile: each line fails when EVM_GPU_ABI_VERSION is smaller (the first) or
+// larger (the second) than ABIVersion.
+var (
+	_ [ABIVersion - C.EVM_GPU_ABI_VERSION]struct{}
+	_ [C.EVM_GPU_ABI_VERSION - ABIVersion]struct{}
+)
+
+// The C structs this file fills and reads, at the sizes go_bridge.h (ABI 7)
 // gives them on LP64. A header that adds, drops or widens a field changes a
 // size, and then this file does not compile until it has been read against
 // the new header: a field it never sets would otherwise cross as zero, which
@@ -77,18 +87,22 @@ var (
 	_ [unsafe.Sizeof(BlockContext{}) - unsafe.Sizeof(C.CBlockContext{})]struct{}
 )
 
-// init validates the ABI version of the loaded shared library against the Go
-// module's expected ABIVersion. A mismatch means the binary and the cevm
-// module were built against incompatible C++ headers and any execution would
-// produce silently wrong results — fail fast at process start instead.
+// libraryABI is the ABI the loaded library reports (gpu_abi_version), read
+// once in init. The library a binary loads at run time need not be the one
+// whose header it was built against.
+var libraryABI uint32
+
+// init reads the loaded library's ABI. A library of another ABI lays the
+// structs out and means ok differently, so ExecuteBlock sends it nothing:
+// every block is declined, and the caller runs it on its own EVM.
 func init() {
-	got := uint32(C.gpu_abi_version())
-	if got != ABIVersion {
-		panic(fmt.Sprintf(
-			"cevm: ABI version mismatch — loaded libevm-gpu reports v%d but Go bindings expect v%d. "+
-				"Rebuild libevm-gpu (see luxcpp/evm) or pin matching versions.",
-			got, ABIVersion))
-	}
+	libraryABI = uint32(C.gpu_abi_version())
+}
+
+// errOtherABI is ExecuteBlock's decline when the loaded library, or a result
+// it returned, is of an ABI this file is not written to.
+func errOtherABI(got uint32) error {
+	return fmt.Errorf("cevm: the library speaks ABI %d, this build reads %d: %w", got, ABIVersion, ErrDeclined)
 }
 
 // buildTxs converts Go transactions into C-layout transactions, pinning any
@@ -149,10 +163,15 @@ func copyU64(ptr *C.uint64_t, want uint32) []uint64 {
 // touches (see StateAccount). numThreads is passed through to the C executor.
 //
 // When the library declines the block (ok=0) ExecuteBlock returns ErrDeclined
-// and no result: the caller runs the block on its own EVM.
+// and no result: the caller runs the block on its own EVM. A loaded library
+// of another ABI is never called: ExecuteBlock declines every block it is
+// given, with an error that wraps ErrDeclined.
 func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext, state []StateAccount) (*BlockResult, error) {
 	if len(txs) == 0 {
 		return &BlockResult{ABIVersion: ABIVersion}, nil
+	}
+	if libraryABI != ABIVersion {
+		return nil, errOtherABI(libraryABI)
 	}
 
 	var pinner runtime.Pinner
@@ -244,15 +263,15 @@ func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *Bl
 	runtime.KeepAlive(cAccts)
 	runtime.KeepAlive(codeBlob)
 
-	// ok=0 names no gas or status the caller may use (every status reads
-	// EVM_GPU_TX_ERROR, and the arrays may be NULL), so nothing below it is
-	// read: the block goes back to the caller whole.
+	// What ok means is the ABI's, so a result of another ABI is not read at
+	// all. ok=0 names no gas or status the caller may use (every status reads
+	// EVM_GPU_TX_ERROR, and the arrays may be NULL). Either way nothing below
+	// is read: the block goes back to the caller whole.
+	if got := uint32(result.abi_version); got != ABIVersion {
+		return nil, errOtherABI(got)
+	}
 	if result.ok == 0 {
 		return nil, ErrDeclined
-	}
-	if uint32(result.abi_version) != ABIVersion {
-		return nil, fmt.Errorf("cevm: ABI version mismatch in result (lib=%d expected=%d)",
-			uint32(result.abi_version), ABIVersion)
 	}
 
 	br := &BlockResult{
@@ -307,10 +326,10 @@ func AvailableBackends() []Backend {
 	return out
 }
 
-// LibraryABIVersion returns the ABI version reported by the loaded library.
-// Useful for diagnostics when binaries and shared libs may drift.
+// LibraryABIVersion returns the ABI the loaded library reports. When it is
+// not ABIVersion, ExecuteBlock declines every block.
 func LibraryABIVersion() uint32 {
-	return uint32(C.gpu_abi_version())
+	return libraryABI
 }
 
 // healthProbe is one entry in the Health() battery: a block, the state before
@@ -325,7 +344,7 @@ type healthProbe struct {
 
 // healthBattery is what Health runs on every backend.
 //
-// gpu_execute_block runs one kind of block (go_bridge.h, ABI 6): plain value
+// gpu_execute_block runs one kind of block (go_bridge.h, ABI 7): plain value
 // transfers, on a GPU lane's value-transfer path. It declines a batch with
 // code, and the CPU lanes run nothing without a host. So the battery is one
 // such block — a funded sender's transfer to a fresh address — which a lane
