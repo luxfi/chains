@@ -6,13 +6,12 @@ package parallel
 import (
 	"errors"
 	"math/big"
-	"os"
-	"strings"
 	"testing"
 
 	"github.com/holiman/uint256"
 
 	"github.com/luxfi/chains/evm/cevm"
+	"github.com/luxfi/crypto/backend"
 	evmparallel "github.com/luxfi/evm/core/parallel"
 	"github.com/luxfi/evm/core/state"
 	"github.com/luxfi/geth/common"
@@ -24,79 +23,156 @@ import (
 )
 
 // -----------------------------------------------------------------------------
-// The declining policy
+// Declining
 // -----------------------------------------------------------------------------
 
-// CEVM_STRICT decides what a block cevm cannot run does: fail loudly, or fall
-// through to the Go EVM.
-//
-// Both answers were unreachable from one process until now, because the value
-// was memoized behind a sync.Once at the first decline. That is why this test
-// can exist: the two branches are the whole policy and each has to be shown.
-func TestStrictModeIsWhatTheEnvironmentSays(t *testing.T) {
-	for _, tc := range []struct {
-		set    string
-		strict bool
-	}{
-		{"0", false},
-		{"false", false},
-		{"FALSE", false},
-		{"no", false},
-		{"off", false},
-		{"  off  ", false},
-		{"", true},
-		{"1", true},
-		{"true", true},
-		{"yes", true},
-		{"maybe", true},
-	} {
-		t.Run(tc.set, func(t *testing.T) {
-			t.Setenv(envCEVMStrict, tc.set)
-			if got := strictGPUEVM(); got != tc.strict {
-				t.Fatalf("CEVM_STRICT=%q → strictGPUEVM() = %v, want %v", tc.set, got, tc.strict)
-			}
-		})
+// fallbacks is how many declines crypto/backend has counted.
+func fallbacks() uint64 {
+	return backend.FallbackCounters()[backend.FallbackUnsupported.String()]
+}
+
+// A decline is luxfi/evm's "not handled", (nil, nil), on which the state
+// processor runs the block on its sequential Go EVM — never an error, which
+// would say the block is bad. It is counted, so a lane that declines
+// everything is visible.
+func TestADeclineFallsThroughToTheGoEVMAndIsCounted(t *testing.T) {
+	before := fallbacks()
+	receipts, err := declineBlock("cevm_declined", 42, 7)
+	if err != nil || receipts != nil {
+		t.Fatalf("declineBlock = (%v, %v), want (nil, nil) so the caller runs the block", receipts, err)
+	}
+	if fallbacks() != before+1 {
+		t.Errorf("fallback counter moved %d → %d, want one more", before, fallbacks())
 	}
 }
 
-// Unset is not the same as set-to-empty for every reader of an environment,
-// so the default is pinned against a genuinely absent variable too. Strict is
-// the safe direction: a binary nobody configured must not silently execute
-// blocks on a backend the operator did not choose.
-func TestAnUnsetEnvironmentIsStrict(t *testing.T) {
-	t.Setenv(envCEVMStrict, "0")
-	if err := os.Unsetenv(envCEVMStrict); err != nil {
-		t.Fatalf("unset %s: %v", envCEVMStrict, err)
+// ok=0 from the library is ErrDeclined, and the block goes to the Go EVM:
+// (nil, nil). Whatever came back with the decline is not read — a declined
+// result's statuses all say Error and its gas is the tx's whole limit, so
+// receipting it would fail every transaction in a block that did not fail.
+func TestABlockCevmDeclinesRunsOnTheGoEVM(t *testing.T) {
+	txs := types.Transactions{transfer(t, 0, big.NewInt(1)), transfer(t, 1, big.NewInt(1))}
+	calls := 0
+	e := &Executor{
+		CevmBackend: cevm.GPUCUDA,
+		execute: func(cevm.Backend, uint32, []cevm.Transaction, *cevm.BlockContext, []cevm.StateAccount) (*cevm.BlockResult, error) {
+			calls++
+			return &cevm.BlockResult{
+				GasUsed: []uint64{21000, 21000},
+				Status:  []cevm.TxStatus{cevm.TxError, cevm.TxError},
+			}, cevm.ErrDeclined
+		},
 	}
-	if !strictGPUEVM() {
-		t.Fatal("with CEVM_STRICT unset the fallback is enabled; the default must be strict")
+	before := fallbacks()
+	receipts, err := e.run(chainConfig(), newHeader(), txs, senders(len(txs)), newState(t))
+	if err != nil || receipts != nil {
+		t.Fatalf("a declined block = (%v, %v), want (nil, nil): the Go EVM runs it", receipts, err)
+	}
+	if calls != 1 {
+		t.Fatalf("cevm was called %d times, want 1", calls)
+	}
+	if fallbacks() != before+1 {
+		t.Errorf("the decline was not counted")
 	}
 }
 
-// A declined block is a refusal under strict mode and a fall-through under the
-// legacy opt-out — and the refusal has to be recognisable, because the caller
-// distinguishes "cevm cannot" from "this block is bad" by the sentinel.
-func TestDecliningIsARefusalUnderStrictAndAFallThroughOtherwise(t *testing.T) {
-	t.Setenv(envCEVMStrict, "1")
-	receipts, err := declineBlock("call_or_create_unsupported_v4", 42, 7)
-	if !errors.Is(err, ErrGPUEVMRequired) {
-		t.Fatalf("strict decline = %v, want ErrGPUEVMRequired", err)
+// A failure that is not a decline — a result for another ABI, say — is an
+// error: the library broke its contract, which is not the same as refusing
+// the block.
+func TestACevmFailureThatIsNotADeclineIsAnError(t *testing.T) {
+	broken := errors.New("cevm: ABI version mismatch in result")
+	e := &Executor{
+		execute: func(cevm.Backend, uint32, []cevm.Transaction, *cevm.BlockContext, []cevm.StateAccount) (*cevm.BlockResult, error) {
+			return nil, broken
+		},
+	}
+	txs := types.Transactions{transfer(t, 0, big.NewInt(1))}
+	receipts, err := e.run(chainConfig(), newHeader(), txs, senders(len(txs)), newState(t))
+	if !errors.Is(err, broken) {
+		t.Fatalf("run = (%v, %v), want the library's error", receipts, err)
 	}
 	if receipts != nil {
-		t.Errorf("strict decline returned %d receipts alongside its refusal", len(receipts))
+		t.Errorf("an error came with %d receipts", len(receipts))
 	}
-	// An operator reading only the log needs the reason and the position.
-	for _, want := range []string{"call_or_create_unsupported_v4", "block=42", "tx_index=7"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("decline error %q does not carry %q", err, want)
-		}
-	}
+}
 
-	t.Setenv(envCEVMStrict, "0")
-	receipts, err = declineBlock("call_or_create_unsupported_v4", 42, 7)
-	if err != nil || receipts != nil {
-		t.Fatalf("legacy decline = (%v, %v), want (nil, nil) so the caller falls through",
-			receipts, err)
+// A block cevm ran comes back as receipts built from its result.
+func TestABlockCevmRanIsReceipted(t *testing.T) {
+	txs := types.Transactions{transfer(t, 0, big.NewInt(1)), transfer(t, 1, big.NewInt(1))}
+	e := &Executor{
+		execute: func(cevm.Backend, uint32, []cevm.Transaction, *cevm.BlockContext, []cevm.StateAccount) (*cevm.BlockResult, error) {
+			return &cevm.BlockResult{
+				GasUsed: []uint64{21000, 21000},
+				Status:  []cevm.TxStatus{cevm.TxOK, cevm.TxOK},
+			}, nil
+		},
+	}
+	receipts, err := e.run(chainConfig(), newHeader(), txs, senders(len(txs)), newState(t))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(receipts) != len(txs) || receipts[1].CumulativeGasUsed != 42000 {
+		t.Fatalf("receipts = %v, want two at 21000 each", receipts)
+	}
+}
+
+// Nothing wider than cevm's 64-bit wire reaches cevm. A value or a price of
+// 2^64 is legal; truncated to 0 it is another transaction, so the block goes
+// to the Go EVM and cevm is never called. The same holds for a tx the wire
+// drops part of, and for a base fee or chain id that does not fit.
+func TestWhatDoesNotFitTheWireNeverReachesCevm(t *testing.T) {
+	huge := new(big.Int).Lsh(big.NewInt(1), 64)
+	to := common.Address{0x11}
+	for _, tc := range []struct {
+		name   string
+		tx     *types.Transaction
+		header func(*types.Header)
+		config *ethparams.ChainConfig
+	}{
+		{name: "value 2^64", tx: types.NewTx(&types.LegacyTx{To: &to, Value: huge, Gas: 21000, GasPrice: big.NewInt(1)})},
+		{name: "gas price 2^64", tx: types.NewTx(&types.LegacyTx{To: &to, Value: big.NewInt(1), Gas: 21000, GasPrice: huge})},
+		{name: "fee cap 2^64", tx: types.NewTx(&types.DynamicFeeTx{To: &to, Value: big.NewInt(1), Gas: 21000, GasFeeCap: huge, GasTipCap: big.NewInt(1)})},
+		{
+			name: "an access list",
+			tx: types.NewTx(&types.AccessListTx{
+				To: &to, Value: big.NewInt(1), Gas: 23400, GasPrice: big.NewInt(1),
+				AccessList: types.AccessList{{Address: common.Address{0x22}}},
+			}),
+		},
+		{name: "tip above fee cap", tx: types.NewTx(&types.DynamicFeeTx{To: &to, Value: big.NewInt(1), Gas: 21000, GasFeeCap: big.NewInt(1), GasTipCap: big.NewInt(2)})},
+		{
+			name:   "base fee 2^64",
+			tx:     transfer(t, 0, big.NewInt(1)),
+			header: func(h *types.Header) { h.BaseFee = new(big.Int).Set(huge) },
+		},
+		{
+			name:   "chain id 2^64",
+			tx:     transfer(t, 0, big.NewInt(1)),
+			config: &ethparams.ChainConfig{ChainID: new(big.Int).Set(huge)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &Executor{
+				CevmBackend: cevm.GPUCUDA,
+				execute: func(cevm.Backend, uint32, []cevm.Transaction, *cevm.BlockContext, []cevm.StateAccount) (*cevm.BlockResult, error) {
+					t.Fatal("cevm was called with a block its wire cannot carry")
+					return nil, nil
+				},
+			}
+			header := newHeader()
+			if tc.header != nil {
+				tc.header(header)
+			}
+			config := chainConfig()
+			if tc.config != nil {
+				config = tc.config
+			}
+			txs := types.Transactions{transfer(t, 0, big.NewInt(1)), tc.tx}
+			receipts, err := e.run(config, header, txs, senders(len(txs)), newState(t))
+			if err != nil || receipts != nil {
+				t.Fatalf("run = (%v, %v), want (nil, nil): the Go EVM runs the block", receipts, err)
+			}
+		})
 	}
 }
 
@@ -105,30 +181,20 @@ func TestDecliningIsARefusalUnderStrictAndAFallThroughOtherwise(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 // The executor in a binary that has no cevm to dispatch to must decline, not
-// hard-fail: the absence of the library is a property of the build, so it
-// belongs to the policy CEVM_STRICT governs.
-//
-// It used to return a bare error from the sender-recovery step, which meant
-// CEVM_STRICT=0 — the documented emergency rollback to the Go EVM — could not
-// clear it. In a build without the library that is every block, permanently.
+// hard-fail: the absence of the library is a property of the build, and every
+// block then belongs to the Go EVM.
 func TestABuildWithNoLibraryDeclinesRatherThanHalting(t *testing.T) {
 	e := &Executor{CevmBackend: cevm.GPUCUDA}
 	sdb := newState(t)
 	header := newHeader()
 	txs := types.Transactions{transfer(t, 1, big.NewInt(1))}
 
-	t.Setenv(envCEVMStrict, "0")
 	receipts, err := e.ExecuteBlock(chainConfig(), header, txs, sdb, vm.Config{})
 	if err != nil {
-		t.Fatalf("with CEVM_STRICT=0 the block must fall through to the Go EVM, got: %v", err)
+		t.Fatalf("the block must fall through to the Go EVM, got: %v", err)
 	}
 	if receipts != nil {
 		t.Errorf("fall-through returned %d receipts", len(receipts))
-	}
-
-	t.Setenv(envCEVMStrict, "1")
-	if _, err := e.ExecuteBlock(chainConfig(), header, txs, sdb, vm.Config{}); !errors.Is(err, ErrGPUEVMRequired) {
-		t.Fatalf("under strict mode the refusal must be ErrGPUEVMRequired, got: %v", err)
 	}
 }
 
@@ -223,29 +289,82 @@ func TestShapeCarriesEachTransactionsOwnFields(t *testing.T) {
 	}
 }
 
-// cevm.Transaction holds Value as a uint64. A value above 2^64-1 is rare but
-// legal, and truncating it would execute a transaction other than the one that
-// was signed — so the block is declined at the index that cannot be carried.
-func TestAValueTooLargeForTheWireIsDeclinedAtItsIndex(t *testing.T) {
+// cevm.Transaction holds Value and GasPrice as uint64. A value or price above
+// 2^64-1 is rare but legal, and truncating it would execute a transaction
+// other than the one that was signed — so the block is declined at the index
+// that cannot be carried.
+func TestAValueOrPriceTooLargeForTheWireIsDeclinedAtItsIndex(t *testing.T) {
 	huge := new(big.Int).Lsh(big.NewInt(1), 64) // 2^64: one past what fits
-	txs := types.Transactions{
-		types.NewTx(&types.LegacyTx{Value: big.NewInt(1), Gas: 21000, GasPrice: big.NewInt(1)}),
-		types.NewTx(&types.LegacyTx{Value: huge, Gas: 21000, GasPrice: big.NewInt(1)}),
-	}
-	if _, i := shape(txs, []common.Address{{}, {}}, newState(t)); i != 1 {
-		t.Fatalf("shape declined at index %d, want 1 (the transaction whose value overflows)", i)
-	}
-
-	// One below the boundary still fits, so the refusal is about the width and
-	// not about "large".
 	max := new(big.Int).Sub(huge, big.NewInt(1))
-	txs[1] = types.NewTx(&types.LegacyTx{Value: max, Gas: 21000, GasPrice: big.NewInt(1)})
-	got, i := shape(txs, []common.Address{{}, {}}, newState(t))
-	if i != len(txs) {
-		t.Fatalf("shape declined 2^64-1 at index %d; it is exactly representable", i)
+	for _, tc := range []struct {
+		name        string
+		wide, exact *types.Transaction
+	}{
+		{
+			name:  "value",
+			wide:  types.NewTx(&types.LegacyTx{Value: huge, Gas: 21000, GasPrice: big.NewInt(1)}),
+			exact: types.NewTx(&types.LegacyTx{Value: max, Gas: 21000, GasPrice: big.NewInt(1)}),
+		},
+		{
+			name:  "legacy price",
+			wide:  types.NewTx(&types.LegacyTx{Value: big.NewInt(1), Gas: 21000, GasPrice: huge}),
+			exact: types.NewTx(&types.LegacyTx{Value: big.NewInt(1), Gas: 21000, GasPrice: max}),
+		},
+		{
+			name:  "fee cap",
+			wide:  types.NewTx(&types.DynamicFeeTx{Value: big.NewInt(1), Gas: 21000, GasFeeCap: huge, GasTipCap: big.NewInt(1)}),
+			exact: types.NewTx(&types.DynamicFeeTx{Value: big.NewInt(1), Gas: 21000, GasFeeCap: max, GasTipCap: big.NewInt(1)}),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			first := types.NewTx(&types.LegacyTx{Value: big.NewInt(1), Gas: 21000, GasPrice: big.NewInt(1)})
+			if _, i := shape(types.Transactions{first, tc.wide}, senders(2), newState(t)); i != 1 {
+				t.Fatalf("shape declined at index %d, want 1 (the transaction that overflows)", i)
+			}
+
+			// One below the boundary still fits, so the refusal is about the
+			// width and not about "large".
+			got, i := shape(types.Transactions{first, tc.exact}, senders(2), newState(t))
+			if i != 2 {
+				t.Fatalf("shape declined 2^64-1 at index %d; it is exactly representable", i)
+			}
+			if got[1].Value != tc.exact.Value().Uint64() || got[1].GasPrice != tc.exact.GasPrice().Uint64() {
+				t.Errorf("shaped value/price = %d/%d, want %d/%d", got[1].Value, got[1].GasPrice,
+					tc.exact.Value().Uint64(), tc.exact.GasPrice().Uint64())
+			}
+		})
 	}
-	if got[1].Value != max.Uint64() {
-		t.Errorf("value = %d, want %d", got[1].Value, max.Uint64())
+}
+
+// CGpuTx has one price and no access list, blob hashes, authorizations or tip.
+// A tx that carries any of them is charged for them, or invalid by them, where
+// cevm would not see it: it is declined at its index.
+func TestATransactionTheWireDropsPartOfIsDeclinedAtItsIndex(t *testing.T) {
+	to := common.Address{0x11}
+	plain := types.NewTx(&types.LegacyTx{To: &to, Value: big.NewInt(1), Gas: 21000, GasPrice: big.NewInt(1)})
+	for _, tc := range []struct {
+		name string
+		tx   *types.Transaction
+		want int
+	}{
+		{"legacy", plain, 2},
+		{"access-list type, empty list", types.NewTx(&types.AccessListTx{To: &to, Gas: 21000, GasPrice: big.NewInt(1)}), 2},
+		{"dynamic fee, tip at the cap", types.NewTx(&types.DynamicFeeTx{To: &to, Gas: 21000, GasFeeCap: big.NewInt(2), GasTipCap: big.NewInt(2)}), 2},
+		{
+			"an access list",
+			types.NewTx(&types.AccessListTx{
+				To: &to, Gas: 25300, GasPrice: big.NewInt(1),
+				AccessList: types.AccessList{{Address: common.Address{0x22}, StorageKeys: []common.Hash{{0x01}}}},
+			}),
+			1,
+		},
+		{"tip above the fee cap", types.NewTx(&types.DynamicFeeTx{To: &to, Gas: 21000, GasFeeCap: big.NewInt(1), GasTipCap: big.NewInt(2)}), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, i := shape(types.Transactions{plain, tc.tx}, senders(2), newState(t)); i != tc.want {
+				t.Fatalf("shape stopped at %d, want %d", i, tc.want)
+			}
+		})
 	}
 }
 
@@ -277,7 +396,10 @@ func TestTheBlockContextIsTheHeader(t *testing.T) {
 	}
 	config := &ethparams.ChainConfig{ChainID: big.NewInt(96369)}
 
-	got := blockContext(config, header)
+	got, ok := blockContext(config, header)
+	if !ok {
+		t.Fatal("blockContext refused a header whose every field fits")
+	}
 
 	if got.ChainID != 96369 {
 		t.Errorf("ChainID = %d, want 96369 — a block executed against the wrong chain id "+
@@ -309,21 +431,27 @@ func TestTheBlockContextIsTheHeader(t *testing.T) {
 // every historical block.
 func TestAHeaderWithoutBaseFeeOrBlobGasIsNotADereference(t *testing.T) {
 	header := &types.Header{Number: big.NewInt(1), Time: 1}
-	got := blockContext(&ethparams.ChainConfig{ChainID: big.NewInt(1)}, header)
+	got, ok := blockContext(&ethparams.ChainConfig{ChainID: big.NewInt(1)}, header)
+	if !ok {
+		t.Fatal("an absent base fee was refused; absent is zero, and zero fits")
+	}
 	if got.BaseFee != 0 || got.BlobBaseFee != 0 {
 		t.Fatalf("absent base fee / blob gas became %d / %d", got.BaseFee, got.BlobBaseFee)
 	}
 }
 
-// A base fee wider than uint64 cannot be carried, and is left at zero rather
-// than truncated into a different fee.
-func TestABaseFeeTooLargeForTheWireIsNotTruncated(t *testing.T) {
-	header := &types.Header{
-		Number:  big.NewInt(1),
-		BaseFee: new(big.Int).Lsh(big.NewInt(1), 64),
+// A base fee or chain id wider than uint64 cannot be carried. Zero would be a
+// different fee — one every underpriced tx clears — so the context is refused
+// and the block declined, rather than truncated.
+func TestABaseFeeOrChainIDTooLargeForTheWireIsRefused(t *testing.T) {
+	huge := new(big.Int).Lsh(big.NewInt(1), 64)
+	header := &types.Header{Number: big.NewInt(1), BaseFee: huge}
+	if got, ok := blockContext(&ethparams.ChainConfig{ChainID: big.NewInt(1)}, header); ok {
+		t.Fatalf("base fee 2^64 gave a context (BaseFee=%d); it must be refused", got.BaseFee)
 	}
-	if got := blockContext(&ethparams.ChainConfig{ChainID: big.NewInt(1)}, header); got.BaseFee != 0 {
-		t.Fatalf("BaseFee = %d; a value that does not fit must not be truncated", got.BaseFee)
+	header.BaseFee = big.NewInt(1)
+	if got, ok := blockContext(&ethparams.ChainConfig{ChainID: huge}, header); ok {
+		t.Fatalf("chain id 2^64 gave a context (ChainID=%d); it must be refused", got.ChainID)
 	}
 }
 
@@ -349,11 +477,10 @@ func TestAResultThatDoesNotMatchTheBlockIsRefused(t *testing.T) {
 	}
 }
 
-// The V4 kernel says CallNotSupported for the CALL/CREATE family. Mixing
-// backends mid-block would execute part of it on cevm and part on the Go EVM,
-// so the whole block is declined at the transaction that could not run.
+// CallNotSupported never reaches a caller, go_bridge.h says. One that does
+// is a result that is not the block's; mixing backends mid-block would execute
+// part of it on cevm and part on the Go EVM, so the whole block is declined.
 func TestATransactionTheKernelCannotRunDeclinesTheWholeBlock(t *testing.T) {
-	t.Setenv(envCEVMStrict, "0")
 	txs := types.Transactions{transfer(t, 1, big.NewInt(1)), transfer(t, 2, big.NewInt(1))}
 	result := &cevm.BlockResult{
 		GasUsed: []uint64{21000, 0},
@@ -424,10 +551,9 @@ func TestOnlyAPlainValueTransferIsReconstructable(t *testing.T) {
 	}
 }
 
-// A block cevm cannot receipt is declined, and under strict mode that refusal
-// names the transaction responsible.
-func TestABlockBeyondValueTransferIsDeclinedAtItsIndex(t *testing.T) {
-	t.Setenv(envCEVMStrict, "1")
+// A block cevm cannot receipt is declined to the Go EVM rather than receipted
+// without the logs or contract address it would need.
+func TestABlockBeyondValueTransferIsDeclined(t *testing.T) {
 	to := common.Address{0x11}
 	txs := types.Transactions{
 		types.NewTx(&types.LegacyTx{To: &to, Value: big.NewInt(1), Gas: 21000}),
@@ -437,19 +563,15 @@ func TestABlockBeyondValueTransferIsDeclinedAtItsIndex(t *testing.T) {
 		GasUsed: []uint64{21000, 53000},
 		Status:  []cevm.TxStatus{cevm.TxOK, cevm.TxOK},
 	}
-	_, err := assemble(txs, newState(t), result, newHeader())
-	if !errors.Is(err, ErrGPUEVMRequired) {
-		t.Fatalf("assemble = %v, want ErrGPUEVMRequired", err)
-	}
-	if !strings.Contains(err.Error(), "tx_index=1") {
-		t.Errorf("refusal %q does not name the transaction that could not be receipted", err)
+	receipts, err := assemble(txs, newState(t), result, newHeader())
+	if err != nil || receipts != nil {
+		t.Fatalf("assemble = (%v, %v), want the block declined: (nil, nil)", receipts, err)
 	}
 }
 
 // The receipt is the parity-critical seam: the receipt trie hash is in the
 // header, so every field has to be what the Go EVM would have produced.
 func TestReceiptsCarryEachTransactionsOwnResult(t *testing.T) {
-	t.Setenv(envCEVMStrict, "1")
 	to := common.Address{0x11}
 	txs := types.Transactions{
 		types.NewTx(&types.LegacyTx{Nonce: 1, To: &to, Value: big.NewInt(1), Gas: 21000}),
@@ -537,12 +659,12 @@ func TestAnUnrecognisedStatusIsNotSuccess(t *testing.T) {
 // The state snapshot
 // -----------------------------------------------------------------------------
 
-// The kernel resolves CALL and CREATE targets from this snapshot, so every
-// address the block touches has to be in it exactly once, carrying the state
-// the StateDB holds.
+// cevm takes an account the snapshot lacks not to exist, so every address the
+// block touches — callers, targets and the coinbase — has to be in it exactly
+// once, carrying the state the StateDB holds.
 func TestTheSnapshotHoldsEveryTouchedAccountOnce(t *testing.T) {
 	sdb := newState(t)
-	from, to := common.Address{0x01}, common.Address{0x02}
+	from, to, coinbase := common.Address{0x01}, common.Address{0x02}, common.Address{0xC0}
 	code := []byte{0x60, 0x01, 0x60, 0x02}
 	sdb.SetNonce(from, 9, tracing.NonceChangeUnspecified)
 	sdb.AddBalance(from, uint256.NewInt(1_000_000), tracing.BalanceChangeUnspecified)
@@ -554,9 +676,9 @@ func TestTheSnapshotHoldsEveryTouchedAccountOnce(t *testing.T) {
 		{From: [20]byte(from)},                                // a creation: no target
 	}
 
-	got := buildStateSnapshot(txs, sdb)
-	if len(got) != 2 {
-		t.Fatalf("snapshot holds %d accounts, want 2 (the caller and the target, deduped)", len(got))
+	got := buildStateSnapshot(txs, coinbase, sdb)
+	if len(got) != 3 {
+		t.Fatalf("snapshot holds %d accounts, want 3 (the caller, the target and the coinbase, deduped)", len(got))
 	}
 
 	byAddr := map[common.Address]cevm.StateAccount{}
@@ -585,6 +707,62 @@ func TestTheSnapshotHoldsEveryTouchedAccountOnce(t *testing.T) {
 	if common.Hash(target.CodeHash) != sdb.GetCodeHash(to) {
 		t.Errorf("target code hash = %x, want %x", target.CodeHash, sdb.GetCodeHash(to))
 	}
+	if _, ok := byAddr[coinbase]; !ok {
+		t.Error("the coinbase, which every fee credits, is not in the snapshot")
+	}
+
+	// The coinbase is already a caller: it is not added twice.
+	if got := buildStateSnapshot(txs, from, sdb); len(got) != 2 {
+		t.Errorf("snapshot with the caller as coinbase holds %d accounts, want 2", len(got))
+	}
+}
+
+// An account that does not exist has no code and no storage, and its row says
+// so with the hashes of nothing. The StateDB answers zero for both, which cevm
+// reads as "says nothing" and declines: a sender or recipient that has never
+// been seen — the usual first transfer to a fresh address — would decline
+// every block it is in.
+func TestAnAccountThatDoesNotExistSaysItHasNoCodeAndNoStorage(t *testing.T) {
+	sdb := newState(t)
+	absent := common.Address{0xAB}
+	if sdb.Exist(absent) {
+		t.Fatal("test setup: the account exists")
+	}
+	got := buildStateSnapshot([]cevm.Transaction{{From: [20]byte(absent)}}, absent, sdb)
+	if len(got) != 1 {
+		t.Fatalf("snapshot holds %d accounts, want 1", len(got))
+	}
+	if common.Hash(got[0].CodeHash) != types.EmptyCodeHash {
+		t.Errorf("code hash = %x, want keccak256 of nothing %x", got[0].CodeHash, types.EmptyCodeHash)
+	}
+	if common.Hash(got[0].StorageRoot) != types.EmptyRootHash {
+		t.Errorf("storage root = %x, want the empty trie root %x", got[0].StorageRoot, types.EmptyRootHash)
+	}
+}
+
+// An account with storage carries its storage trie root, not zero and not the
+// empty root.
+func TestAnAccountCarriesItsStorageRoot(t *testing.T) {
+	sdb := newState(t)
+	addr := common.Address{0x0D}
+	sdb.AddBalance(addr, uint256.NewInt(1), tracing.BalanceChangeUnspecified)
+	sdb.SetState(addr, common.Hash{0x01}, common.Hash{0x02})
+	sdb.IntermediateRoot(false)
+
+	root := sdb.GetStorageRoot(addr)
+	if root == (common.Hash{}) || root == types.EmptyRootHash {
+		t.Fatalf("test setup: storage root %x is not a written trie's", root)
+	}
+	got := buildStateSnapshot([]cevm.Transaction{{From: [20]byte(addr)}}, addr, sdb)
+	if len(got) != 1 {
+		t.Fatalf("snapshot holds %d accounts, want 1", len(got))
+	}
+	if common.Hash(got[0].StorageRoot) != root {
+		t.Errorf("storage root = %x, want %x", got[0].StorageRoot, root)
+	}
+	if common.Hash(got[0].CodeHash) != types.EmptyCodeHash {
+		t.Errorf("code hash = %x, want %x for an account with no code", got[0].CodeHash, types.EmptyCodeHash)
+	}
 }
 
 // Balance crosses as four little-endian uint64 limbs because that is the
@@ -605,7 +783,7 @@ func TestTheBalanceLimbsAreLittleEndian(t *testing.T) {
 	})
 	sdb.AddBalance(addr, bal, tracing.BalanceChangeUnspecified)
 
-	got := buildStateSnapshot([]cevm.Transaction{{From: [20]byte(addr)}}, sdb)
+	got := buildStateSnapshot([]cevm.Transaction{{From: [20]byte(addr)}}, addr, sdb)
 	if len(got) != 1 {
 		t.Fatalf("snapshot holds %d accounts, want 1", len(got))
 	}
@@ -627,10 +805,10 @@ func TestTheBalanceLimbsAreLittleEndian(t *testing.T) {
 // Nothing to snapshot is not an empty snapshot to build. A nil StateDB is the
 // caller having nothing to read from, which must not be a dereference.
 func TestThereIsNoSnapshotWithoutTransactionsOrAState(t *testing.T) {
-	if got := buildStateSnapshot(nil, newState(t)); got != nil {
+	if got := buildStateSnapshot(nil, common.Address{}, newState(t)); got != nil {
 		t.Errorf("snapshot of no transactions = %v, want nil", got)
 	}
-	if got := buildStateSnapshot([]cevm.Transaction{{}}, nil); got != nil {
+	if got := buildStateSnapshot([]cevm.Transaction{{}}, common.Address{}, nil); got != nil {
 		t.Errorf("snapshot with no state = %v, want nil", got)
 	}
 }
@@ -654,6 +832,15 @@ func newHeader() *types.Header {
 
 func chainConfig() *ethparams.ChainConfig {
 	return &ethparams.ChainConfig{ChainID: big.NewInt(96369)}
+}
+
+// senders is n distinct sender addresses, positionally paired with a block.
+func senders(n int) []common.Address {
+	out := make([]common.Address, n)
+	for i := range out {
+		out[i] = common.Address{0xA0, byte(i + 1)}
+	}
+	return out
 }
 
 // transfer builds a plain value transfer to a fixed recipient.

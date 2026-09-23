@@ -172,25 +172,18 @@ Expected single log line:
 [crypto/backend] GPU fallback: reason=disabled where=clob
 ```
 
-## 8. cevm GPU EVM strict mode
+## 8. cevm declines to the Go EVM
 
-The cevm Go EVM fallback is now opt-OUT (strict by default). To verify the
-strict policy:
+cevm's Go entry (`gpu_execute_block`, go_bridge.h ABI 6) answers ok=0 for any
+block it does not run — any batch with code, and any refusal on balance, nonce,
+price, block gas limit, revision or hashes. The executor in
+`evm/cevm/parallel` then returns `(nil, nil)`, and the Go EVM runs the block.
+There is no switch: a decline is never an error.
 
 ```bash
 cd ~/work/lux/chains
 go test -count=1 ./evm/cevm/parallel/
 ```
-
-To re-enable the legacy fallback during V5 transition (emergency rollback):
-
-```bash
-CEVM_STRICT=0 go test -count=1 ./evm/cevm/parallel/
-```
-
-V5 kernel work tracked at `chains/evm/cevm/V5_ABI.md`. Until that lands,
-strict mode treats any CALL/CREATE block as `ErrGPUEVMRequired` — the lie
-of silent Go-EVM shadowing is removed.
 
 ## 9. Full sweep (build everything, run everything)
 
@@ -242,9 +235,8 @@ overhead dominates and CPU wins.
 ## What's still on the luxcpp roadmap (not blocking this PR)
 
 - **cevm V5 kernel**: CALL/CREATE on device per `chains/evm/cevm/V5_ABI.md`.
-  Without V5, strict-mode cevm refuses any CALL-containing block. Operators
-  needing the legacy fallback during the V5 transition set
-  `CEVM_STRICT=0`.
+  Until a Go entry runs code, cevm declines every block with code and the Go
+  EVM runs it.
 - **Precompile-engine → MatchOrderGPU bridge**: the `lux/precompile/dex`
   engine's matching path uses its own embedded path today. Hooking it to
   `MatchOrderGPU` is one small Go change in `engine_embedded.go::Swap` /

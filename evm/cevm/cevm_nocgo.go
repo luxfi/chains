@@ -25,8 +25,9 @@ func BackendName(b Backend) string { return b.String() }
 // LibraryABIVersion returns the Go-side constant when there's no library.
 func LibraryABIVersion() uint32 { return ABIVersion }
 
-// ExecuteBlock returns an error when built without CGo. Mirrors the V4
-// cgo signature so consumers can call it unconditionally.
+// ExecuteBlock returns ErrNotLinked for any transactions: no library is
+// linked. It mirrors the cgo signature so consumers can call it
+// unconditionally.
 func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext, state []StateAccount) (*BlockResult, error) {
 	if len(txs) == 0 {
 		return &BlockResult{ABIVersion: ABIVersion}, nil

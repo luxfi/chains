@@ -24,9 +24,9 @@
 //     tx.Code) that the C side dereferences, and is unpinned via defer
 //     after the C call returns — including on the error path.
 //
-//  2. The C result is freed via defer (gpu_free_result / gpu_free_result_v2)
-//     on every code path including failure. Gas/status arrays are copied
-//     into Go-owned slices before the result is freed.
+//  2. The C result is freed via defer (gpu_free_result) on every code path
+//     including failure. Gas/status arrays are copied into Go-owned slices
+//     before the result is freed.
 //
 //  3. The C++ engine uses a thread_local engine cache (one per OS thread
 //     reached by goroutines via cgo) for the Keccak hasher; per-instance
@@ -72,9 +72,19 @@ import (
 // fell back on a signature the library had rejected.
 var ErrNotLinked = errors.New("cevm: native EVM not linked (rebuild with CGO_ENABLED=1 -tags=lux_cevm_native)")
 
-// Backend selects the C++ EVM execution mode.
-// BlockResult extends BlockResult with the V2 ABI fields: per-tx status
-// and the post-execution state root.
+// ErrDeclined is what ExecuteBlock returns when the library answers ok=0
+// (go_bridge.h): the result is not the block's, and the caller runs the block
+// on its own EVM. cevm declines any batch in which a transaction carries code,
+// and any batch its value-transfer paths cannot run as the EVM does — a
+// refusal on balance, nonce, price, block gas limit or revision, a snapshot
+// row without its hashes, or a device that failed.
+//
+// A declined result carries no gas or status a caller may use, so ExecuteBlock
+// returns none with it.
+var ErrDeclined = errors.New("cevm: declined the block (ok=0); the caller runs it")
+
+// BlockResult is what ExecuteBlock returns for a block cevm ran: per-tx gas
+// and status. StateRoot is zero: gpu_execute_block roots no state.
 type BlockResult struct {
 	StateRoot    [32]byte
 	GasUsed      []uint64
@@ -86,6 +96,7 @@ type BlockResult struct {
 	ABIVersion   uint32
 }
 
+// Backend selects the C++ EVM execution mode.
 type Backend int
 
 const (
@@ -117,16 +128,19 @@ func (b Backend) String() string {
 
 // Transaction is a single EVM transaction to execute.
 //
-// When Code is non-empty AND a GPU backend is selected, the C++ EVM
-// dispatches each tx through the parallel opcode interpreter (Metal:
-// kernel::EvmKernelHost, CUDA: cuda::EvmKernel). When Code is empty, GPU
-// backends use the scheduler-only Block-STM kernel.
+// cevm runs a batch only when it is plain value transfers on a GPU backend's
+// value-transfer path: a batch in which any transaction carries Code is
+// declined (ErrDeclined), because gpu_execute_block passes no host and would
+// run that code as a message, on its whole limit, which is not the tx's gas.
+//
+// Value and GasPrice are 64-bit on the wire. A transaction whose value or
+// price does not fit is the caller's to run; it never belongs in a batch.
 type Transaction struct {
 	From     [20]byte
 	To       [20]byte
 	HasTo    bool
 	Data     []byte // Calldata
-	Code     []byte // EVM bytecode (optional — required for real GPU execution)
+	Code     []byte // The recipient's code; any makes cevm decline the batch
 	GasLimit uint64
 	Value    uint64
 	Nonce    uint64
@@ -176,8 +190,10 @@ func (s TxStatus) String() string {
 // to 0, timestamp to 0, etc., which matches the dispatcher's pre-v0.26
 // behaviour.
 //
-// Field layout matches the C-side CBlockContext byte-for-byte: this struct
-// is passed to the C ABI via direct memcpy, no field-by-field translation.
+// Field layout matches the C-side CBlockContext byte-for-byte. The binding
+// copies it into a CBlockContext field by field, and the C side memcpy's that
+// into evm::gpu::BlockContext; the Go layout is pinned to the C one all the
+// same (TestBlockContextIsTheWireLayout, and the size check in cevm_cgo.go).
 // Field order MUST match go_bridge.h CBlockContext exactly. Adding new
 // fields requires bumping ABIVersion and the C-side EVM_GPU_ABI_VERSION
 // in lockstep.
@@ -196,32 +212,33 @@ type BlockContext struct {
 	NumBlobHashes uint32
 }
 
-// ABIVersion is the C ABI version this Go module expects. Compare against
-// the loaded library's gpu_abi_version() to detect version skew.
-//
-// v5 (v0.26.0): added gpu_execute_block_v3 with CBlockContext (TIMESTAMP,
-// NUMBER, CHAINID, BASEFEE, etc.) and per-tx status[] in BlockResult. V2
-// callers still work; only ExecuteBlock sees the new BlockContext fields.
-//
-// v6: added gpu_execute_block_v4 + CGpuStateAccount. Callers can now hand
-// the GPU a state snapshot (account nonce, balance, code, code_hash) so
-// the kernel CALL/CREATE path resolves targets on-device instead of
-// returning CallNotSupported. V3 callers still see the same wire shape.
-//
+// ABIVersion (cevm_cgo.go / cevm_nocgo.go) is the C ABI this build links:
+// go_bridge.h's EVM_GPU_ABI_VERSION, 6. v6 is one entry, gpu_execute_block,
+// taking a block context and a state snapshot (CGpuStateAccount) and
+// answering per-tx gas and status with ok, freed by gpu_free_result. The
+// versioned _v2/_v3/_v4 entries are gone.
 
 // StateAccount is one entry in the snapshot of touched accounts handed to
-// ExecuteBlock. Fields mirror the C-side CGpuStateAccount byte-for-byte
-// (modulo the inline `Code` slice which the binding flattens into a single
-// blob before crossing the cgo boundary).
+// ExecuteBlock, the state before the block. Fields mirror the C-side
+// CGpuStateAccount (modulo the inline `Code` slice which the binding flattens
+// into a single blob before crossing the cgo boundary).
+//
+// The snapshot must hold every account a transaction touches: cevm takes an
+// account it lacks not to exist, so a transfer to a contract left out runs as
+// a transfer to an empty account.
 //
 // Address is canonical 20-byte big-endian. Balance is little-endian limbs
 // (Balance[0] = low 64 bits). Code may be nil for EOAs — empty code is the
-// EOA marker. CodeHash should be keccak256(code); the dispatcher does not
-// recompute it because callers usually have it cached on the StateDB side.
+// EOA marker. CodeHash is keccak256(code), keccak256 of nothing
+// (types.EmptyCodeHash) for an account with no code, including one that does
+// not exist; zero says nothing, and cevm declines a batch whose sender or
+// recipient row carries it. StorageRoot is the account's storage trie root,
+// types.EmptyRootHash for an account with no storage.
 type StateAccount struct {
-	Address  [20]byte
-	Nonce    uint64
-	Balance  [4]uint64
-	Code     []byte
-	CodeHash [32]byte
+	Address     [20]byte
+	Nonce       uint64
+	Balance     [4]uint64
+	Code        []byte
+	CodeHash    [32]byte
+	StorageRoot [32]byte
 }

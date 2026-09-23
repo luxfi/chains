@@ -54,14 +54,31 @@ func AutoDetect() Backend {
 	return Backend(C.gpu_auto_detect_backend())
 }
 
-// init validates the ABI version of the loaded shared library against the Go
-// module's expected ABIVersion. A mismatch means the binary and the cevm
-// module were built against incompatible C++ headers and any execution would
-// produce silently wrong results — fail fast at process start instead.
 // ABIVersion is the ABI this build was compiled against, taken from the
 // library's own header. There is no second copy to keep in sync.
 const ABIVersion = uint32(C.EVM_GPU_ABI_VERSION)
 
+// The C structs this file fills and reads, at the sizes go_bridge.h (ABI 6)
+// gives them on LP64. A header that adds, drops or widens a field changes a
+// size, and then this file does not compile until it has been read against
+// the new header: a field it never sets would otherwise cross as zero, which
+// is how storage_root went unset. Each pair fails when the size is larger
+// (the first) or smaller (the second).
+var (
+	_ [unsafe.Sizeof(C.CGpuTx{}) - 112]struct{}
+	_ [112 - unsafe.Sizeof(C.CGpuTx{})]struct{}
+	_ [unsafe.Sizeof(C.CGpuStateAccount{}) - 136]struct{}
+	_ [136 - unsafe.Sizeof(C.CGpuStateAccount{})]struct{}
+	_ [unsafe.Sizeof(C.CGpuBlockResult{}) - 88]struct{}
+	_ [88 - unsafe.Sizeof(C.CGpuBlockResult{})]struct{}
+	_ [unsafe.Sizeof(C.CBlockContext{}) - unsafe.Sizeof(BlockContext{})]struct{}
+	_ [unsafe.Sizeof(BlockContext{}) - unsafe.Sizeof(C.CBlockContext{})]struct{}
+)
+
+// init validates the ABI version of the loaded shared library against the Go
+// module's expected ABIVersion. A mismatch means the binary and the cevm
+// module were built against incompatible C++ headers and any execution would
+// produce silently wrong results — fail fast at process start instead.
 func init() {
 	got := uint32(C.gpu_abi_version())
 	if got != ABIVersion {
@@ -124,9 +141,13 @@ func copyU64(ptr *C.uint64_t, want uint32) []uint64 {
 	return dst
 }
 
-// ExecuteBlock runs txs against backend and returns the block result. A nil ctx
-// leaves the C side on its own block defaults; nil state means no prestate is
-// seeded. numThreads is passed through to the C executor.
+// ExecuteBlock runs txs against backend through gpu_execute_block and returns
+// per-tx gas and status. A nil ctx leaves the C side on a zero block context;
+// state is the state before the block and must hold every account a tx
+// touches (see StateAccount). numThreads is passed through to the C executor.
+//
+// When the library declines the block (ok=0) ExecuteBlock returns ErrDeclined
+// and no result: the caller runs the block on its own EVM.
 func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *BlockContext, state []StateAccount) (*BlockResult, error) {
 	if len(txs) == 0 {
 		return &BlockResult{ABIVersion: ABIVersion}, nil
@@ -136,7 +157,7 @@ func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *Bl
 	defer pinner.Unpin()
 	ctxs := buildTxs(txs, &pinner)
 
-	// Build the BlockContext mirror (same shape as V3).
+	// Build the CBlockContext.
 	var cctxStorage C.CBlockContext
 	var cctxPtr *C.CBlockContext
 	if ctx != nil {
@@ -185,10 +206,7 @@ func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *Bl
 				cAccts[i].balance[j] = C.uint64_t(a.Balance[j])
 			}
 			cAccts[i].code_hash = *(*[32]C.uint8_t)(unsafe.Pointer(&a.CodeHash[0]))
-			// storage_root is left zero — the GPU CALL path doesn't
-			// consume it yet (LP-108 P5 reads code only). Filled in
-			// by the trie commit pass on the cevm side; safe to leave
-			// zero here for the dispatch hand-off.
+			cAccts[i].storage_root = *(*[32]C.uint8_t)(unsafe.Pointer(&a.StorageRoot[0]))
 			if n := len(a.Code); n > 0 {
 				cAccts[i].code_off = C.uint32_t(len(codeBlob))
 				cAccts[i].code_size = C.uint32_t(n)
@@ -206,26 +224,29 @@ func ExecuteBlock(backend Backend, numThreads uint32, txs []Transaction, ctx *Bl
 		}
 	}
 
-	result := C.gpu_execute_block_v4(
+	result := C.gpu_execute_block(
 		&ctxs[0],
 		C.uint32_t(len(ctxs)),
 		C.uint8_t(backend),
 		C.uint32_t(numThreads),
-		C.uint8_t(12), // EVM_GPU_REV_CANCUN
+		C.uint8_t(C.EVM_GPU_REV_CANCUN), // the one revision the kernels implement
 		cctxPtr,
 		cAcctsPtr,
 		C.uint32_t(len(state)),
 		codePtr,
 		C.uint32_t(codeSize),
 	)
-	defer C.gpu_free_result_v2(&result)
+	defer C.gpu_free_result(&result)
 	runtime.KeepAlive(ctxs)
 	runtime.KeepAlive(cctxStorage)
 	runtime.KeepAlive(cAccts)
 	runtime.KeepAlive(codeBlob)
 
+	// ok=0 names no gas or status the caller may use (every status reads
+	// EVM_GPU_TX_ERROR, and the arrays may be NULL), so nothing below it is
+	// read: the block goes back to the caller whole.
 	if result.ok == 0 {
-		return nil, fmt.Errorf("cevm: execute_block_v4 failed")
+		return nil, ErrDeclined
 	}
 	if uint32(result.abi_version) != ABIVersion {
 		return nil, fmt.Errorf("cevm: ABI version mismatch in result (lib=%d expected=%d)",
