@@ -9,3 +9,8 @@ build/
 # pass, and are not in the repository.
 /plugin
 .DS_Store
+
+# Local symlinks to LLM.md
+CLAUDE.md
+AGENTS.md
+GEMINI.md
